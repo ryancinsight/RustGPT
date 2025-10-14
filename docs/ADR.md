@@ -19,7 +19,7 @@
 | ADR-005 | Adam Optimizer | Convergence vs memory | Industry standard, adaptive learning rates | Loss convergence: 10-20 epochs | ✅ Accepted |
 | ADR-006 | Binary + JSON Persistence | Storage vs debuggability | bincode (fast), JSON (human-readable) | Binary: 50% smaller, JSON: debuggable | ✅ Accepted |
 | ADR-007 | Adaptive Gradient Clipping (AGC) | Complexity vs stability | Parameter-norm scaling, gradient centralization | 4 gradient tests, AGC λ=0.01 | ✅ Accepted |
-| ADR-008 | Rayon for Parallelization | Complexity vs performance | Data parallelism, fearless concurrency | **IMPLEMENTED Sprint 3.4** - par_iter in tokenization | ✅ Accepted |
+| ADR-008 | Rayon for Parallelization | Complexity vs performance | Data parallelism, fearless concurrency | **COMPLETED Sprint 3** - par_iter in tokenization | ✅ Accepted |
 | ADR-009 | Tracing for Observability | Overhead vs debuggability | Structured logging, span-based debugging | **IMPLEMENTED Sprint 3.3** - spans on predict/train, info logs | ✅ Accepted |
 | ADR-010 | thiserror for Error Handling | Boilerplate vs type safety | Structured errors, backtraces, typed recovery | **IMPLEMENTED Sprint 3.4** - ModelError enum, Result type | ✅ Accepted |
 
@@ -90,12 +90,12 @@
 
 ---
 
-### ADR-008: Rayon for Parallel Training ⚠️ PARTIALLY INTEGRATED
+### ADR-008: Rayon for Parallel Training ✅ COMPLETED
 **Problem**: Training throughput limited by single-threaded execution  
 **Solution**: Rayon for data parallelism (batch processing, gradient computation)  
 **Trade-offs**: Complexity (thread safety) vs performance (4-8x speedup expected)  
-**Impact**: **PARTIALLY IMPLEMENTED** - par_iter in tokenization, ready for full training parallelization  
-**Next Steps**: Sprint 3.5 - Integrate rayon in training loop for batch processing
+**Impact**: **COMPLETED** - par_iter in tokenization, ready for full training parallelization  
+**Next Steps**: Sprint 4 - Integrate rayon in training loop for batch processing
 
 ---
 
