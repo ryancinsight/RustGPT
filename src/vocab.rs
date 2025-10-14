@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use bincode::Encode;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Encode)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Vocab {
     pub encode: HashMap<String, usize>,
     pub decode: HashMap<usize, String>,

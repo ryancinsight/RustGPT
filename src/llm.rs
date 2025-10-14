@@ -1,11 +1,91 @@
 use std::cmp::Ordering;
+use std::fs;
 
 use ndarray::{Array1, Array2, Axis};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
 
 use crate::{
-    EMBEDDING_DIM, Embeddings, HIDDEN_DIM, MAX_SEQ_LEN, Vocab, output_projection::OutputProjection,
+    EMBEDDING_DIM, Embeddings, HIDDEN_DIM, MAX_SEQ_LEN, Vocab, errors::{ModelError, Result}, gradient_clipping::{AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping}, output_projection::OutputProjection,
     transformer::TransformerBlock,
 };
+
+#[derive(Serialize, Deserialize)]
+pub enum LayerEnum {
+    Embeddings(Embeddings),
+    SelfAttention(Box<crate::self_attention::SelfAttention>),
+    FeedForward(Box<crate::feed_forward::FeedForward>),
+    LayerNorm(crate::layer_norm::LayerNorm),
+    OutputProjection(OutputProjection),
+}
+
+impl Layer for LayerEnum {
+    fn layer_type(&self) -> &str {
+        match self {
+            LayerEnum::Embeddings(layer) => layer.layer_type(),
+            LayerEnum::SelfAttention(layer) => layer.layer_type(),
+            LayerEnum::FeedForward(layer) => layer.layer_type(),
+            LayerEnum::LayerNorm(layer) => layer.layer_type(),
+            LayerEnum::OutputProjection(layer) => layer.layer_type(),
+        }
+    }
+
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        match self {
+            LayerEnum::Embeddings(layer) => layer.forward(input),
+            LayerEnum::SelfAttention(layer) => layer.forward(input),
+            LayerEnum::FeedForward(layer) => layer.forward(input),
+            LayerEnum::LayerNorm(layer) => layer.forward(input),
+            LayerEnum::OutputProjection(layer) => layer.forward(input),
+        }
+    }
+
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        match self {
+            LayerEnum::Embeddings(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::SelfAttention(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::FeedForward(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::LayerNorm(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
+        }
+    }
+
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        match self {
+            LayerEnum::Embeddings(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::FeedForward(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::LayerNorm(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
+        }
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        match self {
+            LayerEnum::Embeddings(layer) => layer.backward(grads, lr),
+            LayerEnum::SelfAttention(layer) => layer.backward(grads, lr),
+            LayerEnum::FeedForward(layer) => layer.backward(grads, lr),
+            LayerEnum::LayerNorm(layer) => layer.backward(grads, lr),
+            LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
+        }
+    }
+
+    fn parameters(&self) -> usize {
+        match self {
+            LayerEnum::Embeddings(layer) => layer.parameters(),
+            LayerEnum::SelfAttention(layer) => layer.parameters(),
+            LayerEnum::FeedForward(layer) => layer.parameters(),
+            LayerEnum::LayerNorm(layer) => layer.parameters(),
+            LayerEnum::OutputProjection(layer) => layer.parameters(),
+        }
+    }
+}
+
 pub trait Layer {
     fn layer_type(&self) -> &str;
 
@@ -14,12 +94,23 @@ pub trait Layer {
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
 
     fn parameters(&self) -> usize;
+
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>);
+
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32);
 }
 
+#[derive(Serialize, Deserialize)]
 #[allow(clippy::upper_case_acronyms)]
 pub struct LLM {
     pub vocab: Vocab,
-    pub network: Vec<Box<dyn Layer>>,
+    pub network: Vec<LayerEnum>,
+    #[serde(skip)]
+    pub gradient_clipper: Option<Box<dyn GradientClipping>>,
 }
 
 impl Default for LLM {
@@ -29,17 +120,29 @@ impl Default for LLM {
         Self {
             vocab: Vocab::default(),
             network: vec![
-                Box::new(Embeddings::default()),
-                Box::new(transformer_block),
-                Box::new(output_projection),
+                LayerEnum::Embeddings(Embeddings::default()),
+                LayerEnum::SelfAttention(Box::new(transformer_block.attention)),
+                LayerEnum::LayerNorm(transformer_block.norm1),
+                LayerEnum::FeedForward(Box::new(transformer_block.feed_forward)),
+                LayerEnum::LayerNorm(transformer_block.norm2),
+                LayerEnum::OutputProjection(output_projection),
             ],
+            gradient_clipper: Some(Box::new(AdaptiveGradientClipping::new(
+                AdaptiveClippingConfig::default(),
+            ))),
         }
     }
 }
 
 impl LLM {
-    pub fn new(vocab: Vocab, network: Vec<Box<dyn Layer>>) -> Self {
-        Self { vocab, network }
+    pub fn new(vocab: Vocab, network: Vec<LayerEnum>) -> Self {
+        Self {
+            vocab,
+            network,
+            gradient_clipper: Some(Box::new(AdaptiveGradientClipping::new(
+                AdaptiveClippingConfig::default(),
+            ))),
+        }
     }
 }
 
@@ -60,6 +163,7 @@ impl LLM {
             .sum::<usize>()
     }
 
+    #[instrument(skip(self))]
     pub fn predict(&mut self, text: &str) -> String {
         let output_tokens = self.forward(text);
 
@@ -71,12 +175,13 @@ impl LLM {
         // Convert token_ids to strings
         let token_strs = output_tokens
             .iter()
-            .map(|t| self.vocab.decode[t].clone())
-            .collect::<Vec<String>>();
+            .map(|&t| self.vocab.decode.get(&t).unwrap().as_str())
+            .collect::<Vec<&str>>();
 
         token_strs.join(" ")
     }
 
+    #[instrument(skip(self))]
     fn forward(&mut self, text: &str) -> Vec<usize> {
         // Tokenize the input text
         let mut tokenized = self.tokenize(text);
@@ -145,54 +250,31 @@ impl LLM {
         output_tokens
     }
 
+    #[instrument(skip(self, data))]
     pub fn train(&mut self, data: Vec<&str>, epochs: usize, lr: f32) {
+        self.train_with_batch_size(data, epochs, lr, 1);
+    }
+
+    /// Train with configurable batch size for improved performance
+    pub fn train_with_batch_size(
+        &mut self,
+        data: Vec<&str>,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+    ) {
         let tokenized_data = data
-            .iter()
+            .par_iter()
             .map(|input| self.tokenize(input))
             .collect::<Vec<Vec<usize>>>();
 
         for epoch in 0..epochs {
             let mut total_loss = 0.0;
-            for training_row in &tokenized_data {
-                if training_row.len() < 2 {
-                    continue;
-                }
 
-                // 1. Slice input and targets
-                let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
-                let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab. 
-
-                // Forward pass
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                for layer in &mut self.network {
-                    input = layer.forward(&input);
-                }
-
-                let logits = input;
-                let probs = Self::softmax(&logits);
-
-                total_loss += Self::cross_entropy_loss_step(&probs, target_ids);
-
-                // Backward pass
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids); // this is d_L/d_output_projection
-
-                // Apply gradient clipping BEFORE backpropagation
-                Self::clip_gradients(&mut grads_output, 5.0);
-
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, lr);
-                }
-
-                let tokens = Self::greedy_decode(&probs);
-                let next_token = tokens[tokens.len() - 1];
-
-                if next_token == self.vocab.encode("</s>").unwrap() {
-                    continue;
-                }
+            // Process data in batches
+            for batch in tokenized_data.chunks(batch_size) {
+                let batch_loss = self.train_batch(batch, lr);
+                total_loss += batch_loss;
             }
 
             println!(
@@ -200,9 +282,103 @@ impl LLM {
                 epoch,
                 total_loss / tokenized_data.len() as f32
             );
+            info!(
+                epoch = epoch,
+                loss = total_loss / tokenized_data.len() as f32,
+                "Training epoch completed"
+            );
         }
     }
 
+    /// Train on a single batch of sequences
+    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> f32 {
+        let mut batch_loss = 0.0;
+        let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
+
+        // Initialize accumulated gradients for each layer
+        for _ in &self.network {
+            accumulated_param_grads.push(Vec::new());
+        }
+
+        // Process each sequence in the batch
+        for training_row in batch {
+            if training_row.len() < 2 {
+                continue;
+            }
+
+            // 1. Slice input and targets
+            let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
+            let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab. 
+
+            // Forward pass
+            let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
+            input
+                .row_mut(0)
+                .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
+
+            for layer in &mut self.network {
+                input = layer.forward(&input);
+            }
+
+            let logits = input;
+            let probs = Self::softmax(&logits);
+
+            batch_loss += Self::cross_entropy_loss_step(&probs, target_ids);
+
+            // Compute gradients w.r.t. logits
+            let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+
+            // Apply gradient clipping
+            if let Some(ref mut clipper) = self.gradient_clipper {
+                clipper.clip_gradients(&mut grads_output);
+            }
+
+            // Backward pass: compute parameter gradients for each layer
+            for (rev_idx, layer) in self.network.iter().rev().enumerate() {
+                let (input_grads, param_grads) =
+                    layer.compute_gradients(&Array2::zeros((0, 0)), &grads_output);
+                grads_output = input_grads;
+
+                // Accumulate parameter gradients (correct index for reversed iteration)
+                let layer_idx = self.network.len() - 1 - rev_idx;
+                if accumulated_param_grads[layer_idx].is_empty() {
+                    accumulated_param_grads[layer_idx] = param_grads;
+                } else {
+                    for (acc_grad, new_grad) in accumulated_param_grads[layer_idx]
+                        .iter_mut()
+                        .zip(param_grads)
+                    {
+                        *acc_grad += &new_grad;
+                    }
+                }
+            }
+        }
+
+        // Apply accumulated and averaged gradients
+        for (layer, param_grads) in self.network.iter_mut().zip(accumulated_param_grads) {
+            if !param_grads.is_empty() {
+                // Average gradients across batch
+                let averaged_grads: Vec<Array2<f32>> = param_grads
+                    .into_iter()
+                    .map(|grad| grad / batch.len() as f32)
+                    .collect();
+                layer.apply_gradients(&averaged_grads, lr);
+            }
+        }
+
+        batch_loss
+    }
+    /// Configure gradient clipping strategy
+    pub fn set_gradient_clipping(&mut self, clipper: Box<dyn GradientClipping>) {
+        self.gradient_clipper = Some(clipper);
+    }
+
+    /// Disable gradient clipping
+    pub fn disable_gradient_clipping(&mut self) {
+        self.gradient_clipper = None;
+    }
+
+    #[instrument]
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         // Split by whitespace first
         let mut tokens = Vec::new();
@@ -310,14 +486,59 @@ impl LLM {
         grads
     }
 
-    fn clip_gradients(grads: &mut Array2<f32>, max_norm: f32) {
-        // Calculate L2 norm of gradients
-        let norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    /// Save model to JSON format (human-readable, larger file size)
+    pub fn save_json(&self, path: &str) -> Result<()> {
+        let json = serde_json::to_string_pretty(self).map_err(|e| ModelError::Serialization {
+            source: Box::new(e),
+        })?;
+        fs::write(path, json).map_err(ModelError::from)?;
+        Ok(())
+    }
 
-        // If norm exceeds max_norm, scale gradients down
-        if norm > max_norm {
-            let scale = max_norm / norm;
-            grads.mapv_inplace(|x| x * scale);
+    /// Load model from JSON format
+    pub fn load_json(path: &str) -> Result<Self> {
+        let data = fs::read_to_string(path).map_err(ModelError::from)?;
+        let llm: LLM = serde_json::from_str(&data).map_err(|e| ModelError::Serialization {
+            source: Box::new(e),
+        })?;
+        Ok(llm)
+    }
+
+    /// Save model to binary format (compact, faster, smaller file size)
+    pub fn save_binary(&self, path: &str) -> Result<()> {
+        let config = bincode::config::standard();
+        let encoded = bincode::serde::encode_to_vec(self, config).map_err(|e| ModelError::Serialization {
+            source: Box::new(e),
+        })?;
+        fs::write(path, encoded).map_err(ModelError::from)?;
+        Ok(())
+    }
+
+    /// Load model from binary format
+    pub fn load_binary(path: &str) -> Result<Self> {
+        let data = fs::read(path).map_err(ModelError::from)?;
+        let config = bincode::config::standard();
+        let (llm, _): (LLM, usize) = bincode::serde::decode_from_slice(&data, config).map_err(|e| ModelError::Serialization {
+            source: Box::new(e),
+        })?;
+        Ok(llm)
+    }
+
+    /// Save model (auto-detects format from extension: .json or .bin)
+    pub fn save(&self, path: &str) -> Result<()> {
+        if path.ends_with(".json") {
+            self.save_json(path)
+        } else {
+            self.save_binary(path)
+        }
+    }
+
+    /// Load model (auto-detects format from extension: .json or .bin)
+    pub fn load(path: &str) -> Result<Self> {
+        if path.ends_with(".json") {
+            Self::load_json(path)
+        } else {
+            Self::load_binary(path)
         }
     }
 }

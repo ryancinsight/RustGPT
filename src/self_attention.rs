@@ -2,9 +2,13 @@ use std::f32;
 
 use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
 
-use crate::{EMBEDDING_DIM, adam::Adam, llm::Layer};
+use crate::EMBEDDING_DIM;
+use crate::adam::Adam;
+use crate::llm::Layer;
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SelfAttention {
     pub embedding_dim: usize,
     w_q: Array2<f32>, // Weight matrices for Q, K, V
@@ -132,6 +136,20 @@ impl Layer for SelfAttention {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        self.apply_gradients(&param_grads, lr);
+        input_grads
+    }
+
+    fn parameters(&self) -> usize {
+        self.w_k.len() + self.w_q.len() + self.w_v.len()
+    }
+
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let input = self.cached_input.as_ref().unwrap();
         let q = input.dot(&self.w_q);
         let k = input.dot(&self.w_k);
@@ -152,8 +170,8 @@ impl Layer for SelfAttention {
         let attn_weights = self.softmax(&scores); // also cached
 
         // Step 1: grads = ∂L/∂attn_output
-        let grad_attn_weights = grads.dot(&v.t());
-        let grad_v = attn_weights.t().dot(grads);
+        let grad_attn_weights = output_grads.dot(&v.t());
+        let grad_v = attn_weights.t().dot(output_grads);
 
         // Step 2: softmax backward
         let grad_scores = SelfAttention::softmax_backward(&attn_weights, &grad_attn_weights); // [seq_len, seq_len]
@@ -173,17 +191,14 @@ impl Layer for SelfAttention {
 
         // Step 6: Add gradient from residual connection
         // Forward: residual = attention + input, so gradient flows directly through
-        let grad_input = grad_input_attention + grads;
+        let grad_input = grad_input_attention + output_grads;
 
-        // Step 7: update weights
-        self.optimizer_w_q.step(&mut self.w_q, &grad_w_q, lr);
-        self.optimizer_w_k.step(&mut self.w_k, &grad_w_k, lr);
-        self.optimizer_w_v.step(&mut self.w_v, &grad_w_v, lr);
-
-        grad_input
+        (grad_input, vec![grad_w_q, grad_w_k, grad_w_v])
     }
 
-    fn parameters(&self) -> usize {
-        self.w_k.len() + self.w_q.len() + self.w_v.len()
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        self.optimizer_w_q.step(&mut self.w_q, &param_grads[0], lr);
+        self.optimizer_w_k.step(&mut self.w_k, &param_grads[1], lr);
+        self.optimizer_w_v.step(&mut self.w_v, &param_grads[2], lr);
     }
 }

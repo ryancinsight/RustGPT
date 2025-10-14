@@ -1,8 +1,11 @@
 use ndarray::{Array2, Axis};
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, llm::Layer};
+use crate::adam::Adam;
+use crate::llm::Layer;
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FeedForward {
     w1: Array2<f32>,
     b1: Array2<f32>,
@@ -54,18 +57,36 @@ impl Layer for FeedForward {
         "FeedForward"
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        let hidden_pre_activation = input.dot(&self.w1) + &self.b1;
+        let hidden_post_activation = hidden_pre_activation.mapv(|x| x.max(0.0)); // ReLU
+
+        let output = hidden_post_activation.dot(&self.w2) + &self.b2;
+
+        // Cache values
+        self.input = Some(input.clone());
+        self.hidden_pre_activation = Some(hidden_pre_activation);
+        self.hidden_post_activation = Some(hidden_post_activation);
+
+        output + input // residual connection (no LayerNorm here)
+    }
+
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         // Unwrap cached values
         let input = self.input.as_ref().expect("forward must be run first");
         let hidden_pre_activation = self.hidden_pre_activation.as_ref().unwrap();
         let hidden_post_activation = self.hidden_post_activation.as_ref().unwrap();
 
         // Compute gradients for W2 and b2
-        let grad_w2 = hidden_post_activation.t().dot(grads);
-        let grad_b2 = grads.sum_axis(Axis(0)).insert_axis(Axis(0)); // Shape: [1, embedding_dim]
+        let grad_w2 = hidden_post_activation.t().dot(output_grads);
+        let grad_b2 = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0)); // Shape: [1, embedding_dim]
 
         // Gradient w.r.t. hidden_post_activation
-        let grad_hidden_post_activation = grads.dot(&self.w2.t());
+        let grad_hidden_post_activation = output_grads.dot(&self.w2.t());
 
         // Gradient through ReLU
         let relu_grad = hidden_pre_activation.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
@@ -83,29 +104,22 @@ impl Layer for FeedForward {
         // Add gradient from residual connection
         // Forward: output = W2(ReLU(W1*input + b1)) + b2 + input
         // Backward: grad_input = grad_feedforward + grad_residual
-        let grad_input = grad_input_feedforward + grads;
+        let grad_input = grad_input_feedforward + output_grads;
 
-        // Update parameters via Adam optimizer
-        self.optimizer_w2.step(&mut self.w2, &grad_w2, lr);
-        self.optimizer_b2.step(&mut self.b2, &grad_b2, lr);
-        self.optimizer_w1.step(&mut self.w1, &grad_w1, lr);
-        self.optimizer_b1.step(&mut self.b1, &grad_b1, lr);
-
-        grad_input
+        (grad_input, vec![grad_w1, grad_b1, grad_w2, grad_b2])
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        let hidden_pre_activation = input.dot(&self.w1) + &self.b1;
-        let hidden_post_activation = hidden_pre_activation.mapv(|x| x.max(0.0)); // ReLU
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        self.optimizer_w1.step(&mut self.w1, &param_grads[0], lr);
+        self.optimizer_b1.step(&mut self.b1, &param_grads[1], lr);
+        self.optimizer_w2.step(&mut self.w2, &param_grads[2], lr);
+        self.optimizer_b2.step(&mut self.b2, &param_grads[3], lr);
+    }
 
-        let output = hidden_post_activation.dot(&self.w2) + &self.b2;
-
-        // Cache values
-        self.input = Some(input.clone());
-        self.hidden_pre_activation = Some(hidden_pre_activation);
-        self.hidden_post_activation = Some(hidden_post_activation);
-
-        output + input // residual connection (no LayerNorm here)
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        self.apply_gradients(&param_grads, lr);
+        input_grads
     }
 
     fn parameters(&self) -> usize {

@@ -1,7 +1,9 @@
 pub mod adam;
 pub mod dataset_loader;
 pub mod embeddings;
+pub mod errors;
 pub mod feed_forward;
+pub mod gradient_clipping;
 pub mod layer_norm;
 pub mod llm;
 pub mod output_projection;
@@ -9,9 +11,14 @@ pub mod self_attention;
 pub mod transformer;
 pub mod vocab;
 // Re-export key structs for easier access
+pub use adam::Adam;
 pub use dataset_loader::{Dataset, DatasetType};
 pub use embeddings::Embeddings;
-pub use llm::{LLM, Layer};
+pub use errors::{ModelError, Result};
+pub use gradient_clipping::{
+    AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping, L2GradientClipping,
+};
+pub use llm::{LLM, Layer, LayerEnum};
 pub use vocab::Vocab;
 
 // Constants

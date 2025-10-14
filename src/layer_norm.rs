@@ -1,7 +1,10 @@
 use ndarray::{Array2, Axis};
+use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, llm::Layer};
+use crate::adam::Adam;
+use crate::llm::Layer;
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LayerNorm {
     epsilon: f32,       // Small constant for stability
     gamma: Array2<f32>, // Learnable scaling parameter
@@ -53,7 +56,11 @@ impl Layer for LayerNorm {
         self.normalize(input)
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let input = self.cached_input.as_ref().unwrap();
         let mean = self.cached_mean.as_ref().unwrap();
         let std = self.cached_std.as_ref().unwrap();
@@ -62,11 +69,13 @@ impl Layer for LayerNorm {
         let n_features = input.shape()[1] as f32; // Number of features per token
 
         // Gradients w.r.t. gamma and beta
-        let grad_gamma = (&normalized * grads).sum_axis(Axis(0)).insert_axis(Axis(0));
-        let grad_beta = grads.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_gamma = (&normalized * output_grads)
+            .sum_axis(Axis(0))
+            .insert_axis(Axis(0));
+        let grad_beta = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0));
 
         // Gradient w.r.t. normalized values
-        let grad_normalized = &self.gamma * grads;
+        let grad_normalized = &self.gamma * output_grads;
 
         // LayerNorm backward pass with full chain rule
         let grad_input = {
@@ -86,11 +95,20 @@ impl Layer for LayerNorm {
                 + &grad_mean / n_features
         };
 
-        // Update learnable parameters
-        self.optimizer_gamma.step(&mut self.gamma, &grad_gamma, lr);
-        self.optimizer_beta.step(&mut self.beta, &grad_beta, lr);
+        (grad_input, vec![grad_gamma, grad_beta])
+    }
 
-        grad_input
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        self.optimizer_gamma
+            .step(&mut self.gamma, &param_grads[0], lr);
+        self.optimizer_beta
+            .step(&mut self.beta, &param_grads[1], lr);
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        self.apply_gradients(&param_grads, lr);
+        input_grads
     }
 
     fn parameters(&self) -> usize {
