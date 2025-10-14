@@ -1,25 +1,18 @@
 use std::io::Write;
 
-use ::llm::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
-use dataset_loader::{Dataset, DatasetType};
-
-use crate::{
-    embeddings::Embeddings, llm::LLM, output_projection::OutputProjection,
-    transformer::TransformerBlock, vocab::Vocab,
+use llm::feed_forward::FeedForward;
+use llm::layer_norm::LayerNorm;
+use llm::output_projection::OutputProjection;
+use llm::self_attention::SelfAttention;
+use llm::{
+    Dataset, DatasetType, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, LayerEnum, MAX_SEQ_LEN, Vocab,
 };
 
-mod adam;
-mod dataset_loader;
-mod embeddings;
-mod feed_forward;
-mod layer_norm;
-mod llm;
-mod output_projection;
-mod self_attention;
-mod transformer;
-mod vocab;
-
-fn main() {
+fn main() -> llm::Result<()> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
 
@@ -27,7 +20,7 @@ fn main() {
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
         DatasetType::JSON,
-    ); // Placeholder, not used in this example
+    )?; // Placeholder, not used in this example
 
     // Extract all unique words from training data to create vocabulary
     let mut vocab_set = std::collections::HashSet::new();
@@ -44,19 +37,40 @@ fn main() {
     let vocab_words_refs: Vec<&str> = vocab_words.iter().map(|s: &String| s.as_str()).collect();
     let vocab = Vocab::new(vocab_words_refs);
 
-    let transformer_block_1 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let transformer_block_2 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let transformer_block_3 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
+    let transformer_block_1_attention = SelfAttention::new(EMBEDDING_DIM);
+    let transformer_block_1_norm1 = LayerNorm::new(EMBEDDING_DIM);
+    let transformer_block_1_feed_forward = FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM);
+    let transformer_block_1_norm2 = LayerNorm::new(EMBEDDING_DIM);
+
+    let transformer_block_2_attention = SelfAttention::new(EMBEDDING_DIM);
+    let transformer_block_2_norm1 = LayerNorm::new(EMBEDDING_DIM);
+    let transformer_block_2_feed_forward = FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM);
+    let transformer_block_2_norm2 = LayerNorm::new(EMBEDDING_DIM);
+
+    let transformer_block_3_attention = SelfAttention::new(EMBEDDING_DIM);
+    let transformer_block_3_norm1 = LayerNorm::new(EMBEDDING_DIM);
+    let transformer_block_3_feed_forward = FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM);
+    let transformer_block_3_norm2 = LayerNorm::new(EMBEDDING_DIM);
+
     let output_projection = OutputProjection::new(EMBEDDING_DIM, vocab.words.len());
     let embeddings = Embeddings::new(vocab.clone());
     let mut llm = LLM::new(
         vocab,
         vec![
-            Box::new(embeddings),
-            Box::new(transformer_block_1),
-            Box::new(transformer_block_2),
-            Box::new(transformer_block_3),
-            Box::new(output_projection),
+            LayerEnum::Embeddings(embeddings),
+            LayerEnum::SelfAttention(Box::new(transformer_block_1_attention)),
+            LayerEnum::LayerNorm(transformer_block_1_norm1),
+            LayerEnum::FeedForward(Box::new(transformer_block_1_feed_forward)),
+            LayerEnum::LayerNorm(transformer_block_1_norm2),
+            LayerEnum::SelfAttention(Box::new(transformer_block_2_attention)),
+            LayerEnum::LayerNorm(transformer_block_2_norm1),
+            LayerEnum::FeedForward(Box::new(transformer_block_2_feed_forward)),
+            LayerEnum::LayerNorm(transformer_block_2_norm2),
+            LayerEnum::SelfAttention(Box::new(transformer_block_3_attention)),
+            LayerEnum::LayerNorm(transformer_block_3_norm1),
+            LayerEnum::FeedForward(Box::new(transformer_block_3_feed_forward)),
+            LayerEnum::LayerNorm(transformer_block_3_norm2),
+            LayerEnum::OutputProjection(output_projection),
         ],
     );
 
@@ -93,7 +107,7 @@ fn main() {
         .map(|s| s.as_str())
         .collect();
 
-    llm.train(pretraining_examples, 100, 0.0005);
+    llm.train_with_batch_size(pretraining_examples, 100, 0.0005, 4);
 
     println!("\n=== INSTRUCTION TUNING ===");
     println!(
@@ -103,7 +117,7 @@ fn main() {
         0.0001
     );
 
-    llm.train(chat_training_examples, 100, 0.0001); // Much lower learning rate for stability
+    llm.train_with_batch_size(chat_training_examples, 100, 0.0001, 4); // Much lower learning rate for stability
 
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", string);
@@ -142,4 +156,6 @@ fn main() {
         let prediction = llm.predict(&formatted_input);
         println!("Model output: {}", prediction);
     }
+
+    Ok(())
 }

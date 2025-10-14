@@ -1,8 +1,12 @@
 use ndarray::{Array2, s};
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
 
-use crate::{EMBEDDING_DIM, MAX_SEQ_LEN, adam::Adam, llm::Layer, vocab::Vocab};
+use crate::adam::Adam;
+use crate::llm::Layer;
+use crate::{EMBEDDING_DIM, MAX_SEQ_LEN, Vocab};
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Embeddings {
     pub token_embeddings: Array2<f32>,
     pub positional_embeddings: Array2<f32>,
@@ -95,10 +99,14 @@ impl Layer for Embeddings {
         self.embed_tokens(&token_ids) // shape is [sequence_length, embedding_dim]
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let input = self.cached_input.as_ref().unwrap();
         let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
-        let grads = grads.view(); // (sequence_length, embedding_dim)
+        let grads = output_grads.view(); // (sequence_length, embedding_dim)
 
         // Initialize gradients for embeddings
         let mut token_grads = Array2::zeros(self.token_embeddings.dim());
@@ -127,13 +135,21 @@ impl Layer for Embeddings {
             }
         }
 
-        self.token_optimizer
-            .step(&mut self.token_embeddings, &token_grads, lr);
-        self.positional_optimizer
-            .step(&mut self.positional_embeddings, &positional_grads, lr);
+        // Return input gradients and parameter gradients
+        (output_grads.clone(), vec![token_grads, positional_grads])
+    }
 
-        // Return gradient to propagate further back
-        grads.to_owned()
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        self.token_optimizer
+            .step(&mut self.token_embeddings, &param_grads[0], lr);
+        self.positional_optimizer
+            .step(&mut self.positional_embeddings, &param_grads[1], lr);
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        self.apply_gradients(&param_grads, lr);
+        input_grads
     }
 
     fn parameters(&self) -> usize {
