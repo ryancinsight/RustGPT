@@ -6,7 +6,7 @@ use crate::adam::Adam;
 use crate::llm::Layer;
 use crate::{EMBEDDING_DIM, MAX_SEQ_LEN, Vocab};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Embeddings {
     pub token_embeddings: Array2<f32>,
     pub positional_embeddings: Array2<f32>,

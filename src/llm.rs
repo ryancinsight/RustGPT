@@ -11,7 +11,7 @@ use crate::{
     transformer::TransformerBlock,
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum LayerEnum {
     Embeddings(Embeddings),
     SelfAttention(Box<crate::self_attention::SelfAttention>),
@@ -113,6 +113,16 @@ pub struct LLM {
     pub gradient_clipper: Option<Box<dyn GradientClipping>>,
 }
 
+impl std::fmt::Debug for LLM {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LLM")
+            .field("vocab", &self.vocab)
+            .field("network", &self.network)
+            .field("gradient_clipper", &"Box<dyn GradientClipping>")
+            .finish()
+    }
+}
+
 impl Default for LLM {
     fn default() -> Self {
         let transformer_block = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
@@ -163,7 +173,6 @@ impl LLM {
             .sum::<usize>()
     }
 
-    #[instrument(skip(self))]
     pub fn predict(&mut self, text: &str) -> String {
         let output_tokens = self.forward(text);
 
@@ -181,7 +190,6 @@ impl LLM {
         token_strs.join(" ")
     }
 
-    #[instrument(skip(self))]
     fn forward(&mut self, text: &str) -> Vec<usize> {
         // Tokenize the input text
         let mut tokenized = self.tokenize(text);
@@ -378,7 +386,6 @@ impl LLM {
         self.gradient_clipper = None;
     }
 
-    #[instrument]
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         // Split by whitespace first
         let mut tokens = Vec::new();

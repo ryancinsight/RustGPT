@@ -90,11 +90,12 @@ This checklist tracks the implementation status of requirements from the PRD and
 - [x] **NFR-4.3**: No platform-specific dependencies
 
 ### NFR-5: Reliability
-- [ ] **NFR-5.1**: Graceful error handling (no panics in production)
+
+- [x] **NFR-5.1**: Graceful error handling (thiserror, typed errors) - **IMPLEMENTED Sprint 3**
 - [ ] **NFR-5.2**: Training divergence detection (loss > 1e6 → abort)
 - [ ] **NFR-5.3**: OOM recovery strategies (memory limits, arena allocators)
 - [ ] **NFR-5.4**: Serialization integrity (checksums, version validation)
-- [ ] **NFR-5.5**: Structured error types (thiserror, not String errors)
+- [x] **NFR-5.5**: Structured error types (thiserror, not String errors) - **IMPLEMENTED Sprint 3**
 
 ### NFR-6: Security
 - [ ] **NFR-6.1**: Input validation (max sequence length enforcement)
@@ -111,7 +112,7 @@ This checklist tracks the implementation status of requirements from the PRD and
 - [ ] **NFR-7.5**: Span-based debugging for concurrent operations
 
 ### NFR-8: Scalability
-- [ ] **NFR-8.1**: Parallel training (rayon for data parallelism)
+- [x] **NFR-8.1**: Parallel training (rayon for data parallelism) - **PARTIALLY IMPLEMENTED**
 - [ ] **NFR-8.2**: Configurable model size (embedding/hidden dims)
 - [ ] **NFR-8.3**: Streaming dataset loading (for large datasets)
 - [ ] **NFR-8.4**: Multi-GPU support (future: wgpu backend)

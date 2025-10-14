@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::adam::Adam;
 use crate::llm::Layer;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LayerNorm {
     epsilon: f32,       // Small constant for stability
     gamma: Array2<f32>, // Learnable scaling parameter

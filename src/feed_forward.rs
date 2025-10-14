@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::adam::Adam;
 use crate::llm::Layer;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FeedForward {
     w1: Array2<f32>,
     b1: Array2<f32>,
