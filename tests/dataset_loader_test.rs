@@ -8,7 +8,7 @@ fn test_dataset_new_json() {
         "data/pretraining_data.json".to_string(),
         "data/chat_training_data.json".to_string(),
         DatasetType::JSON,
-    );
+    ).unwrap();
     assert!(
         !dataset.pretraining_data.is_empty(),
         "Pretraining data should not be empty"
@@ -40,7 +40,7 @@ fn test_dataset_new_csv() {
         pretraining_csv.to_string(),
         chat_csv.to_string(),
         DatasetType::CSV,
-    );
+    ).unwrap();
     assert_eq!(
         dataset.pretraining_data[0],
         "The sun rises in the east and sets in the west </s>"

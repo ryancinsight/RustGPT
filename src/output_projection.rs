@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::adam::Adam;
 use crate::llm::Layer;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OutputProjection {
     pub w_out: Array2<f32>, // Weight matrix
     pub b_out: Array2<f32>, // Bias vector

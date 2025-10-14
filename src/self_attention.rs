@@ -8,7 +8,7 @@ use crate::EMBEDDING_DIM;
 use crate::adam::Adam;
 use crate::llm::Layer;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SelfAttention {
     pub embedding_dim: usize,
     w_q: Array2<f32>, // Weight matrices for Q, K, V

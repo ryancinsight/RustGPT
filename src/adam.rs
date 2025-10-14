@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Adam {
     beta1: f32,
     beta2: f32,

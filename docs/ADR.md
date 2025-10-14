@@ -19,7 +19,7 @@
 | ADR-005 | Adam Optimizer | Convergence vs memory | Industry standard, adaptive learning rates | Loss convergence: 10-20 epochs | ✅ Accepted |
 | ADR-006 | Binary + JSON Persistence | Storage vs debuggability | bincode (fast), JSON (human-readable) | Binary: 50% smaller, JSON: debuggable | ✅ Accepted |
 | ADR-007 | Adaptive Gradient Clipping (AGC) | Complexity vs stability | Parameter-norm scaling, gradient centralization | 4 gradient tests, AGC λ=0.01 | ✅ Accepted |
-| ADR-008 | Rayon for Parallelization | Complexity vs performance | Data parallelism, fearless concurrency | **NOT YET INTEGRATED** | ⚠️ Pending |
+| ADR-008 | Rayon for Parallelization | Complexity vs performance | Data parallelism, fearless concurrency | **IMPLEMENTED Sprint 3.4** - par_iter in tokenization | ✅ Accepted |
 | ADR-009 | Tracing for Observability | Overhead vs debuggability | Structured logging, span-based debugging | **IMPLEMENTED Sprint 3.3** - spans on predict/train, info logs | ✅ Accepted |
 | ADR-010 | thiserror for Error Handling | Boilerplate vs type safety | Structured errors, backtraces, typed recovery | **IMPLEMENTED Sprint 3.4** - ModelError enum, Result type | ✅ Accepted |
 
@@ -90,12 +90,12 @@
 
 ---
 
-### ADR-008: Rayon for Parallel Training ⚠️ PENDING INTEGRATION
+### ADR-008: Rayon for Parallel Training ⚠️ PARTIALLY INTEGRATED
 **Problem**: Training throughput limited by single-threaded execution  
 **Solution**: Rayon for data parallelism (batch processing, gradient computation)  
 **Trade-offs**: Complexity (thread safety) vs performance (4-8x speedup expected)  
-**Impact**: **NOT YET MEASURED** - rayon added to Cargo.toml but not integrated  
-**Next Steps**: Sprint 3.5 - Integrate rayon::par_iter in training loop
+**Impact**: **PARTIALLY IMPLEMENTED** - par_iter in tokenization, ready for full training parallelization  
+**Next Steps**: Sprint 3.5 - Integrate rayon in training loop for batch processing
 
 ---
 
@@ -108,12 +108,12 @@
 
 ---
 
-### ADR-010: thiserror for Structured Errors ⚠️ PENDING INTEGRATION
+### ADR-010: thiserror for Structured Errors ✅ COMPLETED
 **Problem**: String errors lack type safety and backtraces  
 **Solution**: thiserror for structured error types, anyhow for propagation  
 **Trade-offs**: Boilerplate (enum definitions) vs type safety (typed recovery)  
-**Impact**: **NOT YET IMPLEMENTED** - planned for Sprint 3.3  
-**Next Steps**: Define ModelError, TrainingError, SerializationError enums
+**Impact**: **IMPLEMENTED** - ModelError enum with variants for serialization, training, etc.  
+**Next Steps**: Add more error variants as needed
 
 ---
 
