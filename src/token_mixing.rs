@@ -128,6 +128,16 @@ impl TokenMixingHead {
 
     /// Forward pass for a single head
     fn forward(&mut self, head_input: &Array2<f32>) -> Array2<f32> {
+        // Clear cache from previous forward passes to prevent stale values
+        self.cached_head_input = None;
+        self.cached_attention_logits = None;
+        self.cached_attention_weights = None;
+        self.cached_pooled = None;
+        self.cached_transposed_input = None;
+        self.cached_hidden_pre_activation = None;
+        self.cached_hidden_post_activation = None;
+        self.cached_mixed_output = None;
+
         let (seq_len, _head_dim) = (head_input.shape()[0], head_input.shape()[1]);
 
         // 1. Attention-like pooling (transformer-inspired)
@@ -394,6 +404,12 @@ impl Layer for TokenMixingMLP {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        // Clear cache from previous forward passes to prevent stale values
+        self.cached_input = None;
+        self.cached_head_outputs = None;
+        self.cached_attention_scores = None;
+        self.cached_pooled = None;
+
         let (seq_len, emb_dim) = (input.shape()[0], input.shape()[1]);
         let head_dim = emb_dim / self.num_heads;
 
