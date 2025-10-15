@@ -167,9 +167,9 @@ impl Layer for HyperMixerBlock {
             idx += 2;
         }
 
-        // Apply token mixing gradients (6 params per head: hyper_w1, hyper_b1, hyper_w2, hyper_b2, pooling_w, pooling_b)
-        // Token mixing returns 6 * num_heads gradients
-        let token_mixing_grads = 6 * self.token_mixing.num_heads();
+        // Apply token mixing gradients (4 params per head: w1, b1, w2, b2)
+        // Token mixing returns 4 * num_heads gradients
+        let token_mixing_grads = 4 * self.token_mixing.num_heads();
         if idx + token_mixing_grads <= param_grads.len() {
             let token_params = &param_grads[idx..idx + token_mixing_grads];
             self.token_mixing.apply_gradients(token_params, lr);

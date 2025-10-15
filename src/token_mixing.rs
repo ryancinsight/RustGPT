@@ -12,16 +12,6 @@ pub struct TokenMixingHead {
     w2: Array2<f32>,
     b2: Array2<f32>,
 
-    /// Attention-like pooling weights (transformer-inspired)
-    /// Shape: (head_dim, 1) - learns which dimensions to weight for pooling
-    pooling_weights: Array2<f32>,
-
-    /// Pooling bias
-    pooling_bias: Array2<f32>,
-
-    /// Head dimension (embedding_dim / num_heads)
-    head_dim: usize,
-
     /// Maximum sequence length
     max_seq_len: usize,
 
@@ -31,15 +21,8 @@ pub struct TokenMixingHead {
     optimizer_w2: crate::adam::Adam,
     optimizer_b2: crate::adam::Adam,
 
-    /// Optimizers for pooling parameters
-    optimizer_pooling_weights: crate::adam::Adam,
-    optimizer_pooling_bias: crate::adam::Adam,
-
     /// Cached values for backward pass
     cached_head_input: Option<Array2<f32>>,
-    cached_attention_logits: Option<Array2<f32>>,
-    cached_attention_weights: Option<Array2<f32>>,
-    cached_pooled: Option<Array2<f32>>,
     cached_transposed_input: Option<Array2<f32>>,
     cached_hidden_pre_activation: Option<Array2<f32>>,
     cached_hidden_post_activation: Option<Array2<f32>>,
@@ -75,7 +58,7 @@ pub struct TokenMixingMLP {
 impl TokenMixingHead {
     /// Create a new token mixing head
     fn new(
-        head_dim: usize,
+        _head_dim: usize, // Not used anymore
         hidden_dim: usize,
         max_seq_len: usize,
         _hypernetwork_hidden_dim: usize, // Not used anymore
@@ -90,10 +73,6 @@ impl TokenMixingHead {
         let std_w2 = (2.0 / hidden_dim as f32).sqrt();
         let normal_w2 = Normal::new(0.0, std_w2).unwrap();
 
-        // Initialize pooling weights (transformer-inspired attention-like pooling)
-        let std_pool = (2.0 / head_dim as f32).sqrt();
-        let normal_pool = Normal::new(0.0, std_pool).unwrap();
-
         Self {
             // MLP weights: w1 mixes tokens (seq_len -> hidden), w2 mixes back (hidden -> seq_len)
             w1: Array2::from_shape_fn((max_seq_len, hidden_dim), |_| normal_w1.sample(&mut rng)),
@@ -101,10 +80,6 @@ impl TokenMixingHead {
             w2: Array2::from_shape_fn((hidden_dim, max_seq_len), |_| normal_w2.sample(&mut rng)),
             b2: Array2::zeros((1, max_seq_len)),
 
-            pooling_weights: Array2::from_shape_fn((head_dim, 1), |_| normal_pool.sample(&mut rng)),
-            pooling_bias: Array2::zeros((1, 1)),
-
-            head_dim,
             max_seq_len,
 
             optimizer_w1: crate::adam::Adam::new((max_seq_len, hidden_dim)),
@@ -112,13 +87,7 @@ impl TokenMixingHead {
             optimizer_w2: crate::adam::Adam::new((hidden_dim, max_seq_len)),
             optimizer_b2: crate::adam::Adam::new((1, max_seq_len)),
 
-            optimizer_pooling_weights: crate::adam::Adam::new((head_dim, 1)),
-            optimizer_pooling_bias: crate::adam::Adam::new((1, 1)),
-
             cached_head_input: None,
-            cached_attention_logits: None,
-            cached_attention_weights: None,
-            cached_pooled: None,
             cached_transposed_input: None,
             cached_hidden_pre_activation: None,
             cached_hidden_post_activation: None,
@@ -130,9 +99,6 @@ impl TokenMixingHead {
     fn forward(&mut self, head_input: &Array2<f32>) -> Array2<f32> {
         // Clear cache from previous forward passes to prevent stale values
         self.cached_head_input = None;
-        self.cached_attention_logits = None;
-        self.cached_attention_weights = None;
-        self.cached_pooled = None;
         self.cached_transposed_input = None;
         self.cached_hidden_pre_activation = None;
         self.cached_hidden_post_activation = None;
@@ -140,20 +106,16 @@ impl TokenMixingHead {
 
         let (seq_len, _head_dim) = (head_input.shape()[0], head_input.shape()[1]);
 
-        // 1. Attention-like pooling (transformer-inspired)
-        let attention_logits = head_input.dot(&self.pooling_weights) + &self.pooling_bias;
-        let attention_weights = self.softmax(&attention_logits);
-        let pooled = (head_input.t().to_owned() * &attention_weights.t()).sum_axis(Axis(1)).insert_axis(Axis(1)).t().to_owned();
+        // Simplified approach: just apply MLP directly to the input
+        // Transpose input to mix across tokens: (seq_len, head_dim) -> (head_dim, seq_len)
+        let transposed_input = head_input.t().to_owned();
 
-        // 2. Use fixed MLP weights (slice to current sequence length)
+        // Use fixed MLP weights (slice to current sequence length)
         let w1 = self.w1.slice(ndarray::s![0..seq_len, ..]).to_owned();
         let w2 = self.w2.slice(ndarray::s![.., 0..seq_len]).to_owned();
         let b2 = self.b2.slice(ndarray::s![.., 0..seq_len]).to_owned();
 
-        // 3. Transpose input to mix across tokens
-        let transposed_input = head_input.t().to_owned();
-
-        // 4. Apply token mixing MLP across sequence dimension (batched)
+        // Apply token mixing MLP across sequence dimension (batched)
         // transposed_input: (head_dim, seq_len)
         // w1: (seq_len, hidden_dim)
         // Result: (head_dim, hidden_dim)
@@ -165,17 +127,14 @@ impl TokenMixingHead {
         // Result: (head_dim, seq_len)
         let mixed_output = hidden_post_activation.dot(&w2) + &b2;
 
-        // 5. Transpose back
+        // Transpose back: (head_dim, seq_len) -> (seq_len, head_dim)
         let output = mixed_output.t().to_owned();
 
-        // 6. Add residual connection
+        // Add residual connection
         let final_output = &output + head_input;
 
         // Cache values for backward pass
         self.cached_head_input = Some(head_input.clone());
-        self.cached_attention_logits = Some(attention_logits);
-        self.cached_attention_weights = Some(attention_weights);
-        self.cached_pooled = Some(pooled);
         self.cached_transposed_input = Some(transposed_input);
         self.cached_hidden_pre_activation = Some(hidden_pre_activation);
         self.cached_hidden_post_activation = Some(hidden_post_activation);
@@ -206,9 +165,6 @@ impl Layer for TokenMixingHead {
     fn compute_gradients(&self, _input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
         // Get cached values from forward pass
         let head_input = self.cached_head_input.as_ref().expect("forward must be called first");
-        let _attention_logits = self.cached_attention_logits.as_ref().unwrap();
-        let attention_weights = self.cached_attention_weights.as_ref().unwrap();
-        let _pooled = self.cached_pooled.as_ref().unwrap();
         let transposed_input = self.cached_transposed_input.as_ref().unwrap();
         let hidden_pre_activation = self.cached_hidden_pre_activation.as_ref().unwrap();
         let hidden_post_activation = self.cached_hidden_post_activation.as_ref().unwrap();
@@ -279,46 +235,25 @@ impl Layer for TokenMixingHead {
         // grad_w1 and grad_w2 are already computed above
         // We need to accumulate them into the full-sized weight matrices
 
-        // 6. Gradient through attention pooling
-        // Since we're not using pooled anymore (no hypernetwork), pooling is just for show
-        // We can simplify this - pooling doesn't affect the output anymore
-        let grad_attention_weights = Array2::zeros((seq_len, 1)); // No gradient flows back through pooling
+        // 6. No pooling - just return MLP gradients
+        let grad_head_input = grad_head_input_from_mlp;
 
-        // Gradient through softmax (not used, but keeping for consistency)
-        let softmax_derivative = attention_weights.clone() * (attention_weights.clone() * -1.0 + 1.0);
-        let grad_attention_logits = grad_attention_weights.clone() * softmax_derivative;
-
-        // Gradient through pooling weights and bias (minimal impact since not used)
-        let grad_pooling_weights = head_input.t().dot(&grad_attention_logits);
-        let grad_pooling_bias = grad_attention_logits.sum_axis(Axis(0)).insert_axis(Axis(0));
-
-        // Gradient from pooling back to input (zero since pooling doesn't affect output)
-        let grad_head_input_from_pooling = grad_attention_logits.dot(&self.pooling_weights.t());
-
-        // 7. Combine gradients from MLP and pooling
-        let grad_head_input = grad_head_input_from_mlp + grad_head_input_from_pooling;
-
-        // Return input gradients and parameter gradients (MLP weights + pooling)
+        // Return input gradients and parameter gradients (only MLP weights)
         let param_grads = vec![
-            grad_w1, grad_b1, grad_w2, grad_b2_full, // MLP parameters
-            grad_pooling_weights, grad_pooling_bias // Pooling parameters (kept for compatibility)
+            grad_w1, grad_b1, grad_w2, grad_b2_full // MLP parameters only
         ];
 
         (grad_head_input, param_grads)
     }
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
-        // param_grads format: [w1_grad, b1_grad, w2_grad, b2_grad, pooling_weights_grad, pooling_bias_grad]
-        if param_grads.len() >= 6 {
-            // Apply MLP gradients (first 4)
+        // param_grads format: [w1_grad, b1_grad, w2_grad, b2_grad]
+        if param_grads.len() >= 4 {
+            // Apply MLP gradients
             self.optimizer_w1.step(&mut self.w1, &param_grads[0], lr);
             self.optimizer_b1.step(&mut self.b1, &param_grads[1], lr);
             self.optimizer_w2.step(&mut self.w2, &param_grads[2], lr);
             self.optimizer_b2.step(&mut self.b2, &param_grads[3], lr);
-
-            // Apply pooling gradients (last 2)
-            self.optimizer_pooling_weights.step(&mut self.pooling_weights, &param_grads[4], lr);
-            self.optimizer_pooling_bias.step(&mut self.pooling_bias, &param_grads[5], lr);
         }
     }
 
@@ -330,7 +265,6 @@ impl Layer for TokenMixingHead {
 
     fn parameters(&self) -> usize {
         self.w1.len() + self.b1.len() + self.w2.len() + self.b2.len()
-            + self.pooling_weights.len() + self.pooling_bias.len()
     }
 }
 
@@ -505,21 +439,17 @@ impl Layer for TokenMixingMLP {
     }
     
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
-        // param_grads contains 6 gradients per head: [w1, b1, w2, b2, pooling_weights, pooling_bias]
+        // param_grads contains 4 gradients per head: [w1, b1, w2, b2]
         let mut idx = 0;
         for head in &mut self.heads {
-            if idx + 6 <= param_grads.len() {
-                // Apply MLP gradients (first 4)
+            if idx + 4 <= param_grads.len() {
+                // Apply MLP gradients
                 head.optimizer_w1.step(&mut head.w1, &param_grads[idx], lr);
                 head.optimizer_b1.step(&mut head.b1, &param_grads[idx + 1], lr);
                 head.optimizer_w2.step(&mut head.w2, &param_grads[idx + 2], lr);
                 head.optimizer_b2.step(&mut head.b2, &param_grads[idx + 3], lr);
 
-                // Apply pooling gradients (last 2)
-                head.optimizer_pooling_weights.step(&mut head.pooling_weights, &param_grads[idx + 4], lr);
-                head.optimizer_pooling_bias.step(&mut head.pooling_bias, &param_grads[idx + 5], lr);
-
-                idx += 6;
+                idx += 4;
             }
         }
     }
