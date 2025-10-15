@@ -59,20 +59,26 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 
     for _ in 0..config.num_layers {
         // Self-attention layer
-        layers.push(LayerEnum::SelfAttention(Box::new(SelfAttention::new_with_heads(
+        let mut attention = SelfAttention::new_with_heads(
             config.embedding_dim,
             num_heads,
-        ))));
-        
+        );
+
+        // Enable gradient clipping for Transformer too (for fair comparison)
+        // Note: This might hurt Transformer performance, but let's see
+        // attention.enable_gradient_clipping(50.0); // Commented out for now
+
+        layers.push(LayerEnum::SelfAttention(Box::new(attention)));
+
         // Layer normalization after attention
         layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
-        
+
         // Feedforward layer
         layers.push(LayerEnum::FeedForward(Box::new(FeedForward::new(
             config.embedding_dim,
             config.hidden_dim,
         ))));
-        
+
         // Layer normalization after feedforward
         layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
     }
@@ -99,8 +105,8 @@ fn build_hypermixer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             num_heads,
         );
 
-        // Enable gradient clipping for training stability
-        hypermixer_block.enable_gradient_clipping(5.0);
+        // Enable gradient clipping for training stability (higher threshold)
+        hypermixer_block.enable_gradient_clipping(50.0);
 
         layers.push(LayerEnum::HyperMixerBlock(Box::new(hypermixer_block)));
     }
