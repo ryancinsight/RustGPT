@@ -1,11 +1,8 @@
 use std::io::Write;
 
-use llm::feed_forward::FeedForward;
-use llm::layer_norm::LayerNorm;
-use llm::output_projection::OutputProjection;
-use llm::self_attention::SelfAttention;
 use llm::{
-    Dataset, DatasetType, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, LayerEnum, MAX_SEQ_LEN, Vocab,
+    build_network, print_architecture_summary, ArchitectureType, Dataset, DatasetType,
+    ModelConfig, LLM, Vocab, EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
 };
 
 fn main() -> llm::Result<()> {
@@ -13,6 +10,38 @@ fn main() -> llm::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // ============================================================================
+    // ARCHITECTURE CONFIGURATION
+    // ============================================================================
+    // Toggle between Transformer and HyperMixer architectures for comparison
+    //
+    // Transformer: Standard self-attention based architecture
+    //   - Uses Q, K, V matrices for token mixing
+    //   - Quadratic complexity O(n²) in sequence length
+    //   - Well-established, proven architecture
+    //
+    // HyperMixer: MLP-based architecture with dynamic token mixing
+    //   - Uses hypernetworks to generate token-mixing weights dynamically
+    //   - Linear complexity O(n) in sequence length
+    //   - More parameter efficient than transformers
+    //   - Better than static MLPMixer due to input-dependent mixing
+    // ============================================================================
+
+    // Choose architecture: Transformer or HyperMixer
+    let architecture = ArchitectureType::HyperMixer; // Change to HyperMixer for comparison
+
+    // Create model configuration
+    let config = match architecture {
+        ArchitectureType::Transformer => {
+            ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN)
+        }
+        ArchitectureType::HyperMixer => {
+            // HyperMixer with hypernetwork hidden dim = embedding_dim / 4
+            ModelConfig::hypermixer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None)
+        }
+    };
+
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
 
@@ -20,16 +49,13 @@ fn main() -> llm::Result<()> {
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
         DatasetType::JSON,
-    )?; // Placeholder, not used in this example
+    )?;
 
     // Extract all unique words from training data to create vocabulary
     let mut vocab_set = std::collections::HashSet::new();
 
     // Process all training examples for vocabulary
-    // First process pre-training data
     Vocab::process_text_for_vocab(&dataset.pretraining_data, &mut vocab_set);
-
-    // Then process chat training data
     Vocab::process_text_for_vocab(&dataset.chat_training_data, &mut vocab_set);
 
     let mut vocab_words: Vec<String> = vocab_set.into_iter().collect();
@@ -37,50 +63,17 @@ fn main() -> llm::Result<()> {
     let vocab_words_refs: Vec<&str> = vocab_words.iter().map(|s: &String| s.as_str()).collect();
     let vocab = Vocab::new(vocab_words_refs);
 
-    let transformer_block_1_attention = SelfAttention::new(EMBEDDING_DIM);
-    let transformer_block_1_norm1 = LayerNorm::new(EMBEDDING_DIM);
-    let transformer_block_1_feed_forward = FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let transformer_block_1_norm2 = LayerNorm::new(EMBEDDING_DIM);
+    // Build network based on configuration
+    let network = build_network(&config, &vocab);
 
-    let transformer_block_2_attention = SelfAttention::new(EMBEDDING_DIM);
-    let transformer_block_2_norm1 = LayerNorm::new(EMBEDDING_DIM);
-    let transformer_block_2_feed_forward = FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let transformer_block_2_norm2 = LayerNorm::new(EMBEDDING_DIM);
+    // Print architecture summary
+    print_architecture_summary(&config, &network);
 
-    let transformer_block_3_attention = SelfAttention::new(EMBEDDING_DIM);
-    let transformer_block_3_norm1 = LayerNorm::new(EMBEDDING_DIM);
-    let transformer_block_3_feed_forward = FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let transformer_block_3_norm2 = LayerNorm::new(EMBEDDING_DIM);
-
-    let output_projection = OutputProjection::new(EMBEDDING_DIM, vocab.words.len());
-    let embeddings = Embeddings::new(vocab.clone());
-    let mut llm = LLM::new(
-        vocab,
-        vec![
-            LayerEnum::Embeddings(embeddings),
-            LayerEnum::SelfAttention(Box::new(transformer_block_1_attention)),
-            LayerEnum::LayerNorm(transformer_block_1_norm1),
-            LayerEnum::FeedForward(Box::new(transformer_block_1_feed_forward)),
-            LayerEnum::LayerNorm(transformer_block_1_norm2),
-            LayerEnum::SelfAttention(Box::new(transformer_block_2_attention)),
-            LayerEnum::LayerNorm(transformer_block_2_norm1),
-            LayerEnum::FeedForward(Box::new(transformer_block_2_feed_forward)),
-            LayerEnum::LayerNorm(transformer_block_2_norm2),
-            LayerEnum::SelfAttention(Box::new(transformer_block_3_attention)),
-            LayerEnum::LayerNorm(transformer_block_3_norm1),
-            LayerEnum::FeedForward(Box::new(transformer_block_3_feed_forward)),
-            LayerEnum::LayerNorm(transformer_block_3_norm2),
-            LayerEnum::OutputProjection(output_projection),
-        ],
-    );
+    // Create LLM with the configured network
+    let mut llm = LLM::new(vocab, network);
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
-    println!(
-        "Model configuration -> max_seq_len: {}, embedding_dim: {}, hidden_dim: {}",
-        MAX_SEQ_LEN, EMBEDDING_DIM, HIDDEN_DIM
-    );
-
     println!("Total parameters: {}", llm.total_parameters());
 
     println!("\n=== BEFORE TRAINING ===");
