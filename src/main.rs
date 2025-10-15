@@ -41,16 +41,16 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // Choose architecture: Transformer or HyperMixer
-    let architecture = ArchitectureType::Transformer; // Change to HyperMixer for comparison
+    let architecture = ArchitectureType::HyperMixer; // Change to HyperMixer for comparison
 
     // Create model configuration
     let config = match architecture {
         ArchitectureType::Transformer => {
-            ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN)
+            ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None, Some(8))
         }
         ArchitectureType::HyperMixer => {
-            // HyperMixer with hypernetwork hidden dim = embedding_dim / 4
-            ModelConfig::hypermixer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None)
+            // HyperMixer with hypernetwork hidden dim = embedding_dim / 4 and 8 heads
+            ModelConfig::hypermixer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None, Some(8))
         }
     };
 
@@ -112,7 +112,7 @@ fn main() -> llm::Result<()> {
         .map(|s| s.as_str())
         .collect();
 
-    llm.train_with_batch_size(pretraining_examples, 100, 0.0005, 4);
+    llm.train_with_batch_size(pretraining_examples, 100, 0.0001, 4);
 
     println!("\n=== INSTRUCTION TUNING ===");
     println!(

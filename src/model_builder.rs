@@ -55,10 +55,13 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 /// - Feedforward networks
 /// - Residual connections (handled within layers)
 fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
+    let num_heads = config.get_num_heads();
+
     for _ in 0..config.num_layers {
         // Self-attention layer
-        layers.push(LayerEnum::SelfAttention(Box::new(SelfAttention::new(
+        layers.push(LayerEnum::SelfAttention(Box::new(SelfAttention::new_with_heads(
             config.embedding_dim,
+            num_heads,
         ))));
         
         // Layer normalization after attention
@@ -84,17 +87,22 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 /// - Residual connections (handled within HyperMixerBlock)
 fn build_hypermixer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let hypernetwork_hidden_dim = config.get_hypernetwork_hidden_dim();
-    
+    let num_heads = config.get_num_heads();
+
     for _ in 0..config.num_layers {
         // HyperMixer block (combines token mixing + channel mixing + norms)
-        layers.push(LayerEnum::HyperMixerBlock(Box::new(
-            HyperMixerBlock::new(
-                config.embedding_dim,
-                config.hidden_dim,
-                config.max_seq_len,
-                hypernetwork_hidden_dim,
-            ),
-        )));
+        let mut hypermixer_block = HyperMixerBlock::new(
+            config.embedding_dim,
+            config.hidden_dim,
+            config.max_seq_len,
+            hypernetwork_hidden_dim,
+            num_heads,
+        );
+
+        // Enable gradient clipping for training stability
+        hypermixer_block.enable_gradient_clipping(5.0);
+
+        layers.push(LayerEnum::HyperMixerBlock(Box::new(hypermixer_block)));
     }
 }
 
@@ -134,7 +142,7 @@ mod tests {
     #[test]
     fn test_build_transformer_network() {
         let vocab = Vocab::new(vec!["a", "b", "c"]);
-        let config = ModelConfig::transformer(128, 256, 2, 80);
+        let config = ModelConfig::transformer(128, 256, 2, 80, None, Some(8));
 
         let layers = build_network(&config, &vocab);
 
@@ -150,7 +158,7 @@ mod tests {
     #[test]
     fn test_build_hypermixer_network() {
         let vocab = Vocab::new(vec!["a", "b", "c"]);
-        let config = ModelConfig::hypermixer(128, 256, 2, 80, Some(32));
+        let config = ModelConfig::hypermixer(128, 256, 2, 80, Some(32), Some(8));
 
         let layers = build_network(&config, &vocab);
 

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     channel_mixing::ChannelMixingMLP,
+    gradient_clipping::{GradientClipping, L2GradientClipping},
     layer_norm::LayerNorm,
     llm::Layer,
     token_mixing::TokenMixingMLP,
@@ -38,21 +39,26 @@ pub struct HyperMixerBlock {
     pub norm1: LayerNorm,
     /// Layer norm after channel mixing
     pub norm2: LayerNorm,
+    /// Gradient clipping for training stability
+    #[serde(skip)]
+    gradient_clipper: Option<L2GradientClipping>,
 }
 
 impl HyperMixerBlock {
     /// Create a new HyperMixer block
-    /// 
+    ///
     /// # Arguments
     /// * `embedding_dim` - Dimension of token embeddings
     /// * `hidden_dim` - Hidden dimension for channel mixing
     /// * `max_seq_len` - Maximum sequence length
     /// * `hypernetwork_hidden_dim` - Hidden dimension for the hypernetwork
+    /// * `num_heads` - Number of attention heads for token mixing (default: 8)
     pub fn new(
         embedding_dim: usize,
         hidden_dim: usize,
         max_seq_len: usize,
         hypernetwork_hidden_dim: usize,
+        num_heads: usize,
     ) -> Self {
         // Token mixing hidden dim can be different from channel mixing
         // Using embedding_dim / 2 as a reasonable default for token mixing
@@ -64,10 +70,31 @@ impl HyperMixerBlock {
                 token_mixing_hidden_dim,
                 max_seq_len,
                 hypernetwork_hidden_dim,
+                num_heads,
             ),
             channel_mixing: ChannelMixingMLP::new(embedding_dim, hidden_dim),
             norm1: LayerNorm::new(embedding_dim),
             norm2: LayerNorm::new(embedding_dim),
+            gradient_clipper: None,
+        }
+    }
+}
+
+impl HyperMixerBlock {
+    /// Check for gradient instability (NaN/inf values)
+    pub fn check_gradient_stability(&self, grads: &Array2<f32>) -> bool {
+        !grads.iter().any(|&x| !x.is_finite())
+    }
+
+    /// Enable gradient clipping for training stability
+    pub fn enable_gradient_clipping(&mut self, threshold: f32) {
+        self.gradient_clipper = Some(L2GradientClipping::new(threshold));
+    }
+
+    /// Apply gradient clipping if enabled
+    fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
+        if let Some(clipper) = &mut self.gradient_clipper {
+            clipper.clip_gradients(grads);
         }
     }
 }
@@ -76,13 +103,13 @@ impl Layer for HyperMixerBlock {
     fn layer_type(&self) -> &str {
         "HyperMixerBlock"
     }
-    
+
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // Token mixing path: norm → token_mixing (includes residual inside token_mixing)
+        // Token mixing path: norm → token_mixing (includes residual inside)
         let norm1_out = self.norm1.normalize(input);
         let token_mixed = self.token_mixing.forward(&norm1_out);
 
-        // Channel mixing path: norm → channel_mixing (includes residual inside channel_mixing)
+        // Channel mixing path: norm → channel_mixing (includes residual inside)
         let norm2_out = self.norm2.normalize(&token_mixed);
         let output = self.channel_mixing.forward(&norm2_out);
 
@@ -140,13 +167,13 @@ impl Layer for HyperMixerBlock {
             idx += 2;
         }
 
-        // Apply token mixing gradients (4 params: hypernetwork w1, b1, w2, b2)
-        // Now that compute_gradients returns actual hypernetwork gradients,
-        // we need to apply them here
-        if idx + 4 <= param_grads.len() {
-            let token_params = &param_grads[idx..idx + 4];
+        // Apply token mixing gradients (6 params per head: hyper_w1, hyper_b1, hyper_w2, hyper_b2, pooling_w, pooling_b)
+        // Token mixing returns 6 * num_heads gradients
+        let token_mixing_grads = 6 * self.token_mixing.num_heads();
+        if idx + token_mixing_grads <= param_grads.len() {
+            let token_params = &param_grads[idx..idx + token_mixing_grads];
             self.token_mixing.apply_gradients(token_params, lr);
-            idx += 4;
+            idx += token_mixing_grads;
         }
 
         // Apply norm2 gradients (2 params: gamma, beta)
@@ -165,8 +192,8 @@ impl Layer for HyperMixerBlock {
     
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         // Backward pass in reverse order of forward pass
-        // Forward was: norm1 → token_mixing → norm2 → channel_mixing
-        // Backward is: channel_mixing → norm2 → token_mixing → norm1
+        // Forward: norm1 → token_mixing → norm2 → channel_mixing
+        // Backward: channel_mixing → norm2 → token_mixing → norm1
 
         // Backward through channel mixing (includes residual)
         let grad_channel = self.channel_mixing.backward(grads, lr);
