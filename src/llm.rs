@@ -18,6 +18,7 @@ pub enum LayerEnum {
     FeedForward(Box<crate::feed_forward::FeedForward>),
     LayerNorm(crate::layer_norm::LayerNorm),
     OutputProjection(OutputProjection),
+    HyperMixerBlock(Box<crate::hypermixer::HyperMixerBlock>),
 }
 
 impl Layer for LayerEnum {
@@ -28,6 +29,7 @@ impl Layer for LayerEnum {
             LayerEnum::FeedForward(layer) => layer.layer_type(),
             LayerEnum::LayerNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
+            LayerEnum::HyperMixerBlock(layer) => layer.layer_type(),
         }
     }
 
@@ -38,6 +40,7 @@ impl Layer for LayerEnum {
             LayerEnum::FeedForward(layer) => layer.forward(input),
             LayerEnum::LayerNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
+            LayerEnum::HyperMixerBlock(layer) => layer.forward(input),
         }
     }
 
@@ -52,6 +55,7 @@ impl Layer for LayerEnum {
             LayerEnum::FeedForward(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::LayerNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::HyperMixerBlock(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -62,6 +66,7 @@ impl Layer for LayerEnum {
             LayerEnum::FeedForward(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::LayerNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::HyperMixerBlock(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
 
@@ -72,6 +77,7 @@ impl Layer for LayerEnum {
             LayerEnum::FeedForward(layer) => layer.backward(grads, lr),
             LayerEnum::LayerNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
+            LayerEnum::HyperMixerBlock(layer) => layer.backward(grads, lr),
         }
     }
 
@@ -82,6 +88,7 @@ impl Layer for LayerEnum {
             LayerEnum::FeedForward(layer) => layer.parameters(),
             LayerEnum::LayerNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
+            LayerEnum::HyperMixerBlock(layer) => layer.parameters(),
         }
     }
 }
