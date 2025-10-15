@@ -1,11 +1,23 @@
 use std::io::Write;
 
+use clap::Parser;
 use llm::{
     build_network, print_architecture_summary, ArchitectureType, Dataset, DatasetType,
     ModelConfig, LLM, Vocab, EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
 };
 
+#[derive(Parser)]
+#[command(name = "llm")]
+#[command(about = "Train and run a language model")]
+struct Args {
+    /// Enable interactive prompt after training
+    #[arg(short)]
+    interactive: bool,
+}
+
 fn main() -> llm::Result<()> {
+    let args = Args::parse();
+
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -29,7 +41,7 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // Choose architecture: Transformer or HyperMixer
-    let architecture = ArchitectureType::HyperMixer; // Change to HyperMixer for comparison
+    let architecture = ArchitectureType::Transformer; // Change to HyperMixer for comparison
 
     // Create model configuration
     let config = match architecture {
@@ -118,36 +130,38 @@ fn main() -> llm::Result<()> {
     println!("Output: {}", result);
     println!("======================\n");
 
-    // Interactive mode for user input
-    println!("\n--- Interactive Mode ---");
-    println!("Type a prompt and press Enter to generate text.");
-    println!("Type 'exit' to quit.");
+    // Interactive mode for user input (only if -i flag is provided)
+    if args.interactive {
+        println!("\n--- Interactive Mode ---");
+        println!("Type a prompt and press Enter to generate text.");
+        println!("Type 'exit' to quit.");
 
-    let mut input = String::new();
-    loop {
-        // Clear the input string
-        input.clear();
+        let mut input = String::new();
+        loop {
+            // Clear the input string
+            input.clear();
 
-        // Prompt for user input
-        print!("\nEnter prompt: ");
-        std::io::stdout().flush().unwrap();
+            // Prompt for user input
+            print!("\nEnter prompt: ");
+            std::io::stdout().flush().unwrap();
 
-        // Read user input
-        std::io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read input");
+            // Read user input
+            std::io::stdin()
+                .read_line(&mut input)
+                .expect("Failed to read input");
 
-        // Trim whitespace and check for exit command
-        let trimmed_input = input.trim();
-        if trimmed_input.eq_ignore_ascii_case("exit") {
-            println!("Exiting interactive mode.");
-            break;
+            // Trim whitespace and check for exit command
+            let trimmed_input = input.trim();
+            if trimmed_input.eq_ignore_ascii_case("exit") {
+                println!("Exiting interactive mode.");
+                break;
+            }
+
+            // Generate prediction based on user input with "User:" prefix
+            let formatted_input = format!("User: {}", trimmed_input);
+            let prediction = llm.predict(&formatted_input);
+            println!("Model output: {}", prediction);
         }
-
-        // Generate prediction based on user input with "User:" prefix
-        let formatted_input = format!("User: {}", trimmed_input);
-        let prediction = llm.predict(&formatted_input);
-        println!("Model output: {}", prediction);
     }
 
     Ok(())
