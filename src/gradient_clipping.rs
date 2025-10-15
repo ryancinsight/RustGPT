@@ -112,6 +112,7 @@ impl GradientClipping for AdaptiveGradientClipping {
 }
 
 /// Simple L2 norm gradient clipping (legacy implementation)
+#[derive(Clone, Debug)]
 pub struct L2GradientClipping {
     threshold: f32,
 }

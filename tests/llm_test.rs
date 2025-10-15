@@ -117,7 +117,7 @@ fn test_llm_total_parameters() {
         vocab,
         vec![
             embeddings,
-            LayerEnum::SelfAttention(Box::new(transformer_block.attention)),
+            LayerEnum::SelfAttention(Box::new(SelfAttention::new_with_heads(EMBEDDING_DIM, 1))), // Single head for parameter count test
             LayerEnum::LayerNorm(transformer_block.norm1),
             LayerEnum::FeedForward(Box::new(transformer_block.feed_forward)),
             LayerEnum::LayerNorm(transformer_block.norm2),

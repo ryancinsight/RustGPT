@@ -30,18 +30,23 @@ pub struct ModelConfig {
     
     /// Maximum sequence length
     pub max_seq_len: usize,
+
+    /// Number of attention heads for multi-head attention (used in both Transformer and HyperMixer)
+    /// If None, defaults to 8 (same as standard transformers)
+    pub num_heads: Option<usize>,
 }
 
 impl ModelConfig {
     /// Create a new Transformer configuration
-    pub fn transformer(embedding_dim: usize, hidden_dim: usize, num_layers: usize, max_seq_len: usize) -> Self {
+    pub fn transformer(embedding_dim: usize, hidden_dim: usize, num_layers: usize, max_seq_len: usize, hypernetwork_hidden_dim: Option<usize>, num_heads: Option<usize>) -> Self {
         Self {
             architecture: ArchitectureType::Transformer,
             embedding_dim,
             hidden_dim,
             num_layers,
-            hypernetwork_hidden_dim: None,
+            hypernetwork_hidden_dim,
             max_seq_len,
+            num_heads,
         }
     }
     
@@ -52,6 +57,7 @@ impl ModelConfig {
         num_layers: usize,
         max_seq_len: usize,
         hypernetwork_hidden_dim: Option<usize>,
+        num_heads: Option<usize>,
     ) -> Self {
         Self {
             architecture: ArchitectureType::HyperMixer,
@@ -60,6 +66,7 @@ impl ModelConfig {
             num_layers,
             hypernetwork_hidden_dim,
             max_seq_len,
+            num_heads,
         }
     }
     
@@ -67,11 +74,16 @@ impl ModelConfig {
     pub fn get_hypernetwork_hidden_dim(&self) -> usize {
         self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4)
     }
+
+    /// Get the number of attention heads, using default if not specified
+    pub fn get_num_heads(&self) -> usize {
+        self.num_heads.unwrap_or(8) // Same as standard transformers
+    }
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self::transformer(128, 256, 3, 80)
+        Self::transformer(128, 256, 3, 80, None, Some(8))
     }
 }
 
