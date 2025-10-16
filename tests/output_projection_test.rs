@@ -6,11 +6,8 @@ fn test_output_projection_creation() {
     let vocab_size = 10;
     let output_proj = OutputProjection::new(EMBEDDING_DIM, vocab_size);
 
-    // Check weight matrix dimensions
+    // Check weight matrix dimensions (no bias - modern LLM practice)
     assert_eq!(output_proj.w_out.shape(), [EMBEDDING_DIM, vocab_size]);
-
-    // Check bias vector dimensions
-    assert_eq!(output_proj.b_out.shape(), [1, vocab_size]);
 
     // Check optimizer dimensions
     assert_eq!(output_proj.optimizer.m.shape(), [EMBEDDING_DIM, vocab_size]);
@@ -72,15 +69,13 @@ fn test_output_projection_backward() {
 
     // Verify that parameters were updated
     let w_out_before = output_proj.w_out.clone();
-    let b_out_before = output_proj.b_out.clone();
 
     // Run another forward and backward pass
     let _output = output_proj.forward(&input);
     let _grad_input = output_proj.backward(&grads, 0.01);
 
-    // Check that parameters changed
+    // Check that parameters changed (no bias to check)
     assert_ne!(output_proj.w_out, w_out_before);
-    assert_ne!(output_proj.b_out, b_out_before);
 }
 
 #[test]
@@ -104,7 +99,6 @@ fn test_output_projection_training() {
         let _grad_input = output_proj.backward(&grads, 0.01);
     }
 
-    // Verify that parameters were updated
+    // Verify that parameters were updated (no bias to check)
     assert_ne!(output_proj.w_out.sum(), 0.0);
-    assert_ne!(output_proj.b_out.sum(), 0.0);
 }

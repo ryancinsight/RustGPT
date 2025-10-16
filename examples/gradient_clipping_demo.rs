@@ -4,7 +4,7 @@
 //! in the RustGPT LLM, including the new adaptive techniques.
 
 use llm::{
-    AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping, L2GradientClipping, LLM,
+    AdaptiveClippingConfig, AdaptiveGradientClipping, L2GradientClipping, LLM,
 };
 
 fn main() {

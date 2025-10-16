@@ -17,6 +17,11 @@ impl Default for Vocab {
 
 impl Vocab {
     pub fn new(words: Vec<&str>) -> Self {
+        // Vocabulary size validation
+        if words.len() > crate::MAX_VOCAB_SIZE {
+            panic!("Vocabulary size {} exceeds maximum allowed size {}", words.len(), crate::MAX_VOCAB_SIZE);
+        }
+
         let mut encode = HashMap::new();
         let mut decode = HashMap::new();
 

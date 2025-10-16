@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     channel_mixing::ChannelMixingMLP,
-    gradient_clipping::{GradientClipping, L2GradientClipping},
     layer_norm::LayerNorm,
     llm::Layer,
     token_mixing::TokenMixingMLP,
@@ -39,9 +38,6 @@ pub struct HyperMixerBlock {
     pub norm1: LayerNorm,
     /// Layer norm after channel mixing
     pub norm2: LayerNorm,
-    /// Gradient clipping for training stability
-    #[serde(skip)]
-    gradient_clipper: Option<L2GradientClipping>,
 }
 
 impl HyperMixerBlock {
@@ -75,7 +71,6 @@ impl HyperMixerBlock {
             channel_mixing: ChannelMixingMLP::new(embedding_dim, hidden_dim),
             norm1: LayerNorm::new(embedding_dim),
             norm2: LayerNorm::new(embedding_dim),
-            gradient_clipper: None,
         }
     }
 }
@@ -86,17 +81,6 @@ impl HyperMixerBlock {
         !grads.iter().any(|&x| !x.is_finite())
     }
 
-    /// Enable gradient clipping for training stability
-    pub fn enable_gradient_clipping(&mut self, threshold: f32) {
-        self.gradient_clipper = Some(L2GradientClipping::new(threshold));
-    }
-
-    /// Apply gradient clipping if enabled
-    fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
-        if let Some(clipper) = &mut self.gradient_clipper {
-            clipper.clip_gradients(grads);
-        }
-    }
 }
 
 impl Layer for HyperMixerBlock {
@@ -111,9 +95,7 @@ impl Layer for HyperMixerBlock {
 
         // Channel mixing path: norm → channel_mixing (includes residual inside)
         let norm2_out = self.norm2.normalize(&token_mixed);
-        let output = self.channel_mixing.forward(&norm2_out);
-
-        output
+        self.channel_mixing.forward(&norm2_out)
     }
     
     fn compute_gradients(
@@ -205,9 +187,7 @@ impl Layer for HyperMixerBlock {
         let grad_token = self.token_mixing.backward(&grad_norm2, lr);
 
         // Backward through norm1
-        let grad_input = self.norm1.backward(&grad_token, lr);
-
-        grad_input
+        self.norm1.backward(&grad_token, lr)
     }
     
     fn parameters(&self) -> usize {

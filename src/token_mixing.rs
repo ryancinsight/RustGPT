@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::Layer;
@@ -179,8 +179,7 @@ impl TokenMixingHead {
 
             // Compute weighted sum of values
             let mut output_token = Array1::zeros(embed_dim);
-            for v_pos in 0..seq_len {
-                let weight = normalized_weights[v_pos];
+            for (v_pos, &weight) in normalized_weights.iter().enumerate().take(seq_len) {
                 let value = values.row(v_pos);
 
                 for d in 0..embed_dim {
@@ -199,14 +198,6 @@ impl TokenMixingHead {
         self.cached_mixed_output = Some(mixed_output);
 
         final_output
-    }
-
-    /// Apply softmax to attention logits
-    fn softmax(&self, logits: &Array2<f32>) -> Array2<f32> {
-        let max_logits = logits.fold_axis(Axis(0), f32::NEG_INFINITY, |&a, &b| a.max(b));
-        let exp_logits = (logits - &max_logits).mapv(|x| x.exp());
-        let sum_exp = exp_logits.sum_axis(Axis(0));
-        exp_logits / &sum_exp
     }
 
 }
@@ -296,14 +287,6 @@ impl TokenMixingMLP {
     /// Get the number of heads
     pub fn num_heads(&self) -> usize {
         self.num_heads
-    }
-
-    /// Apply softmax to attention logits
-    fn softmax(&self, logits: &Array2<f32>) -> Array2<f32> {
-        let max_logits = logits.fold_axis(Axis(0), f32::NEG_INFINITY, |&a, &b| a.max(b));
-        let exp_logits = (logits - &max_logits).mapv(|x| x.exp());
-        let sum_exp = exp_logits.sum_axis(Axis(0));
-        exp_logits / &sum_exp
     }
 
     /// Create a new multi-head token mixing MLP
@@ -398,10 +381,10 @@ impl Layer for TokenMixingMLP {
 
         // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
         let mut output = Array2::zeros((seq_len, emb_dim));
-        for h in 0..self.num_heads {
+        for (h, head_output) in head_outputs.iter().enumerate().take(self.num_heads) {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
-            output.slice_mut(ndarray::s![.., start_col..end_col]).assign(&head_outputs[h]);
+            output.slice_mut(ndarray::s![.., start_col..end_col]).assign(head_output);
         }
 
         // Cache for backward pass

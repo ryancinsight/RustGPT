@@ -4,9 +4,78 @@
 
 ### Version: 0.1.0
 ### Status: Active Development
-### Last Updated: 2025-10-14
+### Last Updated: 2025-10-15
 
 This backlog contains prioritized tasks for enhancing RustGPT based on community contributions and project roadmap.
+
+## Sprint 4: HRM Architecture Integration (CURRENT)
+
+### Critical Priority - HRM Phase 1 Implementation
+
+1. **Research HRM Architecture** ✅ COMPLETE
+   - Web search for HRM papers and implementations
+   - Analyze architecture details and mathematical formulation
+   - Document findings in `docs/HRM_RESEARCH_SUMMARY.md`
+   - Create implementation plan in `docs/HRM_IMPLEMENTATION_PLAN.md`
+   - **Status**: COMPLETE (2025-10-15)
+   - **Outcome**: Comprehensive understanding of HRM, ready for implementation
+
+2. **Implement Low-Level Module** ⏭️ NEXT
+   - Create `src/hrm_low_level.rs`
+   - 2-layer Transformer encoder for fast, detailed computations
+   - Forward: `zL^i = fL(zL^(i-1), zH^(i-1), x̃)`
+   - Backward: 1-step gradient approximation
+   - **Estimate**: 1 hour
+   - **Acceptance**: Compiles, forward/backward pass works, tests pass
+
+3. **Implement High-Level Module**
+   - Create `src/hrm_high_level.rs`
+   - 2-layer Transformer encoder for slow, abstract planning
+   - Forward: `zH^i = fH(zH^(i-1), zL^(i-1))` (every T steps)
+   - Backward: 1-step gradient approximation
+   - **Estimate**: 1 hour
+   - **Acceptance**: Compiles, forward/backward pass works, tests pass
+
+4. **Implement HRM Block**
+   - Create `src/hrm.rs`
+   - Combine low-level and high-level modules
+   - Hierarchical convergence: N high-level cycles × T low-level steps
+   - Initialize states (truncated normal)
+   - Implement Layer trait
+   - **Estimate**: 1.5 hours
+   - **Acceptance**: Full forward/backward pass, hierarchical convergence verified
+
+5. **Update Integration Points**
+   - Update `src/lib.rs` with new modules
+   - Add `LayerEnum::HRMBlock` variant in `src/llm.rs`
+   - Add `ArchitectureType::HRM` in `src/model_config.rs`
+   - Add `build_hrm_layers()` in `src/model_builder.rs`
+   - **Estimate**: 0.5 hours
+   - **Acceptance**: All existing tests pass, HRM network builds
+
+6. **Write Comprehensive Tests**
+   - Create `tests/hrm_test.rs`
+   - Unit tests: creation, forward, backward, parameters
+   - Integration tests: network building, training, prediction
+   - Validation tests: hierarchical convergence, gradient flow
+   - **Estimate**: 1 hour
+   - **Acceptance**: ≥5 tests pass, 100% coverage of HRM code
+
+7. **Validate and Debug**
+   - Run all tests (existing + new)
+   - Verify parameter count matches Transformer (±10%)
+   - Check training stability (no NaN/Inf)
+   - Profile memory usage
+   - **Estimate**: 1 hour
+   - **Acceptance**: All tests pass, clippy clean, stable training
+
+8. **Documentation**
+   - Add rustdoc to all HRM modules
+   - Update ADR with HRM design decisions
+   - Update README with HRM usage examples
+   - Add HRM to architecture comparison table
+   - **Estimate**: 0.5 hours
+   - **Acceptance**: Complete inline docs, ADR updated
 
 ## High Priority Features
 
