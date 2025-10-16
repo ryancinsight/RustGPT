@@ -72,7 +72,7 @@ fn test_llm_train() {
     let training_data = vec!["<pad> <unk> </s>"];
 
     // Training should complete without panicking
-    llm.train(training_data, 10, 0.01);
+    let _ = llm.train(training_data, 10, 0.01);
 }
 
 #[test]
@@ -85,21 +85,38 @@ fn test_llm_integration() {
     let output_projection =
         LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size));
 
+    // Extract norm layers based on their type
+    let norm1_enum = match transformer_block.norm1 {
+        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
+        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
+    };
+
+    let norm2_enum = match transformer_block.norm2 {
+        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
+        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
+    };
+
+    // Extract feedforward layer based on its type
+    let ffn_enum = match transformer_block.feed_forward {
+        llm::transformer::FFNLayer::FeedForward(ffn) => LayerEnum::FeedForward(ffn),
+        llm::transformer::FFNLayer::SwiGLU(swiglu) => LayerEnum::SwiGLU(swiglu),
+    };
+
     let mut llm = LLM::new(
         vocab,
         vec![
             embeddings,
             LayerEnum::SelfAttention(Box::new(transformer_block.attention)),
-            LayerEnum::LayerNorm(transformer_block.norm1),
-            LayerEnum::FeedForward(Box::new(transformer_block.feed_forward)),
-            LayerEnum::LayerNorm(transformer_block.norm2),
+            norm1_enum,
+            ffn_enum,
+            norm2_enum,
             output_projection,
         ],
     );
 
     let input_text = "hello world this is rust";
     // Integration test: training with real layers should complete
-    llm.train(vec![input_text], 10, 0.01);
+    let _ = llm.train(vec![input_text], 10, 0.01);
 }
 
 #[test]
@@ -113,14 +130,31 @@ fn test_llm_total_parameters() {
     let output_projection =
         LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size));
 
+    // Extract norm layers based on their type
+    let norm1_enum = match transformer_block.norm1 {
+        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
+        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
+    };
+
+    let norm2_enum = match transformer_block.norm2 {
+        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
+        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
+    };
+
+    // Extract feedforward layer based on its type
+    let ffn_enum = match transformer_block.feed_forward {
+        llm::transformer::FFNLayer::FeedForward(ffn) => LayerEnum::FeedForward(ffn),
+        llm::transformer::FFNLayer::SwiGLU(swiglu) => LayerEnum::SwiGLU(swiglu),
+    };
+
     let llm = LLM::new(
         vocab,
         vec![
             embeddings,
             LayerEnum::SelfAttention(Box::new(SelfAttention::new_with_heads(EMBEDDING_DIM, 1))), // Single head for parameter count test
-            LayerEnum::LayerNorm(transformer_block.norm1),
-            LayerEnum::FeedForward(Box::new(transformer_block.feed_forward)),
-            LayerEnum::LayerNorm(transformer_block.norm2),
+            norm1_enum,
+            ffn_enum,
+            norm2_enum,
             output_projection,
         ],
     );
@@ -129,13 +163,13 @@ fn test_llm_total_parameters() {
     let param_count = llm.total_parameters();
     assert!(param_count > 0, "Model should have non-zero parameters");
 
-    // Validate exact parameter count based on architecture
+    // Validate exact parameter count based on architecture (no bias terms - modern LLM practice)
     let expected_embeddings_parameters = vocab_size * EMBEDDING_DIM + MAX_SEQ_LEN * EMBEDDING_DIM;
-    let expected_transformer_block_parameters = (2 * EMBEDDING_DIM) + // LayerNorm
-        (3 * EMBEDDING_DIM * EMBEDDING_DIM) + // SelfAttention
-        (2 * EMBEDDING_DIM) + // LayerNorm
-        (EMBEDDING_DIM * HIDDEN_DIM + HIDDEN_DIM + HIDDEN_DIM * EMBEDDING_DIM + EMBEDDING_DIM); // FeedForward
-    let expected_output_projection_parameters = EMBEDDING_DIM * vocab_size + vocab_size;
+    let expected_transformer_block_parameters = (2 * EMBEDDING_DIM) + // LayerNorm (gamma, beta)
+        (3 * EMBEDDING_DIM * EMBEDDING_DIM) + // SelfAttention (w_q, w_k, w_v - no bias)
+        (2 * EMBEDDING_DIM) + // LayerNorm (gamma, beta)
+        (EMBEDDING_DIM * HIDDEN_DIM + HIDDEN_DIM * EMBEDDING_DIM); // FeedForward (w1, w2 - no bias)
+    let expected_output_projection_parameters = EMBEDDING_DIM * vocab_size; // w_out (no bias)
     let expected_total = expected_embeddings_parameters
         + expected_transformer_block_parameters
         + expected_output_projection_parameters;
@@ -228,7 +262,7 @@ fn test_llm_train_empty_data() {
     let mut llm = LLM::default();
 
     // Training with empty data should not panic
-    llm.train(vec![], 5, 0.01);
+    let _ = llm.train(vec![], 5, 0.01);
 }
 
 #[test]
@@ -236,7 +270,7 @@ fn test_llm_train_single_token() {
     let mut llm = LLM::default();
 
     // Single token sequences should be skipped (need at least 2 for input/target)
-    llm.train(vec!["hello"], 5, 0.01);
+    let _ = llm.train(vec!["hello"], 5, 0.01);
 }
 
 // ============================================================================

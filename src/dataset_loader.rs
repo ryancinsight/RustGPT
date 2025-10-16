@@ -44,6 +44,14 @@ impl Dataset {
 }
 
 fn get_data_from_json(path: &str) -> Result<Vec<String>> {
+    // File size validation
+    let metadata = fs::metadata(path).map_err(ModelError::from)?;
+    if metadata.len() > crate::MAX_FILE_SIZE {
+        return Err(ModelError::InvalidInput {
+            message: format!("File size {} exceeds maximum allowed size {}", metadata.len(), crate::MAX_FILE_SIZE)
+        });
+    }
+
     // convert json file to Vec<String>
     let data_json = fs::read_to_string(path).map_err(ModelError::from)?;
     let data: Vec<String> = serde_json::from_str(&data_json).map_err(|e| ModelError::Serialization {
@@ -53,6 +61,14 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
 }
 
 fn get_data_from_csv(path: &str) -> Result<Vec<String>> {
+    // File size validation
+    let metadata = fs::metadata(path).map_err(ModelError::from)?;
+    if metadata.len() > crate::MAX_FILE_SIZE {
+        return Err(ModelError::InvalidInput {
+            message: format!("File size {} exceeds maximum allowed size {}", metadata.len(), crate::MAX_FILE_SIZE)
+        });
+    }
+
     // convert csv file to Vec<String>
     let file = fs::File::open(path).map_err(ModelError::from)?;
     let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(file);

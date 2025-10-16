@@ -16,9 +16,12 @@ pub enum LayerEnum {
     Embeddings(Embeddings),
     SelfAttention(Box<crate::self_attention::SelfAttention>),
     FeedForward(Box<crate::feed_forward::FeedForward>),
+    SwiGLU(Box<crate::swiglu::SwiGLU>),
     LayerNorm(crate::layer_norm::LayerNorm),
+    RMSNorm(crate::rms_norm::RMSNorm),
     OutputProjection(OutputProjection),
     HyperMixerBlock(Box<crate::hypermixer::HyperMixerBlock>),
+    HRMBlock(Box<crate::hrm::HRMBlock>),
 }
 
 impl Layer for LayerEnum {
@@ -27,9 +30,12 @@ impl Layer for LayerEnum {
             LayerEnum::Embeddings(layer) => layer.layer_type(),
             LayerEnum::SelfAttention(layer) => layer.layer_type(),
             LayerEnum::FeedForward(layer) => layer.layer_type(),
+            LayerEnum::SwiGLU(layer) => layer.layer_type(),
             LayerEnum::LayerNorm(layer) => layer.layer_type(),
+            LayerEnum::RMSNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
             LayerEnum::HyperMixerBlock(layer) => layer.layer_type(),
+            LayerEnum::HRMBlock(layer) => layer.layer_type(),
         }
     }
 
@@ -38,9 +44,12 @@ impl Layer for LayerEnum {
             LayerEnum::Embeddings(layer) => layer.forward(input),
             LayerEnum::SelfAttention(layer) => layer.forward(input),
             LayerEnum::FeedForward(layer) => layer.forward(input),
+            LayerEnum::SwiGLU(layer) => layer.forward(input),
             LayerEnum::LayerNorm(layer) => layer.forward(input),
+            LayerEnum::RMSNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
             LayerEnum::HyperMixerBlock(layer) => layer.forward(input),
+            LayerEnum::HRMBlock(layer) => layer.forward(input),
         }
     }
 
@@ -53,9 +62,12 @@ impl Layer for LayerEnum {
             LayerEnum::Embeddings(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::SelfAttention(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::FeedForward(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::SwiGLU(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::LayerNorm(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::RMSNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::HyperMixerBlock(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::HRMBlock(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -64,9 +76,12 @@ impl Layer for LayerEnum {
             LayerEnum::Embeddings(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::FeedForward(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::SwiGLU(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::LayerNorm(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::RMSNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::HyperMixerBlock(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::HRMBlock(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
 
@@ -75,9 +90,12 @@ impl Layer for LayerEnum {
             LayerEnum::Embeddings(layer) => layer.backward(grads, lr),
             LayerEnum::SelfAttention(layer) => layer.backward(grads, lr),
             LayerEnum::FeedForward(layer) => layer.backward(grads, lr),
+            LayerEnum::SwiGLU(layer) => layer.backward(grads, lr),
             LayerEnum::LayerNorm(layer) => layer.backward(grads, lr),
+            LayerEnum::RMSNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
             LayerEnum::HyperMixerBlock(layer) => layer.backward(grads, lr),
+            LayerEnum::HRMBlock(layer) => layer.backward(grads, lr),
         }
     }
 
@@ -86,9 +104,12 @@ impl Layer for LayerEnum {
             LayerEnum::Embeddings(layer) => layer.parameters(),
             LayerEnum::SelfAttention(layer) => layer.parameters(),
             LayerEnum::FeedForward(layer) => layer.parameters(),
+            LayerEnum::SwiGLU(layer) => layer.parameters(),
             LayerEnum::LayerNorm(layer) => layer.parameters(),
+            LayerEnum::RMSNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
             LayerEnum::HyperMixerBlock(layer) => layer.parameters(),
+            LayerEnum::HRMBlock(layer) => layer.parameters(),
         }
     }
 }
@@ -134,14 +155,32 @@ impl Default for LLM {
     fn default() -> Self {
         let transformer_block = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
         let output_projection = OutputProjection::new(EMBEDDING_DIM, Vocab::default_words().len());
+
+        // Extract norm layers based on their type
+        let norm1_enum = match transformer_block.norm1 {
+            crate::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
+            crate::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
+        };
+
+        let norm2_enum = match transformer_block.norm2 {
+            crate::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
+            crate::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
+        };
+
+        // Extract feedforward layer based on its type
+        let ffn_enum = match transformer_block.feed_forward {
+            crate::transformer::FFNLayer::FeedForward(ffn) => LayerEnum::FeedForward(ffn),
+            crate::transformer::FFNLayer::SwiGLU(swiglu) => LayerEnum::SwiGLU(swiglu),
+        };
+
         Self {
             vocab: Vocab::default(),
             network: vec![
                 LayerEnum::Embeddings(Embeddings::default()),
                 LayerEnum::SelfAttention(Box::new(transformer_block.attention)),
-                LayerEnum::LayerNorm(transformer_block.norm1),
-                LayerEnum::FeedForward(Box::new(transformer_block.feed_forward)),
-                LayerEnum::LayerNorm(transformer_block.norm2),
+                norm1_enum,
+                ffn_enum,
+                norm2_enum,
                 LayerEnum::OutputProjection(output_projection),
             ],
             gradient_clipper: Some(Box::new(AdaptiveGradientClipping::new(
@@ -266,8 +305,8 @@ impl LLM {
     }
 
     #[instrument(skip(self, data))]
-    pub fn train(&mut self, data: Vec<&str>, epochs: usize, lr: f32) {
-        self.train_with_batch_size(data, epochs, lr, 1);
+    pub fn train(&mut self, data: Vec<&str>, epochs: usize, lr: f32) -> Result<()> {
+        self.train_with_batch_size(data, epochs, lr, 1)
     }
 
     /// Train with configurable batch size for improved performance
@@ -277,7 +316,7 @@ impl LLM {
         epochs: usize,
         lr: f32,
         batch_size: usize,
-    ) {
+    ) -> Result<()> {
         let tokenized_data = data
             .par_iter()
             .map(|input| self.tokenize(input))
@@ -288,7 +327,7 @@ impl LLM {
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let batch_loss = self.train_batch(batch, lr);
+                let batch_loss = self.train_batch(batch, lr)?;
                 total_loss += batch_loss;
             }
 
@@ -303,10 +342,12 @@ impl LLM {
                 "Training epoch completed"
             );
         }
+
+        Ok(())
     }
 
     /// Train on a single batch of sequences
-    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> f32 {
+    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<f32> {
         let mut batch_loss = 0.0;
         let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
 
@@ -369,19 +410,32 @@ impl LLM {
             }
         }
 
-        // Apply accumulated and averaged gradients
-        for (layer, param_grads) in self.network.iter_mut().zip(accumulated_param_grads) {
+        // Prepare averaged gradients and detect anomalies
+        let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
+        for param_grads in accumulated_param_grads {
             if !param_grads.is_empty() {
-                // Average gradients across batch
                 let averaged_grads: Vec<Array2<f32>> = param_grads
                     .into_iter()
                     .map(|grad| grad / batch.len() as f32)
                     .collect();
+
+                // Detect gradient anomalies (poisoning/training instability)
+                self.detect_gradient_anomalies(&averaged_grads)?;
+
+                averaged_grads_per_layer.push(averaged_grads);
+            } else {
+                averaged_grads_per_layer.push(Vec::new());
+            }
+        }
+
+        // Apply accumulated and averaged gradients
+        for (layer, averaged_grads) in self.network.iter_mut().zip(averaged_grads_per_layer) {
+            if !averaged_grads.is_empty() {
                 layer.apply_gradients(&averaged_grads, lr);
             }
         }
 
-        batch_loss
+        Ok(batch_loss)
     }
     /// Configure gradient clipping strategy
     pub fn set_gradient_clipping(&mut self, clipper: Box<dyn GradientClipping>) {
@@ -393,11 +447,43 @@ impl LLM {
         self.gradient_clipper = None;
     }
 
+    /// Detect gradient anomalies that may indicate training instability or poisoning
+    fn detect_gradient_anomalies(&self, grads: &[Array2<f32>]) -> Result<()> {
+        for (i, grad) in grads.iter().enumerate() {
+            let max_grad = grad.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            if max_grad > crate::GRADIENT_ANOMALY_THRESHOLD {
+                tracing::warn!("Gradient anomaly detected in layer {}: max gradient magnitude {}", i, max_grad);
+                return Err(ModelError::GradientError {
+                    message: format!("Gradient anomaly in layer {}: magnitude {} exceeds threshold {}",
+                                   i, max_grad, crate::GRADIENT_ANOMALY_THRESHOLD)
+                });
+            }
+
+            // Check for NaN/Inf values
+            if grad.iter().any(|&x| !x.is_finite()) {
+                tracing::error!("Non-finite gradients detected in layer {}", i);
+                return Err(ModelError::GradientError {
+                    message: format!("Non-finite gradients detected in layer {}", i)
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
+        // Input validation
+        let safe_text = if text.len() > crate::MAX_INPUT_LENGTH {
+            tracing::warn!("Input text length {} exceeds maximum allowed length {}, truncating",
+                          text.len(), crate::MAX_INPUT_LENGTH);
+            &text[..crate::MAX_INPUT_LENGTH.min(text.len())]
+        } else {
+            text
+        };
+
         // Split by whitespace first
         let mut tokens = Vec::new();
 
-        for word in text.split_whitespace() {
+        for word in safe_text.split_whitespace() {
             // Special case for end token
             if word == "</s>" {
                 if let Some(token_id) = self.vocab.encode(word) {
@@ -498,6 +584,112 @@ impl LLM {
         grads.mapv_inplace(|x| x / batch_size);
 
         grads
+    }
+
+    /// Generate text using beam search
+    ///
+    /// This method uses beam search to generate text, which explores multiple
+    /// hypotheses in parallel and can produce higher quality output than greedy decoding.
+    ///
+    /// # Arguments
+    /// * `text` - Input text to condition generation on
+    /// * `config` - Beam search configuration
+    ///
+    /// # Returns
+    /// Generated text as a String
+    pub fn generate_with_beam_search(&mut self, text: &str, config: &crate::beam_search::BeamSearchConfig) -> String {
+        use crate::beam_search::BeamSearchState;
+
+        // Tokenize the input text
+        let initial_tokens = self.tokenize(text);
+
+        // Safety check: ensure we have at least one token
+        if initial_tokens.is_empty() {
+            return String::new();
+        }
+
+        // Initialize beam search state
+        let mut state = BeamSearchState::new(initial_tokens.clone(), config.beam_width);
+
+        let end_token = self.vocab.encode("</s>").unwrap();
+
+        // Generate tokens
+        for step in 0..config.max_length {
+            if state.is_done() {
+                break;
+            }
+
+            // Collect predictions for all active beams
+            let mut predictions = Vec::new();
+
+            for beam in &state.beams {
+                if beam.is_complete {
+                    continue;
+                }
+
+                // Prepare input for this beam
+                let token_input = Array2::from_shape_vec(
+                    (1, beam.tokens.len()),
+                    beam.tokens.iter().map(|&x| x as f32).collect(),
+                )
+                .unwrap();
+
+                let mut input = token_input;
+
+                // Forward pass through network
+                for layer in &mut self.network {
+                    input = layer.forward(&input);
+                }
+
+                let logits = input;
+
+                // Get last token logits
+                let last_logit = logits
+                    .row(logits.shape()[0] - 1)
+                    .to_owned();
+
+                // Apply softmax to get probabilities
+                let probs_2d = last_logit.insert_axis(Axis(0));
+                let probs = Self::softmax(&probs_2d);
+                let probs_1d = probs.row(0).to_owned();
+
+                predictions.push(probs_1d);
+            }
+
+            // Compute entropy for adaptive beam width
+            if config.use_adaptive_beam && !predictions.is_empty() {
+                let entropy = state.compute_entropy(&predictions);
+                state.adapt_beam_width(entropy, config);
+            }
+
+            // Expand beams with new predictions
+            state.expand(&predictions, config, self.vocab.words.len());
+
+            // Mark complete beams
+            state.mark_complete(end_token, initial_tokens.len() + step + 1);
+        }
+
+        // Get the best hypothesis
+        let best = state.get_best();
+
+        if let Some(hypothesis) = best {
+            // Skip the initial tokens (input) and convert to text
+            let output_tokens = &hypothesis.tokens[initial_tokens.len()..];
+
+            if output_tokens.is_empty() {
+                return String::new();
+            }
+
+            // Convert token_ids to strings
+            let token_strs = output_tokens
+                .iter()
+                .map(|&t| self.vocab.decode.get(&t).unwrap().as_str())
+                .collect::<Vec<&str>>();
+
+            token_strs.join(" ")
+        } else {
+            String::new()
+        }
     }
 
     /// Save model to JSON format (human-readable, larger file size)

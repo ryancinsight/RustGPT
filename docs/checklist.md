@@ -98,11 +98,11 @@ This checklist tracks the implementation status of requirements from the PRD and
 - [x] **NFR-5.5**: Structured error types (thiserror, not String errors) - **IMPLEMENTED Sprint 3**
 
 ### NFR-6: Security
-- [ ] **NFR-6.1**: Input validation (max sequence length enforcement)
-- [ ] **NFR-6.2**: No unsafe code (or justified with safety proofs)
-- [ ] **NFR-6.3**: Dependency audit (cargo audit in CI, no CVEs)
-- [ ] **NFR-6.4**: Model poisoning detection (gradient anomaly detection)
-- [ ] **NFR-6.5**: No secrets in code (API keys, credentials)
+- [x] **NFR-6.1**: Input validation (max sequence length, file size, vocab size limits) - **IMPLEMENTED Sprint 3.3**
+- [x] **NFR-6.2**: No unsafe code (cargo audit clean, zero unsafe blocks) - **VERIFIED Sprint 3.3**
+- [x] **NFR-6.3**: Dependency audit (cargo audit in CI, no CVEs) - **VERIFIED Sprint 3.3**
+- [x] **NFR-6.4**: Model poisoning detection (gradient anomaly monitoring) - **IMPLEMENTED Sprint 3.3**
+- [x] **NFR-6.5**: No secrets in code (API keys, credentials) - **VERIFIED Sprint 3.3**
 
 ### NFR-7: Observability
 - [x] **NFR-7.1**: Structured logging (tracing crate with spans) - **IMPLEMENTED Sprint 3**
@@ -167,18 +167,29 @@ This checklist tracks the implementation status of requirements from the PRD and
 
 ## Sprint Tasks
 
-### Current Sprint (Error Handling & Parallelization) - ✅ COMPLETE Sprint 3
-- [x] Define ModelError enum with thiserror for structured errors
-- [x] Refactor dataset_loader.rs to return Result<ModelError>
-- [x] Refactor llm.rs save/load/predict methods to use Result
-- [x] Add rayon parallel tokenization in LLM::tokenize method
-- [x] Extend tracing spans to train method in llm.rs
-- [x] Update ADR.md with thiserror/rayon/tracing decisions
-- [x] Fix test compilation errors (unwrap Result calls)
-- [x] Add Debug trait implementations for all structs
-- [x] Verify all tests pass (55/55)
-- [x] Verify clippy compliance (-D warnings)
-- [x] Update checklist.md with sprint completion
+### Sprint 3.1: Documentation Foundation + Batch Training - ✅ COMPLETE
+- [x] Consolidated ADR.md to 163 lines (table format)
+- [x] Expanded CHECKLIST.md with 5 new NFRs (Reliability, Security, Observability, Scalability, Extensibility)
+- [x] Batch training with gradient accumulation implemented
+- [x] Fixed critical reversed iteration bug in backward pass
+- [x] 68 tests passing, 0 clippy warnings
+- [x] Test runtime: 10.34s (within <30s target)
+
+### Sprint 3.2: Iterator Performance Optimizations - ✅ COMPLETE
+- [x] Replaced indexed loops with iterator-based approaches (enumerate/take)
+- [x] Optimized hypermixer.rs forward method (eliminated intermediate variables)
+- [x] Optimized token_mixing.rs attention computation (iterator-based indexing)
+- [x] Verified all 68 tests pass without regression
+- [x] Zero clippy warnings maintained
+
+### Sprint 3.3: Security & Validation Hardening - ✅ COMPLETE
+- [x] Input validation: MAX_INPUT_LENGTH (10k chars), MAX_FILE_SIZE (100MB), MAX_VOCAB_SIZE (50k)
+- [x] File size validation in dataset loaders (JSON/CSV)
+- [x] Gradient anomaly detection (threshold: 1000.0, NaN/Inf checking)
+- [x] Training pipeline security (poisoning detection, input sanitization)
+- [x] Updated training methods to return Result for error propagation
+- [x] All security NFRs completed (NFR-6.1 through NFR-6.5)
+- [x] 68 tests passing, zero warnings, cargo audit clean
 
 ## Dependencies Status
 

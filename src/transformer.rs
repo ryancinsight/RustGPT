@@ -2,24 +2,184 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    feed_forward::FeedForward, layer_norm::LayerNorm, llm::Layer, self_attention::SelfAttention,
+    feed_forward::FeedForward, layer_norm::LayerNorm, rms_norm::RMSNorm, swiglu::SwiGLU, llm::Layer, self_attention::SelfAttention,
 };
 
-#[derive(Serialize, Deserialize, Clone)]
+/// Normalization layer type for TransformerBlock
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum NormLayer {
+    LayerNorm(Box<LayerNorm>),
+    RMSNorm(Box<RMSNorm>),
+}
+
+impl NormLayer {
+    /// Create a new LayerNorm
+    pub fn layer_norm(embedding_dim: usize) -> Self {
+        NormLayer::LayerNorm(Box::new(LayerNorm::new(embedding_dim)))
+    }
+
+    /// Create a new RMSNorm
+    pub fn rms_norm(embedding_dim: usize) -> Self {
+        NormLayer::RMSNorm(Box::new(RMSNorm::new(embedding_dim)))
+    }
+
+    /// Normalize the input
+    pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        match self {
+            NormLayer::LayerNorm(norm) => norm.normalize(input),
+            NormLayer::RMSNorm(norm) => norm.normalize(input),
+        }
+    }
+
+    /// Compute gradients
+    pub fn compute_gradients(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+        match self {
+            NormLayer::LayerNorm(norm) => norm.compute_gradients(input, output_grads),
+            NormLayer::RMSNorm(norm) => norm.compute_gradients(input, output_grads),
+        }
+    }
+
+    /// Apply gradients
+    pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        match self {
+            NormLayer::LayerNorm(norm) => norm.apply_gradients(param_grads, lr),
+            NormLayer::RMSNorm(norm) => norm.apply_gradients(param_grads, lr),
+        }
+    }
+
+    /// Get parameter count
+    pub fn parameters(&self) -> usize {
+        match self {
+            NormLayer::LayerNorm(norm) => norm.parameters(),
+            NormLayer::RMSNorm(norm) => norm.parameters(),
+        }
+    }
+
+    /// Get number of parameter gradients
+    pub fn num_param_grads(&self) -> usize {
+        match self {
+            NormLayer::LayerNorm(_) => 2, // gamma, beta
+            NormLayer::RMSNorm(_) => 1,   // gamma only
+        }
+    }
+}
+
+/// Feedforward layer type for TransformerBlock
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum FFNLayer {
+    FeedForward(Box<FeedForward>),
+    SwiGLU(Box<SwiGLU>),
+}
+
+impl FFNLayer {
+    /// Create a new FeedForward layer
+    pub fn feed_forward(embedding_dim: usize, hidden_dim: usize) -> Self {
+        FFNLayer::FeedForward(Box::new(FeedForward::new(embedding_dim, hidden_dim)))
+    }
+
+    /// Create a new SwiGLU layer
+    pub fn swiglu(embedding_dim: usize, hidden_dim: usize) -> Self {
+        FFNLayer::SwiGLU(Box::new(SwiGLU::new(embedding_dim, hidden_dim)))
+    }
+
+    /// Forward pass
+    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        match self {
+            FFNLayer::FeedForward(ffn) => ffn.forward(input),
+            FFNLayer::SwiGLU(swiglu) => swiglu.forward(input),
+        }
+    }
+
+    /// Compute gradients
+    pub fn compute_gradients(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+        match self {
+            FFNLayer::FeedForward(ffn) => ffn.compute_gradients(input, output_grads),
+            FFNLayer::SwiGLU(swiglu) => swiglu.compute_gradients(input, output_grads),
+        }
+    }
+
+    /// Apply gradients
+    pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+        match self {
+            FFNLayer::FeedForward(ffn) => ffn.apply_gradients(param_grads, lr),
+            FFNLayer::SwiGLU(swiglu) => swiglu.apply_gradients(param_grads, lr),
+        }
+    }
+
+    /// Get parameter count
+    pub fn parameters(&self) -> usize {
+        match self {
+            FFNLayer::FeedForward(ffn) => ffn.parameters(),
+            FFNLayer::SwiGLU(swiglu) => swiglu.parameters(),
+        }
+    }
+
+    /// Get number of parameter gradients
+    pub fn num_param_grads(&self) -> usize {
+        match self {
+            FFNLayer::FeedForward(_) => 2, // w1, w2 (no biases - modern LLM practice)
+            FFNLayer::SwiGLU(_) => 3,      // w1, w2, w3 (no biases)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TransformerBlock {
     pub attention: SelfAttention,
-    pub feed_forward: FeedForward,
-    pub norm1: LayerNorm, // After attention
-    pub norm2: LayerNorm, // After feed forward
+    pub feed_forward: FFNLayer,
+    pub norm1: NormLayer, // After attention
+    pub norm2: NormLayer, // After feed forward
 }
 
 impl TransformerBlock {
+    /// Create a new TransformerBlock with LayerNorm and FeedForward (default)
     pub fn new(embedding_dim: usize, hidden_dim: usize) -> Self {
+        Self::with_config(embedding_dim, hidden_dim, false, false)
+    }
+
+    /// Create a new TransformerBlock with specified normalization type (backward compatibility)
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Embedding dimension
+    /// * `hidden_dim` - Hidden dimension for feedforward layer
+    /// * `use_rms_norm` - If true, use RMSNorm; if false, use LayerNorm
+    pub fn with_norm_type(embedding_dim: usize, hidden_dim: usize, use_rms_norm: bool) -> Self {
+        Self::with_config(embedding_dim, hidden_dim, use_rms_norm, false)
+    }
+
+    /// Create a new TransformerBlock with full configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Embedding dimension
+    /// * `hidden_dim` - Hidden dimension for feedforward layer
+    /// * `use_rms_norm` - If true, use RMSNorm; if false, use LayerNorm
+    /// * `use_swiglu` - If true, use SwiGLU; if false, use FeedForward
+    pub fn with_config(embedding_dim: usize, hidden_dim: usize, use_rms_norm: bool, use_swiglu: bool) -> Self {
+        let norm1 = if use_rms_norm {
+            NormLayer::rms_norm(embedding_dim)
+        } else {
+            NormLayer::layer_norm(embedding_dim)
+        };
+
+        let norm2 = if use_rms_norm {
+            NormLayer::rms_norm(embedding_dim)
+        } else {
+            NormLayer::layer_norm(embedding_dim)
+        };
+
+        let feed_forward = if use_swiglu {
+            FFNLayer::swiglu(embedding_dim, hidden_dim)
+        } else {
+            FFNLayer::feed_forward(embedding_dim, hidden_dim)
+        };
+
         TransformerBlock {
             attention: SelfAttention::new(embedding_dim),
-            feed_forward: FeedForward::new(embedding_dim, hidden_dim),
-            norm1: LayerNorm::new(embedding_dim),
-            norm2: LayerNorm::new(embedding_dim),
+            feed_forward,
+            norm1,
+            norm2,
         }
     }
 }
@@ -82,18 +242,21 @@ impl Layer for TransformerBlock {
         self.attention.apply_gradients(attention_params, lr);
         idx += 3;
 
-        // Apply norm1 gradients (2 params: gamma, beta)
-        let norm1_params = &param_grads[idx..idx + 2];
+        // Apply norm1 gradients (1 or 2 params depending on type)
+        let norm1_count = self.norm1.num_param_grads();
+        let norm1_params = &param_grads[idx..idx + norm1_count];
         self.norm1.apply_gradients(norm1_params, lr);
-        idx += 2;
+        idx += norm1_count;
 
-        // Apply feed_forward gradients (4 params: w1, b1, w2, b2)
-        let ffn_params = &param_grads[idx..idx + 4];
+        // Apply feed_forward gradients (3 or 4 params depending on type)
+        let ffn_count = self.feed_forward.num_param_grads();
+        let ffn_params = &param_grads[idx..idx + ffn_count];
         self.feed_forward.apply_gradients(ffn_params, lr);
-        idx += 4;
+        idx += ffn_count;
 
-        // Apply norm2 gradients (2 params: gamma, beta)
-        let norm2_params = &param_grads[idx..idx + 2];
+        // Apply norm2 gradients (1 or 2 params depending on type)
+        let norm2_count = self.norm2.num_param_grads();
+        let norm2_params = &param_grads[idx..idx + norm2_count];
         self.norm2.apply_gradients(norm2_params, lr);
     }
 

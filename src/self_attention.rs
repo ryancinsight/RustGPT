@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::EMBEDDING_DIM;
 use crate::adam::Adam;
 use crate::llm::Layer;
+use crate::rope::RotaryEmbedding;
+use crate::model_config::WindowAdaptationStrategy;
 
 /// Single head for multi-head attention
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -22,13 +24,48 @@ pub struct AttentionHead {
 }
 
 /// Multi-head self-attention mechanism (standard transformer attention)
+/// Supports both Multi-Head Attention (MHA) and Group-Query Attention (GQA)
+/// Supports Sliding Window Attention for efficient long-context processing
+/// Supports Adaptive Window Sizing (Phase 4 enhancement)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SelfAttention {
     pub embedding_dim: usize,
     pub num_heads: usize,
+    /// Number of key-value heads (for GQA)
+    /// If equal to num_heads, this is standard MHA
+    /// If less than num_heads, this is GQA with grouped queries
+    pub num_kv_heads: usize,
     heads: Vec<AttentionHead>,
 
     cached_input: Option<Array2<f32>>,
+
+    /// Optional RoPE (Rotary Positional Encoding)
+    rope: Option<RotaryEmbedding>,
+
+    /// Optional sliding window size for attention
+    /// If None, uses full attention (all tokens attend to all previous tokens)
+    /// If Some(w), each token only attends to the last w tokens
+    window_size: Option<usize>,
+
+    /// Enable adaptive window sizing (Phase 4)
+    use_adaptive_window: bool,
+
+    /// Minimum window size for adaptive sizing
+    min_window_size: usize,
+
+    /// Maximum window size for adaptive sizing
+    max_window_size: usize,
+
+    /// Strategy for adapting window size
+    window_adaptation_strategy: WindowAdaptationStrategy,
+
+    /// Current adaptive window size (computed per forward pass)
+    #[serde(skip)]
+    current_window_size: Option<usize>,
+
+    /// Attention entropy from last forward pass (for AttentionEntropy strategy)
+    #[serde(skip)]
+    last_attention_entropy: Option<f32>,
 }
 
 impl Default for SelfAttention {
@@ -56,26 +93,46 @@ impl AttentionHead {
         }
     }
 
-    /// Compute Q, K, V for this head
-    fn compute_qkv(&self, head_input: &Array2<f32>) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
-        let q = head_input.dot(&self.w_q); // Q = X * W_Q
-        let k = head_input.dot(&self.w_k); // K = X * W_K
+    /// Compute Q, K, V for this head with optional RoPE
+    /// Note: This method is kept for backward compatibility but is not used in GQA forward pass
+    #[allow(dead_code)]
+    fn compute_qkv_with_rope(
+        &self,
+        head_input: &Array2<f32>,
+        rope: Option<&RotaryEmbedding>,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+        let mut q = head_input.dot(&self.w_q); // Q = X * W_Q
+        let mut k = head_input.dot(&self.w_k); // K = X * W_K
         let v = head_input.dot(&self.w_v); // V = X * W_V
+
+        // Apply RoPE to Q and K if enabled
+        if let Some(rope_emb) = rope {
+            q = rope_emb.apply(&q);
+            k = rope_emb.apply(&k);
+        }
+
         (q, k, v)
     }
 
-    /// Compute attention for this head
-    fn attention(&self, q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>) -> Array2<f32> {
+    /// Compute attention for this head with optional sliding window
+    fn attention(&self, q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, window_size: Option<usize>) -> Array2<f32> {
         let dk = (self.head_dim as f32).sqrt();
 
         let k_t = k.t();
         let mut scores = q.dot(&k_t) / dk;
 
-        // Apply causal masking - prevent attention to future tokens
+        // Apply causal masking and optional sliding window masking
         let seq_len = scores.shape()[0];
         for i in 0..seq_len {
-            for j in (i + 1)..seq_len {
-                scores[[i, j]] = f32::NEG_INFINITY;
+            for j in 0..seq_len {
+                // Causal masking: prevent attention to future tokens
+                if j > i {
+                    scores[[i, j]] = f32::NEG_INFINITY;
+                }
+                // Sliding window masking: prevent attention to tokens outside window
+                else if let Some(window) = window_size && j < i.saturating_sub(window) {
+                    scores[[i, j]] = f32::NEG_INFINITY;
+                }
             }
         }
 
@@ -113,24 +170,242 @@ impl SelfAttention {
 
     /// Initialize with specific number of heads
     pub fn new_with_heads(embedding_dim: usize, num_heads: usize) -> Self {
+        Self::new_with_config(embedding_dim, num_heads, false, 512)
+    }
+
+    /// Initialize with full configuration including RoPE
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Embedding dimension
+    /// * `num_heads` - Number of attention heads
+    /// * `use_rope` - Whether to use Rotary Positional Encoding
+    /// * `max_seq_len` - Maximum sequence length (for RoPE)
+    pub fn new_with_config(embedding_dim: usize, num_heads: usize, use_rope: bool, max_seq_len: usize) -> Self {
+        // Default to MHA (num_kv_heads = num_heads) and full attention (window_size = None)
+        Self::new_with_gqa(embedding_dim, num_heads, num_heads, use_rope, max_seq_len, None)
+    }
+
+    /// Initialize with Group-Query Attention (GQA) configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Embedding dimension
+    /// * `num_heads` - Number of query heads
+    /// * `num_kv_heads` - Number of key-value heads (for GQA)
+    /// * `use_rope` - Whether to use Rotary Positional Encoding
+    /// * `max_seq_len` - Maximum sequence length (for RoPE)
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `embedding_dim` is not divisible by `num_heads`
+    /// - `num_heads` is not divisible by `num_kv_heads`
+    /// - `num_kv_heads` is greater than `num_heads`
+    pub fn new_with_gqa(
+        embedding_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        use_rope: bool,
+        max_seq_len: usize,
+        window_size: Option<usize>,
+    ) -> Self {
         assert!(embedding_dim % num_heads == 0, "embedding_dim must be divisible by num_heads");
+        assert!(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads (for GQA grouping)");
+        assert!(num_kv_heads <= num_heads, "num_kv_heads cannot be greater than num_heads");
 
         let head_dim = embedding_dim / num_heads;
+
+        // For GQA: Create num_heads query heads, but only num_kv_heads key/value heads
+        // Query heads will be grouped to share KV heads
         let heads = (0..num_heads)
             .map(|_| AttentionHead::new(head_dim))
             .collect();
 
+        let rope = if use_rope {
+            Some(RotaryEmbedding::new(head_dim, max_seq_len))
+        } else {
+            None
+        };
+
         SelfAttention {
             embedding_dim,
             num_heads,
+            num_kv_heads,
             heads,
             cached_input: None,
+            rope,
+            window_size,
+            use_adaptive_window: false, // Default to fixed window
+            min_window_size: 512,
+            max_window_size: 4096,
+            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            current_window_size: None,
+            last_attention_entropy: None,
         }
     }
 
+    /// Create a new SelfAttention with full adaptive window configuration
+    /// Uses a builder pattern to avoid too many parameters
+    pub fn new_with_adaptive_window(
+        embedding_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        use_rope: bool,
+        max_seq_len: usize,
+        window_size: Option<usize>,
+    ) -> AdaptiveWindowBuilder {
+        AdaptiveWindowBuilder {
+            embedding_dim,
+            num_heads,
+            num_kv_heads,
+            use_rope,
+            max_seq_len,
+            window_size,
+            use_adaptive_window: true,
+            min_window_size: 512,
+            max_window_size: 4096,
+            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+        }
+    }
+}
+
+/// Builder for SelfAttention with adaptive window configuration
+pub struct AdaptiveWindowBuilder {
+    embedding_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    use_rope: bool,
+    max_seq_len: usize,
+    window_size: Option<usize>,
+    use_adaptive_window: bool,
+    min_window_size: usize,
+    max_window_size: usize,
+    window_adaptation_strategy: WindowAdaptationStrategy,
+}
+
+impl AdaptiveWindowBuilder {
+    pub fn min_window_size(mut self, size: usize) -> Self {
+        self.min_window_size = size;
+        self
+    }
+
+    pub fn max_window_size(mut self, size: usize) -> Self {
+        self.max_window_size = size;
+        self
+    }
+
+    pub fn strategy(mut self, strategy: WindowAdaptationStrategy) -> Self {
+        self.window_adaptation_strategy = strategy;
+        self
+    }
+
+    pub fn build(self) -> SelfAttention {
+        assert!(self.embedding_dim % self.num_heads == 0, "embedding_dim must be divisible by num_heads");
+        assert!(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads (for GQA grouping)");
+        assert!(self.num_kv_heads <= self.num_heads, "num_kv_heads cannot be greater than num_heads");
+        assert!(self.min_window_size <= self.max_window_size, "min_window_size must be <= max_window_size");
+
+        let head_dim = self.embedding_dim / self.num_heads;
+
+        let heads = (0..self.num_heads)
+            .map(|_| AttentionHead::new(head_dim))
+            .collect();
+
+        let rope = if self.use_rope {
+            Some(RotaryEmbedding::new(head_dim, self.max_seq_len))
+        } else {
+            None
+        };
+
+        SelfAttention {
+            embedding_dim: self.embedding_dim,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            heads,
+            cached_input: None,
+            rope,
+            window_size: self.window_size,
+            use_adaptive_window: self.use_adaptive_window,
+            min_window_size: self.min_window_size,
+            max_window_size: self.max_window_size,
+            window_adaptation_strategy: self.window_adaptation_strategy,
+            current_window_size: None,
+            last_attention_entropy: None,
+        }
+    }
 }
 
 impl SelfAttention {
+    /// Compute adaptive window size based on the configured strategy
+    fn compute_adaptive_window_size(&self, seq_len: usize) -> usize {
+        if !self.use_adaptive_window {
+            // Use fixed window size if adaptive is disabled
+            return self.window_size.unwrap_or(seq_len);
+        }
+
+        match self.window_adaptation_strategy {
+            WindowAdaptationStrategy::Fixed => {
+                // Fixed strategy: use configured window_size
+                self.window_size.unwrap_or(seq_len)
+            }
+            WindowAdaptationStrategy::SequenceLengthBased => {
+                // Scale window with sequence length: window = min(max, max(min, seq_len / 2))
+                let proposed_window = seq_len / 2;
+                proposed_window.clamp(self.min_window_size, self.max_window_size)
+            }
+            WindowAdaptationStrategy::AttentionEntropy => {
+                // Use attention entropy from last forward pass
+                // Higher entropy (diffuse attention) → larger window
+                // Lower entropy (focused attention) → smaller window
+                if let Some(entropy) = self.last_attention_entropy {
+                    // Normalize entropy to [0, 1] range (assuming max entropy ~= 4.0 for typical attention)
+                    let normalized_entropy = (entropy / 4.0).min(1.0);
+
+                    // Map entropy to window size: high entropy → max window, low entropy → min window
+                    let window_range = self.max_window_size - self.min_window_size;
+                    let adaptive_window = self.min_window_size + (window_range as f32 * normalized_entropy) as usize;
+
+                    adaptive_window.clamp(self.min_window_size, self.max_window_size)
+                } else {
+                    // Fallback to sequence-length-based if no entropy available
+                    let proposed_window = seq_len / 2;
+                    proposed_window.clamp(self.min_window_size, self.max_window_size)
+                }
+            }
+            WindowAdaptationStrategy::PerplexityBased => {
+                // Perplexity-based adaptation (placeholder for now)
+                // Would require perplexity computation from model output
+                // For now, fallback to sequence-length-based
+                let proposed_window = seq_len / 2;
+                proposed_window.clamp(self.min_window_size, self.max_window_size)
+            }
+        }
+    }
+
+    /// Compute attention entropy for adaptive window sizing
+    /// Entropy measures how diffuse the attention distribution is
+    #[allow(dead_code)]
+    fn compute_attention_entropy(&self, attention_weights: &Array2<f32>) -> f32 {
+        let seq_len = attention_weights.shape()[0];
+        let mut total_entropy = 0.0;
+
+        for i in 0..seq_len {
+            let mut row_entropy = 0.0;
+            for j in 0..seq_len {
+                let p = attention_weights[[i, j]];
+                if p > 1e-10 {
+                    // Avoid log(0)
+                    row_entropy -= p * p.ln();
+                }
+            }
+            total_entropy += row_entropy;
+        }
+
+        // Average entropy across all positions
+        total_entropy / seq_len as f32
+    }
+
     /// Compute gradients for a single attention head
     fn compute_head_gradients(
         &self,
@@ -142,18 +417,31 @@ impl SelfAttention {
         let head_dim = head.head_dim;
 
         // Recompute forward pass
-        let q = head_input.dot(&head.w_q);
-        let k = head_input.dot(&head.w_k);
+        let mut q = head_input.dot(&head.w_q);
+        let mut k = head_input.dot(&head.w_k);
         let v = head_input.dot(&head.w_v);
+
+        // Apply RoPE if enabled
+        if let Some(rope) = &self.rope {
+            q = rope.apply(&q);
+            k = rope.apply(&k);
+        }
 
         let dk = head_dim as f32;
         let mut scores = q.dot(&k.t()) / dk.sqrt();
 
-        // Apply causal masking
+        // Apply causal masking and optional sliding window masking
         let seq_len = scores.shape()[0];
         for i in 0..seq_len {
-            for j in (i + 1)..seq_len {
-                scores[[i, j]] = f32::NEG_INFINITY;
+            for j in 0..seq_len {
+                // Causal masking: prevent attention to future tokens
+                if j > i {
+                    scores[[i, j]] = f32::NEG_INFINITY;
+                }
+                // Sliding window masking: prevent attention to tokens outside window
+                else if let Some(window) = self.window_size && j < i.saturating_sub(window) {
+                    scores[[i, j]] = f32::NEG_INFINITY;
+                }
             }
         }
 
@@ -224,6 +512,15 @@ impl Layer for SelfAttention {
         let (seq_len, emb_dim) = (input.shape()[0], input.shape()[1]);
         let head_dim = emb_dim / self.num_heads;
 
+        // Compute adaptive window size if enabled
+        let effective_window_size = if self.use_adaptive_window {
+            let adaptive_size = self.compute_adaptive_window_size(seq_len);
+            self.current_window_size = Some(adaptive_size);
+            Some(adaptive_size)
+        } else {
+            self.window_size
+        };
+
         // Split input into heads: (seq_len, emb_dim) -> num_heads × (seq_len, head_dim)
         let mut head_inputs = Vec::new();
         for h in 0..self.num_heads {
@@ -233,20 +530,57 @@ impl Layer for SelfAttention {
             head_inputs.push(head_input);
         }
 
-        // Process each head
-        let mut head_outputs = Vec::new();
-        for (h, head_input) in head_inputs.into_iter().enumerate() {
-            let qkv = self.heads[h].compute_qkv(&head_input);
-            let head_attention = self.heads[h].attention(&qkv.0, &qkv.1, &qkv.2);
-            head_outputs.push(head_attention);
+        // For GQA: compute K, V only for num_kv_heads, then share across query groups
+        let queries_per_kv = self.num_heads / self.num_kv_heads;
+
+        // Compute all queries
+        let mut queries: Vec<Array2<f32>> = Vec::new();
+        for (h, head_input) in head_inputs.iter().enumerate() {
+            let mut q = head_input.dot(&self.heads[h].w_q);
+            // Apply RoPE to queries if enabled
+            if let Some(rope) = &self.rope {
+                q = rope.apply(&q);
+            }
+            queries.push(q);
         }
+
+        // Compute K, V for each KV head (only num_kv_heads, not num_heads)
+        let mut keys: Vec<Array2<f32>> = Vec::new();
+        let mut values: Vec<Array2<f32>> = Vec::new();
+        for kv_idx in 0..self.num_kv_heads {
+            // Use the first query head in each group to compute K, V
+            let head_idx = kv_idx * queries_per_kv;
+            let head_input = &head_inputs[head_idx];
+
+            let mut k = head_input.dot(&self.heads[head_idx].w_k);
+            let v = head_input.dot(&self.heads[head_idx].w_v);
+
+            // Apply RoPE to keys if enabled
+            if let Some(rope) = &self.rope {
+                k = rope.apply(&k);
+            }
+
+            keys.push(k);
+            values.push(v);
+        }
+
+        // Process each query head with its corresponding KV head (GQA grouping)
+        let head_outputs: Vec<Array2<f32>> = queries.iter().enumerate().map(|(h, q)| {
+            // Determine which KV head this query head uses
+            let kv_idx = h / queries_per_kv;
+            let k = &keys[kv_idx];
+            let v = &values[kv_idx];
+
+            // Compute attention for this head with adaptive or fixed sliding window
+            self.heads[h].attention(q, k, v, effective_window_size)
+        }).collect();
 
         // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
         let mut output = Array2::zeros((seq_len, emb_dim));
-        for h in 0..self.num_heads {
+        for (h, head_output) in head_outputs.iter().enumerate().take(self.num_heads) {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
-            output.slice_mut(ndarray::s![.., start_col..end_col]).assign(&head_outputs[h]);
+            output.slice_mut(ndarray::s![.., start_col..end_col]).assign(head_output);
         }
 
         output + input // residual connection
@@ -259,7 +593,16 @@ impl Layer for SelfAttention {
     }
 
     fn parameters(&self) -> usize {
-        self.heads.iter().map(|head| head.w_q.len() + head.w_k.len() + head.w_v.len()).sum::<usize>()
+        // For GQA: num_heads query projections + num_kv_heads key/value projections
+        let head_dim = self.embedding_dim / self.num_heads;
+
+        // All query heads have their own W_q
+        let q_params = self.num_heads * head_dim * head_dim;
+
+        // Only num_kv_heads have W_k and W_v
+        let kv_params = self.num_kv_heads * 2 * head_dim * head_dim;
+
+        q_params + kv_params
     }
 
     fn compute_gradients(
