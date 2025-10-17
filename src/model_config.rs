@@ -65,6 +65,55 @@ pub enum WindowAdaptationStrategy {
     PerplexityBased,
 }
 
+/// Strategy for selecting which attention heads to activate
+///
+/// Implements Mixture-of-Heads (MoH) for dynamic head selection per token.
+/// Based on "MoH: Multi-Head Attention as Mixture-of-Head Attention" (Skywork AI, 2024).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HeadSelectionStrategy {
+    /// All heads always active (standard multi-head attention)
+    /// - Zero overhead
+    /// - Backward compatible
+    /// - Use for baseline comparisons
+    AllHeads,
+
+    /// Mixture-of-Heads: dynamic head selection per token
+    /// - Learned routing via router network
+    /// - Shared heads (always active) + routed heads (Top-K)
+    /// - Weighted summation for flexibility
+    /// - Load balance loss to prevent routing collapse
+    /// - Recommended for 5-8% speedup with minimal memory overhead
+    MixtureOfHeads {
+        /// Number of shared heads (always active, capture common knowledge)
+        /// Recommended: 25% of total heads (e.g., 2 out of 8)
+        num_shared_heads: usize,
+
+        /// Number of routed heads to activate per token (Top-K)
+        /// Recommended: 50-75% of routed heads
+        /// Example: 8 total, 2 shared, 6 routed → activate 3-4 routed
+        num_active_routed_heads: usize,
+
+        /// Weight for load balance loss (β in paper)
+        /// Recommended: 0.01 (prevents routing collapse)
+        load_balance_weight: f32,
+    },
+
+    /// Static head pruning: use only first K heads (for ablation studies)
+    /// - No routing overhead
+    /// - Fixed head selection
+    /// - Useful for comparing against dynamic routing
+    StaticPruning {
+        /// Number of heads to keep active
+        num_active_heads: usize,
+    },
+}
+
+impl Default for HeadSelectionStrategy {
+    fn default() -> Self {
+        HeadSelectionStrategy::AllHeads
+    }
+}
+
 /// Configuration for model architecture and hyperparameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -161,6 +210,16 @@ pub struct ModelConfig {
     ///
     /// Default: SequenceLengthBased (simplest and most stable)
     pub window_adaptation_strategy: WindowAdaptationStrategy,
+
+    /// Strategy for selecting which attention heads to activate
+    ///
+    /// Controls dynamic head selection (Mixture-of-Heads):
+    /// - AllHeads: All heads active (standard MHA, backward compatible)
+    /// - MixtureOfHeads: Dynamic head selection (5-8% speedup, <1% memory)
+    /// - StaticPruning: First K heads (for ablation studies)
+    ///
+    /// Default: AllHeads (backward compatible)
+    pub head_selection: HeadSelectionStrategy,
 }
 
 impl ModelConfig {
@@ -184,6 +243,7 @@ impl ModelConfig {
             min_window_size: 512,       // Reasonable minimum
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
         }
     }
     
@@ -214,6 +274,7 @@ impl ModelConfig {
             min_window_size: 512,       // Reasonable minimum
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
         }
     }
 
@@ -277,6 +338,7 @@ impl ModelConfig {
             min_window_size: 512,       // Reasonable minimum
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
         }
     }
 

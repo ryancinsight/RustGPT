@@ -67,7 +67,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     for _ in 0..config.num_layers {
         // Self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
         // Use the modern constructor that accepts PositionalEncodingType directly
-        let attention = if config.use_adaptive_window {
+        let mut attention = if config.use_adaptive_window {
             // For adaptive window, we still need to use the builder pattern
             // Convert PositionalEncodingType to boolean for backward compatibility
             let use_rope = matches!(config.positional_encoding, crate::model_config::PositionalEncodingType::RoPE);
@@ -94,6 +94,9 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
                 config.window_size,
             )
         };
+
+        // Set head selection strategy (MoH, AllHeads, or StaticPruning)
+        attention.set_head_selection(config.head_selection.clone());
 
         // Enable gradient clipping for Transformer too (for fair comparison)
         // Note: This might hurt Transformer performance, but let's see
@@ -242,6 +245,37 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     } else {
         println!("  • Full Attention");
         println!("    - Complexity: O(N²)");
+    }
+
+    // Head Selection Strategy (Mixture-of-Heads)
+    use crate::model_config::HeadSelectionStrategy;
+    match &config.head_selection {
+        HeadSelectionStrategy::AllHeads => {
+            println!("  • All Heads Active (standard MHA)");
+        }
+        HeadSelectionStrategy::MixtureOfHeads {
+            num_shared_heads,
+            num_active_routed_heads,
+            load_balance_weight,
+        } => {
+            let num_routed_heads = num_heads - num_shared_heads;
+            let total_active = num_shared_heads + num_active_routed_heads;
+            let compute_savings = ((num_heads - total_active) as f32 / num_heads as f32 * 100.0) as usize;
+            println!("  ✓ Mixture-of-Heads (MoH) - Dynamic Head Selection");
+            println!("    - Total Heads: {}", num_heads);
+            println!("    - Shared Heads: {} (always active)", num_shared_heads);
+            println!("    - Routed Heads: {} (Top-{} selection)", num_routed_heads, num_active_routed_heads);
+            println!("    - Active per Token: {}/{} heads", total_active, num_heads);
+            println!("    - Compute Savings: ~{}%", compute_savings);
+            println!("    - Load Balance Weight: {}", load_balance_weight);
+            println!("    - Expected Speedup: 5-8%");
+        }
+        HeadSelectionStrategy::StaticPruning { num_active_heads } => {
+            let compute_savings = ((num_heads - num_active_heads) as f32 / num_heads as f32 * 100.0) as usize;
+            println!("  • Static Head Pruning (ablation study)");
+            println!("    - Active Heads: {}/{}", num_active_heads, num_heads);
+            println!("    - Compute Savings: ~{}%", compute_savings);
+        }
     }
 
     // Architecture Alignment
