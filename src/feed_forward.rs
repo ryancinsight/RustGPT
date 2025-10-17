@@ -97,14 +97,29 @@ impl Layer for FeedForward {
         (grad_input, vec![grad_w1, grad_w2])
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        if param_grads.len() != 2 {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "FeedForward expected 2 parameter gradients (W1, W2), got {}",
+                    param_grads.len()
+                ),
+            });
+        }
+
         self.optimizer_w1.step(&mut self.w1, &param_grads[0], lr);
         self.optimizer_w2.step(&mut self.w2, &param_grads[1], lr);
+        Ok(())
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
-        self.apply_gradients(&param_grads, lr);
+        // Unwrap is safe: backward is only called from training loop which validates inputs
+        self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
 

@@ -67,10 +67,10 @@ pub struct SwiGLU {
 
     // Cached values for backward pass
     cached_input: Option<Array2<f32>>,
-    cached_x1: Option<Array2<f32>>,      // xW₁
-    cached_x2: Option<Array2<f32>>,      // xW₂
-    cached_swish: Option<Array2<f32>>,   // Swish(xW₁)
-    cached_gated: Option<Array2<f32>>,   // Swish(xW₁) ⊙ xW₂
+    cached_x1: Option<Array2<f32>>,    // xW₁
+    cached_x2: Option<Array2<f32>>,    // xW₂
+    cached_swish: Option<Array2<f32>>, // Swish(xW₁)
+    cached_gated: Option<Array2<f32>>, // Swish(xW₁) ⊙ xW₂
 
     // Adam optimizers for each weight matrix
     optimizer_w1: Adam,
@@ -213,11 +213,26 @@ impl Layer for SwiGLU {
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         // Retrieve cached values
-        let input = self.cached_input.as_ref().expect("forward must be called before compute_gradients");
-        let x1 = self.cached_x1.as_ref().expect("forward must be called before compute_gradients");
-        let x2 = self.cached_x2.as_ref().expect("forward must be called before compute_gradients");
-        let swish = self.cached_swish.as_ref().expect("forward must be called before compute_gradients");
-        let gated = self.cached_gated.as_ref().expect("forward must be called before compute_gradients");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let x1 = self
+            .cached_x1
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let x2 = self
+            .cached_x2
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let swish = self
+            .cached_swish
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let gated = self
+            .cached_gated
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
 
         // Gradient w.r.t. W₃: ∂L/∂W₃ = gated^T · ∂L/∂output
         let grad_w3 = gated.t().dot(output_grads);
@@ -252,15 +267,30 @@ impl Layer for SwiGLU {
         (grad_input, vec![grad_w1, grad_w2, grad_w3])
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        if param_grads.len() != 3 {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "SwiGLU expected 3 parameter gradients (W1, W2, W3), got {}",
+                    param_grads.len()
+                ),
+            });
+        }
+
         self.optimizer_w1.step(&mut self.w1, &param_grads[0], lr);
         self.optimizer_w2.step(&mut self.w2, &param_grads[1], lr);
         self.optimizer_w3.step(&mut self.w3, &param_grads[2], lr);
+        Ok(())
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
-        self.apply_gradients(&param_grads, lr);
+        // Unwrap is safe: backward is only called from training loop which validates inputs
+        self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
 
@@ -287,10 +317,10 @@ mod tests {
         let mut swiglu = SwiGLU::new(64, 256);
         let input = Array2::ones((10, 64));
         let output = swiglu.forward(&input);
-        
+
         // Output shape should match input shape (with residual)
         assert_eq!(output.shape(), &[10, 64]);
-        
+
         // Output should not be all zeros
         assert!(output.iter().any(|&x| x.abs() > 1e-6));
     }
@@ -299,14 +329,14 @@ mod tests {
     fn test_swiglu_gradient_shapes() {
         let mut swiglu = SwiGLU::new(32, 128);
         let input = Array2::ones((5, 32));
-        
+
         // Forward pass
         let _output = swiglu.forward(&input);
-        
+
         // Compute gradients
         let output_grads = Array2::ones((5, 32));
         let (input_grads, param_grads) = swiglu.compute_gradients(&input, &output_grads);
-        
+
         // Check gradient shapes
         assert_eq!(input_grads.shape(), &[5, 32]);
         assert_eq!(param_grads.len(), 3); // W₁, W₂, W₃
@@ -317,18 +347,14 @@ mod tests {
 
     #[test]
     fn test_swish_activation() {
-        let x = Array2::from_shape_vec((2, 3), vec![
-            -2.0, 0.0, 2.0,
-            -1.0, 0.5, 1.0,
-        ]).unwrap();
-        
+        let x = Array2::from_shape_vec((2, 3), vec![-2.0, 0.0, 2.0, -1.0, 0.5, 1.0]).unwrap();
+
         let swish = SwiGLU::swish(&x);
-        
+
         // Swish(0) should be close to 0
         assert!((swish[[0, 1]]).abs() < 0.01);
-        
+
         // Swish should be smooth and non-zero for most inputs
         assert!(swish.iter().any(|&val| val.abs() > 0.1));
     }
 }
-

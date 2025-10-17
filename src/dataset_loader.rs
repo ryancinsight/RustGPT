@@ -48,15 +48,20 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
     let metadata = fs::metadata(path).map_err(ModelError::from)?;
     if metadata.len() > crate::MAX_FILE_SIZE {
         return Err(ModelError::InvalidInput {
-            message: format!("File size {} exceeds maximum allowed size {}", metadata.len(), crate::MAX_FILE_SIZE)
+            message: format!(
+                "File size {} exceeds maximum allowed size {}",
+                metadata.len(),
+                crate::MAX_FILE_SIZE
+            ),
         });
     }
 
     // convert json file to Vec<String>
     let data_json = fs::read_to_string(path).map_err(ModelError::from)?;
-    let data: Vec<String> = serde_json::from_str(&data_json).map_err(|e| ModelError::Serialization {
-        source: Box::new(e),
-    })?;
+    let data: Vec<String> =
+        serde_json::from_str(&data_json).map_err(|e| ModelError::Serialization {
+            source: Box::new(e),
+        })?;
     Ok(data)
 }
 
@@ -65,7 +70,11 @@ fn get_data_from_csv(path: &str) -> Result<Vec<String>> {
     let metadata = fs::metadata(path).map_err(ModelError::from)?;
     if metadata.len() > crate::MAX_FILE_SIZE {
         return Err(ModelError::InvalidInput {
-            message: format!("File size {} exceeds maximum allowed size {}", metadata.len(), crate::MAX_FILE_SIZE)
+            message: format!(
+                "File size {} exceeds maximum allowed size {}",
+                metadata.len(),
+                crate::MAX_FILE_SIZE
+            ),
         });
     }
 

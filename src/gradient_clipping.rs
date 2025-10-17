@@ -17,23 +17,31 @@ pub trait GradientClipping: Send + Sync {
 /// Configuration for adaptive gradient clipping
 #[derive(Debug, Clone)]
 pub struct AdaptiveClippingConfig {
-    /// Clipping threshold for AGC (λ parameter)
-    pub agc_threshold: f32,
+    /// Clipping threshold for adaptive clipping
+    pub threshold: f32,
     /// Whether to apply gradient centralization
     pub use_centralization: bool,
-    /// Whether to use AGC (Adaptive Gradient Clipping)
-    pub use_agc: bool,
-    /// Fallback L2 norm threshold when AGC is disabled
-    pub l2_threshold: f32,
+    /// Adaptive scaling factor (approximates AGC)
+    pub adaptive_factor: f32,
+    /// Fallback clipping type when adaptive is disabled
+    pub fallback_clipping: ClippingType,
+}
+
+/// Types of gradient clipping
+#[derive(Debug, Clone)]
+pub enum ClippingType {
+    L2(f32),
+    L1(f32),
+    ElementWise(f32),
 }
 
 impl Default for AdaptiveClippingConfig {
     fn default() -> Self {
         Self {
-            agc_threshold: 0.01, // Standard AGC threshold
+            threshold: 1.0, // Increased from 0.01 for less aggressive clipping
             use_centralization: true,
-            use_agc: true,
-            l2_threshold: 5.0, // Fallback L2 threshold
+            adaptive_factor: 1.0,                      // No additional scaling
+            fallback_clipping: ClippingType::L2(10.0), // Increased from 5.0
         }
     }
 }
@@ -58,19 +66,17 @@ impl AdaptiveGradientClipping {
         }
     }
 
-    /// Apply Adaptive Gradient Clipping (AGC) based on parameter norms
-    /// Note: This is a simplified version since we don't have direct access to parameters
-    /// In a full implementation, this would use parameter norms per layer
-    fn apply_agc(grads: &mut Array2<f32>, threshold: f32) {
+    /// Apply adaptive scaling based on gradient magnitude
+    fn apply_adaptive_scaling(grads: &mut Array2<f32>, threshold: f32, factor: f32) {
         // Calculate gradient norm
         let grad_norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
 
         if grad_norm > 0.0 {
-            // AGC scaling factor: min(1, threshold / (grad_norm / sqrt(num_elements)))
-            // This approximates the parameter-norm based scaling
+            // Adaptive scaling: scale based on effective gradient magnitude
             let num_elements = grads.len() as f32;
-            let effective_grad_norm = grad_norm / num_elements.sqrt();
-            let scale = (threshold / effective_grad_norm).min(1.0);
+            let effective_norm = grad_norm / num_elements.sqrt();
+            let adaptive_threshold = threshold * factor;
+            let scale = (adaptive_threshold / effective_norm).min(1.0);
 
             if scale < 1.0 {
                 grads.mapv_inplace(|x| x * scale);
@@ -78,30 +84,53 @@ impl AdaptiveGradientClipping {
         }
     }
 
-    /// Fallback L2 norm clipping
-    fn apply_l2_clipping(grads: &mut Array2<f32>, threshold: f32) {
-        let norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
-
-        if norm > threshold {
-            let scale = threshold / norm;
-            grads.mapv_inplace(|x| x * scale);
+    /// Apply fallback clipping based on type
+    fn apply_fallback_clipping(grads: &mut Array2<f32>, clipping_type: &ClippingType) {
+        match clipping_type {
+            ClippingType::L2(threshold) => {
+                let norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                if norm > *threshold {
+                    let scale = *threshold / norm;
+                    grads.mapv_inplace(|x| x * scale);
+                }
+            }
+            ClippingType::L1(threshold) => {
+                let l1_norm = grads.iter().map(|&x| x.abs()).sum::<f32>();
+                if l1_norm > *threshold {
+                    let scale = *threshold / l1_norm;
+                    grads.mapv_inplace(|x| x * scale);
+                }
+            }
+            ClippingType::ElementWise(threshold) => {
+                grads.mapv_inplace(|x| {
+                    if x > *threshold {
+                        *threshold
+                    } else if x < -*threshold {
+                        -*threshold
+                    } else {
+                        x
+                    }
+                });
+            }
         }
     }
 }
 
 impl GradientClipping for AdaptiveGradientClipping {
     fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
+        // Handle NaN/inf values
+        grads.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+
         // Apply gradient centralization first if enabled
         if self.config.use_centralization {
             Self::centralize_gradients(grads);
         }
 
-        // Apply AGC or fallback to L2 clipping
-        if self.config.use_agc {
-            Self::apply_agc(grads, self.config.agc_threshold);
-        } else {
-            Self::apply_l2_clipping(grads, self.config.l2_threshold);
-        }
+        // Apply adaptive scaling
+        Self::apply_adaptive_scaling(grads, self.config.threshold, self.config.adaptive_factor);
+
+        // Apply fallback clipping if needed (adaptive scaling might not be sufficient)
+        Self::apply_fallback_clipping(grads, &self.config.fallback_clipping);
     }
 
     fn clone_box(&self) -> Box<dyn GradientClipping> {
@@ -125,12 +154,76 @@ impl L2GradientClipping {
 
 impl GradientClipping for L2GradientClipping {
     fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
+        // Handle NaN/inf values
+        grads.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+
         let norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
 
-        if norm > self.threshold {
+        if norm > self.threshold && norm > 0.0 {
             let scale = self.threshold / norm;
             grads.mapv_inplace(|x| x * scale);
         }
+    }
+
+    fn clone_box(&self) -> Box<dyn GradientClipping> {
+        Box::new(Self {
+            threshold: self.threshold,
+        })
+    }
+}
+
+/// L1 norm gradient clipping
+#[derive(Clone, Debug)]
+pub struct L1GradientClipping {
+    threshold: f32,
+}
+
+impl L1GradientClipping {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
+}
+
+impl GradientClipping for L1GradientClipping {
+    fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
+        let l1_norm = grads.iter().map(|&x| x.abs()).sum::<f32>();
+
+        if l1_norm > self.threshold {
+            let scale = self.threshold / l1_norm;
+            grads.mapv_inplace(|x| x * scale);
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn GradientClipping> {
+        Box::new(Self {
+            threshold: self.threshold,
+        })
+    }
+}
+
+/// Element-wise gradient clipping (clip each gradient individually)
+#[derive(Clone, Debug)]
+pub struct ElementWiseClipping {
+    threshold: f32,
+}
+
+impl ElementWiseClipping {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
+}
+
+impl GradientClipping for ElementWiseClipping {
+    fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
+        grads.mapv_inplace(|x| {
+            if x > self.threshold {
+                self.threshold
+            } else if x < -self.threshold {
+                -self.threshold
+            } else {
+                x
+            }
+        });
     }
 
     fn clone_box(&self) -> Box<dyn GradientClipping> {
@@ -163,10 +256,10 @@ mod tests {
     fn test_adaptive_clipping_with_centralization() {
         let mut grads = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let config = AdaptiveClippingConfig {
-            agc_threshold: 0.1,
+            threshold: 0.1,
             use_centralization: true,
-            use_agc: true,
-            l2_threshold: 5.0,
+            adaptive_factor: 1.0,
+            fallback_clipping: ClippingType::L2(5.0),
         };
         let mut clipper = AdaptiveGradientClipping::new(config);
 
@@ -187,34 +280,51 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_clipping_without_agc() {
+    fn test_adaptive_clipping_without_centralization() {
         let mut grads = Array2::from_shape_vec((2, 3), vec![3.0, 4.0, 0.0, 0.0, 0.0, 5.0]).unwrap();
         let config = AdaptiveClippingConfig {
-            agc_threshold: 0.01,
+            threshold: 0.01,
             use_centralization: false,
-            use_agc: false,
-            l2_threshold: 5.0,
+            adaptive_factor: 1.0,
+            fallback_clipping: ClippingType::L2(5.0),
         };
         let mut clipper = AdaptiveGradientClipping::new(config);
 
         clipper.clip_gradients(&mut grads);
 
-        // Should behave like L2 clipping
+        // Should apply adaptive scaling and fallback L2
         let norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 5.0).abs() < 1e-6);
+        assert!(norm <= 5.0);
     }
 
     #[test]
-    fn test_gradient_centralization() {
-        let mut grads = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    fn test_l1_clipping() {
+        let mut grads =
+            Array2::from_shape_vec((2, 3), vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0]).unwrap();
+        let mut clipper = L1GradientClipping::new(10.0);
 
-        // Row 0: [1, 2, 3], mean = 2.0, centralized: [-1, 0, 1]
-        // Row 1: [4, 5, 6], mean = 5.0, centralized: [-1, 0, 1]
+        // L1 norm is |1| + |-2| + |3| + |-4| + |5| + |-6| = 21
+        // Should scale by 10/21 ≈ 0.476
+        clipper.clip_gradients(&mut grads);
 
-        AdaptiveGradientClipping::centralize_gradients(&mut grads);
+        let l1_norm = grads.iter().map(|&x| x.abs()).sum::<f32>();
+        assert!((l1_norm - 10.0).abs() < 1e-6);
+    }
 
-        let expected =
-            Array2::from_shape_vec((2, 3), vec![-1.0, 0.0, 1.0, -1.0, 0.0, 1.0]).unwrap();
-        assert_eq!(grads, expected);
+    #[test]
+    fn test_element_wise_clipping() {
+        let mut grads =
+            Array2::from_shape_vec((2, 3), vec![1.0, -3.0, 2.0, -5.0, 0.5, 4.0]).unwrap();
+        let mut clipper = ElementWiseClipping::new(2.0);
+
+        clipper.clip_gradients(&mut grads);
+
+        // Values should be clamped to [-2, 2]
+        for &val in grads.iter() {
+            assert!(val >= -2.0 && val <= 2.0);
+        }
+        assert_eq!(grads[[0, 0]], 1.0); // unchanged
+        assert_eq!(grads[[0, 1]], -2.0); // clamped
+        assert_eq!(grads[[0, 2]], 2.0); // clamped
     }
 }

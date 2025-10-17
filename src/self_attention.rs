@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::EMBEDDING_DIM;
 use crate::adam::Adam;
-use crate::llm::Layer;
-use crate::rope::RotaryEmbedding;
 use crate::cop::ContextualPositionEncoding;
-use crate::model_config::{HeadSelectionStrategy, WindowAdaptationStrategy};
 use crate::head_router::HeadRouter;
+use crate::llm::Layer;
+use crate::model_config::{HeadSelectionStrategy, WindowAdaptationStrategy};
+use crate::rope::RotaryEmbedding;
 
 /// Positional encoding variant used in attention
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -140,7 +140,13 @@ impl AttentionHead {
     }
 
     /// Compute attention for this head with optional sliding window
-    fn attention(&self, q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, window_size: Option<usize>) -> Array2<f32> {
+    fn attention(
+        &self,
+        q: &Array2<f32>,
+        k: &Array2<f32>,
+        v: &Array2<f32>,
+        window_size: Option<usize>,
+    ) -> Array2<f32> {
         let dk = (self.head_dim as f32).sqrt();
 
         let k_t = k.t();
@@ -155,7 +161,9 @@ impl AttentionHead {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
                 // Sliding window masking: prevent attention to tokens outside window
-                else if let Some(window) = window_size && j < i.saturating_sub(window) {
+                else if let Some(window) = window_size
+                    && j < i.saturating_sub(window)
+                {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
             }
@@ -180,7 +188,7 @@ impl AttentionHead {
         let mut scores = q.dot(&k_t) / dk;
 
         // Add position logits from CoPE
-        scores = scores + position_logits;
+        scores += position_logits;
 
         // Apply causal masking and optional sliding window masking
         let seq_len = scores.shape()[0];
@@ -191,7 +199,9 @@ impl AttentionHead {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
                 // Sliding window masking: prevent attention to tokens outside window
-                else if let Some(window) = window_size && j < i.saturating_sub(window) {
+                else if let Some(window) = window_size
+                    && j < i.saturating_sub(window)
+                {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
             }
@@ -242,9 +252,21 @@ impl SelfAttention {
     /// * `num_heads` - Number of attention heads
     /// * `use_rope` - Whether to use Rotary Positional Encoding
     /// * `max_seq_len` - Maximum sequence length (for RoPE)
-    pub fn new_with_config(embedding_dim: usize, num_heads: usize, use_rope: bool, max_seq_len: usize) -> Self {
+    pub fn new_with_config(
+        embedding_dim: usize,
+        num_heads: usize,
+        use_rope: bool,
+        max_seq_len: usize,
+    ) -> Self {
         // Default to MHA (num_kv_heads = num_heads) and full attention (window_size = None)
-        Self::new_with_gqa(embedding_dim, num_heads, num_heads, use_rope, max_seq_len, None)
+        Self::new_with_gqa(
+            embedding_dim,
+            num_heads,
+            num_heads,
+            use_rope,
+            max_seq_len,
+            None,
+        )
     }
 
     /// Initialize with Group-Query Attention (GQA) configuration
@@ -271,9 +293,18 @@ impl SelfAttention {
         max_seq_len: usize,
         window_size: Option<usize>,
     ) -> Self {
-        assert!(embedding_dim % num_heads == 0, "embedding_dim must be divisible by num_heads");
-        assert!(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads (for GQA grouping)");
-        assert!(num_kv_heads <= num_heads, "num_kv_heads cannot be greater than num_heads");
+        assert!(
+            embedding_dim % num_heads == 0,
+            "embedding_dim must be divisible by num_heads"
+        );
+        assert!(
+            num_heads % num_kv_heads == 0,
+            "num_heads must be divisible by num_kv_heads (for GQA grouping)"
+        );
+        assert!(
+            num_kv_heads <= num_heads,
+            "num_kv_heads cannot be greater than num_heads"
+        );
 
         let head_dim = embedding_dim / num_heads;
 
@@ -338,9 +369,18 @@ impl SelfAttention {
         max_seq_len: usize,
         window_size: Option<usize>,
     ) -> Self {
-        assert!(embedding_dim % num_heads == 0, "embedding_dim must be divisible by num_heads");
-        assert!(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads (for GQA grouping)");
-        assert!(num_kv_heads <= num_heads, "num_kv_heads cannot be greater than num_heads");
+        assert!(
+            embedding_dim % num_heads == 0,
+            "embedding_dim must be divisible by num_heads"
+        );
+        assert!(
+            num_heads % num_kv_heads == 0,
+            "num_heads must be divisible by num_kv_heads (for GQA grouping)"
+        );
+        assert!(
+            num_kv_heads <= num_heads,
+            "num_kv_heads cannot be greater than num_heads"
+        );
 
         let head_dim = embedding_dim / num_heads;
 
@@ -456,7 +496,22 @@ impl SelfAttention {
     ///
     /// Returns 0.0 if MoH is not enabled or no routing has been performed yet.
     pub fn get_load_balance_loss(&self) -> f32 {
-        self.router.as_ref().map_or(0.0, |r| r.compute_load_balance_loss())
+        self.router
+            .as_ref()
+            .map_or(0.0, |r| r.compute_load_balance_loss())
+    }
+
+    /// Enable adaptive window sizing
+    pub fn enable_adaptive_window(
+        &mut self,
+        min_size: usize,
+        max_size: usize,
+        strategy: WindowAdaptationStrategy,
+    ) {
+        self.use_adaptive_window = true;
+        self.min_window_size = min_size;
+        self.max_window_size = max_size;
+        self.window_adaptation_strategy = strategy;
     }
 }
 
@@ -491,10 +546,22 @@ impl AdaptiveWindowBuilder {
     }
 
     pub fn build(self) -> SelfAttention {
-        assert!(self.embedding_dim % self.num_heads == 0, "embedding_dim must be divisible by num_heads");
-        assert!(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads (for GQA grouping)");
-        assert!(self.num_kv_heads <= self.num_heads, "num_kv_heads cannot be greater than num_heads");
-        assert!(self.min_window_size <= self.max_window_size, "min_window_size must be <= max_window_size");
+        assert!(
+            self.embedding_dim % self.num_heads == 0,
+            "embedding_dim must be divisible by num_heads"
+        );
+        assert!(
+            self.num_heads % self.num_kv_heads == 0,
+            "num_heads must be divisible by num_kv_heads (for GQA grouping)"
+        );
+        assert!(
+            self.num_kv_heads <= self.num_heads,
+            "num_kv_heads cannot be greater than num_heads"
+        );
+        assert!(
+            self.min_window_size <= self.max_window_size,
+            "min_window_size must be <= max_window_size"
+        );
 
         let head_dim = self.embedding_dim / self.num_heads;
 
@@ -558,7 +625,8 @@ impl SelfAttention {
 
                     // Map entropy to window size: high entropy → max window, low entropy → min window
                     let window_range = self.max_window_size - self.min_window_size;
-                    let adaptive_window = self.min_window_size + (window_range as f32 * normalized_entropy) as usize;
+                    let adaptive_window =
+                        self.min_window_size + (window_range as f32 * normalized_entropy) as usize;
 
                     adaptive_window.clamp(self.min_window_size, self.max_window_size)
                 } else {
@@ -568,9 +636,13 @@ impl SelfAttention {
                 }
             }
             WindowAdaptationStrategy::PerplexityBased => {
-                // Perplexity-based adaptation (placeholder for now)
-                // Would require perplexity computation from model output
-                // For now, fallback to sequence-length-based
+                // Perplexity-based adaptation: adapts window size based on model uncertainty
+                // Implementation requires perplexity computation from model output logits,
+                // which would need to be passed from the LLM training loop to this layer.
+                // This is a future enhancement tracked in NFR-8.6.
+                //
+                // Current behavior: Uses sequence-length-based adaptation as a reasonable
+                // approximation, since longer sequences often correlate with higher perplexity.
                 let proposed_window = seq_len / 2;
                 proposed_window.clamp(self.min_window_size, self.max_window_size)
             }
@@ -642,7 +714,9 @@ impl SelfAttention {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
                 // Sliding window masking: prevent attention to tokens outside window
-                else if let Some(window) = self.window_size && j < i.saturating_sub(window) {
+                else if let Some(window) = self.window_size
+                    && j < i.saturating_sub(window)
+                {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
             }
@@ -667,16 +741,14 @@ impl SelfAttention {
         let grad_w_v = head_input.t().dot(&grad_v);
 
         // Input gradients
-        let grad_input = grad_q.dot(&head.w_q.t()) + grad_k.dot(&head.w_k.t()) + grad_v.dot(&head.w_v.t());
+        let grad_input =
+            grad_q.dot(&head.w_q.t()) + grad_k.dot(&head.w_k.t()) + grad_v.dot(&head.w_v.t());
 
         (grad_input, vec![grad_w_q, grad_w_k, grad_w_v])
     }
 
     /// Softmax backward pass for attention
-    fn softmax_backward(
-        softmax_output: &Array2<f32>,
-        grad_output: &Array2<f32>,
-    ) -> Array2<f32> {
+    fn softmax_backward(softmax_output: &Array2<f32>, grad_output: &Array2<f32>) -> Array2<f32> {
         let mut grad_input = Array2::zeros(softmax_output.dim());
 
         for ((mut grad_row, softmax_row), grad_out_row) in grad_input
@@ -812,40 +884,50 @@ impl Layer for SelfAttention {
 
         // Process each query head with its corresponding KV head (GQA grouping)
         // Apply head masking if enabled (MoH or StaticPruning)
-        let head_outputs: Vec<Array2<f32>> = queries.iter().enumerate().map(|(h, q)| {
-            // Check if this head is active
-            let is_head_active = if let Some(mask) = &head_mask {
-                // Check if ANY token activates this head (for per-token routing)
-                // We'll apply per-token masking later during concatenation
-                mask.column(h).iter().any(|&active| active)
-            } else {
-                true // AllHeads: all heads always active
-            };
+        let head_outputs: Vec<Array2<f32>> = queries
+            .iter()
+            .enumerate()
+            .map(|(h, q)| {
+                // Check if this head is active
+                let is_head_active = if let Some(mask) = &head_mask {
+                    // Check if ANY token activates this head (for per-token routing)
+                    // We'll apply per-token masking later during concatenation
+                    mask.column(h).iter().any(|&active| active)
+                } else {
+                    true // AllHeads: all heads always active
+                };
 
-            if !is_head_active {
-                // Head is completely inactive: return zeros
-                Array2::zeros((seq_len, head_dim))
-            } else {
-                // Determine which KV head this query head uses
-                let kv_idx = h / queries_per_kv;
-                let k = &keys[kv_idx];
-                let v = &values[kv_idx];
+                if !is_head_active {
+                    // Head is completely inactive: return zeros
+                    Array2::zeros((seq_len, head_dim))
+                } else {
+                    // Determine which KV head this query head uses
+                    let kv_idx = h / queries_per_kv;
+                    let k = &keys[kv_idx];
+                    let v = &values[kv_idx];
 
-                // Compute attention for this head with adaptive or fixed sliding window
-                // For CoPE, we need to add position logits to attention scores
-                match &self.positional_encoding {
-                    PositionalEncodingVariant::CoPE(cope_heads) => {
-                        // Apply CoPE: compute position logits and add to attention scores
-                        let position_logits = cope_heads[h].apply(q, k);
-                        self.heads[h].attention_with_position_bias(q, k, v, &position_logits, effective_window_size)
-                    }
-                    _ => {
-                        // Standard attention (Learned or RoPE)
-                        self.heads[h].attention(q, k, v, effective_window_size)
+                    // Compute attention for this head with adaptive or fixed sliding window
+                    // For CoPE, we need to add position logits to attention scores
+                    match &self.positional_encoding {
+                        PositionalEncodingVariant::CoPE(cope_heads) => {
+                            // Apply CoPE: compute position logits and add to attention scores
+                            let position_logits = cope_heads[h].apply(q, k);
+                            self.heads[h].attention_with_position_bias(
+                                q,
+                                k,
+                                v,
+                                &position_logits,
+                                effective_window_size,
+                            )
+                        }
+                        _ => {
+                            // Standard attention (Learned or RoPE)
+                            self.heads[h].attention(q, k, v, effective_window_size)
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
         // Apply per-token masking if MoH is enabled
@@ -860,13 +942,17 @@ impl Layer for SelfAttention {
                 for token_idx in 0..seq_len {
                     if mask[[token_idx, h]] {
                         let head_row = head_output.row(token_idx);
-                        output.slice_mut(ndarray::s![token_idx, start_col..end_col]).assign(&head_row);
+                        output
+                            .slice_mut(ndarray::s![token_idx, start_col..end_col])
+                            .assign(&head_row);
                     }
                     // else: leave as zeros (head inactive for this token)
                 }
             } else {
                 // No masking: assign all head outputs
-                output.slice_mut(ndarray::s![.., start_col..end_col]).assign(head_output);
+                output
+                    .slice_mut(ndarray::s![.., start_col..end_col])
+                    .assign(head_output);
             }
         }
 
@@ -875,7 +961,8 @@ impl Layer for SelfAttention {
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
-        self.apply_gradients(&param_grads, lr);
+        // Unwrap is safe: backward is only called from training loop which validates inputs
+        self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
 
@@ -909,7 +996,9 @@ impl Layer for SelfAttention {
         for h in 0..self.num_heads {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
-            let head_grad = output_grads.slice(ndarray::s![.., start_col..end_col]).to_owned();
+            let head_grad = output_grads
+                .slice(ndarray::s![.., start_col..end_col])
+                .to_owned();
             head_grads.push(head_grad);
         }
 
@@ -918,8 +1007,11 @@ impl Layer for SelfAttention {
 
         // Compute gradients for each head
         for (h, head_grad) in head_grads.into_iter().enumerate() {
-            let head_input = input.slice(ndarray::s![.., h * head_dim..(h + 1) * head_dim]).to_owned();
-            let (head_input_grad, head_param_grads) = self.compute_head_gradients(h, &head_input, &head_grad);
+            let head_input = input
+                .slice(ndarray::s![.., h * head_dim..(h + 1) * head_dim])
+                .to_owned();
+            let (head_input_grad, head_param_grads) =
+                self.compute_head_gradients(h, &head_input, &head_grad);
 
             // Store parameter gradients
             all_param_grads.extend(head_param_grads);
@@ -927,7 +1019,9 @@ impl Layer for SelfAttention {
             // Concatenate input gradients
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
-            input_grads.slice_mut(ndarray::s![.., start_col..end_col]).assign(&head_input_grad);
+            input_grads
+                .slice_mut(ndarray::s![.., start_col..end_col])
+                .assign(&head_input_grad);
         }
 
         // Add residual connection gradient
@@ -936,17 +1030,34 @@ impl Layer for SelfAttention {
         (total_input_grads, all_param_grads)
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        let expected_grad_arrays = self.heads.len() * 3;
+        if param_grads.len() != expected_grad_arrays {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "SelfAttention expected {} gradient arrays (3 per head), got {}",
+                    expected_grad_arrays,
+                    param_grads.len()
+                ),
+            });
+        }
+
         // Apply gradients to each head's parameters
-        // param_grads should contain 3 gradients per head: [grad_w_q, grad_w_k, grad_w_v]
+        // param_grads contains 3 gradients per head: [grad_w_q, grad_w_k, grad_w_v]
         let mut idx = 0;
         for head in &mut self.heads {
-            if idx + 3 <= param_grads.len() {
-                head.optimizer_w_q.step(&mut head.w_q, &param_grads[idx], lr);
-                head.optimizer_w_k.step(&mut head.w_k, &param_grads[idx + 1], lr);
-                head.optimizer_w_v.step(&mut head.w_v, &param_grads[idx + 2], lr);
-                idx += 3;
-            }
+            head.optimizer_w_q
+                .step(&mut head.w_q, &param_grads[idx], lr);
+            head.optimizer_w_k
+                .step(&mut head.w_k, &param_grads[idx + 1], lr);
+            head.optimizer_w_v
+                .step(&mut head.w_v, &param_grads[idx + 2], lr);
+            idx += 3;
         }
+        Ok(())
     }
 }

@@ -4,12 +4,12 @@ use crate::{
     hrm::HRMBlock,
     hypermixer::HyperMixerBlock,
     layer_norm::LayerNorm,
-    rms_norm::RMSNorm,
-    swiglu::SwiGLU,
     llm::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
+    rms_norm::RMSNorm,
     self_attention::SelfAttention,
+    swiglu::SwiGLU,
     vocab::Vocab,
 };
 
@@ -66,41 +66,34 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 
     for _ in 0..config.num_layers {
         // Self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
-        // Use the modern constructor that accepts PositionalEncodingType directly
-        let mut attention = if config.use_adaptive_window {
-            // For adaptive window, we still need to use the builder pattern
-            // Convert PositionalEncodingType to boolean for backward compatibility
-            let use_rope = matches!(config.positional_encoding, crate::model_config::PositionalEncodingType::RoPE);
-            SelfAttention::new_with_adaptive_window(
-                config.embedding_dim,
-                num_heads,
-                num_kv_heads,
-                use_rope,
-                config.max_seq_len,
-                config.window_size,
-            )
-            .min_window_size(config.min_window_size)
-            .max_window_size(config.max_window_size)
-            .strategy(config.window_adaptation_strategy)
-            .build()
-        } else {
-            // Use the modern constructor with PositionalEncodingType
-            SelfAttention::new_with_positional_encoding(
-                config.embedding_dim,
-                num_heads,
-                num_kv_heads,
-                &config.positional_encoding,
-                config.max_seq_len,
-                config.window_size,
-            )
-        };
+        let mut attention = SelfAttention::new_with_positional_encoding(
+            config.embedding_dim,
+            num_heads,
+            num_kv_heads,
+            &config.positional_encoding,
+            config.max_seq_len,
+            if config.use_adaptive_window {
+                None
+            } else {
+                config.window_size
+            },
+        );
+
+        // Enable adaptive window if configured
+        if config.use_adaptive_window {
+            attention.enable_adaptive_window(
+                config.min_window_size,
+                config.max_window_size,
+                config.window_adaptation_strategy,
+            );
+        }
 
         // Set head selection strategy (MoH, AllHeads, or StaticPruning)
         attention.set_head_selection(config.head_selection.clone());
 
-        // Enable gradient clipping for Transformer too (for fair comparison)
-        // Note: This might hurt Transformer performance, but let's see
-        // attention.enable_gradient_clipping(50.0); // Commented out for now
+        // Gradient clipping is handled globally in the training loop via AdaptiveGradientClipper
+        // Per-layer gradient clipping is disabled to avoid double-clipping and maintain
+        // consistent gradient flow across all layers
 
         layers.push(LayerEnum::SelfAttention(Box::new(attention)));
 
@@ -134,7 +127,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 }
 
 /// Build HyperMixer architecture layers
-/// 
+///
 /// Creates the HyperMixer architecture with:
 /// - Token mixing via hypernetworks (replaces attention)
 /// - Channel mixing (similar to feedforward)
@@ -211,7 +204,10 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
             println!("  ✓ RoPE (zero params, better extrapolation)");
         }
         PositionalEncodingType::CoPE { max_pos } => {
-            println!("  ✓ CoPE (context-aware, max_pos={}, best performance)", max_pos);
+            println!(
+                "  ✓ CoPE (context-aware, max_pos={}, best performance)",
+                max_pos
+            );
         }
     }
 
@@ -234,8 +230,16 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     if config.use_adaptive_window {
         println!("  ✓ Adaptive Sliding Window Attention (Phase 4)");
         println!("    - Strategy: {:?}", config.window_adaptation_strategy);
-        println!("    - Window Range: {} - {}", config.min_window_size, config.max_window_size);
-        println!("    - Base Window: {}", config.window_size.map_or("None".to_string(), |w| w.to_string()));
+        println!(
+            "    - Window Range: {} - {}",
+            config.min_window_size, config.max_window_size
+        );
+        println!(
+            "    - Base Window: {}",
+            config
+                .window_size
+                .map_or("None".to_string(), |w| w.to_string())
+        );
         println!("    - Adapts dynamically based on context");
     } else if let Some(window_size) = config.window_size {
         println!("  ✓ Sliding Window Attention");
@@ -260,18 +264,26 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
         } => {
             let num_routed_heads = num_heads - num_shared_heads;
             let total_active = num_shared_heads + num_active_routed_heads;
-            let compute_savings = ((num_heads - total_active) as f32 / num_heads as f32 * 100.0) as usize;
+            let compute_savings =
+                ((num_heads - total_active) as f32 / num_heads as f32 * 100.0) as usize;
             println!("  ✓ Mixture-of-Heads (MoH) - Dynamic Head Selection");
             println!("    - Total Heads: {}", num_heads);
             println!("    - Shared Heads: {} (always active)", num_shared_heads);
-            println!("    - Routed Heads: {} (Top-{} selection)", num_routed_heads, num_active_routed_heads);
-            println!("    - Active per Token: {}/{} heads", total_active, num_heads);
+            println!(
+                "    - Routed Heads: {} (Top-{} selection)",
+                num_routed_heads, num_active_routed_heads
+            );
+            println!(
+                "    - Active per Token: {}/{} heads",
+                total_active, num_heads
+            );
             println!("    - Compute Savings: ~{}%", compute_savings);
             println!("    - Load Balance Weight: {}", load_balance_weight);
             println!("    - Expected Speedup: 5-8%");
         }
         HeadSelectionStrategy::StaticPruning { num_active_heads } => {
-            let compute_savings = ((num_heads - num_active_heads) as f32 / num_heads as f32 * 100.0) as usize;
+            let compute_savings =
+                ((num_heads - num_active_heads) as f32 / num_heads as f32 * 100.0) as usize;
             println!("  • Static Head Pruning (ablation study)");
             println!("    - Active Heads: {}/{}", num_active_heads, num_heads);
             println!("    - Compute Savings: ~{}%", compute_savings);
@@ -283,7 +295,10 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     let has_rms = config.use_rms_norm;
     let has_swiglu = config.use_swiglu;
     let has_rope = matches!(config.positional_encoding, PositionalEncodingType::RoPE);
-    let has_cope = matches!(config.positional_encoding, PositionalEncodingType::CoPE { .. });
+    let has_cope = matches!(
+        config.positional_encoding,
+        PositionalEncodingType::CoPE { .. }
+    );
     let has_gqa = num_kv_heads < num_heads;
     let has_window = config.window_size.is_some();
 
@@ -343,7 +358,7 @@ fn build_hrm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_build_transformer_network() {
         let vocab = Vocab::new(vec!["a", "b", "c"]);

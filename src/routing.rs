@@ -1,24 +1,23 @@
-/// Shared routing utilities for Mixture-of-Heads (MoH) and future Mixture-of-Experts (MoE)
-///
-/// This module provides generic routing functionality that can be reused across different
-/// mixture architectures:
-/// - Top-K selection for choosing active components (heads or experts)
-/// - Load balance loss to prevent routing collapse
-/// - Straight-through estimator for gradient flow through discrete selection
-/// - Numerically stable softmax
-///
-/// # Design Principles
-///
-/// - **DRY**: Single implementation of routing logic
-/// - **Reusability**: Works for both MoH (heads) and MoE (experts)
-/// - **Testability**: Easy to test in isolation
-/// - **Maintainability**: Fix bugs in one place
-///
-/// # Future Compatibility
-///
-/// When MoE is implemented, ExpertRouter will use these same utilities,
-/// ensuring consistent behavior and reducing code duplication.
-
+//! Shared routing utilities for Mixture-of-Heads (MoH) and future Mixture-of-Experts (MoE)
+//!
+//! This module provides generic routing functionality that can be reused across different
+//! mixture architectures:
+//! - Top-K selection for choosing active components (heads or experts)
+//! - Load balance loss to prevent routing collapse
+//! - Straight-through estimator for gradient flow through discrete selection
+//! - Numerically stable softmax
+//!
+//! # Design Principles
+//!
+//! - **DRY**: Single implementation of routing logic
+//! - **Reusability**: Works for both MoH (heads) and MoE (experts)
+//! - **Testability**: Easy to test in isolation
+//! - **Maintainability**: Fix bugs in one place
+//!
+//! # Future Compatibility
+//!
+//! When MoE is implemented, ExpertRouter will use these same utilities,
+//! ensuring consistent behavior and reducing code duplication.
 use ndarray::{Array1, Array2, Axis};
 
 /// Select Top-K indices for each row in the scores matrix
@@ -43,32 +42,28 @@ use ndarray::{Array1, Array2, Axis};
 pub fn top_k_indices(scores: &Array2<f32>, k: usize) -> Vec<Vec<usize>> {
     let (batch_size, num_candidates) = scores.dim();
     let k = k.min(num_candidates); // Ensure k doesn't exceed number of candidates
-    
+
     let mut result = Vec::with_capacity(batch_size);
-    
+
     for batch_idx in 0..batch_size {
         let row = scores.row(batch_idx);
-        
+
         // Create (index, score) pairs
         let mut indexed_scores: Vec<(usize, f32)> = row
             .iter()
             .enumerate()
             .map(|(idx, &score)| (idx, score))
             .collect();
-        
+
         // Sort by score in descending order
         indexed_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         // Take top-K indices
-        let top_k: Vec<usize> = indexed_scores
-            .iter()
-            .take(k)
-            .map(|(idx, _)| *idx)
-            .collect();
-        
+        let top_k: Vec<usize> = indexed_scores.iter().take(k).map(|(idx, _)| *idx).collect();
+
         result.push(top_k);
     }
-    
+
     result
 }
 
@@ -92,7 +87,7 @@ pub fn top_k_indices(scores: &Array2<f32>, k: usize) -> Vec<Vec<usize>> {
 ///
 /// * `routing_scores` - Routing scores of shape (batch_size, num_candidates)
 /// * `activation_mask` - Boolean mask of shape (batch_size, num_candidates)
-///                       indicating which candidates are active
+///   indicating which candidates are active
 ///
 /// # Returns
 ///
@@ -111,16 +106,16 @@ pub fn compute_load_balance_loss(
     activation_mask: &Array2<bool>,
 ) -> f32 {
     let (batch_size, num_candidates) = routing_scores.dim();
-    
+
     if batch_size == 0 || num_candidates == 0 {
         return 0.0;
     }
-    
+
     let batch_size_f32 = batch_size as f32;
-    
+
     // Compute P_i: average routing score for each candidate
     let p_i: Array1<f32> = routing_scores.mean_axis(Axis(0)).unwrap();
-    
+
     // Compute f_i: fraction of tokens that selected each candidate
     let mut f_i = Array1::<f32>::zeros(num_candidates);
     for candidate_idx in 0..num_candidates {
@@ -131,10 +126,10 @@ pub fn compute_load_balance_loss(
             .count();
         f_i[candidate_idx] = count as f32 / batch_size_f32;
     }
-    
+
     // Compute L_b = Σ P_i × f_i
     let loss: f32 = p_i.iter().zip(f_i.iter()).map(|(p, f)| p * f).sum();
-    
+
     // Scale by number of candidates for normalization
     loss * num_candidates as f32
 }
@@ -211,25 +206,25 @@ pub fn straight_through_estimator(
 pub fn softmax(x: &Array2<f32>) -> Array2<f32> {
     let (batch_size, num_features) = x.dim();
     let mut result = Array2::<f32>::zeros((batch_size, num_features));
-    
+
     for batch_idx in 0..batch_size {
         let row = x.row(batch_idx);
-        
+
         // Find max for numerical stability
         let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        
+
         // Compute exp(x - max)
         let exp_row: Vec<f32> = row.iter().map(|&val| (val - max_val).exp()).collect();
-        
+
         // Compute sum of exponentials
         let sum_exp: f32 = exp_row.iter().sum();
-        
+
         // Normalize
         for (col_idx, &exp_val) in exp_row.iter().enumerate() {
             result[[batch_idx, col_idx]] = exp_val / sum_exp;
         }
     }
-    
+
     result
 }
 
@@ -242,7 +237,7 @@ mod tests {
     fn test_top_k_indices_basic() {
         let scores = array![[0.1, 0.5, 0.3, 0.2]];
         let top_k = top_k_indices(&scores, 2);
-        
+
         assert_eq!(top_k.len(), 1);
         assert_eq!(top_k[0].len(), 2);
         assert_eq!(top_k[0][0], 1); // Index 1 has score 0.5 (highest)
@@ -251,12 +246,9 @@ mod tests {
 
     #[test]
     fn test_top_k_indices_batch() {
-        let scores = array![
-            [0.1, 0.5, 0.3],
-            [0.4, 0.2, 0.6]
-        ];
+        let scores = array![[0.1, 0.5, 0.3], [0.4, 0.2, 0.6]];
         let top_k = top_k_indices(&scores, 2);
-        
+
         assert_eq!(top_k.len(), 2);
         assert_eq!(top_k[0], vec![1, 2]); // Batch 0: indices 1, 2
         assert_eq!(top_k[1], vec![2, 0]); // Batch 1: indices 2, 0
@@ -266,18 +258,14 @@ mod tests {
     fn test_top_k_indices_k_exceeds_candidates() {
         let scores = array![[0.1, 0.5]];
         let top_k = top_k_indices(&scores, 5); // k > num_candidates
-        
+
         assert_eq!(top_k[0].len(), 2); // Should return all candidates
     }
 
     #[test]
     fn test_load_balance_loss_balanced() {
         // Perfectly balanced: all candidates equally likely
-        let scores = array![
-            [0.33, 0.33, 0.34],
-            [0.33, 0.33, 0.34],
-            [0.33, 0.33, 0.34]
-        ];
+        let scores = array![[0.33, 0.33, 0.34], [0.33, 0.33, 0.34], [0.33, 0.33, 0.34]];
         let mask = array![
             [true, false, false],
             [false, true, false],
@@ -290,34 +278,37 @@ mod tests {
         // With perfect balance: P_i ≈ 0.33, f_i ≈ 0.33, loss ≈ 3 × (0.33 × 0.33) ≈ 1.0
         assert!(loss.is_finite(), "Loss should be finite");
         assert!(loss >= 0.0, "Loss should be non-negative");
-        assert!(loss <= 2.0, "Loss should be reasonable for balanced distribution, got {}", loss);
+        assert!(
+            loss <= 2.0,
+            "Loss should be reasonable for balanced distribution, got {}",
+            loss
+        );
     }
 
     #[test]
     fn test_load_balance_loss_imbalanced() {
         // Imbalanced: all tokens route to first candidate
-        let scores = array![
-            [0.9, 0.05, 0.05],
-            [0.9, 0.05, 0.05],
-            [0.9, 0.05, 0.05]
-        ];
+        let scores = array![[0.9, 0.05, 0.05], [0.9, 0.05, 0.05], [0.9, 0.05, 0.05]];
         let mask = array![
             [true, false, false],
             [true, false, false],
             [true, false, false]
         ];
-        
+
         let loss = compute_load_balance_loss(&scores, &mask);
-        
+
         // Loss should be higher for imbalanced distribution
-        assert!(loss > 0.5, "Loss should be high for imbalanced distribution");
+        assert!(
+            loss > 0.5,
+            "Loss should be high for imbalanced distribution"
+        );
     }
 
     #[test]
     fn test_softmax_sums_to_one() {
         let x = array![[1.0, 2.0, 3.0]];
         let probs = softmax(&x);
-        
+
         let sum: f32 = probs.sum();
         assert!((sum - 1.0).abs() < 1e-6, "Softmax should sum to 1");
     }
@@ -327,10 +318,10 @@ mod tests {
         // Large values that would overflow without max subtraction
         let x = array![[1000.0, 1001.0, 1002.0]];
         let probs = softmax(&x);
-        
+
         // Should not contain NaN or Inf
         assert!(probs.iter().all(|&p| p.is_finite()));
-        
+
         // Should still sum to 1
         let sum: f32 = probs.sum();
         assert!((sum - 1.0).abs() < 1e-6);
@@ -340,11 +331,10 @@ mod tests {
     fn test_straight_through_estimator() {
         let forward_output = array![[true, false, true]];
         let backward_gradient = array![[0.5, 0.3, 0.2]];
-        
+
         let grad_input = straight_through_estimator(&forward_output, &backward_gradient);
-        
+
         // STE should pass gradients through unchanged
         assert_eq!(grad_input, backward_gradient);
     }
 }
-

@@ -1,11 +1,9 @@
-use ndarray::{s, Array2};
+use ndarray::{Array2, s};
 use rand::rng;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    hrm_high_level::HighLevelModule, hrm_low_level::LowLevelModule, llm::Layer,
-};
+use crate::{hrm_high_level::HighLevelModule, hrm_low_level::LowLevelModule, llm::Layer};
 
 /// Hierarchical Reasoning Model (HRM) Block
 ///
@@ -223,15 +221,21 @@ impl Layer for HRMBlock {
         _input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        // For HRM, we just pass through the gradients
+        // For HRM, gradients are passed through directly
         // The actual backward pass with parameter updates is done in backward()
-        // This is a simplified approach since HRM uses 1-step gradient approximation
+        // This matches HRM's design: 1-step gradient approximation per cycle
+        // (see HRM paper: "Hierarchical Reasoning Model" for theoretical justification)
         (output_grads.clone(), vec![])
     }
 
-    fn apply_gradients(&mut self, _param_grads: &[Array2<f32>], _lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        _param_grads: &[Array2<f32>],
+        _lr: f32,
+    ) -> crate::errors::Result<()> {
         // Parameter updates are handled in backward() method
         // This is intentionally empty
+        Ok(())
     }
 }
 
@@ -307,4 +311,3 @@ mod tests {
         }
     }
 }
-

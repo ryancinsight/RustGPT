@@ -2,7 +2,8 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    feed_forward::FeedForward, layer_norm::LayerNorm, rms_norm::RMSNorm, swiglu::SwiGLU, llm::Layer, self_attention::SelfAttention,
+    feed_forward::FeedForward, layer_norm::LayerNorm, llm::Layer, rms_norm::RMSNorm,
+    self_attention::SelfAttention, swiglu::SwiGLU,
 };
 
 /// Normalization layer type for TransformerBlock
@@ -32,7 +33,11 @@ impl NormLayer {
     }
 
     /// Compute gradients
-    pub fn compute_gradients(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    pub fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match self {
             NormLayer::LayerNorm(norm) => norm.compute_gradients(input, output_grads),
             NormLayer::RMSNorm(norm) => norm.compute_gradients(input, output_grads),
@@ -40,7 +45,11 @@ impl NormLayer {
     }
 
     /// Apply gradients
-    pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    pub fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
         match self {
             NormLayer::LayerNorm(norm) => norm.apply_gradients(param_grads, lr),
             NormLayer::RMSNorm(norm) => norm.apply_gradients(param_grads, lr),
@@ -91,7 +100,11 @@ impl FFNLayer {
     }
 
     /// Compute gradients
-    pub fn compute_gradients(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    pub fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match self {
             FFNLayer::FeedForward(ffn) => ffn.compute_gradients(input, output_grads),
             FFNLayer::SwiGLU(swiglu) => swiglu.compute_gradients(input, output_grads),
@@ -99,7 +112,11 @@ impl FFNLayer {
     }
 
     /// Apply gradients
-    pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    pub fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
         match self {
             FFNLayer::FeedForward(ffn) => ffn.apply_gradients(param_grads, lr),
             FFNLayer::SwiGLU(swiglu) => swiglu.apply_gradients(param_grads, lr),
@@ -156,7 +173,12 @@ impl TransformerBlock {
     /// * `hidden_dim` - Hidden dimension for feedforward layer
     /// * `use_rms_norm` - If true, use RMSNorm; if false, use LayerNorm
     /// * `use_swiglu` - If true, use SwiGLU; if false, use FeedForward
-    pub fn with_config(embedding_dim: usize, hidden_dim: usize, use_rms_norm: bool, use_swiglu: bool) -> Self {
+    pub fn with_config(
+        embedding_dim: usize,
+        hidden_dim: usize,
+        use_rms_norm: bool,
+        use_swiglu: bool,
+    ) -> Self {
         let norm1 = if use_rms_norm {
             NormLayer::rms_norm(embedding_dim)
         } else {
@@ -234,35 +256,53 @@ impl Layer for TransformerBlock {
         (grad_attention, all_param_grads)
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        let expected_params = self.parameters();
+        if param_grads.len() != expected_params {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "TransformerBlock expected {} parameter gradients, got {}",
+                    expected_params,
+                    param_grads.len()
+                ),
+            });
+        }
+
         let mut idx = 0;
 
         // Apply attention gradients (3 params: w_q, w_k, w_v)
         let attention_params = &param_grads[idx..idx + 3];
-        self.attention.apply_gradients(attention_params, lr);
+        self.attention.apply_gradients(attention_params, lr)?;
         idx += 3;
 
         // Apply norm1 gradients (1 or 2 params depending on type)
         let norm1_count = self.norm1.num_param_grads();
         let norm1_params = &param_grads[idx..idx + norm1_count];
-        self.norm1.apply_gradients(norm1_params, lr);
+        self.norm1.apply_gradients(norm1_params, lr)?;
         idx += norm1_count;
 
         // Apply feed_forward gradients (3 or 4 params depending on type)
         let ffn_count = self.feed_forward.num_param_grads();
         let ffn_params = &param_grads[idx..idx + ffn_count];
-        self.feed_forward.apply_gradients(ffn_params, lr);
+        self.feed_forward.apply_gradients(ffn_params, lr)?;
         idx += ffn_count;
 
         // Apply norm2 gradients (1 or 2 params depending on type)
         let norm2_count = self.norm2.num_param_grads();
         let norm2_params = &param_grads[idx..idx + norm2_count];
-        self.norm2.apply_gradients(norm2_params, lr);
+        self.norm2.apply_gradients(norm2_params, lr)?;
+
+        Ok(())
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
-        self.apply_gradients(&param_grads, lr);
+        // Unwrap is safe: backward is only called from training loop which validates inputs
+        self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
 

@@ -2,9 +2,7 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    channel_mixing::ChannelMixingMLP,
-    layer_norm::LayerNorm,
-    llm::Layer,
+    channel_mixing::ChannelMixingMLP, layer_norm::LayerNorm, llm::Layer,
     token_mixing::TokenMixingMLP,
 };
 
@@ -59,7 +57,7 @@ impl HyperMixerBlock {
         // Token mixing hidden dim can be different from channel mixing
         // Using embedding_dim / 2 as a reasonable default for token mixing
         let token_mixing_hidden_dim = embedding_dim / 2;
-        
+
         Self {
             token_mixing: TokenMixingMLP::new(
                 embedding_dim,
@@ -80,7 +78,6 @@ impl HyperMixerBlock {
     pub fn check_gradient_stability(&self, grads: &Array2<f32>) -> bool {
         !grads.iter().any(|&x| !x.is_finite())
     }
-
 }
 
 impl Layer for HyperMixerBlock {
@@ -97,7 +94,7 @@ impl Layer for HyperMixerBlock {
         let norm2_out = self.norm2.normalize(&token_mixed);
         self.channel_mixing.forward(&norm2_out)
     }
-    
+
     fn compute_gradients(
         &self,
         _input: &Array2<f32>,
@@ -135,43 +132,51 @@ impl Layer for HyperMixerBlock {
 
         (grad_input, all_param_grads)
     }
-    
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        let expected_params = self.parameters();
+        if param_grads.len() != expected_params {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "HyperMixerBlock expected {} parameter gradients, got {}",
+                    expected_params,
+                    param_grads.len()
+                ),
+            });
+        }
+
         let mut idx = 0;
 
         // Apply gradients in the order they were collected:
         // norm1 → token_mixing → norm2 → channel_mixing
 
         // Apply norm1 gradients (2 params: gamma, beta)
-        if idx + 2 <= param_grads.len() {
-            let norm1_params = &param_grads[idx..idx + 2];
-            self.norm1.apply_gradients(norm1_params, lr);
-            idx += 2;
-        }
+        let norm1_params = &param_grads[idx..idx + 2];
+        self.norm1.apply_gradients(norm1_params, lr)?;
+        idx += 2;
 
         // Apply token mixing gradients (4 params per head: w1, b1, w2, b2)
-        // Token mixing returns 4 * num_heads gradients
         let token_mixing_grads = 4 * self.token_mixing.num_heads();
-        if idx + token_mixing_grads <= param_grads.len() {
-            let token_params = &param_grads[idx..idx + token_mixing_grads];
-            self.token_mixing.apply_gradients(token_params, lr);
-            idx += token_mixing_grads;
-        }
+        let token_params = &param_grads[idx..idx + token_mixing_grads];
+        self.token_mixing.apply_gradients(token_params, lr)?;
+        idx += token_mixing_grads;
 
         // Apply norm2 gradients (2 params: gamma, beta)
-        if idx + 2 <= param_grads.len() {
-            let norm2_params = &param_grads[idx..idx + 2];
-            self.norm2.apply_gradients(norm2_params, lr);
-            idx += 2;
-        }
+        let norm2_params = &param_grads[idx..idx + 2];
+        self.norm2.apply_gradients(norm2_params, lr)?;
+        idx += 2;
 
         // Apply channel mixing gradients (4 params: w1, b1, w2, b2)
-        if idx + 4 <= param_grads.len() {
-            let channel_params = &param_grads[idx..idx + 4];
-            self.channel_mixing.apply_gradients(channel_params, lr);
-        }
+        let channel_params = &param_grads[idx..idx + 4];
+        self.channel_mixing.apply_gradients(channel_params, lr)?;
+
+        Ok(())
     }
-    
+
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         // Backward pass in reverse order of forward pass
         // Forward: norm1 → token_mixing → norm2 → channel_mixing
@@ -189,7 +194,7 @@ impl Layer for HyperMixerBlock {
         // Backward through norm1
         self.norm1.backward(&grad_token, lr)
     }
-    
+
     fn parameters(&self) -> usize {
         self.token_mixing.parameters()
             + self.channel_mixing.parameters()
@@ -197,4 +202,3 @@ impl Layer for HyperMixerBlock {
             + self.norm2.parameters()
     }
 }
-

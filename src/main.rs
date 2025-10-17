@@ -2,9 +2,10 @@ use std::io::Write;
 
 use clap::Parser;
 use llm::{
-    build_network, print_architecture_summary, ArchitectureType, BeamSearchConfig, Dataset, DatasetType,
-    HeadSelectionStrategy, ModelConfig, PositionalEncodingType, WindowAdaptationStrategy, LLM, Vocab,
-    EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
+    ArchitectureType, BeamSearchConfig, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
+    HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, PositionalEncodingType, Vocab,
+    WindowAdaptationStrategy, build_network, gradient_clipping::L2GradientClipping,
+    print_architecture_summary,
 };
 
 #[derive(Parser)]
@@ -21,7 +22,10 @@ fn main() -> llm::Result<()> {
 
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
         .init();
 
     // ============================================================================
@@ -199,9 +203,9 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     let use_adaptive_window: bool = true; // Enable adaptive window sizing
-    let min_window_size: usize = 512;      // Minimum window size
-    let max_window_size: usize = 4096;     // Maximum window size
-    let window_adaptation_strategy = WindowAdaptationStrategy::SequenceLengthBased;
+    let min_window_size: usize = 512; // Minimum window size
+    let max_window_size: usize = 4096; // Maximum window size
+    let window_adaptation_strategy = WindowAdaptationStrategy::AttentionEntropy;
 
     // ============================================================================
     // MIXTURE-OF-HEADS (MoH) CONFIGURATION
@@ -248,9 +252,9 @@ fn main() -> llm::Result<()> {
 
     // Enable MoH with parameter-neutral configuration (default)
     let head_selection = HeadSelectionStrategy::MixtureOfHeads {
-        num_shared_heads: 2,           // 25% of 8 heads always active
-        num_active_routed_heads: 4,    // Top-4 of 6 routed heads (67% of routed)
-        load_balance_weight: 0.01,     // Prevents routing collapse
+        num_shared_heads: 2,        // 25% of 8 heads always active
+        num_active_routed_heads: 4, // Top-4 of 6 routed heads (67% of routed)
+        load_balance_weight: 0.01,  // Prevents routing collapse
     };
 
     // Alternative configurations:
@@ -287,13 +291,13 @@ fn main() -> llm::Result<()> {
     //   - Configurable trade-off between quality and speed
     // ============================================================================
 
-    let use_beam_search: bool = true;     // Enable beam search (false = greedy decoding)
-    let beam_width: usize = 4;             // Number of hypotheses to maintain
-    let use_adaptive_beam: bool = true;   // Enable adaptive beam width
-    let min_beam_width: usize = 1;         // Minimum beam width
-    let max_beam_width: usize = 8;         // Maximum beam width
-    let beam_max_length: usize = 100;      // Maximum generation length
-    let beam_temperature: f32 = 1.0;       // Sampling temperature
+    let use_beam_search: bool = true; // Enable beam search (false = greedy decoding)
+    let beam_width: usize = 4; // Number of hypotheses to maintain
+    let use_adaptive_beam: bool = true; // Enable adaptive beam width
+    let min_beam_width: usize = 1; // Minimum beam width
+    let max_beam_width: usize = 8; // Maximum beam width
+    let beam_max_length: usize = 100; // Maximum generation length
+    let beam_temperature: f32 = 1.0; // Sampling temperature
 
     // Create model configuration
     let mut config = match architecture {
@@ -352,6 +356,9 @@ fn main() -> llm::Result<()> {
     // Create LLM with the configured network
     let mut llm = LLM::new(vocab, network);
 
+    // Configure gradient clipping to prevent gradient explosion
+    llm.set_gradient_clipping(Box::new(L2GradientClipping::new(100.0)));
+
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
     println!("Total parameters: {}", llm.total_parameters());
@@ -380,7 +387,7 @@ fn main() -> llm::Result<()> {
         .map(|s| s.as_str())
         .collect();
 
-    llm.train_with_batch_size(pretraining_examples, 100, 0.0001, 4)?;
+    llm.train_with_batch_size(pretraining_examples, 100, 0.0001, 8)?;
 
     println!("\n=== INSTRUCTION TUNING ===");
     println!(
@@ -403,7 +410,10 @@ fn main() -> llm::Result<()> {
         println!("\n--- Interactive Mode ---");
         println!("Type a prompt and press Enter to generate text.");
         if use_beam_search {
-            println!("Using beam search (beam_width={}, adaptive={})", beam_width, use_adaptive_beam);
+            println!(
+                "Using beam search (beam_width={}, adaptive={})",
+                beam_width, use_adaptive_beam
+            );
         } else {
             println!("Using greedy decoding");
         }
@@ -411,12 +421,14 @@ fn main() -> llm::Result<()> {
 
         // Create beam search config if enabled
         let beam_config = if use_beam_search {
-            Some(BeamSearchConfig::new()
-                .with_beam_width(beam_width)
-                .with_adaptive_beam(use_adaptive_beam)
-                .with_beam_range(min_beam_width, max_beam_width)
-                .with_max_length(beam_max_length)
-                .with_temperature(beam_temperature))
+            Some(
+                BeamSearchConfig::new()
+                    .with_beam_width(beam_width)
+                    .with_adaptive_beam(use_adaptive_beam)
+                    .with_beam_range(min_beam_width, max_beam_width)
+                    .with_max_length(beam_max_length)
+                    .with_temperature(beam_temperature),
+            )
         } else {
             None
         };

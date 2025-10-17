@@ -98,16 +98,31 @@ impl Layer for LayerNorm {
         (grad_input, vec![grad_gamma, grad_beta])
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        if param_grads.len() != 2 {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "LayerNorm expected 2 parameter gradients (gamma, beta), got {}",
+                    param_grads.len()
+                ),
+            });
+        }
+
         self.optimizer_gamma
             .step(&mut self.gamma, &param_grads[0], lr);
         self.optimizer_beta
             .step(&mut self.beta, &param_grads[1], lr);
+        Ok(())
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
-        self.apply_gradients(&param_grads, lr);
+        // Unwrap is safe: backward is only called from training loop which validates inputs
+        self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
 

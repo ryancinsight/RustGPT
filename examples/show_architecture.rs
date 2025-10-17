@@ -2,7 +2,7 @@
 ///
 /// This example demonstrates the modern LLM architecture configurations
 /// available in RustGPT and displays detailed architecture summaries.
-use llm::{build_network, print_architecture_summary, ModelConfig, Vocab};
+use llm::{ModelConfig, PositionalEncodingType, Vocab, build_network, print_architecture_summary};
 
 fn main() {
     println!("\n🦀 RustGPT Architecture Showcase\n");
@@ -16,7 +16,7 @@ fn main() {
     let mut config1 = ModelConfig::transformer(512, 2048, 6, 512, None, Some(8));
     config1.use_rms_norm = false;
     config1.use_swiglu = false;
-    config1.use_rope = false;
+    config1.positional_encoding = PositionalEncodingType::Learned;
     config1.num_kv_heads = None;
     config1.window_size = None;
     let network1 = build_network(&config1, &vocab);
@@ -29,9 +29,9 @@ fn main() {
     let mut config2 = ModelConfig::transformer(512, 2048, 6, 2048, None, Some(8));
     config2.use_rms_norm = true;
     config2.use_swiglu = true;
-    config2.use_rope = true;
-    config2.num_kv_heads = None;  // MHA
-    config2.window_size = None;   // Full attention
+    config2.positional_encoding = PositionalEncodingType::RoPE;
+    config2.num_kv_heads = None; // MHA
+    config2.window_size = None; // Full attention
     let network2 = build_network(&config2, &vocab);
     print_architecture_summary(&config2, &network2);
 
@@ -42,9 +42,9 @@ fn main() {
     let mut config3 = ModelConfig::transformer(512, 2048, 6, 4096, None, Some(8));
     config3.use_rms_norm = true;
     config3.use_swiglu = true;
-    config3.use_rope = true;
-    config3.num_kv_heads = Some(4);  // GQA
-    config3.window_size = None;      // Full attention
+    config3.positional_encoding = PositionalEncodingType::RoPE;
+    config3.num_kv_heads = Some(4); // GQA
+    config3.window_size = None; // Full attention
     let network3 = build_network(&config3, &vocab);
     print_architecture_summary(&config3, &network3);
 
@@ -55,9 +55,9 @@ fn main() {
     let mut config4 = ModelConfig::transformer(512, 2048, 6, 8192, None, Some(8));
     config4.use_rms_norm = true;
     config4.use_swiglu = true;
-    config4.use_rope = true;
-    config4.num_kv_heads = Some(4);     // GQA
-    config4.window_size = Some(4096);   // Sliding Window
+    config4.positional_encoding = PositionalEncodingType::RoPE;
+    config4.num_kv_heads = Some(4); // GQA
+    config4.window_size = Some(4096); // Sliding Window
     let network4 = build_network(&config4, &vocab);
     print_architecture_summary(&config4, &network4);
 
@@ -68,9 +68,9 @@ fn main() {
     let mut config5 = ModelConfig::transformer(512, 2048, 6, 4096, None, Some(8));
     config5.use_rms_norm = true;
     config5.use_swiglu = true;
-    config5.use_rope = true;
-    config5.num_kv_heads = Some(2);     // Aggressive GQA (4x reduction)
-    config5.window_size = Some(1024);   // Small window (very fast)
+    config5.positional_encoding = PositionalEncodingType::RoPE;
+    config5.num_kv_heads = Some(2); // Aggressive GQA (4x reduction)
+    config5.window_size = Some(1024); // Small window (very fast)
     let network5 = build_network(&config5, &vocab);
     print_architecture_summary(&config5, &network5);
 
@@ -82,4 +82,3 @@ fn main() {
     println!("   - Phase 3: Sliding Window Attention");
     println!("\n🚀 Ready for production use!\n");
 }
-
