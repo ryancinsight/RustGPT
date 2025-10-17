@@ -84,20 +84,36 @@ fn main() -> llm::Result<()> {
     // ============================================================================
     // POSITIONAL ENCODING CONFIGURATION
     // ============================================================================
-    // Toggle between learned positional embeddings and RoPE
+    // Choose between three positional encoding strategies:
     //
-    // Learned Embeddings: Standard absolute positional embeddings
-    //   - Parameters: max_seq_len × embedding_dim learned weights
-    //   - Used in original Transformer, GPT-2, GPT-3
+    // 1. Learned Embeddings: Standard absolute positional embeddings
+    //    - Parameters: max_seq_len × embedding_dim learned weights
+    //    - Used in original Transformer, GPT-2, GPT-3
+    //    - Simple and effective for fixed-length contexts
     //
-    // RoPE (Rotary Positional Encoding): Geometric position encoding
-    //   - Parameters: Zero (no learned weights)
-    //   - Encodes relative position through rotation matrices
-    //   - Better length extrapolation (handles longer sequences)
-    //   - Used in LLaMA, PaLM, GPT-NeoX, Mistral
+    // 2. RoPE (Rotary Positional Encoding): Geometric position encoding
+    //    - Parameters: Zero (no learned weights)
+    //    - Encodes relative position through rotation matrices
+    //    - Better length extrapolation (handles longer sequences)
+    //    - Used in LLaMA, PaLM, GPT-NeoX, Mistral
+    //
+    // 3. CoPE (Contextual Position Encoding): Context-aware position encoding
+    //    - Parameters: max_pos × head_dim learned position embeddings
+    //    - Positions conditioned on context via gating mechanism
+    //    - Can count abstract units (words, sentences, specific tokens)
+    //    - Better OOD generalization and perplexity than RoPE
+    //    - Used in research (Meta FAIR 2024)
+    //    - Recommended for best performance
     // ============================================================================
 
-    let use_rope = true; // Set to true to use RoPE, false for learned embeddings
+    use llm::PositionalEncodingType;
+
+    // Select positional encoding type (CoPE recommended)
+    let positional_encoding = PositionalEncodingType::CoPE { max_pos: 64 };
+
+    // Alternative options:
+    // let positional_encoding = PositionalEncodingType::Learned;
+    // let positional_encoding = PositionalEncodingType::RoPE;
 
     // ============================================================================
     // GROUP-QUERY ATTENTION (GQA) CONFIGURATION
@@ -244,7 +260,7 @@ fn main() -> llm::Result<()> {
     // Apply modern LLM enhancements configuration
     config.use_rms_norm = use_rms_norm;
     config.use_swiglu = use_swiglu;
-    config.use_rope = use_rope;
+    config.positional_encoding = positional_encoding;
     config.num_kv_heads = num_kv_heads;
     config.window_size = window_size;
     config.use_adaptive_window = use_adaptive_window;

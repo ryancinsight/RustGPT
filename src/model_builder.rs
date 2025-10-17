@@ -65,13 +65,17 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let num_kv_heads = config.get_num_kv_heads();
 
     for _ in 0..config.num_layers {
-        // Self-attention layer (with optional RoPE, GQA, Sliding Window, and Adaptive Window)
+        // Self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
+        // Use the modern constructor that accepts PositionalEncodingType directly
         let attention = if config.use_adaptive_window {
+            // For adaptive window, we still need to use the builder pattern
+            // Convert PositionalEncodingType to boolean for backward compatibility
+            let use_rope = matches!(config.positional_encoding, crate::model_config::PositionalEncodingType::RoPE);
             SelfAttention::new_with_adaptive_window(
                 config.embedding_dim,
                 num_heads,
                 num_kv_heads,
-                config.use_rope,
+                use_rope,
                 config.max_seq_len,
                 config.window_size,
             )
@@ -80,11 +84,12 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             .strategy(config.window_adaptation_strategy)
             .build()
         } else {
-            SelfAttention::new_with_gqa(
+            // Use the modern constructor with PositionalEncodingType
+            SelfAttention::new_with_positional_encoding(
                 config.embedding_dim,
                 num_heads,
                 num_kv_heads,
-                config.use_rope,
+                &config.positional_encoding,
                 config.max_seq_len,
                 config.window_size,
             )
@@ -194,10 +199,17 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     }
 
     // Positional Encoding
-    if config.use_rope {
-        println!("  ✓ RoPE (zero params, better extrapolation)");
-    } else {
-        println!("  • Learned Positional Embeddings");
+    use crate::model_config::PositionalEncodingType;
+    match &config.positional_encoding {
+        PositionalEncodingType::Learned => {
+            println!("  • Learned Positional Embeddings (standard)");
+        }
+        PositionalEncodingType::RoPE => {
+            println!("  ✓ RoPE (zero params, better extrapolation)");
+        }
+        PositionalEncodingType::CoPE { max_pos } => {
+            println!("  ✓ CoPE (context-aware, max_pos={}, best performance)", max_pos);
+        }
     }
 
     // Group-Query Attention
@@ -236,7 +248,8 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("\n🎯 Architecture Alignment:");
     let has_rms = config.use_rms_norm;
     let has_swiglu = config.use_swiglu;
-    let has_rope = config.use_rope;
+    let has_rope = matches!(config.positional_encoding, PositionalEncodingType::RoPE);
+    let has_cope = matches!(config.positional_encoding, PositionalEncodingType::CoPE { .. });
     let has_gqa = num_kv_heads < num_heads;
     let has_window = config.window_size.is_some();
 
@@ -248,6 +261,8 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
         println!("  Matches: Mistral 7B ⭐");
     } else if !has_rms && !has_swiglu && !has_rope && !has_gqa && !has_window {
         println!("  Matches: Original Transformer, GPT-2");
+    } else if has_cope {
+        println!("  Custom Configuration with CoPE (Research/Experimental) 🔬");
     } else {
         println!("  Custom Configuration");
     }

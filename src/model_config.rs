@@ -11,6 +11,41 @@ pub enum ArchitectureType {
     HRM,
 }
 
+/// Positional encoding type for attention mechanism
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PositionalEncodingType {
+    /// Learned positional embeddings (standard absolute positional embeddings)
+    /// - Parameters: max_seq_len × embedding_dim learned weights
+    /// - Used in original Transformer, GPT-2, GPT-3
+    /// - Simple and effective for fixed-length contexts
+    Learned,
+
+    /// RoPE (Rotary Positional Encoding): Geometric position encoding
+    /// - Parameters: Zero (no learned weights)
+    /// - Encodes relative position through rotation matrices
+    /// - Better length extrapolation (handles longer sequences)
+    /// - Used in LLaMA, PaLM, GPT-NeoX, Mistral
+    RoPE,
+
+    /// CoPE (Contextual Position Encoding): Context-aware position encoding
+    /// - Parameters: max_pos × head_dim learned position embeddings (max_pos << max_seq_len)
+    /// - Positions conditioned on context via gating mechanism
+    /// - Can count abstract units (words, sentences, specific tokens)
+    /// - Better OOD generalization and perplexity than RoPE
+    /// - Used in research (Meta FAIR 2024)
+    CoPE {
+        /// Maximum position value (can be much smaller than sequence length)
+        /// For example, max_pos=64 works well for context length 1024
+        max_pos: usize,
+    },
+}
+
+impl Default for PositionalEncodingType {
+    fn default() -> Self {
+        PositionalEncodingType::Learned
+    }
+}
+
 /// Strategy for adapting sliding window size dynamically
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowAdaptationStrategy {
@@ -64,8 +99,13 @@ pub struct ModelConfig {
     /// Default: false (use FeedForward for backward compatibility)
     pub use_swiglu: bool,
 
-    /// Use RoPE (Rotary Positional Encoding) instead of learned positional embeddings
-    /// Default: false (use learned embeddings for backward compatibility)
+    /// Positional encoding type to use
+    /// Default: Learned (for backward compatibility)
+    pub positional_encoding: PositionalEncodingType,
+
+    /// DEPRECATED: Use positional_encoding instead
+    /// Kept for backward compatibility during migration
+    #[deprecated(since = "0.2.0", note = "Use positional_encoding field instead")]
     pub use_rope: bool,
 
     /// Number of key-value heads for Group-Query Attention (GQA)
@@ -136,7 +176,8 @@ impl ModelConfig {
             num_heads,
             use_rms_norm: false, // Default to LayerNorm for backward compatibility
             use_swiglu: false,   // Default to FeedForward for backward compatibility
-            use_rope: false,     // Default to learned embeddings for backward compatibility
+            positional_encoding: PositionalEncodingType::Learned, // Default for backward compatibility
+            use_rope: false,     // DEPRECATED: kept for backward compatibility
             num_kv_heads: None,  // Default to MHA for backward compatibility
             window_size: None,   // Default to full attention for backward compatibility
             use_adaptive_window: false, // Default to fixed window for backward compatibility
@@ -165,7 +206,8 @@ impl ModelConfig {
             num_heads,
             use_rms_norm: false, // Default to LayerNorm for backward compatibility
             use_swiglu: false,   // Default to FeedForward for backward compatibility
-            use_rope: false,     // Default to learned embeddings for backward compatibility
+            positional_encoding: PositionalEncodingType::Learned, // Default for backward compatibility
+            use_rope: false,     // DEPRECATED: kept for backward compatibility
             num_kv_heads: None,  // Default to MHA for backward compatibility
             window_size: None,   // Default to full attention for backward compatibility
             use_adaptive_window: false, // Default to fixed window for backward compatibility
@@ -174,7 +216,7 @@ impl ModelConfig {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
         }
     }
-    
+
     /// Get the hypernetwork hidden dimension, using default if not specified
     pub fn get_hypernetwork_hidden_dim(&self) -> usize {
         self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4)
@@ -227,7 +269,8 @@ impl ModelConfig {
             num_heads: None,
             use_rms_norm: false, // Default to LayerNorm for backward compatibility
             use_swiglu: false,   // Default to FeedForward for backward compatibility
-            use_rope: false,     // Default to learned embeddings for backward compatibility
+            positional_encoding: PositionalEncodingType::Learned, // Default for backward compatibility
+            use_rope: false,     // DEPRECATED: kept for backward compatibility
             num_kv_heads: None,  // Default to MHA for backward compatibility
             window_size: None,   // Default to full attention for backward compatibility
             use_adaptive_window: false, // Default to fixed window for backward compatibility

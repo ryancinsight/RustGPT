@@ -8,7 +8,19 @@ use crate::EMBEDDING_DIM;
 use crate::adam::Adam;
 use crate::llm::Layer;
 use crate::rope::RotaryEmbedding;
+use crate::cop::ContextualPositionEncoding;
 use crate::model_config::WindowAdaptationStrategy;
+
+/// Positional encoding variant used in attention
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum PositionalEncodingVariant {
+    /// No positional encoding in attention (handled by Embeddings layer)
+    Learned,
+    /// Rotary Positional Encoding
+    RoPE(RotaryEmbedding),
+    /// Contextual Position Encoding (one per head for multi-head flexibility)
+    CoPE(Vec<ContextualPositionEncoding>),
+}
 
 /// Single head for multi-head attention
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -39,8 +51,10 @@ pub struct SelfAttention {
 
     cached_input: Option<Array2<f32>>,
 
-    /// Optional RoPE (Rotary Positional Encoding)
-    rope: Option<RotaryEmbedding>,
+    /// Positional encoding type (Learned, RoPE, or CoPE)
+    /// Learned embeddings are handled in the Embeddings layer
+    /// RoPE and CoPE are applied within attention
+    positional_encoding: PositionalEncodingVariant,
 
     /// Optional sliding window size for attention
     /// If None, uses full attention (all tokens attend to all previous tokens)
@@ -120,6 +134,42 @@ impl AttentionHead {
 
         let k_t = k.t();
         let mut scores = q.dot(&k_t) / dk;
+
+        // Apply causal masking and optional sliding window masking
+        let seq_len = scores.shape()[0];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                // Causal masking: prevent attention to future tokens
+                if j > i {
+                    scores[[i, j]] = f32::NEG_INFINITY;
+                }
+                // Sliding window masking: prevent attention to tokens outside window
+                else if let Some(window) = window_size && j < i.saturating_sub(window) {
+                    scores[[i, j]] = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        let weights = self.softmax(&scores);
+        weights.dot(v)
+    }
+
+    /// Compute attention with additional position bias (for CoPE)
+    fn attention_with_position_bias(
+        &self,
+        q: &Array2<f32>,
+        k: &Array2<f32>,
+        v: &Array2<f32>,
+        position_logits: &Array2<f32>,
+        window_size: Option<usize>,
+    ) -> Array2<f32> {
+        let dk = (self.head_dim as f32).sqrt();
+
+        let k_t = k.t();
+        let mut scores = q.dot(&k_t) / dk;
+
+        // Add position logits from CoPE
+        scores = scores + position_logits;
 
         // Apply causal masking and optional sliding window masking
         let seq_len = scores.shape()[0];
@@ -222,10 +272,11 @@ impl SelfAttention {
             .map(|_| AttentionHead::new(head_dim))
             .collect();
 
-        let rope = if use_rope {
-            Some(RotaryEmbedding::new(head_dim, max_seq_len))
+        // Convert boolean use_rope to PositionalEncodingType for backward compatibility
+        let positional_encoding = if use_rope {
+            PositionalEncodingVariant::RoPE(RotaryEmbedding::new(head_dim, max_seq_len))
         } else {
-            None
+            PositionalEncodingVariant::Learned
         };
 
         SelfAttention {
@@ -234,9 +285,81 @@ impl SelfAttention {
             num_kv_heads,
             heads,
             cached_input: None,
-            rope,
+            positional_encoding,
             window_size,
             use_adaptive_window: false, // Default to fixed window
+            min_window_size: 512,
+            max_window_size: 4096,
+            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            current_window_size: None,
+            last_attention_entropy: None,
+        }
+    }
+
+    /// Create a new SelfAttention with explicit positional encoding type
+    ///
+    /// This is the modern constructor that accepts `PositionalEncodingType` directly.
+    /// Use this for new code instead of the boolean `use_rope` parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Embedding dimension
+    /// * `num_heads` - Number of query heads
+    /// * `num_kv_heads` - Number of key-value heads (for GQA)
+    /// * `positional_encoding` - Type of positional encoding to use
+    /// * `max_seq_len` - Maximum sequence length
+    /// * `window_size` - Optional sliding window size
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `embedding_dim` is not divisible by `num_heads`
+    /// - `num_heads` is not divisible by `num_kv_heads`
+    /// - `num_kv_heads` is greater than `num_heads`
+    pub fn new_with_positional_encoding(
+        embedding_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        positional_encoding: &crate::model_config::PositionalEncodingType,
+        max_seq_len: usize,
+        window_size: Option<usize>,
+    ) -> Self {
+        assert!(embedding_dim % num_heads == 0, "embedding_dim must be divisible by num_heads");
+        assert!(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads (for GQA grouping)");
+        assert!(num_kv_heads <= num_heads, "num_kv_heads cannot be greater than num_heads");
+
+        let head_dim = embedding_dim / num_heads;
+
+        // Create attention heads
+        let heads = (0..num_heads)
+            .map(|_| AttentionHead::new(head_dim))
+            .collect();
+
+        // Convert PositionalEncodingType to PositionalEncodingVariant
+        use crate::model_config::PositionalEncodingType;
+        let positional_encoding_variant = match positional_encoding {
+            PositionalEncodingType::Learned => PositionalEncodingVariant::Learned,
+            PositionalEncodingType::RoPE => {
+                PositionalEncodingVariant::RoPE(RotaryEmbedding::new(head_dim, max_seq_len))
+            }
+            PositionalEncodingType::CoPE { max_pos } => {
+                // Create one CoPE instance per head for multi-head flexibility
+                let cope_heads = (0..num_heads)
+                    .map(|_| ContextualPositionEncoding::new(head_dim, *max_pos))
+                    .collect();
+                PositionalEncodingVariant::CoPE(cope_heads)
+            }
+        };
+
+        SelfAttention {
+            embedding_dim,
+            num_heads,
+            num_kv_heads,
+            heads,
+            cached_input: None,
+            positional_encoding: positional_encoding_variant,
+            window_size,
+            use_adaptive_window: false,
             min_window_size: 512,
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
@@ -312,10 +435,11 @@ impl AdaptiveWindowBuilder {
             .map(|_| AttentionHead::new(head_dim))
             .collect();
 
-        let rope = if self.use_rope {
-            Some(RotaryEmbedding::new(head_dim, self.max_seq_len))
+        // Convert boolean use_rope to PositionalEncodingType for backward compatibility
+        let positional_encoding = if self.use_rope {
+            PositionalEncodingVariant::RoPE(RotaryEmbedding::new(head_dim, self.max_seq_len))
         } else {
-            None
+            PositionalEncodingVariant::Learned
         };
 
         SelfAttention {
@@ -324,7 +448,7 @@ impl AdaptiveWindowBuilder {
             num_kv_heads: self.num_kv_heads,
             heads,
             cached_input: None,
-            rope,
+            positional_encoding,
             window_size: self.window_size,
             use_adaptive_window: self.use_adaptive_window,
             min_window_size: self.min_window_size,
@@ -421,10 +545,19 @@ impl SelfAttention {
         let mut k = head_input.dot(&head.w_k);
         let v = head_input.dot(&head.w_v);
 
-        // Apply RoPE if enabled
-        if let Some(rope) = &self.rope {
-            q = rope.apply(&q);
-            k = rope.apply(&k);
+        // Apply positional encoding if needed
+        match &self.positional_encoding {
+            PositionalEncodingVariant::Learned => {
+                // No-op: positional encoding handled in Embeddings layer
+            }
+            PositionalEncodingVariant::RoPE(rope) => {
+                q = rope.apply(&q);
+                k = rope.apply(&k);
+            }
+            PositionalEncodingVariant::CoPE(_) => {
+                // CoPE is applied differently in the forward pass
+                // For backward pass, we skip it here
+            }
         }
 
         let dk = head_dim as f32;
@@ -538,8 +671,16 @@ impl Layer for SelfAttention {
         for (h, head_input) in head_inputs.iter().enumerate() {
             let mut q = head_input.dot(&self.heads[h].w_q);
             // Apply RoPE to queries if enabled
-            if let Some(rope) = &self.rope {
-                q = rope.apply(&q);
+            match &self.positional_encoding {
+                PositionalEncodingVariant::Learned => {
+                    // No-op: positional encoding handled in Embeddings layer
+                }
+                PositionalEncodingVariant::RoPE(rope) => {
+                    q = rope.apply(&q);
+                }
+                PositionalEncodingVariant::CoPE(_) => {
+                    // CoPE is applied later in attention computation
+                }
             }
             queries.push(q);
         }
@@ -556,8 +697,16 @@ impl Layer for SelfAttention {
             let v = head_input.dot(&self.heads[head_idx].w_v);
 
             // Apply RoPE to keys if enabled
-            if let Some(rope) = &self.rope {
-                k = rope.apply(&k);
+            match &self.positional_encoding {
+                PositionalEncodingVariant::Learned => {
+                    // No-op: positional encoding handled in Embeddings layer
+                }
+                PositionalEncodingVariant::RoPE(rope) => {
+                    k = rope.apply(&k);
+                }
+                PositionalEncodingVariant::CoPE(_) => {
+                    // CoPE is applied later in attention computation
+                }
             }
 
             keys.push(k);
@@ -572,7 +721,18 @@ impl Layer for SelfAttention {
             let v = &values[kv_idx];
 
             // Compute attention for this head with adaptive or fixed sliding window
-            self.heads[h].attention(q, k, v, effective_window_size)
+            // For CoPE, we need to add position logits to attention scores
+            match &self.positional_encoding {
+                PositionalEncodingVariant::CoPE(cope_heads) => {
+                    // Apply CoPE: compute position logits and add to attention scores
+                    let position_logits = cope_heads[h].apply(q, k);
+                    self.heads[h].attention_with_position_bias(q, k, v, &position_logits, effective_window_size)
+                }
+                _ => {
+                    // Standard attention (Learned or RoPE)
+                    self.heads[h].attention(q, k, v, effective_window_size)
+                }
+            }
         }).collect();
 
         // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
