@@ -189,8 +189,13 @@ impl Layer for LowLevelModule {
         (Array2::zeros((0, 0)), vec![])
     }
 
-    fn apply_gradients(&mut self, _param_grads: &[Array2<f32>], _lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        _param_grads: &[Array2<f32>],
+        _lr: f32,
+    ) -> crate::errors::Result<()> {
         // Not used in current training loop (backward() handles updates)
+        Ok(())
     }
 }
 
@@ -229,4 +234,3 @@ mod tests {
         assert!(params > 0, "Should have parameters");
     }
 }
-

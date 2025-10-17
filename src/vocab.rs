@@ -17,15 +17,23 @@ impl Default for Vocab {
 
 impl Vocab {
     pub fn new(words: Vec<&str>) -> Self {
-        // Vocabulary size validation
+        // Vocabulary size validation with defensive clamping
         if words.len() > crate::MAX_VOCAB_SIZE {
-            panic!("Vocabulary size {} exceeds maximum allowed size {}", words.len(), crate::MAX_VOCAB_SIZE);
+            tracing::warn!(
+                vocab_size = words.len(),
+                max_vocab_size = crate::MAX_VOCAB_SIZE,
+                "Vocabulary size exceeds maximum, truncating to first {} words",
+                crate::MAX_VOCAB_SIZE
+            );
         }
+
+        // Take only the first MAX_VOCAB_SIZE words to prevent OOM
+        let safe_words: Vec<&str> = words.into_iter().take(crate::MAX_VOCAB_SIZE).collect();
 
         let mut encode = HashMap::new();
         let mut decode = HashMap::new();
 
-        for (i, &word) in words.iter().enumerate() {
+        for (i, &word) in safe_words.iter().enumerate() {
             println!("Adding word: {word} to encoding: {i}");
             encode.insert(word.to_string(), i);
             decode.insert(i, word.to_string());
@@ -34,7 +42,7 @@ impl Vocab {
         Vocab {
             encode,
             decode,
-            words: words.iter().map(|w| w.to_string()).collect(),
+            words: safe_words.iter().map(|w| w.to_string()).collect(),
         }
     }
 

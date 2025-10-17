@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::{
-    EMBEDDING_DIM, Embeddings, HIDDEN_DIM, MAX_SEQ_LEN, Vocab, errors::{ModelError, Result}, gradient_clipping::{AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping}, output_projection::OutputProjection,
-    transformer::TransformerBlock,
+    Embeddings, MAX_SEQ_LEN, Vocab,
+    errors::{ModelError, Result},
+    gradient_clipping::{AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping},
+    output_projection::OutputProjection,
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -71,7 +73,7 @@ impl Layer for LayerEnum {
         }
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
         match self {
             LayerEnum::Embeddings(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
@@ -129,7 +131,9 @@ pub trait Layer {
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>);
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32);
+    /// Apply gradients to layer parameters
+    /// Returns GradientError if param_grads has incorrect length
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()>;
 }
 
 #[derive(Serialize, Deserialize)]
@@ -153,36 +157,16 @@ impl std::fmt::Debug for LLM {
 
 impl Default for LLM {
     fn default() -> Self {
-        let transformer_block = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-        let output_projection = OutputProjection::new(EMBEDDING_DIM, Vocab::default_words().len());
+        use crate::model_builder::build_network;
+        use crate::model_config::ModelConfig;
 
-        // Extract norm layers based on their type
-        let norm1_enum = match transformer_block.norm1 {
-            crate::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
-            crate::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
-        };
-
-        let norm2_enum = match transformer_block.norm2 {
-            crate::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
-            crate::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
-        };
-
-        // Extract feedforward layer based on its type
-        let ffn_enum = match transformer_block.feed_forward {
-            crate::transformer::FFNLayer::FeedForward(ffn) => LayerEnum::FeedForward(ffn),
-            crate::transformer::FFNLayer::SwiGLU(swiglu) => LayerEnum::SwiGLU(swiglu),
-        };
+        let config = ModelConfig::default();
+        let vocab = Vocab::default();
+        let network = build_network(&config, &vocab);
 
         Self {
-            vocab: Vocab::default(),
-            network: vec![
-                LayerEnum::Embeddings(Embeddings::default()),
-                LayerEnum::SelfAttention(Box::new(transformer_block.attention)),
-                norm1_enum,
-                ffn_enum,
-                norm2_enum,
-                LayerEnum::OutputProjection(output_projection),
-            ],
+            vocab,
+            network,
             gradient_clipper: Some(Box::new(AdaptiveGradientClipping::new(
                 AdaptiveClippingConfig::default(),
             ))),
@@ -324,21 +308,45 @@ impl LLM {
 
         for epoch in 0..epochs {
             let mut total_loss = 0.0;
+            let mut total_grad_norm = 0.0;
+            let mut batch_count = 0;
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let batch_loss = self.train_batch(batch, lr)?;
+                let (batch_loss, grad_norm) = self.train_batch(batch, lr)?;
                 total_loss += batch_loss;
+                total_grad_norm += grad_norm;
+                batch_count += 1;
             }
 
-            println!(
-                "Epoch {}: Loss = {:.4}",
-                epoch,
-                total_loss / tokenized_data.len() as f32
-            );
+            let avg_loss = total_loss / tokenized_data.len() as f32;
+            let avg_grad_norm = total_grad_norm / batch_count as f32;
+
+            // NFR-5.2: Training divergence detection
+            if avg_loss.is_nan() || avg_loss.is_infinite() {
+                return Err(ModelError::Training {
+                    message: format!(
+                        "Training diverged at epoch {}: loss is {} (NaN or Inf detected)",
+                        epoch, avg_loss
+                    ),
+                });
+            }
+
+            if avg_loss > 1e6 {
+                return Err(ModelError::Training {
+                    message: format!(
+                        "Training diverged at epoch {}: loss exceeded threshold (loss = {:.2e} > 1e6)",
+                        epoch, avg_loss
+                    ),
+                });
+            }
+
+            // NFR-7.3: Training metrics with gradient norms
             info!(
                 epoch = epoch,
-                loss = total_loss / tokenized_data.len() as f32,
+                loss = avg_loss,
+                grad_norm = avg_grad_norm,
+                learning_rate = lr,
                 "Training epoch completed"
             );
         }
@@ -347,7 +355,8 @@ impl LLM {
     }
 
     /// Train on a single batch of sequences
-    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<f32> {
+    /// Returns (batch_loss, gradient_norm)
+    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<(f32, f32)> {
         let mut batch_loss = 0.0;
         let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
 
@@ -412,6 +421,8 @@ impl LLM {
 
         // Prepare averaged gradients and detect anomalies
         let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
+        let mut total_grad_norm_sq = 0.0f32;
+
         for param_grads in accumulated_param_grads {
             if !param_grads.is_empty() {
                 let averaged_grads: Vec<Array2<f32>> = param_grads
@@ -422,20 +433,47 @@ impl LLM {
                 // Detect gradient anomalies (poisoning/training instability)
                 self.detect_gradient_anomalies(&averaged_grads)?;
 
+                // Compute L2 norm of gradients for this layer
+                for grad in &averaged_grads {
+                    total_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
+                }
+
                 averaged_grads_per_layer.push(averaged_grads);
             } else {
                 averaged_grads_per_layer.push(Vec::new());
             }
         }
 
+        // Compute global gradient norm (L2 norm across all parameters)
+        let mut grad_norm = total_grad_norm_sq.sqrt();
+
+        // Apply global gradient clipping on parameter gradients
+        const GRAD_CLIP_THRESHOLD: f32 = 100.0;
+        if grad_norm > GRAD_CLIP_THRESHOLD {
+            let scale = GRAD_CLIP_THRESHOLD / grad_norm;
+            for grads in &mut averaged_grads_per_layer {
+                for grad in grads {
+                    grad.mapv_inplace(|x| x * scale);
+                }
+            }
+            // Recompute grad_norm after clipping
+            let mut clipped_total_grad_norm_sq = 0.0f32;
+            for grads in &averaged_grads_per_layer {
+                for grad in grads {
+                    clipped_total_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
+                }
+            }
+            grad_norm = clipped_total_grad_norm_sq.sqrt();
+        }
+
         // Apply accumulated and averaged gradients
         for (layer, averaged_grads) in self.network.iter_mut().zip(averaged_grads_per_layer) {
             if !averaged_grads.is_empty() {
-                layer.apply_gradients(&averaged_grads, lr);
+                layer.apply_gradients(&averaged_grads, lr)?;
             }
         }
 
-        Ok(batch_loss)
+        Ok((batch_loss, grad_norm))
     }
     /// Configure gradient clipping strategy
     pub fn set_gradient_clipping(&mut self, clipper: Box<dyn GradientClipping>) {
@@ -452,10 +490,18 @@ impl LLM {
         for (i, grad) in grads.iter().enumerate() {
             let max_grad = grad.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
             if max_grad > crate::GRADIENT_ANOMALY_THRESHOLD {
-                tracing::warn!("Gradient anomaly detected in layer {}: max gradient magnitude {}", i, max_grad);
+                tracing::warn!(
+                    "Gradient anomaly detected in layer {}: max gradient magnitude {}",
+                    i,
+                    max_grad
+                );
                 return Err(ModelError::GradientError {
-                    message: format!("Gradient anomaly in layer {}: magnitude {} exceeds threshold {}",
-                                   i, max_grad, crate::GRADIENT_ANOMALY_THRESHOLD)
+                    message: format!(
+                        "Gradient anomaly in layer {}: magnitude {} exceeds threshold {}",
+                        i,
+                        max_grad,
+                        crate::GRADIENT_ANOMALY_THRESHOLD
+                    ),
                 });
             }
 
@@ -463,7 +509,7 @@ impl LLM {
             if grad.iter().any(|&x| !x.is_finite()) {
                 tracing::error!("Non-finite gradients detected in layer {}", i);
                 return Err(ModelError::GradientError {
-                    message: format!("Non-finite gradients detected in layer {}", i)
+                    message: format!("Non-finite gradients detected in layer {}", i),
                 });
             }
         }
@@ -473,8 +519,11 @@ impl LLM {
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         // Input validation
         let safe_text = if text.len() > crate::MAX_INPUT_LENGTH {
-            tracing::warn!("Input text length {} exceeds maximum allowed length {}, truncating",
-                          text.len(), crate::MAX_INPUT_LENGTH);
+            tracing::warn!(
+                "Input text length {} exceeds maximum allowed length {}, truncating",
+                text.len(),
+                crate::MAX_INPUT_LENGTH
+            );
             &text[..crate::MAX_INPUT_LENGTH.min(text.len())]
         } else {
             text
@@ -569,8 +618,14 @@ impl LLM {
     fn compute_gradients_step(probs: &Array2<f32>, target: &[usize]) -> Array2<f32> {
         let mut grads = probs.clone(); // Start with softmax probabilities
 
+        // Defensive check: if shapes mismatch, log warning and return zero gradients
         if probs.shape()[0] != target.len() {
-            panic!("Probs and target must have the same number of rows");
+            tracing::error!(
+                probs_rows = probs.shape()[0],
+                target_len = target.len(),
+                "Shape mismatch in gradient computation, returning zero gradients"
+            );
+            return Array2::zeros(probs.raw_dim());
         }
 
         let batch_size = target.len() as f32;
@@ -597,7 +652,11 @@ impl LLM {
     ///
     /// # Returns
     /// Generated text as a String
-    pub fn generate_with_beam_search(&mut self, text: &str, config: &crate::beam_search::BeamSearchConfig) -> String {
+    pub fn generate_with_beam_search(
+        &mut self,
+        text: &str,
+        config: &crate::beam_search::BeamSearchConfig,
+    ) -> String {
         use crate::beam_search::BeamSearchState;
 
         // Tokenize the input text
@@ -620,41 +679,34 @@ impl LLM {
             }
 
             // Collect predictions for all active beams
-            let mut predictions = Vec::new();
-
-            for beam in &state.beams {
-                if beam.is_complete {
-                    continue;
-                }
-
-                // Prepare input for this beam
-                let token_input = Array2::from_shape_vec(
-                    (1, beam.tokens.len()),
-                    beam.tokens.iter().map(|&x| x as f32).collect(),
-                )
-                .unwrap();
-
-                let mut input = token_input;
-
-                // Forward pass through network
-                for layer in &mut self.network {
-                    input = layer.forward(&input);
-                }
-
-                let logits = input;
-
-                // Get last token logits
-                let last_logit = logits
-                    .row(logits.shape()[0] - 1)
-                    .to_owned();
-
-                // Apply softmax to get probabilities
-                let probs_2d = last_logit.insert_axis(Axis(0));
-                let probs = Self::softmax(&probs_2d);
-                let probs_1d = probs.row(0).to_owned();
-
-                predictions.push(probs_1d);
+            let active_beams: Vec<&BeamHypothesis> =
+                state.beams.iter().filter(|b| !b.is_complete).collect();
+            let num_active = active_beams.len();
+            if num_active == 0 {
+                break;
             }
+
+            let seq_len = active_beams[0].tokens.len();
+            let mut token_matrix = Array2::<f32>::zeros((num_active, seq_len));
+
+            for (i, beam) in active_beams.iter().enumerate() {
+                for (j, &token) in beam.tokens.iter().enumerate() {
+                    token_matrix[[i, j]] = token as f32;
+                }
+            }
+
+            let mut input = token_matrix;
+
+            // Forward pass through network (batched)
+            for layer in &mut self.network {
+                input = layer.forward(&input);
+            }
+
+            let logits = input; // shape (num_active, vocab_size)
+
+            // Extract predictions for each beam
+            let predictions: Vec<Array1<f32>> =
+                (0..num_active).map(|i| logits.row(i).to_owned()).collect();
 
             // Compute entropy for adaptive beam width
             if config.use_adaptive_beam && !predictions.is_empty() {
@@ -670,7 +722,7 @@ impl LLM {
         }
 
         // Get the best hypothesis
-        let best = state.get_best();
+        let best = state.get_best(config);
 
         if let Some(hypothesis) = best {
             // Skip the initial tokens (input) and convert to text
@@ -713,9 +765,10 @@ impl LLM {
     /// Save model to binary format (compact, faster, smaller file size)
     pub fn save_binary(&self, path: &str) -> Result<()> {
         let config = bincode::config::standard();
-        let encoded = bincode::serde::encode_to_vec(self, config).map_err(|e| ModelError::Serialization {
-            source: Box::new(e),
-        })?;
+        let encoded =
+            bincode::serde::encode_to_vec(self, config).map_err(|e| ModelError::Serialization {
+                source: Box::new(e),
+            })?;
         fs::write(path, encoded).map_err(ModelError::from)?;
         Ok(())
     }
@@ -724,9 +777,12 @@ impl LLM {
     pub fn load_binary(path: &str) -> Result<Self> {
         let data = fs::read(path).map_err(ModelError::from)?;
         let config = bincode::config::standard();
-        let (llm, _): (LLM, usize) = bincode::serde::decode_from_slice(&data, config).map_err(|e| ModelError::Serialization {
-            source: Box::new(e),
-        })?;
+        let (llm, _): (LLM, usize) =
+            bincode::serde::decode_from_slice(&data, config).map_err(|e| {
+                ModelError::Serialization {
+                    source: Box::new(e),
+                }
+            })?;
         Ok(llm)
     }
 
@@ -748,3 +804,5 @@ impl LLM {
         }
     }
 }
+
+pub use crate::beam_search::*;

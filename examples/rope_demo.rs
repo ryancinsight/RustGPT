@@ -1,6 +1,5 @@
 use llm::{
-    EMBEDDING_DIM, HIDDEN_DIM, ModelConfig,
-    build_network, print_architecture_summary, Vocab, LLM
+    EMBEDDING_DIM, HIDDEN_DIM, LLM, ModelConfig, Vocab, build_network, print_architecture_summary,
 };
 
 /// Demonstrate different model architectures available in RustGPT
@@ -13,8 +12,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("======================================\n");
 
     // Create configurations for comparison
-    let config_transformer = ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 2, 80, None, Some(8));
-    let config_hypermixer = ModelConfig::hypermixer(EMBEDDING_DIM, HIDDEN_DIM, 2, 80, None, Some(8));
+    let config_transformer =
+        ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 2, 80, None, Some(8));
+    let config_hypermixer =
+        ModelConfig::hypermixer(EMBEDDING_DIM, HIDDEN_DIM, 2, 80, None, Some(8));
 
     println!("Configuration Comparison:");
     println!("------------------------");

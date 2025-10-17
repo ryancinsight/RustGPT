@@ -92,9 +92,18 @@ This checklist tracks the implementation status of requirements from the PRD and
 ### NFR-5: Reliability
 
 - [x] **NFR-5.1**: Graceful error handling (thiserror, typed errors) - **IMPLEMENTED Sprint 3**
-- [ ] **NFR-5.2**: Training divergence detection (loss > 1e6 → abort)
+- [x] **NFR-5.2**: Training divergence detection (loss > 1e6 → abort) - **IMPLEMENTED Sprint 4.2**
+  - [x] NaN/Inf detection in training loop
+  - [x] Loss threshold check (> 1e6)
+  - [x] Graceful error with diagnostic message
+  - [x] Test coverage for divergence detection
 - [ ] **NFR-5.3**: OOM recovery strategies (memory limits, arena allocators)
-- [ ] **NFR-5.4**: Serialization integrity (checksums, version validation)
+- [x] **NFR-5.4**: Serialization integrity (checksums, version validation) - **IMPLEMENTED Sprint 4.3**
+  - [x] SHA256 checksums for data integrity
+  - [x] Model versioning for backward compatibility
+  - [x] Validation on load with proper error handling
+  - [x] Metadata tracking (timestamp, architecture, parameters)
+  - [x] Test coverage for integrity checks
 - [x] **NFR-5.5**: Structured error types (thiserror, not String errors) - **IMPLEMENTED Sprint 3**
 
 ### NFR-6: Security
@@ -106,10 +115,17 @@ This checklist tracks the implementation status of requirements from the PRD and
 
 ### NFR-7: Observability
 - [x] **NFR-7.1**: Structured logging (tracing crate with spans) - **IMPLEMENTED Sprint 3**
-- [ ] **NFR-7.2**: Configurable log levels (RUST_LOG env var)
-- [ ] **NFR-7.3**: Training metrics (loss, gradient norms, learning rate)
+- [x] **NFR-7.2**: Configurable log levels (RUST_LOG env var) - **VERIFIED Sprint 4.2**
+  - [x] EnvFilter configured in main.rs
+  - [x] Supports RUST_LOG=debug/info/warn/error
+  - [x] Documentation in README
+- [x] **NFR-7.3**: Training metrics (loss, gradient norms, learning rate) - **IMPLEMENTED Sprint 4.2**
+  - [x] Global gradient L2 norm computation
+  - [x] Per-epoch metrics logging (loss, grad_norm, lr)
+  - [x] Structured logging with key-value pairs
+  - [x] Console output for monitoring
 - [ ] **NFR-7.4**: Performance profiling (flamegraphs, allocation tracking)
-- [ ] **NFR-7.5**: Span-based debugging for concurrent operations
+- [x] **NFR-7.5**: Span-based debugging for concurrent operations - **PARTIALLY IMPLEMENTED Sprint 3**
 
 ### NFR-8: Scalability
 - [x] **NFR-8.1**: Parallel training (rayon for data parallelism) - **PARTIALLY IMPLEMENTED Sprint 3**

@@ -3,9 +3,7 @@
 //! This example shows how to configure and use different gradient clipping strategies
 //! in the RustGPT LLM, including the new adaptive techniques.
 
-use llm::{
-    AdaptiveClippingConfig, AdaptiveGradientClipping, L2GradientClipping, LLM,
-};
+use llm::{AdaptiveClippingConfig, AdaptiveGradientClipping, L2GradientClipping, LLM};
 
 fn main() {
     println!("=== Adaptive Gradient Clipping Demo ===\n");

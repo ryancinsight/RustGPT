@@ -53,14 +53,21 @@ impl Embeddings {
     fn get_token_embeddings(embeddings: &Array2<f32>, token_ids: &[usize]) -> Array2<f32> {
         let mut token_embeds = Array2::<f32>::zeros((token_ids.len(), embeddings.ncols()));
         for (i, &token_id) in token_ids.iter().enumerate() {
-            if token_id >= embeddings.nrows() {
-                panic!(
-                    "Token ID {} out of bounds for vocab size {}",
-                    token_id,
-                    embeddings.nrows()
+            // Defensive check: clamp token_id to valid range to prevent panic
+            // Invalid tokens are mapped to token 0 (typically <UNK> or <PAD>)
+            let safe_token_id = if token_id >= embeddings.nrows() {
+                tracing::warn!(
+                    token_id = token_id,
+                    vocab_size = embeddings.nrows(),
+                    "Token ID out of bounds, clamping to 0"
                 );
-            }
-            token_embeds.row_mut(i).assign(&embeddings.row(token_id));
+                0
+            } else {
+                token_id
+            };
+            token_embeds
+                .row_mut(i)
+                .assign(&embeddings.row(safe_token_id));
         }
         token_embeds
     }
@@ -69,14 +76,20 @@ impl Embeddings {
         positional_encodings: &Array2<f32>,
         seq_len: usize,
     ) -> Array2<f32> {
-        if seq_len > positional_encodings.nrows() {
-            panic!(
-                "Sequence length {} exceeds maximum {}",
-                seq_len,
-                positional_encodings.nrows()
+        // Defensive check: clamp seq_len to max_seq_len to prevent panic
+        let safe_seq_len = if seq_len > positional_encodings.nrows() {
+            tracing::warn!(
+                seq_len = seq_len,
+                max_seq_len = positional_encodings.nrows(),
+                "Sequence length exceeds maximum, clamping"
             );
-        }
-        positional_encodings.slice(s![0..seq_len, ..]).to_owned()
+            positional_encodings.nrows()
+        } else {
+            seq_len
+        };
+        positional_encodings
+            .slice(s![0..safe_seq_len, ..])
+            .to_owned()
     }
 
     pub fn embed_tokens(&self, token_ids: &[usize]) -> Array2<f32> {
@@ -113,18 +126,22 @@ impl Layer for Embeddings {
         let mut positional_grads = Array2::zeros(self.positional_embeddings.dim());
 
         for (i, &token_id) in token_ids.iter().enumerate() {
-            if token_id >= self.token_embeddings.nrows() {
-                panic!(
-                    "Token ID {} out of bounds for vocab size {}",
-                    token_id,
-                    self.token_embeddings.nrows()
+            // Defensive check: clamp token_id to valid range
+            let safe_token_id = if token_id >= self.token_embeddings.nrows() {
+                tracing::warn!(
+                    token_id = token_id,
+                    vocab_size = self.token_embeddings.nrows(),
+                    "Token ID out of bounds in gradient computation, clamping to 0"
                 );
-            }
+                0
+            } else {
+                token_id
+            };
             let grad_row = grads.row(i);
 
             // Accumulate token embedding gradients efficiently (no temp variable)
             {
-                let mut token_row = token_grads.row_mut(token_id);
+                let mut token_row = token_grads.row_mut(safe_token_id);
                 token_row += &grad_row;
             }
 
@@ -139,16 +156,31 @@ impl Layer for Embeddings {
         (output_grads.clone(), vec![token_grads, positional_grads])
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
+        if param_grads.len() != 2 {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "Embeddings expected 2 parameter gradients (token + positional), got {}",
+                    param_grads.len()
+                ),
+            });
+        }
+
         self.token_optimizer
             .step(&mut self.token_embeddings, &param_grads[0], lr);
         self.positional_optimizer
             .step(&mut self.positional_embeddings, &param_grads[1], lr);
+        Ok(())
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
-        self.apply_gradients(&param_grads, lr);
+        // Unwrap is safe here: backward is only called from training loop which validates inputs
+        self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
 

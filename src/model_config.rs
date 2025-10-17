@@ -12,12 +12,13 @@ pub enum ArchitectureType {
 }
 
 /// Positional encoding type for attention mechanism
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PositionalEncodingType {
     /// Learned positional embeddings (standard absolute positional embeddings)
     /// - Parameters: max_seq_len × embedding_dim learned weights
     /// - Used in original Transformer, GPT-2, GPT-3
     /// - Simple and effective for fixed-length contexts
+    #[default]
     Learned,
 
     /// RoPE (Rotary Positional Encoding): Geometric position encoding
@@ -38,12 +39,6 @@ pub enum PositionalEncodingType {
         /// For example, max_pos=64 works well for context length 1024
         max_pos: usize,
     },
-}
-
-impl Default for PositionalEncodingType {
-    fn default() -> Self {
-        PositionalEncodingType::Learned
-    }
 }
 
 /// Strategy for adapting sliding window size dynamically
@@ -69,12 +64,13 @@ pub enum WindowAdaptationStrategy {
 ///
 /// Implements Mixture-of-Heads (MoH) for dynamic head selection per token.
 /// Based on "MoH: Multi-Head Attention as Mixture-of-Head Attention" (Skywork AI, 2024).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum HeadSelectionStrategy {
     /// All heads always active (standard multi-head attention)
     /// - Zero overhead
     /// - Backward compatible
     /// - Use for baseline comparisons
+    #[default]
     AllHeads,
 
     /// Mixture-of-Heads: dynamic head selection per token
@@ -108,31 +104,25 @@ pub enum HeadSelectionStrategy {
     },
 }
 
-impl Default for HeadSelectionStrategy {
-    fn default() -> Self {
-        HeadSelectionStrategy::AllHeads
-    }
-}
-
 /// Configuration for model architecture and hyperparameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Type of architecture to use
     pub architecture: ArchitectureType,
-    
+
     /// Embedding dimension
     pub embedding_dim: usize,
-    
+
     /// Hidden dimension for feedforward/channel mixing layers
     pub hidden_dim: usize,
-    
+
     /// Number of transformer/hypermixer blocks
     pub num_layers: usize,
-    
+
     /// Hidden dimension for hypernetwork (only used in HyperMixer)
     /// If None, defaults to embedding_dim / 4
     pub hypernetwork_hidden_dim: Option<usize>,
-    
+
     /// Maximum sequence length
     pub max_seq_len: usize,
 
@@ -149,13 +139,8 @@ pub struct ModelConfig {
     pub use_swiglu: bool,
 
     /// Positional encoding type to use
-    /// Default: Learned (for backward compatibility)
+    /// Default: CoPE (modern default for best performance)
     pub positional_encoding: PositionalEncodingType,
-
-    /// DEPRECATED: Use positional_encoding instead
-    /// Kept for backward compatibility during migration
-    #[deprecated(since = "0.2.0", note = "Use positional_encoding field instead")]
-    pub use_rope: bool,
 
     /// Number of key-value heads for Group-Query Attention (GQA)
     /// If None, uses standard Multi-Head Attention (MHA) with num_heads KV heads
@@ -223,8 +208,22 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// Create a new Transformer configuration
-    pub fn transformer(embedding_dim: usize, hidden_dim: usize, num_layers: usize, max_seq_len: usize, hypernetwork_hidden_dim: Option<usize>, num_heads: Option<usize>) -> Self {
+    /// Create a new Transformer configuration with modern defaults
+    ///
+    /// Modern defaults (as of 2024):
+    /// - RMSNorm (faster, more stable than LayerNorm)
+    /// - SwiGLU (better than ReLU/GELU)
+    /// - CoPE positional encoding (better than RoPE/Learned)
+    /// - MHA (can be changed to GQA via num_kv_heads)
+    /// - Full attention (can be changed via window_size)
+    pub fn transformer(
+        embedding_dim: usize,
+        hidden_dim: usize,
+        num_layers: usize,
+        max_seq_len: usize,
+        hypernetwork_hidden_dim: Option<usize>,
+        num_heads: Option<usize>,
+    ) -> Self {
         Self {
             architecture: ArchitectureType::Transformer,
             embedding_dim,
@@ -233,21 +232,20 @@ impl ModelConfig {
             hypernetwork_hidden_dim,
             max_seq_len,
             num_heads,
-            use_rms_norm: false, // Default to LayerNorm for backward compatibility
-            use_swiglu: false,   // Default to FeedForward for backward compatibility
-            positional_encoding: PositionalEncodingType::Learned, // Default for backward compatibility
-            use_rope: false,     // DEPRECATED: kept for backward compatibility
-            num_kv_heads: None,  // Default to MHA for backward compatibility
-            window_size: None,   // Default to full attention for backward compatibility
-            use_adaptive_window: false, // Default to fixed window for backward compatibility
-            min_window_size: 512,       // Reasonable minimum
-            max_window_size: 4096,      // Mistral 7B style
+            use_rms_norm: true, // Modern default: RMSNorm
+            use_swiglu: true,   // Modern default: SwiGLU
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
+            num_kv_heads: None,         // Default to MHA (can be changed to GQA)
+            window_size: None, // Default to full attention (can be changed to sliding window)
+            use_adaptive_window: false, // Default to fixed window
+            min_window_size: 512, // Reasonable minimum
+            max_window_size: 4096, // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
+            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads (can be changed to MoH)
         }
     }
-    
-    /// Create a new HyperMixer configuration
+
+    /// Create a new HyperMixer configuration with modern defaults
     pub fn hypermixer(
         embedding_dim: usize,
         hidden_dim: usize,
@@ -264,23 +262,23 @@ impl ModelConfig {
             hypernetwork_hidden_dim,
             max_seq_len,
             num_heads,
-            use_rms_norm: false, // Default to LayerNorm for backward compatibility
-            use_swiglu: false,   // Default to FeedForward for backward compatibility
-            positional_encoding: PositionalEncodingType::Learned, // Default for backward compatibility
-            use_rope: false,     // DEPRECATED: kept for backward compatibility
-            num_kv_heads: None,  // Default to MHA for backward compatibility
-            window_size: None,   // Default to full attention for backward compatibility
-            use_adaptive_window: false, // Default to fixed window for backward compatibility
+            use_rms_norm: true, // Modern default: RMSNorm
+            use_swiglu: true,   // Modern default: SwiGLU
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
+            num_kv_heads: None,                                                // Default to MHA
+            window_size: None,          // Default to full attention
+            use_adaptive_window: false, // Default to fixed window
             min_window_size: 512,       // Reasonable minimum
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
+            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
         }
     }
 
     /// Get the hypernetwork hidden dimension, using default if not specified
     pub fn get_hypernetwork_hidden_dim(&self) -> usize {
-        self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4)
+        self.hypernetwork_hidden_dim
+            .unwrap_or(self.embedding_dim / 4)
     }
 
     /// Get the number of attention heads, using default if not specified
@@ -328,17 +326,16 @@ impl ModelConfig {
             hypernetwork_hidden_dim: Some(low_steps_per_cycle),
             max_seq_len,
             num_heads: None,
-            use_rms_norm: false, // Default to LayerNorm for backward compatibility
-            use_swiglu: false,   // Default to FeedForward for backward compatibility
-            positional_encoding: PositionalEncodingType::Learned, // Default for backward compatibility
-            use_rope: false,     // DEPRECATED: kept for backward compatibility
-            num_kv_heads: None,  // Default to MHA for backward compatibility
-            window_size: None,   // Default to full attention for backward compatibility
-            use_adaptive_window: false, // Default to fixed window for backward compatibility
+            use_rms_norm: true, // Modern default: RMSNorm
+            use_swiglu: true,   // Modern default: SwiGLU
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
+            num_kv_heads: None,                                                // Default to MHA
+            window_size: None,          // Default to full attention
+            use_adaptive_window: false, // Default to fixed window
             min_window_size: 512,       // Reasonable minimum
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
+            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
         }
     }
 
@@ -358,4 +355,3 @@ impl Default for ModelConfig {
         Self::transformer(128, 256, 3, 80, None, Some(8))
     }
 }
-
