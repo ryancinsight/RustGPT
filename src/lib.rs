@@ -16,6 +16,8 @@ pub mod layer_norm;
 pub mod rms_norm;
 pub mod rope;
 pub mod cop;
+pub mod routing;
+pub mod head_router;
 pub mod llm;
 pub mod model_builder;
 pub mod model_config;
@@ -41,7 +43,8 @@ pub use hypernetwork::Hypernetwork;
 pub use hypermixer::HyperMixerBlock;
 pub use llm::{LLM, Layer, LayerEnum};
 pub use model_builder::{build_network, print_architecture_summary};
-pub use model_config::{ArchitectureType, ModelConfig, PositionalEncodingType, WindowAdaptationStrategy};
+pub use model_config::{ArchitectureType, HeadSelectionStrategy, ModelConfig, PositionalEncodingType, WindowAdaptationStrategy};
+pub use head_router::HeadRouter;
 pub use token_mixing::TokenMixingMLP;
 pub use vocab::Vocab;
 

@@ -9,7 +9,8 @@ use crate::adam::Adam;
 use crate::llm::Layer;
 use crate::rope::RotaryEmbedding;
 use crate::cop::ContextualPositionEncoding;
-use crate::model_config::WindowAdaptationStrategy;
+use crate::model_config::{HeadSelectionStrategy, WindowAdaptationStrategy};
+use crate::head_router::HeadRouter;
 
 /// Positional encoding variant used in attention
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -80,6 +81,16 @@ pub struct SelfAttention {
     /// Attention entropy from last forward pass (for AttentionEntropy strategy)
     #[serde(skip)]
     last_attention_entropy: Option<f32>,
+
+    /// Head selection strategy (AllHeads, MixtureOfHeads, StaticPruning)
+    head_selection: HeadSelectionStrategy,
+
+    /// Router for Mixture-of-Heads (if enabled)
+    router: Option<HeadRouter>,
+
+    /// Cached head activation mask from last forward pass (for backward)
+    #[serde(skip)]
+    cached_head_mask: Option<Array2<bool>>,
 }
 
 impl Default for SelfAttention {
@@ -293,6 +304,9 @@ impl SelfAttention {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             current_window_size: None,
             last_attention_entropy: None,
+            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
+            router: None,
+            cached_head_mask: None,
         }
     }
 
@@ -365,6 +379,9 @@ impl SelfAttention {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             current_window_size: None,
             last_attention_entropy: None,
+            head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
+            router: None,
+            cached_head_mask: None,
         }
     }
 
@@ -390,6 +407,56 @@ impl SelfAttention {
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
         }
+    }
+
+    /// Set the head selection strategy for this attention layer
+    ///
+    /// This method should be called after construction to enable MoH or other head selection strategies.
+    ///
+    /// # Arguments
+    ///
+    /// * `strategy` - The head selection strategy to use
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut attention = SelfAttention::new_with_positional_encoding(...);
+    /// attention.set_head_selection(HeadSelectionStrategy::MixtureOfHeads {
+    ///     num_shared_heads: 2,
+    ///     num_active_routed_heads: 4,
+    ///     load_balance_weight: 0.01,
+    /// });
+    /// ```
+    pub fn set_head_selection(&mut self, strategy: HeadSelectionStrategy) {
+        self.head_selection = strategy.clone();
+
+        // Initialize router if MoH is enabled
+        match &strategy {
+            HeadSelectionStrategy::MixtureOfHeads {
+                num_shared_heads,
+                num_active_routed_heads,
+                load_balance_weight,
+            } => {
+                let num_routed_heads = self.num_heads - num_shared_heads;
+                self.router = Some(HeadRouter::new(
+                    self.embedding_dim,
+                    *num_shared_heads,
+                    num_routed_heads,
+                    *num_active_routed_heads,
+                    *load_balance_weight,
+                ));
+            }
+            _ => {
+                self.router = None;
+            }
+        }
+    }
+
+    /// Get the load balance loss from the router (if MoH is enabled)
+    ///
+    /// Returns 0.0 if MoH is not enabled or no routing has been performed yet.
+    pub fn get_load_balance_loss(&self) -> f32 {
+        self.router.as_ref().map_or(0.0, |r| r.compute_load_balance_loss())
     }
 }
 
@@ -456,6 +523,9 @@ impl AdaptiveWindowBuilder {
             window_adaptation_strategy: self.window_adaptation_strategy,
             current_window_size: None,
             last_attention_entropy: None,
+            head_selection: HeadSelectionStrategy::AllHeads,
+            router: None,
+            cached_head_mask: None,
         }
     }
 }
@@ -654,6 +724,33 @@ impl Layer for SelfAttention {
             self.window_size
         };
 
+        // Compute head activation mask if MoH is enabled
+        let head_mask = if let Some(router) = &mut self.router {
+            let mask = router.route(input);
+            self.cached_head_mask = Some(mask.clone());
+            Some(mask)
+        } else {
+            // AllHeads or StaticPruning: create mask based on strategy
+            match &self.head_selection {
+                HeadSelectionStrategy::AllHeads => None, // All heads active
+                HeadSelectionStrategy::StaticPruning { num_active_heads } => {
+                    // Only first K heads active
+                    let mut mask = Array2::<bool>::from_elem((seq_len, self.num_heads), false);
+                    for token_idx in 0..seq_len {
+                        for head_idx in 0..*num_active_heads {
+                            mask[[token_idx, head_idx]] = true;
+                        }
+                    }
+                    self.cached_head_mask = Some(mask.clone());
+                    Some(mask)
+                }
+                HeadSelectionStrategy::MixtureOfHeads { .. } => {
+                    // Should not reach here (router should be initialized)
+                    None
+                }
+            }
+        };
+
         // Split input into heads: (seq_len, emb_dim) -> num_heads × (seq_len, head_dim)
         let mut head_inputs = Vec::new();
         for h in 0..self.num_heads {
@@ -714,33 +811,63 @@ impl Layer for SelfAttention {
         }
 
         // Process each query head with its corresponding KV head (GQA grouping)
+        // Apply head masking if enabled (MoH or StaticPruning)
         let head_outputs: Vec<Array2<f32>> = queries.iter().enumerate().map(|(h, q)| {
-            // Determine which KV head this query head uses
-            let kv_idx = h / queries_per_kv;
-            let k = &keys[kv_idx];
-            let v = &values[kv_idx];
+            // Check if this head is active
+            let is_head_active = if let Some(mask) = &head_mask {
+                // Check if ANY token activates this head (for per-token routing)
+                // We'll apply per-token masking later during concatenation
+                mask.column(h).iter().any(|&active| active)
+            } else {
+                true // AllHeads: all heads always active
+            };
 
-            // Compute attention for this head with adaptive or fixed sliding window
-            // For CoPE, we need to add position logits to attention scores
-            match &self.positional_encoding {
-                PositionalEncodingVariant::CoPE(cope_heads) => {
-                    // Apply CoPE: compute position logits and add to attention scores
-                    let position_logits = cope_heads[h].apply(q, k);
-                    self.heads[h].attention_with_position_bias(q, k, v, &position_logits, effective_window_size)
-                }
-                _ => {
-                    // Standard attention (Learned or RoPE)
-                    self.heads[h].attention(q, k, v, effective_window_size)
+            if !is_head_active {
+                // Head is completely inactive: return zeros
+                Array2::zeros((seq_len, head_dim))
+            } else {
+                // Determine which KV head this query head uses
+                let kv_idx = h / queries_per_kv;
+                let k = &keys[kv_idx];
+                let v = &values[kv_idx];
+
+                // Compute attention for this head with adaptive or fixed sliding window
+                // For CoPE, we need to add position logits to attention scores
+                match &self.positional_encoding {
+                    PositionalEncodingVariant::CoPE(cope_heads) => {
+                        // Apply CoPE: compute position logits and add to attention scores
+                        let position_logits = cope_heads[h].apply(q, k);
+                        self.heads[h].attention_with_position_bias(q, k, v, &position_logits, effective_window_size)
+                    }
+                    _ => {
+                        // Standard attention (Learned or RoPE)
+                        self.heads[h].attention(q, k, v, effective_window_size)
+                    }
                 }
             }
         }).collect();
 
         // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
+        // Apply per-token masking if MoH is enabled
         let mut output = Array2::zeros((seq_len, emb_dim));
         for (h, head_output) in head_outputs.iter().enumerate().take(self.num_heads) {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
-            output.slice_mut(ndarray::s![.., start_col..end_col]).assign(head_output);
+
+            // Apply per-token masking if head_mask is present
+            if let Some(mask) = &head_mask {
+                // For each token, only include this head's output if it's active
+                for token_idx in 0..seq_len {
+                    if mask[[token_idx, h]] {
+                        let head_row = head_output.row(token_idx);
+                        output.slice_mut(ndarray::s![token_idx, start_col..end_col]).assign(&head_row);
+                    }
+                    // else: leave as zeros (head inactive for this token)
+                }
+            } else {
+                // No masking: assign all head outputs
+                output.slice_mut(ndarray::s![.., start_col..end_col]).assign(head_output);
+            }
         }
 
         output + input // residual connection
@@ -762,7 +889,10 @@ impl Layer for SelfAttention {
         // Only num_kv_heads have W_k and W_v
         let kv_params = self.num_kv_heads * 2 * head_dim * head_dim;
 
-        q_params + kv_params
+        // Add router parameters if MoH is enabled
+        let router_params = self.router.as_ref().map_or(0, |r| r.parameters());
+
+        q_params + kv_params + router_params
     }
 
     fn compute_gradients(
