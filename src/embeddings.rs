@@ -40,13 +40,20 @@ impl Embeddings {
 
     fn init_embeddings(vocab_size: usize, embedding_dim: usize) -> Array2<f32> {
         let mut rng = rand::rng();
-        let normal = Normal::new(0.0, 0.02).unwrap(); // Increased for better learning
+        // Proper embedding initialization: std = 1 / sqrt(embedding_dim)
+        // Reference: "Attention is All You Need" (Vaswani et al., 2017)
+        // This prevents gradient explosion in early layers
+        let std = 1.0 / (embedding_dim as f32).sqrt();
+        let normal = Normal::new(0.0, std).unwrap();
         Array2::from_shape_fn((vocab_size, embedding_dim), |_| normal.sample(&mut rng))
     }
 
     fn init_positional_embeddings(max_seq_len: usize, embedding_dim: usize) -> Array2<f32> {
         let mut rng = rand::rng();
-        let normal = Normal::new(0.0, 0.02).unwrap(); // Increased for better learning
+        // Positional embeddings use same initialization as token embeddings
+        // Reference: "Attention is All You Need" (Vaswani et al., 2017)
+        let std = 1.0 / (embedding_dim as f32).sqrt();
+        let normal = Normal::new(0.0, std).unwrap();
         Array2::from_shape_fn((max_seq_len, embedding_dim), |_| normal.sample(&mut rng))
     }
 

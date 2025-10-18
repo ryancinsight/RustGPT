@@ -55,11 +55,14 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 
 /// Build Transformer architecture layers
 ///
-/// Creates the standard transformer architecture with:
-/// - Self-attention layers (with optional RoPE)
+/// Creates the Pre-LN transformer architecture with:
+/// - Self-attention layers (with optional RoPE/CoPE)
 /// - Layer normalization or RMSNorm (based on config)
 /// - Feedforward networks or SwiGLU (based on config)
 /// - Residual connections (handled within layers)
+/// - Final normalization layer (required for Pre-LN stability)
+///
+/// Reference: "On Layer Normalization in the Transformer Architecture" (Xiong et al., 2020)
 fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let num_heads = config.get_num_heads();
     let num_kv_heads = config.get_num_kv_heads();
@@ -123,6 +126,15 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         } else {
             layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
         }
+    }
+
+    // Final normalization layer (critical for Pre-LN Transformer stability)
+    // Reference: "On Layer Normalization in the Transformer Architecture" (Xiong et al., 2020)
+    // Pre-LN requires a final norm before the output projection to stabilize gradients
+    if config.use_rms_norm {
+        layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
+    } else {
+        layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
     }
 }
 
