@@ -5,6 +5,7 @@ use crate::{
     hypermixer::HyperMixerBlock,
     layer_norm::LayerNorm,
     llm::{Layer, LayerEnum},
+    moe::MoELayer,
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     rms_norm::RMSNorm,
@@ -107,13 +108,25 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
         }
 
-        // Feedforward layer (FeedForward or SwiGLU based on config)
-        if config.use_swiglu {
+        // Feedforward layer (MoE, SwiGLU, or FeedForward based on config)
+        if config.use_moe {
+            // Use Mixture of Experts
+            layers.push(LayerEnum::MoE(Box::new(MoELayer::new(
+                config.embedding_dim,
+                config.expert_hidden_dim,
+                config.num_experts,
+                config.num_active_experts,
+                config.moe_load_balance_weight,
+                config.moe_router_z_loss_weight,
+            ))));
+        } else if config.use_swiglu {
+            // Use SwiGLU
             layers.push(LayerEnum::SwiGLU(Box::new(SwiGLU::new(
                 config.embedding_dim,
                 config.hidden_dim,
             ))));
         } else {
+            // Use standard FeedForward
             layers.push(LayerEnum::FeedForward(Box::new(FeedForward::new(
                 config.embedding_dim,
                 config.hidden_dim,

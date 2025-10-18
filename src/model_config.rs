@@ -205,6 +205,60 @@ pub struct ModelConfig {
     ///
     /// Default: AllHeads (backward compatible)
     pub head_selection: HeadSelectionStrategy,
+
+    /// Use Mixture of Experts (MoE) instead of standard feedforward layers
+    ///
+    /// If true, replaces SwiGLU/FeedForward with sparse MoE layers
+    /// Each MoE layer contains multiple expert networks with learned routing
+    ///
+    /// Benefits:
+    /// - Increased model capacity without proportional compute increase
+    /// - Sparse activation (only k out of N experts active per token)
+    /// - Better specialization through expert routing
+    ///
+    /// Default: false (use standard feedforward for backward compatibility)
+    pub use_moe: bool,
+
+    /// Number of expert networks in each MoE layer
+    ///
+    /// Only used when use_moe = true
+    /// Typical values: 4, 8, 16
+    ///
+    /// Default: 4 (balance between capacity and complexity)
+    pub num_experts: usize,
+
+    /// Number of experts to activate per token (k in top-k routing)
+    ///
+    /// Only used when use_moe = true
+    /// Typical values: 1 (Switch Transformers), 2 (Mixtral)
+    ///
+    /// Default: 2 (Mixtral-style, more stable than top-1)
+    pub num_active_experts: usize,
+
+    /// Hidden dimension for each expert network
+    ///
+    /// Only used when use_moe = true
+    /// Should be smaller than hidden_dim to maintain parameter count
+    /// Typical: hidden_dim / num_experts or hidden_dim / (num_experts / 2)
+    ///
+    /// Default: hidden_dim / 4 (for 4 experts, maintains ~same params)
+    pub expert_hidden_dim: usize,
+
+    /// Weight for MoE load balance loss
+    ///
+    /// Only used when use_moe = true
+    /// Encourages uniform expert utilization
+    ///
+    /// Default: 0.01 (standard in literature)
+    pub moe_load_balance_weight: f32,
+
+    /// Weight for MoE router z-loss
+    ///
+    /// Only used when use_moe = true
+    /// Prevents routing logits from growing too large
+    ///
+    /// Default: 0.001 (standard in literature)
+    pub moe_router_z_loss_weight: f32,
 }
 
 impl ModelConfig {
@@ -242,6 +296,12 @@ impl ModelConfig {
             max_window_size: 4096, // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads (can be changed to MoH)
+            use_moe: false, // Default to standard feedforward (can be changed to MoE)
+            num_experts: 4, // 4 experts (balance between capacity and complexity)
+            num_active_experts: 2, // Top-2 routing (Mixtral-style)
+            expert_hidden_dim: hidden_dim / 4, // Maintain parameter count
+            moe_load_balance_weight: 0.01, // Standard load balance weight
+            moe_router_z_loss_weight: 0.001, // Standard router z-loss weight
         }
     }
 
@@ -272,6 +332,12 @@ impl ModelConfig {
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
+            use_moe: false, // Default to standard feedforward
+            num_experts: 4,
+            num_active_experts: 2,
+            expert_hidden_dim: hidden_dim / 4,
+            moe_load_balance_weight: 0.01,
+            moe_router_z_loss_weight: 0.001,
         }
     }
 
@@ -336,6 +402,12 @@ impl ModelConfig {
             max_window_size: 4096,      // Mistral 7B style
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
+            use_moe: false, // Default to standard feedforward
+            num_experts: 4,
+            num_active_experts: 2,
+            expert_hidden_dim: hidden_dim / 4,
+            moe_load_balance_weight: 0.01,
+            moe_router_z_loss_weight: 0.001,
         }
     }
 

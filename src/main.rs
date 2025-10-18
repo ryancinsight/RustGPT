@@ -327,6 +327,48 @@ fn main() -> llm::Result<()> {
     config.window_adaptation_strategy = window_adaptation_strategy;
     config.head_selection = head_selection;
 
+    // ============================================================================
+    // MIXTURE OF EXPERTS (MoE) CONFIGURATION
+    // ============================================================================
+    // Enable sparse MoE for increased model capacity
+    //
+    // When enabled, replaces standard feedforward layers with sparse MoE layers
+    // Each MoE layer contains multiple expert networks with learned routing
+    //
+    // Configuration:
+    //   - use_moe: Enable MoE (false = standard feedforward)
+    //   - num_experts: Total number of experts (4, 8, 16)
+    //   - num_active_experts: Experts to activate per token (1 = Switch, 2 = Mixtral)
+    //   - expert_hidden_dim: Hidden dim for each expert (smaller than hidden_dim)
+    //
+    // Benefits:
+    //   - Increased model capacity without proportional compute increase
+    //   - Sparse activation (only k/N experts active per token)
+    //   - Expert specialization through learned routing
+    //
+    // Parameter Budget (for 4 experts, top-2, expert_hidden_dim=64):
+    //   - Baseline SwiGLU: 3 × (128×256) = 196,608 params
+    //   - MoE: 4 × 3 × (128×64) + router = 196,608 + 512 = 197,120 params
+    //   - Overhead: +0.26% (within budget)
+    //
+    // Recommended configurations:
+    //   - use_moe = false: Standard feedforward (baseline)
+    //   - use_moe = true, num_experts = 4, num_active_experts = 2: Balanced (recommended)
+    //   - use_moe = true, num_experts = 8, num_active_experts = 2: Higher capacity
+    // ============================================================================
+
+    let use_moe: bool = false; // Enable MoE (false = standard feedforward) - DISABLED: See docs/MOE_IMPLEMENTATION_STATUS.md
+    let num_experts: usize = 4; // Total number of experts
+    let num_active_experts: usize = 2; // Experts to activate per token (top-k)
+    let expert_hidden_dim: usize = HIDDEN_DIM / 2; // Hidden dim for each expert (128, so 2 experts = 256 total)
+
+    config.use_moe = use_moe;
+    config.num_experts = num_experts;
+    config.num_active_experts = num_active_experts;
+    config.expert_hidden_dim = expert_hidden_dim;
+    config.moe_load_balance_weight = 0.0; // Disable load balance loss for debugging
+    config.moe_router_z_loss_weight = 0.0; // Disable router z-loss for debugging
+
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
 
