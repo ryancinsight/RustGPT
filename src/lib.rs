@@ -16,6 +16,7 @@ pub mod hypermixer;
 pub mod hypernetwork;
 pub mod layer_norm;
 pub mod llm;
+pub mod moe;
 pub mod model_builder;
 pub mod model_config;
 pub mod model_persistence;
@@ -45,6 +46,7 @@ pub use hrm_low_level::LowLevelModule;
 pub use hypermixer::HyperMixerBlock;
 pub use hypernetwork::Hypernetwork;
 pub use llm::{LLM, Layer, LayerEnum};
+pub use moe::{MoELayer, Router};
 pub use model_builder::{build_network, print_architecture_summary};
 pub use model_config::{
     ArchitectureType, HeadSelectionStrategy, ModelConfig, PositionalEncodingType,

@@ -19,6 +19,7 @@ pub enum LayerEnum {
     SelfAttention(Box<crate::self_attention::SelfAttention>),
     FeedForward(Box<crate::feed_forward::FeedForward>),
     SwiGLU(Box<crate::swiglu::SwiGLU>),
+    MoE(Box<crate::moe::MoELayer>),
     LayerNorm(crate::layer_norm::LayerNorm),
     RMSNorm(crate::rms_norm::RMSNorm),
     OutputProjection(OutputProjection),
@@ -33,6 +34,7 @@ impl Layer for LayerEnum {
             LayerEnum::SelfAttention(layer) => layer.layer_type(),
             LayerEnum::FeedForward(layer) => layer.layer_type(),
             LayerEnum::SwiGLU(layer) => layer.layer_type(),
+            LayerEnum::MoE(layer) => layer.layer_type(),
             LayerEnum::LayerNorm(layer) => layer.layer_type(),
             LayerEnum::RMSNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
@@ -47,6 +49,7 @@ impl Layer for LayerEnum {
             LayerEnum::SelfAttention(layer) => layer.forward(input),
             LayerEnum::FeedForward(layer) => layer.forward(input),
             LayerEnum::SwiGLU(layer) => layer.forward(input),
+            LayerEnum::MoE(layer) => layer.forward(input),
             LayerEnum::LayerNorm(layer) => layer.forward(input),
             LayerEnum::RMSNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
@@ -65,6 +68,7 @@ impl Layer for LayerEnum {
             LayerEnum::SelfAttention(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::FeedForward(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::SwiGLU(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::MoE(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::LayerNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::RMSNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
@@ -79,6 +83,7 @@ impl Layer for LayerEnum {
             LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::FeedForward(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::SwiGLU(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::MoE(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::LayerNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::RMSNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
@@ -93,6 +98,7 @@ impl Layer for LayerEnum {
             LayerEnum::SelfAttention(layer) => layer.backward(grads, lr),
             LayerEnum::FeedForward(layer) => layer.backward(grads, lr),
             LayerEnum::SwiGLU(layer) => layer.backward(grads, lr),
+            LayerEnum::MoE(layer) => layer.backward(grads, lr),
             LayerEnum::LayerNorm(layer) => layer.backward(grads, lr),
             LayerEnum::RMSNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
@@ -107,6 +113,7 @@ impl Layer for LayerEnum {
             LayerEnum::SelfAttention(layer) => layer.parameters(),
             LayerEnum::FeedForward(layer) => layer.parameters(),
             LayerEnum::SwiGLU(layer) => layer.parameters(),
+            LayerEnum::MoE(layer) => layer.parameters(),
             LayerEnum::LayerNorm(layer) => layer.parameters(),
             LayerEnum::RMSNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
@@ -301,7 +308,7 @@ impl LLM {
         lr: f32,
         batch_size: usize,
     ) -> Result<()> {
-        self.train_with_warmup(data, epochs, lr, batch_size, 10) // 10 warmup epochs by default
+        self.train_with_warmup(data, epochs, lr, batch_size, 15) // 15 warmup epochs for better stability
     }
 
     /// Train with learning rate warmup for stability
@@ -328,11 +335,20 @@ impl LLM {
             let mut total_grad_norm = 0.0;
             let mut batch_count = 0;
 
-            // Learning rate warmup: linearly increase from 0 to target_lr
+            // Learning rate warmup + cosine annealing
+            // Reference: "SGDR: Stochastic Gradient Descent with Warm Restarts" (Loshchilov & Hutter, 2016)
             let effective_lr = if epoch < warmup_epochs {
+                // Linear warmup: gradually increase LR from 0 to target
                 target_lr * ((epoch + 1) as f32 / warmup_epochs as f32)
             } else {
-                target_lr
+                // Cosine annealing after warmup to escape loss plateaus
+                // Formula: lr_t = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(π * t / T))
+                let t = (epoch - warmup_epochs) as f32;
+                let t_max = (epochs - warmup_epochs) as f32;
+                let lr_min = target_lr * 0.10; // Minimum LR is 10% of base LR (gentler decay)
+                let lr_max = target_lr;
+
+                lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
             };
 
             // Process data in batches
@@ -540,15 +556,98 @@ impl LLM {
             grad_norm = clipped_total_grad_norm_sq.sqrt();
         }
 
-        // Apply accumulated and averaged gradients
-        for (layer, averaged_grads) in self.network.iter_mut().zip(averaged_grads_per_layer) {
+        // Apply accumulated and averaged gradients with layer-wise adaptive learning rates
+        // Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
+        // Formula: lr_layer = lr_base * trust_coef * ||W|| / (||∇W|| + weight_decay * ||W|| + ε)
+        // This balances gradient flow across layers of different depths
+
+        // Compute adaptive learning rates for all layers first (to avoid borrow checker issues)
+        let adaptive_lrs: Vec<f32> = self.network.iter()
+            .zip(&averaged_grads_per_layer)
+            .enumerate()
+            .map(|(layer_idx, (layer, grads))| {
+                if grads.is_empty() {
+                    lr
+                } else {
+                    Self::compute_layer_adaptive_lr_static(layer, grads, lr, layer_idx)
+                }
+            })
+            .collect();
+
+        // Apply gradients with computed adaptive learning rates
+        for ((layer, averaged_grads), adaptive_lr) in self.network.iter_mut()
+            .zip(averaged_grads_per_layer)
+            .zip(adaptive_lrs)
+        {
             if !averaged_grads.is_empty() {
-                layer.apply_gradients(&averaged_grads, lr)?;
+                layer.apply_gradients(&averaged_grads, adaptive_lr)?;
             }
         }
 
         Ok((batch_loss, grad_norm))
     }
+    /// Compute layer-wise adaptive learning rate using bidirectional LARS
+    /// Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
+    ///
+    /// Bidirectional approach: Balance gradient flow across all layers
+    /// - High-gradient layers (L0-L2): Reduce LR to prevent over-updating
+    /// - Low-gradient layers (L6-L14): Increase LR to prevent under-updating
+    /// - Target: All layers converge at similar rates
+    ///
+    /// Formula: lr_layer = lr_base * (target_norm / (grad_norm + ε))^power
+    /// where power controls aggressiveness (0.5 = gentle, 1.0 = aggressive)
+    fn compute_layer_adaptive_lr_static(
+        layer: &LayerEnum,
+        grads: &[Array2<f32>],
+        base_lr: f32,
+        layer_idx: usize,
+    ) -> f32 {
+        // Skip for layers without gradients
+        if grads.is_empty() {
+            return base_lr;
+        }
+
+        // Compute gradient norm ||∇W||
+        let grad_norm: f32 = grads.iter()
+            .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
+            .sum::<f32>()
+            .sqrt();
+
+        // Avoid division by zero
+        const EPSILON: f32 = 1e-6;
+        if grad_norm < EPSILON {
+            return base_lr;
+        }
+
+        // Bidirectional LARS: Target gradient norm for balanced learning
+        // Target chosen based on observed mid-layer gradients (L3-L5: ~2-4)
+        const TARGET_GRAD_NORM: f32 = 3.0;
+        const POWER: f32 = 0.5; // Gentle adaptation (sqrt scaling)
+
+        // Compute scaling factor
+        let scale = (TARGET_GRAD_NORM / (grad_norm + EPSILON)).powf(POWER);
+
+        // Clamp to reasonable range to prevent extreme adjustments
+        // 0.3x-3.0x range allows significant adaptation while maintaining stability
+        let scale_clamped = scale.clamp(0.3, 3.0);
+        let adaptive_lr = base_lr * scale_clamped;
+
+        // Log adaptive LR for all layers to monitor balance
+        if layer_idx <= 2 || layer_idx >= 12 {
+            tracing::info!(
+                layer_idx = layer_idx,
+                layer_type = layer.layer_type(),
+                grad_norm = grad_norm,
+                base_lr = base_lr,
+                adaptive_lr = adaptive_lr,
+                scale = scale_clamped,
+                "Bidirectional LARS"
+            );
+        }
+
+        adaptive_lr
+    }
+
     /// Configure gradient clipping strategy
     pub fn set_gradient_clipping(&mut self, clipper: Box<dyn GradientClipping>) {
         self.gradient_clipper = Some(clipper);
