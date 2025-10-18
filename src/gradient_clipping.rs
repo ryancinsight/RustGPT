@@ -233,6 +233,104 @@ impl GradientClipping for ElementWiseClipping {
     }
 }
 
+/// True Adaptive Gradient Clipping (AGC) from Brock et al. 2021
+/// Reference: "High-Performance Large-Scale Image Recognition Without Normalization"
+///
+/// AGC clips gradients based on the ratio of gradient norm to parameter norm:
+///   g_i ← g_i * min(1, λ * ||w_i|| / (||g_i|| + ε))
+///
+/// where:
+/// - g_i: gradient for parameter i
+/// - w_i: parameter i
+/// - λ: clipping threshold (typically 0.01-0.1)
+/// - ε: small constant for numerical stability (typically 1e-3)
+///
+/// This is more adaptive than global norm clipping because it considers
+/// the scale of each parameter group separately.
+#[derive(Clone, Debug)]
+pub struct TrueAGC {
+    /// Clipping threshold λ (typically 0.01-0.1)
+    pub lambda: f32,
+    /// Numerical stability constant ε (typically 1e-3)
+    pub epsilon: f32,
+}
+
+impl TrueAGC {
+    /// Create a new AGC clipper with default parameters
+    pub fn new() -> Self {
+        Self {
+            lambda: 0.01,
+            epsilon: 1e-3,
+        }
+    }
+
+    /// Create a new AGC clipper with custom parameters
+    pub fn with_params(lambda: f32, epsilon: f32) -> Self {
+        Self { lambda, epsilon }
+    }
+
+    /// Apply AGC to a single parameter-gradient pair
+    /// This should be called per-parameter, not globally
+    pub fn clip_parameter_gradient(
+        &self,
+        param: &Array2<f32>,
+        grad: &mut Array2<f32>,
+    ) {
+        // Compute parameter norm
+        let param_norm = param.iter().map(|&x| x * x).sum::<f32>().sqrt();
+
+        // Compute gradient norm
+        let grad_norm = grad.iter().map(|&x| x * x).sum::<f32>().sqrt();
+
+        // Compute clipping coefficient
+        let clip_coef = self.lambda * param_norm / (grad_norm + self.epsilon);
+
+        // Apply clipping if needed
+        if clip_coef < 1.0 {
+            grad.mapv_inplace(|x| x * clip_coef);
+        }
+    }
+}
+
+impl Default for TrueAGC {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GradientClipping for TrueAGC {
+    fn clip_gradients(&mut self, grads: &mut Array2<f32>) {
+        // Note: This implementation assumes grads is a single parameter's gradients
+        // For proper AGC, we need access to the parameters themselves
+        // This is a simplified version that uses gradient norm only
+
+        // Handle NaN/inf values
+        grads.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+
+        // Simplified AGC without parameter access:
+        // Use gradient norm as a proxy for parameter norm
+        let grad_norm = grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
+
+        if grad_norm > 0.0 {
+            // Assume parameter norm is proportional to gradient norm
+            // This is a rough approximation
+            let estimated_param_norm = grad_norm * 10.0; // Heuristic scaling
+            let clip_coef = self.lambda * estimated_param_norm / (grad_norm + self.epsilon);
+
+            if clip_coef < 1.0 {
+                grads.mapv_inplace(|x| x * clip_coef);
+            }
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn GradientClipping> {
+        Box::new(Self {
+            lambda: self.lambda,
+            epsilon: self.epsilon,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

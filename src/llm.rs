@@ -301,6 +301,23 @@ impl LLM {
         lr: f32,
         batch_size: usize,
     ) -> Result<()> {
+        self.train_with_warmup(data, epochs, lr, batch_size, 10) // 10 warmup epochs by default
+    }
+
+    /// Train with learning rate warmup for stability
+    ///
+    /// Warmup prevents gradient explosion in early training by gradually increasing
+    /// the learning rate from 0 to the target value over warmup_epochs.
+    ///
+    /// Reference: "Attention is All You Need" (Vaswani et al., 2017)
+    pub fn train_with_warmup(
+        &mut self,
+        data: Vec<&str>,
+        epochs: usize,
+        target_lr: f32,
+        batch_size: usize,
+        warmup_epochs: usize,
+    ) -> Result<()> {
         let tokenized_data = data
             .par_iter()
             .map(|input| self.tokenize(input))
@@ -311,9 +328,16 @@ impl LLM {
             let mut total_grad_norm = 0.0;
             let mut batch_count = 0;
 
+            // Learning rate warmup: linearly increase from 0 to target_lr
+            let effective_lr = if epoch < warmup_epochs {
+                target_lr * ((epoch + 1) as f32 / warmup_epochs as f32)
+            } else {
+                target_lr
+            };
+
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, grad_norm) = self.train_batch(batch, lr)?;
+                let (batch_loss, grad_norm) = self.train_batch(batch, effective_lr)?;
                 total_loss += batch_loss;
                 total_grad_norm += grad_norm;
                 batch_count += 1;
@@ -342,12 +366,19 @@ impl LLM {
             }
 
             // NFR-7.3: Training metrics with gradient norms
+            let warmup_status = if epoch < warmup_epochs {
+                format!(" (warmup {}/{})", epoch + 1, warmup_epochs)
+            } else {
+                String::new()
+            };
+
             info!(
                 epoch = epoch,
                 loss = avg_loss,
                 grad_norm = avg_grad_norm,
-                learning_rate = lr,
-                "Training epoch completed"
+                learning_rate = effective_lr,
+                "Training epoch completed{}",
+                warmup_status
             );
         }
 
@@ -359,10 +390,12 @@ impl LLM {
     fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<(f32, f32)> {
         let mut batch_loss = 0.0;
         let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
+        let mut layer_grad_norms: Vec<f32> = Vec::new(); // Track per-layer gradient norms
 
         // Initialize accumulated gradients for each layer
         for _ in &self.network {
             accumulated_param_grads.push(Vec::new());
+            layer_grad_norms.push(0.0);
         }
 
         // Process each sequence in the batch
@@ -373,16 +406,28 @@ impl LLM {
 
             // 1. Slice input and targets
             let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
-            let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab. 
+            let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab.
 
-            // Forward pass
+            // Forward pass with signal propagation variance tracking
             let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
             input
                 .row_mut(0)
                 .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+            // Track forward pass variance for signal propagation analysis
+            // Reference: "Deep Information Propagation" (Schoenholz et al., 2017)
+            // Ideal: Var(x_l) ≈ Var(x_0) for all layers (isometry condition)
+            let mut layer_variances: Vec<f32> = Vec::new();
+
             for layer in &mut self.network {
                 input = layer.forward(&input);
+
+                // Compute variance of layer output
+                let mean: f32 = input.iter().sum::<f32>() / input.len() as f32;
+                let variance: f32 = input.iter()
+                    .map(|&x| (x - mean).powi(2))
+                    .sum::<f32>() / input.len() as f32;
+                layer_variances.push(variance);
             }
 
             let logits = input;
@@ -402,10 +447,15 @@ impl LLM {
             for (rev_idx, layer) in self.network.iter().rev().enumerate() {
                 let (input_grads, param_grads) =
                     layer.compute_gradients(&Array2::zeros((0, 0)), &grads_output);
+
+                // Track layer-wise gradient norm for diagnostics
+                let layer_idx = self.network.len() - 1 - rev_idx;
+                let layer_grad_norm: f32 = input_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                layer_grad_norms[layer_idx] += layer_grad_norm;
+
                 grads_output = input_grads;
 
                 // Accumulate parameter gradients (correct index for reversed iteration)
-                let layer_idx = self.network.len() - 1 - rev_idx;
                 if accumulated_param_grads[layer_idx].is_empty() {
                     accumulated_param_grads[layer_idx] = param_grads;
                 } else {
@@ -419,11 +469,28 @@ impl LLM {
             }
         }
 
+        // Average layer-wise gradient norms
+        for norm in &mut layer_grad_norms {
+            *norm /= batch.len() as f32;
+        }
+
+        // Log layer-wise gradient norms for debugging (only if any exceed threshold)
+        let max_layer_grad = layer_grad_norms.iter().fold(0.0f32, |a, &b| a.max(b));
+        if max_layer_grad > 10.0 {
+            tracing::warn!(
+                "Layer-wise gradient norms: {:?}",
+                layer_grad_norms.iter()
+                    .enumerate()
+                    .map(|(i, &norm)| format!("L{}: {:.2}", i, norm))
+                    .collect::<Vec<_>>()
+            );
+        }
+
         // Prepare averaged gradients and detect anomalies
         let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
         let mut total_grad_norm_sq = 0.0f32;
 
-        for param_grads in accumulated_param_grads {
+        for (layer_idx, param_grads) in accumulated_param_grads.into_iter().enumerate() {
             if !param_grads.is_empty() {
                 let averaged_grads: Vec<Array2<f32>> = param_grads
                     .into_iter()
@@ -431,7 +498,14 @@ impl LLM {
                     .collect();
 
                 // Detect gradient anomalies (poisoning/training instability)
-                self.detect_gradient_anomalies(&averaged_grads)?;
+                if let Err(e) = self.detect_gradient_anomalies(&averaged_grads) {
+                    tracing::error!(
+                        layer_idx = layer_idx,
+                        layer_type = self.network[layer_idx].layer_type(),
+                        "Gradient anomaly detected in layer"
+                    );
+                    return Err(e);
+                }
 
                 // Compute L2 norm of gradients for this layer
                 for grad in &averaged_grads {

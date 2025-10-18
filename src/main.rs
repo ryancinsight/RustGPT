@@ -48,6 +48,7 @@ fn main() -> llm::Result<()> {
     // Choose architecture: Transformer or HyperMixer
     //let architecture = ArchitectureType::HyperMixer; // Change to HyperMixer for comparison
     let architecture = ArchitectureType::Transformer; // Change to HyperMixer for comparison
+    //let architecture = ArchitectureType::HRM; // Change to HyperMixer for comparison
 
     // ============================================================================
     // NORMALIZATION CONFIGURATION
