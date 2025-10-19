@@ -45,10 +45,11 @@ fn main() -> llm::Result<()> {
     //   - Better than static MLPMixer due to input-dependent mixing
     // ============================================================================
 
-    // Choose architecture: Transformer or HyperMixer
+    // Choose architecture: Transformer, HyperMixer, HRM, or TRM
     //let architecture = ArchitectureType::HyperMixer; // Change to HyperMixer for comparison
-    let architecture = ArchitectureType::Transformer; // Change to HyperMixer for comparison
-    //let architecture = ArchitectureType::HRM; // Change to HyperMixer for comparison
+    //let architecture = ArchitectureType::Transformer; // Standard transformer
+    //let architecture = ArchitectureType::HRM; // Hierarchical Reasoning Model
+    let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing)
 
     // ============================================================================
     // NORMALIZATION CONFIGURATION
@@ -251,11 +252,26 @@ fn main() -> llm::Result<()> {
     //   - StaticPruning: Fixed head selection (ablation studies only)
     // ============================================================================
 
-    // Enable MoH with parameter-neutral configuration (default)
-    let head_selection = HeadSelectionStrategy::MixtureOfHeads {
-        num_shared_heads: 2,        // 25% of 8 heads always active
-        num_active_routed_heads: 4, // Top-4 of 6 routed heads (67% of routed)
-        load_balance_weight: 0.01,  // Prevents routing collapse
+    // Head selection strategy (MoH vs standard MHA)
+    // For TRM, use AllHeads to avoid complexity during initial testing
+    let head_selection = if architecture == ArchitectureType::TRM {
+        HeadSelectionStrategy::AllHeads // Standard MHA for TRM (simpler for initial testing)
+    } else {
+        // Enable MoH with fully adaptive routing (optimized based on training logs)
+        HeadSelectionStrategy::MixtureOfHeads {
+            num_shared_heads: 2,                // 25% of 8 heads always active
+            num_active_routed_heads: 4,         // DEPRECATED: not used in adaptive routing (kept for backward compat)
+            load_balance_weight: 0.01,          // Prevents routing collapse
+            threshold_p_base: 0.4,              // OPTIMIZED: Lower base (0.4 vs 0.5) → fewer heads, better loss
+                                                // Layer-wise: early=0.5, middle=0.4, late=0.3
+            dynamic_loss_weight_base: 5e-5,     // OPTIMIZED: Lower weight (5e-5 vs 1e-4) → less aggressive sparsity penalty
+            use_learned_threshold: true,        // ENABLED: Per-token learned thresholds for fine-grained adaptation
+            target_avg_routed_heads: 3.5,       // OPTIMIZED: Increased target (3.5 vs 3.0) → less aggressive sparsity
+            confidence_threshold: 0.4,          // TUNED: Lower threshold (0.4 vs 0.6) → less aggressive fallback
+                                                // Previous: 0.6 caused 50.7% fallback rate and 73% loss increase
+            use_confidence_fallback: false,     // DISABLED: Fallback too conservative, hurts loss significantly
+                                                // Will re-enable after predictor converges better
+        }
     };
 
     // Alternative configurations:
@@ -313,6 +329,11 @@ fn main() -> llm::Result<()> {
             // HRM with N=2 cycles, T=2 steps per cycle, hidden_dim=192 for parameter efficiency
             ModelConfig::hrm(EMBEDDING_DIM, 192, 2, 2, MAX_SEQ_LEN)
         }
+        ArchitectureType::TRM => {
+            // TRM with recursive_depth=5 (single block applied 5 times)
+            // Parameter efficient: O(1) params regardless of depth
+            ModelConfig::trm(EMBEDDING_DIM, HIDDEN_DIM, 5, MAX_SEQ_LEN, Some(8))
+        }
     };
 
     // Apply modern LLM enhancements configuration
@@ -368,6 +389,44 @@ fn main() -> llm::Result<()> {
     config.expert_hidden_dim = expert_hidden_dim;
     config.moe_load_balance_weight = 0.0; // Disable load balance loss for debugging
     config.moe_router_z_loss_weight = 0.0; // Disable router z-loss for debugging
+
+    // ============================================================================
+    // HIERARCHICAL ADAPTIVE ROUTING (MOH + MOE)
+    // ============================================================================
+    // Enable both MoH (attention) and MoE (FFN) for hierarchical adaptive routing
+    //
+    // When both are enabled, creates complementary routing:
+    //   - MoH: Routes tokens to attention heads (efficiency)
+    //   - MoE: Routes tokens to FFN experts (capacity scaling)
+    //
+    // Configuration:
+    //   - use_moh_in_experts: Enable hierarchical routing (both MoH and MoE)
+    //   - Shares adaptive mechanisms: warm-up, annealing, gradient smoothing
+    //   - Independent routing decisions for attention and FFN
+    //
+    // Benefits:
+    //   - Complementary optimizations (attention efficiency + FFN capacity)
+    //   - Shared adaptive mechanisms reduce complexity
+    //   - Hierarchical logging shows both routing patterns
+    //
+    // Note: Currently disabled - MoH is working well standalone
+    // ============================================================================
+
+    let use_moh_in_experts: bool = false; // DISABLED: Hierarchical MoH-in-MoE produces wrong output even with ALL experts active
+    // Optimized settings: more shared heads for stability, fewer routed for simplicity
+    let expert_moh_num_shared_heads: usize = 6;
+    let expert_moh_num_routed_heads: usize = 2;
+    let expert_moh_use_learned_threshold: bool = true;
+
+    config.use_moh_in_experts = use_moh_in_experts;
+    config.expert_moh_num_shared_heads = expert_moh_num_shared_heads;
+    config.expert_moh_num_routed_heads = expert_moh_num_routed_heads;
+    config.expert_moh_use_learned_threshold = expert_moh_use_learned_threshold;
+
+    // TEST: Use ALL experts active (no sparsity) to verify architecture works
+    // If this produces correct output, then the problem is sparse activation
+    // If this still produces wrong output, then the problem is the architecture itself
+    config.num_active_experts = config.num_experts; // 4 active out of 4 total = 100% activation
 
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
@@ -433,14 +492,18 @@ fn main() -> llm::Result<()> {
     llm.train_with_batch_size(pretraining_examples, 100, 0.0001, 8)?;
 
     println!("\n=== INSTRUCTION TUNING ===");
+    // Use same LR as pre-training
+    // Reduced to 100 epochs with fully adaptive MoH (no hardcoded parameters)
+    let instruction_lr = 0.0001;
+    let instruction_epochs = 100;
     println!(
         "Instruction tuning on {} examples for {} epochs with learning rate {}",
         dataset.chat_training_data.len(),
-        100,
-        0.0001
+        instruction_epochs,
+        instruction_lr
     );
 
-    llm.train_with_batch_size(chat_training_examples, 100, 0.0001, 4)?; // Much lower learning rate for stability
+    llm.train_with_batch_size(chat_training_examples, instruction_epochs, instruction_lr, 4)?;
 
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", string);

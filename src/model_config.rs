@@ -9,6 +9,8 @@ pub enum ArchitectureType {
     HyperMixer,
     /// Hierarchical Reasoning Model with two-level recurrent architecture
     HRM,
+    /// Tiny Recursive Model with weight sharing across depth
+    TRM,
 }
 
 /// Positional encoding type for attention mechanism
@@ -73,25 +75,67 @@ pub enum HeadSelectionStrategy {
     #[default]
     AllHeads,
 
-    /// Mixture-of-Heads: dynamic head selection per token
+    /// Mixture-of-Heads: fully adaptive dynamic head selection per token
     /// - Learned routing via router network
-    /// - Shared heads (always active) + routed heads (Top-K)
-    /// - Weighted summation for flexibility
+    /// - Shared heads (always active) + routed heads (adaptive top-p)
+    /// - Per-token learned thresholds (optional)
+    /// - Layer-wise adaptive thresholds
+    /// - Sparsity-based adaptive loss weight
+    /// - Training-progress-based annealing
     /// - Load balance loss to prevent routing collapse
-    /// - Recommended for 5-8% speedup with minimal memory overhead
+    /// - Dynamic loss (entropy minimization) to encourage sparsity
+    /// - Recommended for 30-50% efficiency gain with maintained/improved performance
     MixtureOfHeads {
         /// Number of shared heads (always active, capture common knowledge)
         /// Recommended: 25% of total heads (e.g., 2 out of 8)
         num_shared_heads: usize,
 
-        /// Number of routed heads to activate per token (Top-K)
-        /// Recommended: 50-75% of routed heads
-        /// Example: 8 total, 2 shared, 6 routed → activate 3-4 routed
+        /// Number of routed heads to activate per token (DEPRECATED for adaptive routing)
+        /// Kept for backward compatibility, not used in adaptive top-p routing
+        /// With adaptive routing, each token selects 1-6 routed heads based on confidence
         num_active_routed_heads: usize,
 
         /// Weight for load balance loss (β in paper)
         /// Recommended: 0.01 (prevents routing collapse)
         load_balance_weight: f32,
+
+        /// Base threshold for adaptive top-p routing (adjusted per-layer and per-token)
+        /// Range: 0.0-1.0, typical: 0.4-0.6
+        /// Lower values → fewer heads activated (more efficient, may hurt accuracy)
+        /// Higher values → more heads activated (less efficient, better accuracy)
+        /// Recommended: 0.5 (balanced efficiency and performance)
+        /// Note: Actual threshold varies by layer (early: +0.1, late: -0.1)
+        threshold_p_base: f32,
+
+        /// Base weight for dynamic loss (adjusted adaptively based on sparsity and training progress)
+        /// Typical: 1e-4
+        /// Actual weight = base * sparsity_multiplier * annealing_multiplier
+        /// Prevents model from activating all heads by encouraging confident routing
+        dynamic_loss_weight_base: f32,
+
+        /// Whether to use learned per-token threshold predictor
+        /// If true: each token gets custom threshold based on its representation
+        /// If false: use layer-wise base thresholds only
+        /// Recommended: true for maximum adaptability (adds ~embedding_dim parameters)
+        use_learned_threshold: bool,
+
+        /// Target average number of routed heads for sparsity-based adaptation
+        /// Typical: 3.0 (for 6 routed heads total)
+        /// Used to adjust dynamic_loss_weight based on current sparsity
+        target_avg_routed_heads: f32,
+
+        /// Confidence threshold for fallback to all heads (0.0-1.0)
+        /// When max routing probability < threshold, activate all routed heads
+        /// Typical: 0.6 (60% confidence required for sparse routing)
+        /// Lower values → more aggressive sparsity (may hurt quality)
+        /// Higher values → more conservative (better quality, less efficient)
+        confidence_threshold: f32,
+
+        /// Whether to use confidence-based fallback
+        /// If true: activate all heads when routing confidence is low
+        /// If false: always use adaptive sparse routing
+        /// Recommended: true for maintaining quality during training
+        use_confidence_fallback: bool,
     },
 
     /// Static head pruning: use only first K heads (for ablation studies)
@@ -259,6 +303,45 @@ pub struct ModelConfig {
     ///
     /// Default: 0.001 (standard in literature)
     pub moe_router_z_loss_weight: f32,
+
+    /// Use Mixture-of-Heads (MoH) within each expert of Mixture-of-Experts (MoE)
+    ///
+    /// Creates hierarchical adaptive routing: MoE → Experts → MoH → Heads
+    /// Each attention expert uses MoH for dynamic head selection
+    ///
+    /// Only used when use_moe = true
+    ///
+    /// Benefits:
+    /// - Hierarchical routing provides interpretable attention patterns
+    /// - Each expert can specialize its head usage
+    /// - Combines MoE capacity scaling with MoH efficiency
+    ///
+    /// Default: false (standard MoE without MoH)
+    pub use_moh_in_experts: bool,
+
+    /// Number of always-active shared heads per expert (when use_moh_in_experts = true)
+    ///
+    /// Only used when use_moh_in_experts = true
+    /// Shared heads capture common knowledge across all tokens
+    ///
+    /// Default: 2 (balance between stability and adaptivity)
+    pub expert_moh_num_shared_heads: usize,
+
+    /// Number of adaptively-routed heads per expert (when use_moh_in_experts = true)
+    ///
+    /// Only used when use_moh_in_experts = true
+    /// Routed heads specialize for specific patterns
+    ///
+    /// Default: 4 (balance between capacity and efficiency)
+    pub expert_moh_num_routed_heads: usize,
+
+    /// Enable learned threshold predictor for expert MoH (when use_moh_in_experts = true)
+    ///
+    /// Only used when use_moh_in_experts = true
+    /// Allows per-token adaptive thresholds for expert head routing
+    ///
+    /// Default: true (use learned predictor for maximum adaptivity)
+    pub expert_moh_use_learned_threshold: bool,
 }
 
 impl ModelConfig {
@@ -302,6 +385,10 @@ impl ModelConfig {
             expert_hidden_dim: hidden_dim / 4, // Maintain parameter count
             moe_load_balance_weight: 0.01, // Standard load balance weight
             moe_router_z_loss_weight: 0.001, // Standard router z-loss weight
+            use_moh_in_experts: false, // Default to standard MoE without MoH
+            expert_moh_num_shared_heads: 2, // 2 shared heads per expert
+            expert_moh_num_routed_heads: 4, // 4 routed heads per expert
+            expert_moh_use_learned_threshold: true, // Use learned predictor
         }
     }
 
@@ -338,6 +425,10 @@ impl ModelConfig {
             expert_hidden_dim: hidden_dim / 4,
             moe_load_balance_weight: 0.01,
             moe_router_z_loss_weight: 0.001,
+            use_moh_in_experts: false, // Default to standard MoE without MoH
+            expert_moh_num_shared_heads: 2, // 2 shared heads per expert
+            expert_moh_num_routed_heads: 4, // 4 routed heads per expert
+            expert_moh_use_learned_threshold: true, // Use learned predictor
         }
     }
 
@@ -408,6 +499,10 @@ impl ModelConfig {
             expert_hidden_dim: hidden_dim / 4,
             moe_load_balance_weight: 0.01,
             moe_router_z_loss_weight: 0.001,
+            use_moh_in_experts: false, // Default to standard MoE without MoH
+            expert_moh_num_shared_heads: 2, // 2 shared heads per expert
+            expert_moh_num_routed_heads: 4, // 4 routed heads per expert
+            expert_moh_use_learned_threshold: true, // Use learned predictor
         }
     }
 
@@ -419,6 +514,66 @@ impl ModelConfig {
     /// Get the number of low-level steps per cycle (T) for HRM
     pub fn get_low_steps_per_cycle(&self) -> usize {
         self.hypernetwork_hidden_dim.unwrap_or(2)
+    }
+
+    /// Create a new TRM (Tiny Recursive Model) configuration
+    ///
+    /// TRM applies a single transformer block recursively multiple times,
+    /// achieving parameter efficiency through weight sharing.
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Embedding dimension
+    /// * `hidden_dim` - Hidden dimension for feedforward layer
+    /// * `recursive_depth` - Number of times to apply the block recursively
+    /// * `max_seq_len` - Maximum sequence length
+    /// * `num_heads` - Number of attention heads (optional, defaults to 8)
+    ///
+    /// # Note
+    ///
+    /// - `num_layers` stores the recursive depth
+    /// - Modern defaults: RMSNorm, SwiGLU, CoPE
+    pub fn trm(
+        embedding_dim: usize,
+        hidden_dim: usize,
+        recursive_depth: usize,
+        max_seq_len: usize,
+        num_heads: Option<usize>,
+    ) -> Self {
+        Self {
+            architecture: ArchitectureType::TRM,
+            embedding_dim,
+            hidden_dim,
+            num_layers: recursive_depth, // Store recursive depth in num_layers
+            hypernetwork_hidden_dim: None,
+            max_seq_len,
+            num_heads,
+            use_rms_norm: true, // Modern default: RMSNorm
+            use_swiglu: true,   // Modern default: SwiGLU
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
+            num_kv_heads: None,         // Default to MHA (can be changed to GQA)
+            window_size: None, // Default to full attention
+            use_adaptive_window: false, // Default to fixed window
+            min_window_size: 512,       // Reasonable minimum
+            max_window_size: 4096,      // Reasonable maximum
+            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
+            use_moe: false,             // Default to standard feedforward
+            num_experts: 4,             // Default number of experts
+            num_active_experts: 2,      // Default top-k
+            expert_hidden_dim: hidden_dim / 2, // Default expert hidden dim
+            moe_load_balance_weight: 0.01,
+            moe_router_z_loss_weight: 0.001,
+            use_moh_in_experts: false, // Default to standard architecture
+            expert_moh_num_shared_heads: 2,
+            expert_moh_num_routed_heads: 4,
+            expert_moh_use_learned_threshold: true,
+        }
+    }
+
+    /// Get the recursive depth for TRM
+    pub fn get_recursive_depth(&self) -> usize {
+        self.num_layers
     }
 }
 
