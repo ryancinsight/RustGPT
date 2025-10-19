@@ -47,9 +47,9 @@ fn main() -> llm::Result<()> {
 
     // Choose architecture: Transformer, HyperMixer, HRM, or TRM
     //let architecture = ArchitectureType::HyperMixer; // HyperMixer (refined with TRM learnings)
-    let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
+    //let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
     //let architecture = ArchitectureType::HRM; // Hierarchical Reasoning Model
-    //let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing)
+    let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing) - TESTING FULLY ADAPTIVE MOH
 
     // ============================================================================
     // NORMALIZATION CONFIGURATION
@@ -253,10 +253,7 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // Head selection strategy (MoH vs standard MHA)
-    // For TRM, use AllHeads to avoid complexity during initial testing
-    let head_selection = if architecture == ArchitectureType::TRM {
-        HeadSelectionStrategy::AllHeads // Standard MHA for TRM (simpler for initial testing)
-    } else {
+    let head_selection = {
         // ============================================================================
         // FULLY ADAPTIVE MIXTURE-OF-HEADS (Phase 1 Implementation)
         // ============================================================================
@@ -516,7 +513,7 @@ fn main() -> llm::Result<()> {
 
     println!("\n=== INSTRUCTION TUNING ===");
     // Use same LR as pre-training
-    // Reduced to 100 epochs with fully adaptive MoH (no hardcoded parameters)
+    // Full 100 epochs for TRM+MoH validation
     let instruction_lr = 0.0001;
     let instruction_epochs = 100;
     println!(

@@ -7,6 +7,7 @@ use crate::{
     errors::Result,
     feed_forward::FeedForward,
     llm::Layer,
+    model_config::HeadSelectionStrategy,
     rms_norm::RMSNorm,
     self_attention::SelfAttention,
     swiglu::SwiGLU,
@@ -138,6 +139,7 @@ impl TinyRecursiveModel {
     /// * `recursive_depth` - Number of times to apply the block recursively
     /// * `use_swiglu` - Whether to use SwiGLU (true) or standard FeedForward (false)
     /// * `max_seq_len` - Maximum sequence length
+    /// * `head_selection` - Head selection strategy (AllHeads, MoH, or FullyAdaptiveMoH)
     pub fn new(
         embedding_dim: usize,
         hidden_dim: usize,
@@ -146,10 +148,11 @@ impl TinyRecursiveModel {
         recursive_depth: usize,
         use_swiglu: bool,
         max_seq_len: usize,
+        head_selection: HeadSelectionStrategy,
     ) -> Self {
         // Create attention layer with GQA support
         let kv_heads = num_kv_heads.unwrap_or(num_heads);
-        let attention = SelfAttention::new_with_gqa(
+        let mut attention = SelfAttention::new_with_gqa(
             embedding_dim,
             num_heads,
             kv_heads,
@@ -157,6 +160,10 @@ impl TinyRecursiveModel {
             max_seq_len,
             None, // window_size = None (full attention)
         );
+
+        // Set head selection strategy (MoH, AllHeads, or FullyAdaptiveMoH)
+        // Use layer_idx=0 since TRM is a single block
+        attention.set_head_selection(head_selection, 0);
 
         // Create normalization layers
         let norm1 = RMSNorm::new(embedding_dim);
@@ -243,6 +250,36 @@ impl TinyRecursiveModel {
             attn_scales.join(","),
             ffn_scales.join(",")
         )
+    }
+
+    /// Get MoH statistics from internal attention layer
+    ///
+    /// Returns (avg_routed_heads, mean_threshold, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm)
+    /// Returns (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) if MoH is not enabled.
+    pub fn get_moh_stats(&self) -> (f32, f32, f32, f32, f32, f32, f32) {
+        self.attention.get_moh_stats()
+    }
+
+    /// Get temperature statistics from internal attention layer
+    ///
+    /// Returns (avg, min, max) or None if temperature predictor is not enabled.
+    pub fn get_temperature_stats(&self) -> Option<(f32, f32, f32)> {
+        self.attention.get_temperature_stats()
+    }
+
+    /// Get load balance loss from internal attention layer
+    pub fn get_load_balance_loss(&self) -> f32 {
+        self.attention.get_load_balance_loss()
+    }
+
+    /// Get dynamic loss from internal attention layer
+    pub fn get_dynamic_loss(&self) -> f32 {
+        self.attention.get_dynamic_loss()
+    }
+
+    /// Get dynamic loss weight from internal attention layer
+    pub fn get_dynamic_loss_weight(&self, training_progress: f32) -> f32 {
+        self.attention.get_dynamic_loss_weight(training_progress)
     }
 }
 
