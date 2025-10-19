@@ -467,7 +467,7 @@ impl SelfAttention {
     ///     load_balance_weight: 0.01,
     /// });
     /// ```
-    pub fn set_head_selection(&mut self, strategy: HeadSelectionStrategy) {
+    pub fn set_head_selection(&mut self, strategy: HeadSelectionStrategy, layer_idx: usize) {
         self.head_selection = strategy.clone();
 
         // Initialize router if MoH is enabled
@@ -476,6 +476,12 @@ impl SelfAttention {
                 num_shared_heads,
                 num_active_routed_heads,
                 load_balance_weight,
+                threshold_p_base,
+                dynamic_loss_weight_base,
+                use_learned_threshold,
+                target_avg_routed_heads,
+                confidence_threshold,
+                use_confidence_fallback,
             } => {
                 let num_routed_heads = self.num_heads - num_shared_heads;
                 self.router = Some(HeadRouter::new(
@@ -484,6 +490,13 @@ impl SelfAttention {
                     num_routed_heads,
                     *num_active_routed_heads,
                     *load_balance_weight,
+                    *threshold_p_base,
+                    *dynamic_loss_weight_base,
+                    layer_idx,
+                    *use_learned_threshold,
+                    *target_avg_routed_heads,
+                    *confidence_threshold,
+                    *use_confidence_fallback,
                 ));
             }
             _ => {
@@ -499,6 +512,121 @@ impl SelfAttention {
         self.router
             .as_ref()
             .map_or(0.0, |r| r.compute_load_balance_loss())
+    }
+
+    /// Get the dynamic loss (entropy minimization) from the router (if MoH is enabled)
+    ///
+    /// Returns 0.0 if MoH is not enabled or no routing has been performed yet.
+    pub fn get_dynamic_loss(&self) -> f32 {
+        self.router
+            .as_ref()
+            .map_or(0.0, |r| r.compute_dynamic_loss())
+    }
+
+    /// Get the adaptive dynamic loss weight from the router (if MoH is enabled)
+    ///
+    /// # Arguments
+    ///
+    /// * `training_progress` - Training progress in range [0.0, 1.0]
+    ///
+    /// Returns 0.0 if MoH is not enabled.
+    pub fn get_dynamic_loss_weight(&self, training_progress: f32) -> f32 {
+        self.router
+            .as_ref()
+            .map_or(0.0, |r| r.dynamic_loss_weight(training_progress))
+    }
+
+    /// Get average number of active routed heads per token (if MoH is enabled)
+    ///
+    /// Returns 0.0 if MoH is not enabled or no routing has been performed yet.
+    pub fn get_avg_active_routed_heads(&self) -> f32 {
+        self.router
+            .as_ref()
+            .map_or(0.0, |r| r.avg_active_routed_heads())
+    }
+
+    /// Get threshold statistics (min, max, mean, std) from the router (if MoH is enabled)
+    ///
+    /// Returns (0.0, 0.0, 0.0, 0.0) if MoH is not enabled or no routing has been performed yet.
+    pub fn get_threshold_stats(&self) -> (f32, f32, f32, f32) {
+        self.router
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0, 0.0), |r| r.threshold_stats())
+    }
+
+    /// Update threshold predictor if MoH with learned predictor is enabled
+    ///
+    /// # Arguments
+    ///
+    /// * `lr` - Learning rate for predictor updates
+    pub fn update_threshold_predictor(&mut self, lr: f32) {
+        if let Some(router) = &mut self.router {
+            router.update_threshold_predictor(lr);
+        }
+    }
+
+    /// Check if this layer has a learned threshold predictor
+    pub fn has_learned_predictor(&self) -> bool {
+        self.router
+            .as_ref()
+            .map_or(false, |r| r.has_learned_predictor())
+    }
+
+    /// Get confidence statistics (avg, min, fallback_pct) from the router (if MoH is enabled)
+    ///
+    /// Returns (0.0, 0.0, 0.0) if MoH is not enabled or no routing has been performed yet.
+    pub fn get_confidence_stats(&self) -> (f32, f32, f32) {
+        self.router
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0), |r| r.confidence_stats())
+    }
+
+    /// Get complexity statistics (avg, min, max) from the router (if MoH is enabled)
+    ///
+    /// Returns (0.0, 0.0, 0.0) if MoH is not enabled or no routing has been performed yet.
+    pub fn get_complexity_stats(&self) -> (f32, f32, f32) {
+        self.router
+            .as_ref()
+            .map_or((0.0, 0.0, 0.0), |r| r.complexity_stats())
+    }
+
+    /// Get predictor weight norm (for tracking convergence)
+    ///
+    /// Returns 0.0 if MoH is not enabled or no learned predictor is enabled.
+    pub fn get_predictor_weight_norm(&self) -> f32 {
+        self.router
+            .as_ref()
+            .map_or(0.0, |r| r.predictor_weight_norm())
+    }
+
+    /// Get all MoH statistics in one call
+    ///
+    /// Returns (avg_routed_heads, mean_threshold, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm)
+    /// Returns (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) if MoH is not enabled.
+    pub fn get_moh_stats(&self) -> (f32, f32, f32, f32, f32, f32, f32) {
+        if self.router.is_none() {
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+
+        let avg_routed = self.get_avg_active_routed_heads();
+        let (_, _, mean_thresh, _) = self.get_threshold_stats();
+        let (conf_avg, conf_min, fallback_pct) = self.get_confidence_stats();
+        let (complexity_avg, _, _) = self.get_complexity_stats();
+        let pred_norm = self.get_predictor_weight_norm();
+
+        (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm)
+    }
+
+    /// Set epoch information for warm-up and annealing (if MoH is enabled)
+    ///
+    /// # Arguments
+    ///
+    /// * `current_epoch` - Current training epoch (0-indexed)
+    /// * `max_epochs` - Maximum number of training epochs
+    pub fn set_epoch_info(&mut self, current_epoch: usize, max_epochs: usize) {
+        if let Some(router) = &mut self.router {
+            router.set_epoch_info(current_epoch, max_epochs);
+        }
     }
 
     /// Enable adaptive window sizing

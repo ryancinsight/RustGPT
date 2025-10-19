@@ -17,6 +17,7 @@ use crate::{
 pub enum LayerEnum {
     Embeddings(Embeddings),
     SelfAttention(Box<crate::self_attention::SelfAttention>),
+    AttentionMoE(Box<crate::attention_moe::AttentionMoELayer>),
     FeedForward(Box<crate::feed_forward::FeedForward>),
     SwiGLU(Box<crate::swiglu::SwiGLU>),
     MoE(Box<crate::moe::MoELayer>),
@@ -25,6 +26,41 @@ pub enum LayerEnum {
     OutputProjection(OutputProjection),
     HyperMixerBlock(Box<crate::hypermixer::HyperMixerBlock>),
     HRMBlock(Box<crate::hrm::HRMBlock>),
+    TRMBlock(Box<crate::trm::TinyRecursiveModel>),
+}
+
+impl LayerEnum {
+    /// Downcast to SelfAttention layer if this is a SelfAttention variant
+    pub fn as_self_attention(&self) -> Option<&crate::self_attention::SelfAttention> {
+        match self {
+            LayerEnum::SelfAttention(layer) => Some(layer.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Downcast to mutable SelfAttention layer if this is a SelfAttention variant
+    pub fn as_self_attention_mut(&mut self) -> Option<&mut crate::self_attention::SelfAttention> {
+        match self {
+            LayerEnum::SelfAttention(layer) => Some(layer.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Downcast to AttentionMoE layer if this is an AttentionMoE variant
+    pub fn as_attention_moe(&self) -> Option<&crate::attention_moe::AttentionMoELayer> {
+        match self {
+            LayerEnum::AttentionMoE(layer) => Some(layer.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Downcast to mutable AttentionMoE layer if this is an AttentionMoE variant
+    pub fn as_attention_moe_mut(&mut self) -> Option<&mut crate::attention_moe::AttentionMoELayer> {
+        match self {
+            LayerEnum::AttentionMoE(layer) => Some(layer.as_mut()),
+            _ => None,
+        }
+    }
 }
 
 impl Layer for LayerEnum {
@@ -32,6 +68,7 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.layer_type(),
             LayerEnum::SelfAttention(layer) => layer.layer_type(),
+            LayerEnum::AttentionMoE(_) => "AttentionMoE",
             LayerEnum::FeedForward(layer) => layer.layer_type(),
             LayerEnum::SwiGLU(layer) => layer.layer_type(),
             LayerEnum::MoE(layer) => layer.layer_type(),
@@ -40,6 +77,7 @@ impl Layer for LayerEnum {
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
             LayerEnum::HyperMixerBlock(layer) => layer.layer_type(),
             LayerEnum::HRMBlock(layer) => layer.layer_type(),
+            LayerEnum::TRMBlock(layer) => layer.layer_type(),
         }
     }
 
@@ -47,6 +85,7 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.forward(input),
             LayerEnum::SelfAttention(layer) => layer.forward(input),
+            LayerEnum::AttentionMoE(layer) => layer.forward(input),
             LayerEnum::FeedForward(layer) => layer.forward(input),
             LayerEnum::SwiGLU(layer) => layer.forward(input),
             LayerEnum::MoE(layer) => layer.forward(input),
@@ -55,6 +94,7 @@ impl Layer for LayerEnum {
             LayerEnum::OutputProjection(layer) => layer.forward(input),
             LayerEnum::HyperMixerBlock(layer) => layer.forward(input),
             LayerEnum::HRMBlock(layer) => layer.forward(input),
+            LayerEnum::TRMBlock(layer) => layer.forward(input),
         }
     }
 
@@ -66,6 +106,9 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::SelfAttention(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::AttentionMoE(_) => {
+                panic!("AttentionMoE does not support compute_gradients - use backward() instead");
+            }
             LayerEnum::FeedForward(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::SwiGLU(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::MoE(layer) => layer.compute_gradients(input, output_grads),
@@ -74,6 +117,7 @@ impl Layer for LayerEnum {
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::HyperMixerBlock(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::HRMBlock(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::TRMBlock(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -81,6 +125,9 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::AttentionMoE(_) => {
+                panic!("AttentionMoE does not support apply_gradients - use backward() instead");
+            }
             LayerEnum::FeedForward(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::SwiGLU(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::MoE(layer) => layer.apply_gradients(param_grads, lr),
@@ -89,6 +136,7 @@ impl Layer for LayerEnum {
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::HyperMixerBlock(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::HRMBlock(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::TRMBlock(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
 
@@ -96,6 +144,7 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.backward(grads, lr),
             LayerEnum::SelfAttention(layer) => layer.backward(grads, lr),
+            LayerEnum::AttentionMoE(layer) => layer.backward(grads, lr),
             LayerEnum::FeedForward(layer) => layer.backward(grads, lr),
             LayerEnum::SwiGLU(layer) => layer.backward(grads, lr),
             LayerEnum::MoE(layer) => layer.backward(grads, lr),
@@ -104,6 +153,7 @@ impl Layer for LayerEnum {
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
             LayerEnum::HyperMixerBlock(layer) => layer.backward(grads, lr),
             LayerEnum::HRMBlock(layer) => layer.backward(grads, lr),
+            LayerEnum::TRMBlock(layer) => layer.backward(grads, lr),
         }
     }
 
@@ -111,6 +161,7 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.parameters(),
             LayerEnum::SelfAttention(layer) => layer.parameters(),
+            LayerEnum::AttentionMoE(_) => 0, // TODO: Implement parameter counting
             LayerEnum::FeedForward(layer) => layer.parameters(),
             LayerEnum::SwiGLU(layer) => layer.parameters(),
             LayerEnum::MoE(layer) => layer.parameters(),
@@ -118,6 +169,7 @@ impl Layer for LayerEnum {
             LayerEnum::RMSNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
             LayerEnum::HyperMixerBlock(layer) => layer.parameters(),
+            LayerEnum::TRMBlock(layer) => layer.parameters(),
             LayerEnum::HRMBlock(layer) => layer.parameters(),
         }
     }
@@ -351,9 +403,25 @@ impl LLM {
                 lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
             };
 
+            // Compute training progress for adaptive MoH
+            let training_progress = if epoch < warmup_epochs {
+                0.0
+            } else {
+                (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
+            };
+
+            // Set epoch info for all MoH layers (for warm-up and annealing)
+            for layer in self.network.iter_mut() {
+                if let Some(attn_layer) = layer.as_self_attention_mut() {
+                    attn_layer.set_epoch_info(epoch, epochs);
+                } else if let Some(moe_layer) = layer.as_attention_moe_mut() {
+                    moe_layer.set_epoch_info(epoch, epochs);
+                }
+            }
+
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, grad_norm) = self.train_batch(batch, effective_lr)?;
+                let (batch_loss, grad_norm) = self.train_batch(batch, effective_lr, training_progress)?;
                 total_loss += batch_loss;
                 total_grad_norm += grad_norm;
                 batch_count += 1;
@@ -388,14 +456,198 @@ impl LLM {
                 String::new()
             };
 
+            // Log MoH statistics if enabled (with adaptive metrics)
+            let training_progress = if epoch < warmup_epochs {
+                0.0
+            } else {
+                (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
+            };
+
+            // Collect stats from all MoH layers
+            let mut moh_layers_stats = Vec::new();
+            let mut has_learned_predictor = false;
+            let mut threshold_range_min = f32::INFINITY;
+            let mut threshold_range_max = f32::NEG_INFINITY;
+            let mut total_conf_avg = 0.0;
+            let mut total_conf_min = f32::INFINITY;
+            let mut total_fallback_pct = 0.0;
+            let mut total_pred_norm = 0.0;
+            let mut total_complexity_avg = 0.0;
+            let mut total_complexity_min = f32::INFINITY;
+            let mut total_complexity_max = f32::NEG_INFINITY;
+            let mut moh_layer_count = 0;
+
+            for (layer_idx, layer) in self.network.iter().enumerate() {
+                if let Some(attn_layer) = layer.as_self_attention() {
+                    let avg_routed = attn_layer.get_avg_active_routed_heads();
+                    if avg_routed > 0.0 {
+                        let (min_thresh, max_thresh, mean_thresh, _std_thresh) = attn_layer.get_threshold_stats();
+                        let dyn_weight = attn_layer.get_dynamic_loss_weight(training_progress);
+                        moh_layers_stats.push((layer_idx, avg_routed, mean_thresh, dyn_weight));
+
+                        // Track threshold range across all layers
+                        threshold_range_min = threshold_range_min.min(min_thresh);
+                        threshold_range_max = threshold_range_max.max(max_thresh);
+
+                        // Track confidence statistics
+                        let (conf_avg, conf_min, fallback_pct) = attn_layer.get_confidence_stats();
+                        total_conf_avg += conf_avg;
+                        total_conf_min = total_conf_min.min(conf_min);
+                        total_fallback_pct += fallback_pct;
+
+                        // Track complexity statistics
+                        let (complexity_avg, complexity_min, complexity_max) = attn_layer.get_complexity_stats();
+                        total_complexity_avg += complexity_avg;
+                        total_complexity_min = total_complexity_min.min(complexity_min);
+                        total_complexity_max = total_complexity_max.max(complexity_max);
+
+                        // Track predictor weight norm
+                        let pred_norm = attn_layer.get_predictor_weight_norm();
+                        total_pred_norm += pred_norm;
+
+                        // Check if any layer has learned predictor
+                        if attn_layer.has_learned_predictor() {
+                            has_learned_predictor = true;
+                        }
+
+                        moh_layer_count += 1;
+                    }
+                } else if let Some(moe_layer) = layer.as_attention_moe() {
+                    // For AttentionMoE, get per-expert MoH statistics
+                    let expert_stats = moe_layer.get_expert_moh_stats();
+                    if !expert_stats.is_empty() {
+                        // Aggregate statistics across all experts
+                        let mut total_avg_routed = 0.0;
+                        let mut total_threshold = 0.0;
+                        let mut expert_count = 0;
+
+                        for (_expert_idx, avg_heads, threshold_p, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm) in &expert_stats {
+                            if *avg_heads > 0.0 {
+                                total_avg_routed += avg_heads;
+                                total_threshold += threshold_p;
+                                total_conf_avg += conf_avg;
+                                total_conf_min = total_conf_min.min(*conf_min);
+                                total_fallback_pct += fallback_pct;
+                                total_complexity_avg += complexity_avg;
+                                total_pred_norm += pred_norm;
+                                expert_count += 1;
+                            }
+                        }
+
+                        if expert_count > 0 {
+                            let avg_routed = total_avg_routed / expert_count as f32;
+                            let mean_thresh = total_threshold / expert_count as f32;
+                            let dyn_weight = 0.0; // AttentionMoE doesn't have dynamic loss weight yet
+
+                            moh_layers_stats.push((layer_idx, avg_routed, mean_thresh, dyn_weight));
+
+                            // Track threshold range (approximate from mean)
+                            threshold_range_min = threshold_range_min.min(mean_thresh - 0.1);
+                            threshold_range_max = threshold_range_max.max(mean_thresh + 0.1);
+
+                            has_learned_predictor = true;
+                            moh_layer_count += expert_count;
+                        }
+                    }
+                }
+            }
+
+            // Compute averages
+            let avg_conf = if moh_layer_count > 0 { total_conf_avg / moh_layer_count as f32 } else { 0.0 };
+            let avg_fallback_pct = if moh_layer_count > 0 { total_fallback_pct / moh_layer_count as f32 } else { 0.0 };
+            let avg_pred_norm = if moh_layer_count > 0 { total_pred_norm / moh_layer_count as f32 } else { 0.0 };
+            let avg_complexity = if moh_layer_count > 0 { total_complexity_avg / moh_layer_count as f32 } else { 0.0 };
+
+            // Format MoH stats: show first, middle, and last layers + confidence + predictor stats
+            let mut moh_stats = String::new();
+            if !moh_layers_stats.is_empty() {
+                let first = &moh_layers_stats[0];
+                let last = moh_layers_stats.last().unwrap();
+
+                // Add threshold range if learned predictor is enabled
+                let threshold_range_str = if has_learned_predictor && threshold_range_min.is_finite() {
+                    format!(" | ThreshRange: [{:.2}-{:.2}]", threshold_range_min, threshold_range_max)
+                } else {
+                    String::new()
+                };
+
+                // Add confidence statistics
+                let confidence_str = if avg_conf > 0.0 {
+                    format!(" | ConfAvg: {:.2}, ConfMin: {:.2}, Fallback: {:.1}%",
+                            avg_conf, total_conf_min, avg_fallback_pct)
+                } else {
+                    String::new()
+                };
+
+                // Add predictor weight norm if learned predictor is enabled
+                let predictor_str = if has_learned_predictor && avg_pred_norm > 0.0 {
+                    format!(" | PredNorm: {:.4}", avg_pred_norm)
+                } else {
+                    String::new()
+                };
+
+                // Add complexity statistics
+                let complexity_str = if avg_complexity > 0.0 && total_complexity_min.is_finite() {
+                    format!(" | Complexity: {:.3} [{:.3}-{:.3}]",
+                            avg_complexity, total_complexity_min, total_complexity_max)
+                } else {
+                    String::new()
+                };
+
+                if moh_layers_stats.len() > 2 {
+                    let mid = &moh_layers_stats[moh_layers_stats.len() / 2];
+                    moh_stats = format!(
+                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}",
+                        first.0, first.1, first.2,
+                        mid.0, mid.1, mid.2,
+                        last.0, last.1, last.2,
+                        first.3,
+                        threshold_range_str,
+                        confidence_str,
+                        predictor_str,
+                        complexity_str
+                    );
+                } else {
+                    moh_stats = format!(
+                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}",
+                        first.0, first.1, first.2,
+                        last.0, last.1, last.2,
+                        first.3,
+                        threshold_range_str,
+                        confidence_str,
+                        predictor_str,
+                        complexity_str
+                    );
+                }
+            }
+
+            // Log TRM statistics if present
+            let mut trm_stats = String::new();
+            for layer in self.network.iter() {
+                if let LayerEnum::TRMBlock(trm) = layer {
+                    let scales = trm.get_step_scales();
+                    trm_stats = format!(" | TRM: {}", scales);
+                    break;
+                }
+            }
+
             info!(
                 epoch = epoch,
                 loss = avg_loss,
                 grad_norm = avg_grad_norm,
                 learning_rate = effective_lr,
-                "Training epoch completed{}",
-                warmup_status
+                "Training epoch completed{}{}{}",
+                warmup_status,
+                moh_stats,
+                trm_stats
             );
+
+            // Log detailed AttentionMoE statistics (per-expert metrics)
+            for (layer_idx, layer) in self.network.iter().enumerate() {
+                if let Some(moe_layer) = layer.as_attention_moe() {
+                    moe_layer.log_expert_stats(layer_idx, epoch);
+                }
+            }
         }
 
         Ok(())
@@ -403,7 +655,7 @@ impl LLM {
 
     /// Train on a single batch of sequences
     /// Returns (batch_loss, gradient_norm)
-    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<(f32, f32)> {
+    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32, training_progress: f32) -> Result<(f32, f32)> {
         let mut batch_loss = 0.0;
         let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
         let mut layer_grad_norms: Vec<f32> = Vec::new(); // Track per-layer gradient norms
@@ -449,6 +701,7 @@ impl LLM {
             let logits = input;
             let probs = Self::softmax(&logits);
 
+            // Compute cross-entropy loss
             batch_loss += Self::cross_entropy_loss_step(&probs, target_ids);
 
             // Compute gradients w.r.t. logits
@@ -460,12 +713,30 @@ impl LLM {
             }
 
             // Backward pass: compute parameter gradients for each layer
+            // Note: AttentionMoE layers use backward() directly and are handled separately
             for (rev_idx, layer) in self.network.iter().rev().enumerate() {
+                let layer_idx = self.network.len() - 1 - rev_idx;
+
+                // AttentionMoE uses backward() directly, not compute_gradients/apply_gradients
+                // We store the gradients and will call backward() on them later
+                if matches!(layer, LayerEnum::AttentionMoE(_)) {
+                    // Track layer-wise gradient norm for diagnostics
+                    let layer_grad_norm: f32 = grads_output.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                    layer_grad_norms[layer_idx] += layer_grad_norm;
+
+                    // Store gradients for later backward() call
+                    // We use a single-element vec to match the structure
+                    accumulated_param_grads[layer_idx] = vec![grads_output.clone()];
+
+                    // For now, pass gradients through unchanged
+                    // (AttentionMoE will compute input_grads during backward())
+                    continue;
+                }
+
                 let (input_grads, param_grads) =
                     layer.compute_gradients(&Array2::zeros((0, 0)), &grads_output);
 
                 // Track layer-wise gradient norm for diagnostics
-                let layer_idx = self.network.len() - 1 - rev_idx;
                 let layer_grad_norm: f32 = input_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
                 layer_grad_norms[layer_idx] += layer_grad_norm;
 
@@ -500,6 +771,25 @@ impl LLM {
                     .map(|(i, &norm)| format!("L{}: {:.2}", i, norm))
                     .collect::<Vec<_>>()
             );
+        }
+
+        // Add auxiliary losses from MoH routing (load balance + dynamic loss)
+        // These are computed once per batch, not per sequence
+        for layer in &self.network {
+            if let Some(attn_layer) = layer.as_self_attention() {
+                // Load balance loss (weighted by load_balance_weight)
+                let lb_loss = attn_layer.get_load_balance_loss();
+                batch_loss += lb_loss; // Weight is already applied in the loss computation
+
+                // Dynamic loss (weighted by adaptive dynamic_loss_weight)
+                let dyn_loss = attn_layer.get_dynamic_loss();
+                let dyn_weight = attn_layer.get_dynamic_loss_weight(training_progress);
+                batch_loss += dyn_loss * dyn_weight;
+            } else if let Some(moe_layer) = layer.as_attention_moe() {
+                // For AttentionMoE, add auxiliary loss (includes both MoE routing and MoH routing losses)
+                let aux_loss = moe_layer.get_auxiliary_loss();
+                batch_loss += aux_loss;
+            }
         }
 
         // Prepare averaged gradients and detect anomalies
@@ -580,7 +870,30 @@ impl LLM {
             .zip(adaptive_lrs)
         {
             if !averaged_grads.is_empty() {
-                layer.apply_gradients(&averaged_grads, adaptive_lr)?;
+                // AttentionMoE uses backward() directly instead of apply_gradients()
+                if let LayerEnum::AttentionMoE(moe_layer) = layer {
+                    // For AttentionMoE, averaged_grads contains the output gradients
+                    // Call backward() which updates parameters directly
+                    if !averaged_grads.is_empty() {
+                        let _input_grads = moe_layer.backward(&averaged_grads[0], adaptive_lr);
+                    }
+                } else {
+                    layer.apply_gradients(&averaged_grads, adaptive_lr)?;
+                }
+            }
+        }
+
+        // Update threshold predictors in MoH layers (if enabled)
+        // This happens after parameter updates to use the latest routing statistics
+        for layer in &mut self.network {
+            if let Some(attn_layer) = layer.as_self_attention_mut() {
+                if attn_layer.has_learned_predictor() {
+                    // Use a separate learning rate for predictor (slightly higher than base LR)
+                    // Predictor needs faster adaptation to track routing efficiency, but not too aggressive
+                    // 2x base LR provides faster learning while maintaining stability
+                    let predictor_lr = lr * 2.0;
+                    attn_layer.update_threshold_predictor(predictor_lr);
+                }
             }
         }
 

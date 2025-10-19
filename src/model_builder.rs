@@ -1,4 +1,5 @@
 use crate::{
+    attention_moe::AttentionMoELayer,
     embeddings::Embeddings,
     feed_forward::FeedForward,
     hrm::HRMBlock,
@@ -11,6 +12,7 @@ use crate::{
     rms_norm::RMSNorm,
     self_attention::SelfAttention,
     swiglu::SwiGLU,
+    trm::TinyRecursiveModel,
     vocab::Vocab,
 };
 
@@ -43,6 +45,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         ArchitectureType::HRM => {
             build_hrm_layers(&mut layers, config);
         }
+        ArchitectureType::TRM => {
+            build_trm_layers(&mut layers, config);
+        }
     }
 
     // Add output projection layer (common to all architectures)
@@ -68,38 +73,57 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let num_heads = config.get_num_heads();
     let num_kv_heads = config.get_num_kv_heads();
 
-    for _ in 0..config.num_layers {
-        // Self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
-        let mut attention = SelfAttention::new_with_positional_encoding(
-            config.embedding_dim,
-            num_heads,
-            num_kv_heads,
-            &config.positional_encoding,
-            config.max_seq_len,
-            if config.use_adaptive_window {
-                None
-            } else {
-                config.window_size
-            },
-        );
-
-        // Enable adaptive window if configured
-        if config.use_adaptive_window {
-            attention.enable_adaptive_window(
-                config.min_window_size,
-                config.max_window_size,
-                config.window_adaptation_strategy,
+    for layer_idx in 0..config.num_layers {
+        // Check if we should use hierarchical MoH-in-MoE for attention
+        if config.use_moh_in_experts {
+            // Use AttentionMoE: MoE of attention experts, each with MoH
+            let attention_moe = AttentionMoELayer::new(
+                config.embedding_dim,
+                config.num_experts,
+                config.num_active_experts,
+                config.expert_moh_num_shared_heads,
+                config.expert_moh_num_routed_heads,
+                num_kv_heads,
+                config.expert_moh_use_learned_threshold,
+                config.moe_load_balance_weight,
+                config.moe_router_z_loss_weight,
             );
+
+            layers.push(LayerEnum::AttentionMoE(Box::new(attention_moe)));
+        } else {
+            // Standard self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
+            let mut attention = SelfAttention::new_with_positional_encoding(
+                config.embedding_dim,
+                num_heads,
+                num_kv_heads,
+                &config.positional_encoding,
+                config.max_seq_len,
+                if config.use_adaptive_window {
+                    None
+                } else {
+                    config.window_size
+                },
+            );
+
+            // Enable adaptive window if configured
+            if config.use_adaptive_window {
+                attention.enable_adaptive_window(
+                    config.min_window_size,
+                    config.max_window_size,
+                    config.window_adaptation_strategy,
+                );
+            }
+
+            // Set head selection strategy (MoH, AllHeads, or StaticPruning)
+            // Pass layer_idx for layer-wise adaptive thresholds
+            attention.set_head_selection(config.head_selection.clone(), layer_idx);
+
+            // Gradient clipping is handled globally in the training loop via AdaptiveGradientClipper
+            // Per-layer gradient clipping is disabled to avoid double-clipping and maintain
+            // consistent gradient flow across all layers
+
+            layers.push(LayerEnum::SelfAttention(Box::new(attention)));
         }
-
-        // Set head selection strategy (MoH, AllHeads, or StaticPruning)
-        attention.set_head_selection(config.head_selection.clone());
-
-        // Gradient clipping is handled globally in the training loop via AdaptiveGradientClipper
-        // Per-layer gradient clipping is disabled to avoid double-clipping and maintain
-        // consistent gradient flow across all layers
-
-        layers.push(LayerEnum::SelfAttention(Box::new(attention)));
 
         // Normalization after attention (LayerNorm or RMSNorm based on config)
         if config.use_rms_norm {
@@ -284,27 +308,61 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
         }
         HeadSelectionStrategy::MixtureOfHeads {
             num_shared_heads,
-            num_active_routed_heads,
+            num_active_routed_heads: _,
             load_balance_weight,
+            threshold_p_base,
+            dynamic_loss_weight_base,
+            use_learned_threshold,
+            target_avg_routed_heads,
+            confidence_threshold,
+            use_confidence_fallback,
         } => {
             let num_routed_heads = num_heads - num_shared_heads;
-            let total_active = num_shared_heads + num_active_routed_heads;
+            // With adaptive routing, estimate average active heads based on threshold_p_base
+            // Lower threshold → fewer heads, higher threshold → more heads
+            let estimated_avg_routed = (num_routed_heads as f32 * threshold_p_base * 1.2).min(num_routed_heads as f32);
+            let estimated_total_active = *num_shared_heads as f32 + estimated_avg_routed;
             let compute_savings =
-                ((num_heads - total_active) as f32 / num_heads as f32 * 100.0) as usize;
-            println!("  ✓ Mixture-of-Heads (MoH) - Dynamic Head Selection");
+                ((num_heads as f32 - estimated_total_active) / num_heads as f32 * 100.0) as usize;
+            println!("  ✓ Mixture-of-Heads (MoH) - Fully Adaptive Routing");
             println!("    - Total Heads: {}", num_heads);
             println!("    - Shared Heads: {} (always active)", num_shared_heads);
             println!(
-                "    - Routed Heads: {} (Top-{} selection)",
-                num_routed_heads, num_active_routed_heads
+                "    - Routed Heads: {} (adaptive top-p selection)",
+                num_routed_heads
             );
             println!(
-                "    - Active per Token: {}/{} heads",
-                total_active, num_heads
+                "    - Target Avg Routed: {:.1} heads",
+                target_avg_routed_heads
             );
-            println!("    - Compute Savings: ~{}%", compute_savings);
+            println!(
+                "    - Estimated Active per Token: {:.1}/{} heads",
+                estimated_total_active, num_heads
+            );
+            println!("    - Base Threshold P: {} (layer-wise adjusted)", threshold_p_base);
+            if *use_learned_threshold {
+                println!("    - Learned Per-Token Thresholds: ENABLED");
+                println!("      → Each token gets custom threshold [0.3-0.7]");
+            } else {
+                println!("    - Learned Per-Token Thresholds: DISABLED");
+                println!("      → Using layer-wise base thresholds only");
+            }
+            println!("    - Layer-Wise Adaptation:");
+            println!("      → Early layers (L0-L3): p = {:.2} (more heads)", threshold_p_base + 0.1);
+            println!("      → Middle layers (L4-L7): p = {:.2}", threshold_p_base);
+            println!("      → Late layers (L8+): p = {:.2} (fewer heads)", threshold_p_base - 0.1);
+            println!("    - Estimated Compute Savings: ~{}%", compute_savings);
             println!("    - Load Balance Weight: {}", load_balance_weight);
-            println!("    - Expected Speedup: 5-8%");
+            println!("    - Base Dynamic Loss Weight: {}", dynamic_loss_weight_base);
+            println!("      → Adjusted by sparsity & training progress");
+            if *use_confidence_fallback {
+                println!("    - Confidence-Based Fallback: ENABLED");
+                println!("      → Confidence Threshold: {:.2} ({}% required)", confidence_threshold, confidence_threshold * 100.0);
+                println!("      → Activates all heads when routing confidence < threshold");
+            } else {
+                println!("    - Confidence-Based Fallback: DISABLED");
+            }
+            println!("    - Expected Efficiency Gain: 30-50%");
         }
         HeadSelectionStrategy::StaticPruning { num_active_heads } => {
             let compute_savings =
@@ -378,6 +436,52 @@ fn build_hrm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     );
 
     layers.push(LayerEnum::HRMBlock(Box::new(hrm_block)));
+}
+
+/// Build TRM (Tiny Recursive Model) architecture layers
+///
+/// Creates a parameter-efficient architecture with weight sharing across depth.
+/// A single transformer block is applied recursively multiple times.
+///
+/// # Architecture
+/// - Single transformer block (attention + FFN + norms)
+/// - Applied recursively D times (recursive depth)
+/// - Adaptive residual scaling per step (learned)
+/// - Per-step gradient tracking
+///
+/// # TRM Configuration
+/// - `num_layers` stores recursive depth (D)
+/// - `use_swiglu` determines FFN type (SwiGLU vs FeedForward)
+/// - `use_rms_norm` determines normalization type (RMSNorm vs LayerNorm)
+///
+/// # Gradient Stability
+/// - Adaptive residual scaling prevents vanishing/exploding gradients
+/// - Per-step gradient tracking for analysis
+/// - No gradient clipping required (handled by adaptive mechanisms)
+fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
+    let recursive_depth = config.get_recursive_depth();
+    let num_heads = config.get_num_heads();
+    let num_kv_heads = config.get_num_kv_heads();
+
+    // Create single TRM block (contains recursive depth internally)
+    let trm_block = TinyRecursiveModel::new(
+        config.embedding_dim,
+        config.hidden_dim,
+        num_heads,
+        Some(num_kv_heads),
+        recursive_depth,
+        config.use_swiglu,
+        config.max_seq_len,
+    );
+
+    layers.push(LayerEnum::TRMBlock(Box::new(trm_block)));
+
+    // Add final normalization layer (critical for Pre-LN stability)
+    if config.use_rms_norm {
+        layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
+    } else {
+        layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 pub mod activations;
 pub mod adam;
+pub mod attention_moe;
 pub mod beam_search;
 pub mod channel_mixing;
 pub mod cop;
@@ -28,9 +29,11 @@ pub mod self_attention;
 pub mod swiglu;
 pub mod token_mixing;
 pub mod transformer;
+pub mod trm;
 pub mod vocab;
 // Re-export key structs for easier access
 pub use adam::Adam;
+pub use attention_moe::{AttentionExpert, AttentionMoELayer, AttentionRouter};
 pub use beam_search::{BeamHypothesis, BeamSearchConfig, BeamSearchState};
 pub use channel_mixing::ChannelMixingMLP;
 pub use dataset_loader::{Dataset, DatasetType};
@@ -54,6 +57,7 @@ pub use model_config::{
 };
 pub use model_persistence::{ModelMetadata, VersionedModel};
 pub use token_mixing::TokenMixingMLP;
+pub use trm::TinyRecursiveModel;
 pub use vocab::Vocab;
 
 // Constants
