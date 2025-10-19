@@ -475,6 +475,10 @@ impl LLM {
             let mut total_complexity_avg = 0.0;
             let mut total_complexity_min = f32::INFINITY;
             let mut total_complexity_max = f32::NEG_INFINITY;
+            let mut total_temp_avg = 0.0;
+            let mut total_temp_min = f32::INFINITY;
+            let mut total_temp_max = f32::NEG_INFINITY;
+            let mut has_temperature_stats = false;
             let mut moh_layer_count = 0;
 
             for (layer_idx, layer) in self.network.iter().enumerate() {
@@ -504,6 +508,14 @@ impl LLM {
                         // Track predictor weight norm
                         let pred_norm = attn_layer.get_predictor_weight_norm();
                         total_pred_norm += pred_norm;
+
+                        // Track temperature statistics (for fully adaptive MoH)
+                        if let Some((temp_avg, temp_min, temp_max)) = attn_layer.get_temperature_stats() {
+                            total_temp_avg += temp_avg;
+                            total_temp_min = total_temp_min.min(temp_min);
+                            total_temp_max = total_temp_max.max(temp_max);
+                            has_temperature_stats = true;
+                        }
 
                         // Check if any layer has learned predictor
                         if attn_layer.has_learned_predictor() {
@@ -594,10 +606,19 @@ impl LLM {
                     String::new()
                 };
 
+                // Add temperature statistics (for fully adaptive MoH)
+                let avg_temp = if moh_layer_count > 0 { total_temp_avg / moh_layer_count as f32 } else { 0.0 };
+                let temperature_str = if has_temperature_stats && total_temp_min.is_finite() {
+                    format!(" | Temp: {:.2} [{:.2}-{:.2}]",
+                            avg_temp, total_temp_min, total_temp_max)
+                } else {
+                    String::new()
+                };
+
                 if moh_layers_stats.len() > 2 {
                     let mid = &moh_layers_stats[moh_layers_stats.len() / 2];
                     moh_stats = format!(
-                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}",
+                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}{}",
                         first.0, first.1, first.2,
                         mid.0, mid.1, mid.2,
                         last.0, last.1, last.2,
@@ -605,18 +626,20 @@ impl LLM {
                         threshold_range_str,
                         confidence_str,
                         predictor_str,
-                        complexity_str
+                        complexity_str,
+                        temperature_str
                     );
                 } else {
                     moh_stats = format!(
-                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}",
+                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}{}",
                         first.0, first.1, first.2,
                         last.0, last.1, last.2,
                         first.3,
                         threshold_range_str,
                         confidence_str,
                         predictor_str,
-                        complexity_str
+                        complexity_str,
+                        temperature_str
                     );
                 }
             }
@@ -631,15 +654,29 @@ impl LLM {
                 }
             }
 
+            // Log HyperMixer statistics if present
+            let mut hypermixer_stats = String::new();
+            let mut hypermixer_count = 0;
+            for layer in self.network.iter() {
+                if let LayerEnum::HyperMixerBlock(hm) = layer {
+                    if hypermixer_count == 0 {
+                        // Log first block
+                        hypermixer_stats = format!(" | HM: {}", hm.get_scales());
+                    }
+                    hypermixer_count += 1;
+                }
+            }
+
             info!(
                 epoch = epoch,
                 loss = avg_loss,
                 grad_norm = avg_grad_norm,
                 learning_rate = effective_lr,
-                "Training epoch completed{}{}{}",
+                "Training epoch completed{}{}{}{}",
                 warmup_status,
                 moh_stats,
-                trm_stats
+                trm_stats,
+                hypermixer_stats
             );
 
             // Log detailed AttentionMoE statistics (per-expert metrics)
