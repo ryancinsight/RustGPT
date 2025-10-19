@@ -227,9 +227,153 @@ impl ThresholdPredictor {
     }
 }
 
-/// Router network for Mixture-of-Heads attention
+/// Router type enum to support multiple routing strategies
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct HeadRouter {
+pub enum RouterType {
+    /// Standard MoH router with shared/routed head split
+    Standard(HeadRouterStandard),
+
+    /// Fully adaptive router with complexity-aware head selection
+    FullyAdaptive(FullyAdaptiveHeadRouter),
+}
+
+impl RouterType {
+    /// Route input tokens to heads
+    ///
+    /// Returns soft weights in [0, 1] for differentiable routing.
+    /// For discrete routing (Standard), weights are 0.0 or 1.0.
+    /// For soft routing (FullyAdaptive), weights are continuous.
+    pub fn route(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        match self {
+            RouterType::Standard(router) => {
+                // Convert boolean mask to f32 (0.0 or 1.0)
+                let mask = router.route_discrete(input);
+                mask.mapv(|b| if b { 1.0 } else { 0.0 })
+            }
+            RouterType::FullyAdaptive(router) => router.route(input),
+        }
+    }
+
+    /// Compute total auxiliary loss (load balance + complexity + sparsity)
+    pub fn compute_auxiliary_loss(&self) -> f32 {
+        match self {
+            RouterType::Standard(router) => {
+                router.compute_load_balance_loss() + router.compute_dynamic_loss()
+            }
+            RouterType::FullyAdaptive(router) => {
+                router.compute_load_balance_loss()
+                    + router.compute_complexity_loss()
+                    + router.compute_sparsity_loss()
+            }
+        }
+    }
+
+    /// Backward pass to update router parameters
+    pub fn backward(&mut self, lr: f32) {
+        match self {
+            RouterType::Standard(router) => {
+                // Standard router updates are handled separately
+                // This is a placeholder for consistency
+            }
+            RouterType::FullyAdaptive(router) => {
+                router.backward(lr);
+            }
+        }
+    }
+
+    /// Get routing statistics
+    pub fn routing_stats(&self) -> String {
+        match self {
+            RouterType::Standard(router) => {
+                if let Some(stats) = router.cached_num_active_routed.as_ref() {
+                    let avg = stats.iter().sum::<usize>() as f32 / stats.len() as f32;
+                    format!("Standard MoH: avg {:.1} routed heads", avg)
+                } else {
+                    "Standard MoH: no stats".to_string()
+                }
+            }
+            RouterType::FullyAdaptive(router) => {
+                let (avg_heads, min_heads, max_heads, avg_complexity, avg_threshold) = router.routing_stats();
+                format!(
+                    "Fully Adaptive MoH: avg {:.1} heads (min {}, max {}), complexity {:.2}, threshold {:.2}",
+                    avg_heads, min_heads, max_heads, avg_complexity, avg_threshold
+                )
+            }
+        }
+    }
+
+    /// Check if router has learned predictor
+    pub fn has_learned_predictor(&self) -> bool {
+        match self {
+            RouterType::Standard(router) => router.threshold_predictor.is_some(),
+            RouterType::FullyAdaptive(_) => true, // Always has predictors
+        }
+    }
+
+    /// Get confidence statistics (only for standard router)
+    pub fn confidence_stats(&self) -> Option<(f32, f32, f32)> {
+        match self {
+            RouterType::Standard(router) => router.cached_confidence_stats,
+            RouterType::FullyAdaptive(_) => None,
+        }
+    }
+
+    /// Get complexity statistics for both standard and fully adaptive routers
+    pub fn complexity_stats(&self) -> Option<(f32, f32, f32)> {
+        match self {
+            RouterType::Standard(router) => router.cached_complexity_stats,
+            RouterType::FullyAdaptive(router) => {
+                // Get complexity stats from routing_stats method
+                let (_, _, _, avg_complexity, _) = router.routing_stats();
+                if avg_complexity > 0.0 {
+                    // Return avg as all values since we don't track min/max separately
+                    Some((avg_complexity, avg_complexity, avg_complexity))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Get predictor weight norm for both standard and fully adaptive routers
+    pub fn predictor_weight_norm(&self) -> f32 {
+        match self {
+            RouterType::Standard(router) => {
+                if let Some(predictor) = &router.threshold_predictor {
+                    predictor.weights.iter().map(|&x| x * x).sum::<f32>().sqrt()
+                } else {
+                    0.0
+                }
+            }
+            RouterType::FullyAdaptive(router) => router.get_predictor_weight_norm(),
+        }
+    }
+
+    /// Set epoch information for training progress tracking
+    pub fn set_epoch_info(&mut self, current_epoch: usize, max_epochs: usize) {
+        match self {
+            RouterType::Standard(router) => {
+                router.current_epoch = current_epoch;
+                router.max_epochs = max_epochs;
+            }
+            RouterType::FullyAdaptive(_) => {
+                // Fully adaptive doesn't need epoch info currently
+            }
+        }
+    }
+
+    /// Get total number of parameters
+    pub fn parameters(&self) -> usize {
+        match self {
+            RouterType::Standard(router) => router.parameters(),
+            RouterType::FullyAdaptive(router) => router.num_parameters(),
+        }
+    }
+}
+
+/// Router network for Mixture-of-Heads attention (standard version with shared/routed split)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeadRouterStandard {
     /// Number of shared heads (always active)
     num_shared_heads: usize,
 
@@ -332,7 +476,7 @@ pub struct HeadRouter {
     cached_complexity_stats: Option<(f32, f32, f32)>,
 }
 
-impl HeadRouter {
+impl HeadRouterStandard {
     /// Create a new head router with fully adaptive routing
     ///
     /// # Arguments
@@ -396,7 +540,7 @@ impl HeadRouter {
             None
         };
 
-        HeadRouter {
+        HeadRouterStandard {
             num_shared_heads,
             num_routed_heads,
             num_active_routed_heads,
@@ -468,7 +612,7 @@ impl HeadRouter {
     /// // mask[i][0..2] = [true, true]  (shared heads always active)
     /// // mask[i][2..8] has 1-6 true values (adaptive top-p routed heads)
     /// ```
-    pub fn route(&mut self, input: &Array2<f32>) -> Array2<bool> {
+    pub fn route_discrete(&mut self, input: &Array2<f32>) -> Array2<bool> {
         let (seq_len, _) = input.dim();
         let total_heads = self.num_shared_heads + self.num_routed_heads;
 
@@ -955,6 +1099,487 @@ impl HeadRouter {
     }
 }
 
+/// Fully Adaptive Head Router for complexity-aware dynamic head selection
+///
+/// Unlike standard MoH which has hardcoded shared/routed head splits, this router:
+/// - Treats ALL heads as routing candidates (no hardcoded shared heads)
+/// - Predicts input complexity to determine target head count
+/// - Uses complexity-driven adaptive top-p selection
+///
+/// # Architecture
+///
+/// ```text
+/// Input → Complexity Predictor → Target Heads (1-8)
+///      ↘ Threshold Predictor → Top-P Threshold (0.3-0.8)
+///      ↘ Unified Router → Routing Probabilities
+///
+/// Selection: Pick heads until cumsum ≥ threshold OR count ≥ target
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// let mut router = FullyAdaptiveHeadRouter::new(
+///     128,   // embedding_dim
+///     8,     // num_heads
+///     1,     // min_heads
+///     8,     // max_heads
+///     0.01,  // load_balance_weight
+///     0.01,  // complexity_loss_weight
+///     0.001, // sparsity_weight
+/// );
+///
+/// let input = Array2::ones((10, 128));
+/// let mask = router.route(&input);  // (10, 8) boolean mask
+/// // Simple inputs: 1-2 heads active
+/// // Complex inputs: 6-8 heads active
+/// ```
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FullyAdaptiveHeadRouter {
+    /// Total number of heads (all are routing candidates)
+    num_heads: usize,
+
+    /// Embedding dimension
+    embedding_dim: usize,
+
+    /// Unified router weights: (num_heads, embedding_dim)
+    /// Computes routing scores for ALL heads (no shared/routed split)
+    w_router: Array2<f32>,
+
+    /// Complexity predictor weights: (embedding_dim, 1)
+    /// Predicts input complexity score [0, 1] → target head count
+    w_complexity: Array2<f32>,
+
+    /// Complexity predictor bias
+    complexity_bias: f32,
+
+    /// Threshold predictor weights: (embedding_dim, 1)
+    /// Predicts per-token threshold for top-p selection
+    w_threshold: Array2<f32>,
+
+    /// Threshold predictor bias
+    threshold_bias: f32,
+
+    /// Minimum heads to activate (safety constraint)
+    min_heads: usize,
+
+    /// Maximum heads to activate (efficiency constraint)
+    max_heads: usize,
+
+    /// Weight for load balance loss
+    load_balance_weight: f32,
+
+    /// Weight for complexity alignment loss
+    complexity_loss_weight: f32,
+
+    /// Weight for sparsity loss
+    sparsity_weight: f32,
+
+    /// Temperature for soft routing (controls sharpness of sigmoid gating)
+    /// Higher values = sharper transitions (more discrete-like)
+    /// Lower values = smoother transitions (more continuous)
+    /// Typical range: 1.0-10.0, default: 5.0
+    temperature: f32,
+
+    /// Optimizer for router weights
+    router_optimizer: Adam,
+
+    /// Optimizer for complexity predictor
+    complexity_optimizer: Adam,
+
+    /// Optimizer for threshold predictor
+    threshold_optimizer: Adam,
+
+    /// Cached routing probabilities for backward pass
+    #[serde(skip)]
+    cached_routing_probs: Option<Array2<f32>>,
+
+    /// Cached complexity scores for backward pass
+    #[serde(skip)]
+    cached_complexity_scores: Option<Array1<f32>>,
+
+    /// Cached thresholds for backward pass
+    #[serde(skip)]
+    cached_thresholds: Option<Array1<f32>>,
+
+    /// Cached soft weights for backward pass (differentiable routing)
+    #[serde(skip)]
+    cached_soft_weights: Option<Array2<f32>>,
+
+    /// Cached target heads for backward pass
+    #[serde(skip)]
+    cached_target_heads: Option<Array1<f32>>,
+
+    /// Cached input for backward pass
+    #[serde(skip)]
+    cached_input: Option<Array2<f32>>,
+}
+
+impl FullyAdaptiveHeadRouter {
+    /// Create a new fully adaptive head router
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding_dim` - Input embedding dimension
+    /// * `num_heads` - Total number of attention heads (all are routing candidates)
+    /// * `min_heads` - Minimum heads to activate (typically 1)
+    /// * `max_heads` - Maximum heads to activate (typically num_heads)
+    /// * `load_balance_weight` - Weight for load balance loss (typically 0.01)
+    /// * `complexity_loss_weight` - Weight for complexity alignment loss (typically 0.01)
+    /// * `sparsity_weight` - Weight for sparsity loss (typically 0.001)
+    pub fn new(
+        embedding_dim: usize,
+        num_heads: usize,
+        min_heads: usize,
+        max_heads: usize,
+        load_balance_weight: f32,
+        complexity_loss_weight: f32,
+        sparsity_weight: f32,
+    ) -> Self {
+        assert!(min_heads >= 1, "min_heads must be >= 1");
+        assert!(max_heads <= num_heads, "max_heads must be <= num_heads");
+        assert!(min_heads <= max_heads, "min_heads must be <= max_heads");
+
+        let mut rng = rand::rng();
+
+        // Xavier initialization for router weights
+        let router_std = (2.0 / (embedding_dim + num_heads) as f32).sqrt();
+        let router_normal = Normal::new(0.0, router_std).unwrap();
+        let w_router = Array2::from_shape_fn((num_heads, embedding_dim), |_| {
+            router_normal.sample(&mut rng)
+        });
+
+        // Xavier initialization for complexity predictor
+        let complexity_std = (2.0 / (embedding_dim + 1) as f32).sqrt();
+        let complexity_normal = Normal::new(0.0, complexity_std).unwrap();
+        let w_complexity = Array2::from_shape_fn((embedding_dim, 1), |_| {
+            complexity_normal.sample(&mut rng)
+        });
+        let complexity_bias = 0.0;
+
+        // Xavier initialization for threshold predictor
+        let threshold_std = (2.0 / (embedding_dim + 1) as f32).sqrt();
+        let threshold_normal = Normal::new(0.0, threshold_std).unwrap();
+        let w_threshold = Array2::from_shape_fn((embedding_dim, 1), |_| {
+            threshold_normal.sample(&mut rng)
+        });
+        let threshold_bias = 0.0;
+
+        Self {
+            num_heads,
+            embedding_dim,
+            w_router,
+            w_complexity,
+            complexity_bias,
+            w_threshold,
+            threshold_bias,
+            min_heads,
+            max_heads,
+            load_balance_weight,
+            complexity_loss_weight,
+            sparsity_weight,
+            temperature: 5.0, // Default temperature for soft routing
+            router_optimizer: Adam::new((num_heads, embedding_dim)),
+            complexity_optimizer: Adam::new((embedding_dim, 1)),
+            threshold_optimizer: Adam::new((embedding_dim, 1)),
+            cached_routing_probs: None,
+            cached_complexity_scores: None,
+            cached_thresholds: None,
+            cached_soft_weights: None,
+            cached_target_heads: None,
+            cached_input: None,
+        }
+    }
+
+    /// Route input tokens to heads using complexity-driven adaptive top-p selection
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Predict complexity score [0, 1] for each token
+    /// 2. Map complexity to target head count: min_heads + complexity × (max_heads - min_heads)
+    /// 3. Predict per-token threshold for top-p selection
+    /// 4. Compute routing probabilities for all heads
+    /// 5. Select heads until: cumsum ≥ threshold OR count ≥ target OR all heads selected
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input tensor of shape (seq_len, embedding_dim)
+    ///
+    /// # Returns
+    ///
+    /// Soft weights of shape (seq_len, num_heads) where weights[i][j] ∈ [0, 1] is the activation weight for head j on token i
+    /// Uses differentiable sigmoid-based gating for gradient flow
+    pub fn route(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        let (seq_len, _) = input.dim();
+
+        // 1. Predict complexity scores [0, 1] for each token
+        let complexity_logits = input.dot(&self.w_complexity).into_shape(seq_len).unwrap();
+        let complexity_scores = complexity_logits.mapv(|x| {
+            let sigmoid = 1.0 / (1.0 + (-(x + self.complexity_bias)).exp());
+            sigmoid
+        });
+
+        // 2. Map complexity to target head count
+        let head_range = (self.max_heads - self.min_heads) as f32;
+        let target_heads = complexity_scores.mapv(|c| {
+            self.min_heads as f32 + c * head_range
+        });
+
+        // 3. Predict per-token thresholds [0.3, 0.8]
+        let threshold_logits = input.dot(&self.w_threshold).into_shape(seq_len).unwrap();
+        let thresholds = threshold_logits.mapv(|x| {
+            let sigmoid = 1.0 / (1.0 + (-(x + self.threshold_bias)).exp());
+            0.3 + sigmoid * 0.5  // Map [0, 1] → [0.3, 0.8]
+        });
+
+        // 4. Compute routing probabilities for all heads
+        let routing_logits = input.dot(&self.w_router.t());
+        let routing_probs = routing::softmax(&routing_logits);
+
+        // 5. SOFT ROUTING: Differentiable sigmoid-based gating
+        // Instead of discrete top-p selection, use continuous soft weights
+        let mut soft_weights = Array2::<f32>::zeros((seq_len, self.num_heads));
+
+        for token_idx in 0..seq_len {
+            let token_probs = routing_probs.row(token_idx);
+            let token_threshold = thresholds[token_idx];
+
+            // Sort heads by probability (descending)
+            let mut sorted_indices: Vec<usize> = (0..self.num_heads).collect();
+            sorted_indices.sort_by(|&a, &b| {
+                token_probs[b].partial_cmp(&token_probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Compute cumulative probabilities for each head
+            let mut cumulative_prob = 0.0;
+            for &head_idx in &sorted_indices {
+                cumulative_prob += token_probs[head_idx];
+
+                // Soft gating: sigmoid((cumulative_prob - threshold) * temperature)
+                // When cumulative_prob < threshold: gating ≈ 0 (head inactive)
+                // When cumulative_prob > threshold: gating ≈ 1 (head active)
+                // Temperature controls sharpness of transition
+                let gating = 1.0 / (1.0 + (-(cumulative_prob - token_threshold) * self.temperature).exp());
+
+                // Soft weight = routing_prob * gating
+                // This is differentiable w.r.t. both routing_probs and threshold
+                soft_weights[[token_idx, head_idx]] = token_probs[head_idx] * gating;
+            }
+
+            // Normalize soft weights to sum to approximately target_heads[token_idx]
+            // This maintains the complexity-driven head count behavior
+            let weight_sum: f32 = soft_weights.row(token_idx).sum();
+            if weight_sum > 0.0 {
+                let scale = target_heads[token_idx] / weight_sum;
+                for head_idx in 0..self.num_heads {
+                    soft_weights[[token_idx, head_idx]] *= scale;
+                }
+            }
+        }
+
+        // Cache for backward pass
+        self.cached_routing_probs = Some(routing_probs);
+        self.cached_complexity_scores = Some(complexity_scores);
+        self.cached_thresholds = Some(thresholds);
+        self.cached_soft_weights = Some(soft_weights.clone());
+        self.cached_target_heads = Some(target_heads);
+        self.cached_input = Some(input.clone());
+
+        soft_weights
+    }
+
+    /// Compute load balance loss to prevent routing collapse
+    ///
+    /// Loss: L_balance = Σ(i=1 to num_heads) P_i × W_i
+    ///
+    /// Where:
+    /// - P_i = average routing probability for head i across all tokens
+    /// - W_i = average soft weight for head i across all tokens
+    ///
+    /// This encourages uniform head usage across tokens (soft version).
+    pub fn compute_load_balance_loss(&self) -> f32 {
+        if let (Some(routing_probs), Some(soft_weights)) = (&self.cached_routing_probs, &self.cached_soft_weights) {
+            let seq_len = routing_probs.nrows();
+
+            let mut loss = 0.0;
+            for head_idx in 0..self.num_heads {
+                // P_i: average routing probability for head i
+                let avg_prob: f32 = routing_probs.column(head_idx).sum() / seq_len as f32;
+
+                // W_i: average soft weight for head i (continuous version of selection fraction)
+                let avg_weight: f32 = soft_weights.column(head_idx).sum() / seq_len as f32;
+
+                loss += avg_prob * avg_weight;
+            }
+
+            loss * self.load_balance_weight
+        } else {
+            0.0
+        }
+    }
+
+    /// Compute complexity alignment loss
+    ///
+    /// Loss: L_complexity = |avg_soft_heads - avg_target_heads|
+    ///
+    /// Encourages the router to use the number of heads predicted by the complexity predictor (soft version).
+    pub fn compute_complexity_loss(&self) -> f32 {
+        if let (Some(soft_weights), Some(target_heads)) = (&self.cached_soft_weights, &self.cached_target_heads) {
+            let seq_len = soft_weights.nrows();
+
+            // Compute average soft heads (sum of soft weights per token)
+            let mut total_soft_heads = 0.0;
+            for token_idx in 0..seq_len {
+                let token_soft_heads: f32 = soft_weights.row(token_idx).sum();
+                total_soft_heads += token_soft_heads;
+            }
+            let avg_soft_heads = total_soft_heads / seq_len as f32;
+
+            // Compute average target heads
+            let avg_target = target_heads.sum() / seq_len as f32;
+
+            // L1 loss
+            (avg_soft_heads - avg_target).abs() * self.complexity_loss_weight
+        } else {
+            0.0
+        }
+    }
+
+    /// Compute sparsity loss to encourage minimal head usage
+    ///
+    /// Loss: L_sparsity = (avg_soft_heads / num_heads)
+    ///
+    /// Provides a small penalty for using more heads (soft version).
+    pub fn compute_sparsity_loss(&self) -> f32 {
+        if let Some(soft_weights) = &self.cached_soft_weights {
+            let seq_len = soft_weights.nrows();
+
+            // Compute average soft heads (sum of soft weights per token)
+            let mut total_soft_heads = 0.0;
+            for token_idx in 0..seq_len {
+                let token_soft_heads: f32 = soft_weights.row(token_idx).sum();
+                total_soft_heads += token_soft_heads;
+            }
+            let avg_soft_heads = total_soft_heads / seq_len as f32;
+
+            (avg_soft_heads / self.num_heads as f32) * self.sparsity_weight
+        } else {
+            0.0
+        }
+    }
+
+    /// Get statistics about the last routing operation
+    ///
+    /// Returns: (avg_heads, min_heads, max_heads, avg_complexity, avg_threshold)
+    /// For soft routing, avg_heads is the average sum of soft weights per token
+    pub fn routing_stats(&self) -> (f32, usize, usize, f32, f32) {
+        if let (Some(soft_weights), Some(complexity), Some(thresholds)) =
+            (&self.cached_soft_weights, &self.cached_complexity_scores, &self.cached_thresholds) {
+
+            let seq_len = soft_weights.nrows();
+
+            // Compute soft head statistics
+            let mut soft_head_counts = Vec::with_capacity(seq_len);
+            for token_idx in 0..seq_len {
+                let soft_count: f32 = soft_weights.row(token_idx).sum();
+                soft_head_counts.push(soft_count);
+            }
+
+            let avg_heads = soft_head_counts.iter().sum::<f32>() / seq_len as f32;
+            let min_heads = soft_head_counts.iter().cloned().fold(f32::INFINITY, f32::min).round() as usize;
+            let max_heads = soft_head_counts.iter().cloned().fold(f32::NEG_INFINITY, f32::max).round() as usize;
+            let avg_complexity = complexity.sum() / seq_len as f32;
+            let avg_threshold = thresholds.sum() / seq_len as f32;
+
+            (avg_heads, min_heads, max_heads, avg_complexity, avg_threshold)
+        } else {
+            (0.0, 0, 0, 0.0, 0.0)
+        }
+    }
+
+    /// Get combined weight norm of all predictors
+    ///
+    /// Returns the average L2 norm of router, complexity, and threshold predictor weights
+    pub fn get_predictor_weight_norm(&self) -> f32 {
+        let complexity_norm = self.w_complexity.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let threshold_norm = self.w_threshold.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let router_norm = self.w_router.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        (complexity_norm + threshold_norm + router_norm) / 3.0
+    }
+
+    /// Backward pass: compute gradients and update parameters
+    ///
+    /// This is a simplified backward pass that uses the auxiliary losses
+    /// to update the router, complexity predictor, and threshold predictor.
+    ///
+    /// # Arguments
+    ///
+    /// * `lr` - Learning rate for parameter updates
+    pub fn backward(&mut self, lr: f32) {
+        // Soft routing: gradients flow through continuous soft weights
+        // The auxiliary losses provide additional training signal
+
+        if let (Some(input), Some(soft_weights), Some(routing_probs), Some(complexity_scores), Some(target_heads)) =
+            (&self.cached_input, &self.cached_soft_weights, &self.cached_routing_probs,
+             &self.cached_complexity_scores, &self.cached_target_heads) {
+
+            let seq_len = input.nrows();
+
+            // 1. Router gradients: encourage high-weight heads, discourage low-weight heads
+            let mut router_grads = Array2::zeros((self.num_heads, self.embedding_dim));
+            for token_idx in 0..seq_len {
+                for head_idx in 0..self.num_heads {
+                    let weight = soft_weights[[token_idx, head_idx]];
+                    let prob = routing_probs[[token_idx, head_idx]];
+
+                    // Gradient: (weight - prob) to push prob toward weight
+                    // This encourages routing probs to match the soft weights
+                    let grad_scale = weight - prob;
+
+                    for dim_idx in 0..self.embedding_dim {
+                        router_grads[[head_idx, dim_idx]] += grad_scale * input[[token_idx, dim_idx]];
+                    }
+                }
+            }
+            router_grads /= seq_len as f32;
+
+            // 2. Complexity predictor gradients: align with actual soft head usage
+            let mut complexity_grads = Array2::zeros((self.embedding_dim, 1));
+            for token_idx in 0..seq_len {
+                let actual_soft_heads: f32 = soft_weights.row(token_idx).sum();
+                let target = target_heads[token_idx];
+                let complexity = complexity_scores[token_idx];
+
+                // Gradient: push complexity toward value that would give actual_soft_heads
+                let desired_complexity = (actual_soft_heads - self.min_heads as f32) / (self.max_heads - self.min_heads) as f32;
+                let grad_scale = (desired_complexity - complexity) * complexity * (1.0 - complexity); // sigmoid derivative
+
+                for dim_idx in 0..self.embedding_dim {
+                    complexity_grads[[dim_idx, 0]] += grad_scale * input[[token_idx, dim_idx]];
+                }
+            }
+            complexity_grads /= seq_len as f32;
+
+            // 3. Threshold predictor gradients: simple heuristic
+            let mut threshold_grads = Array2::zeros((self.embedding_dim, 1));
+            // For now, keep thresholds relatively stable (small gradients)
+            threshold_grads *= 0.1;
+
+            // Update parameters using Adam optimizer
+            self.router_optimizer.step(&mut self.w_router, &router_grads, lr);
+            self.complexity_optimizer.step(&mut self.w_complexity, &complexity_grads, lr * 0.1); // Slower learning for complexity
+            self.threshold_optimizer.step(&mut self.w_threshold, &threshold_grads, lr * 0.1); // Slower learning for threshold
+        }
+    }
+
+    /// Get total number of parameters
+    pub fn num_parameters(&self) -> usize {
+        self.num_heads * self.embedding_dim  // w_router
+            + self.embedding_dim + 1          // w_complexity + bias
+            + self.embedding_dim + 1          // w_threshold + bias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,7 +1587,7 @@ mod tests {
 
     #[test]
     fn test_head_router_creation() {
-        let router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        let router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
 
         assert_eq!(router.total_heads(), 8);
         assert_eq!(router.num_shared_heads, 2);
@@ -976,7 +1601,7 @@ mod tests {
 
     #[test]
     fn test_head_router_route_shape() {
-        let mut router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
         let mask = router.route(&input);

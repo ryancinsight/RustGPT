@@ -46,10 +46,10 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // Choose architecture: Transformer, HyperMixer, HRM, or TRM
-    //let architecture = ArchitectureType::HyperMixer; // Change to HyperMixer for comparison
-    //let architecture = ArchitectureType::Transformer; // Standard transformer
+    //let architecture = ArchitectureType::HyperMixer; // HyperMixer (refined with TRM learnings)
+    let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
     //let architecture = ArchitectureType::HRM; // Hierarchical Reasoning Model
-    let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing)
+    //let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing)
 
     // ============================================================================
     // NORMALIZATION CONFIGURATION
@@ -257,21 +257,44 @@ fn main() -> llm::Result<()> {
     let head_selection = if architecture == ArchitectureType::TRM {
         HeadSelectionStrategy::AllHeads // Standard MHA for TRM (simpler for initial testing)
     } else {
-        // Enable MoH with fully adaptive routing (optimized based on training logs)
-        HeadSelectionStrategy::MixtureOfHeads {
-            num_shared_heads: 2,                // 25% of 8 heads always active
-            num_active_routed_heads: 4,         // DEPRECATED: not used in adaptive routing (kept for backward compat)
-            load_balance_weight: 0.01,          // Prevents routing collapse
-            threshold_p_base: 0.4,              // OPTIMIZED: Lower base (0.4 vs 0.5) → fewer heads, better loss
-                                                // Layer-wise: early=0.5, middle=0.4, late=0.3
-            dynamic_loss_weight_base: 5e-5,     // OPTIMIZED: Lower weight (5e-5 vs 1e-4) → less aggressive sparsity penalty
-            use_learned_threshold: true,        // ENABLED: Per-token learned thresholds for fine-grained adaptation
-            target_avg_routed_heads: 3.5,       // OPTIMIZED: Increased target (3.5 vs 3.0) → less aggressive sparsity
-            confidence_threshold: 0.4,          // TUNED: Lower threshold (0.4 vs 0.6) → less aggressive fallback
-                                                // Previous: 0.6 caused 50.7% fallback rate and 73% loss increase
-            use_confidence_fallback: false,     // DISABLED: Fallback too conservative, hurts loss significantly
-                                                // Will re-enable after predictor converges better
+        // ============================================================================
+        // FULLY ADAPTIVE MIXTURE-OF-HEADS (Phase 1 Implementation)
+        // ============================================================================
+        // Complexity-aware dynamic head selection with NO hardcoded shared/routed splits
+        //
+        // Key Features:
+        // - ALL 8 heads are routing candidates (no hardcoded shared heads)
+        // - Complexity predictor learns input difficulty → target head count
+        // - Threshold predictor learns per-token threshold for top-p selection
+        // - Simple inputs use 1-2 heads, complex inputs use 6-8 heads
+        //
+        // Expected Performance:
+        // - Loss: ≤ 0.40 (comparable to standard MoH)
+        // - Gradient norm: ≤ 2.5 (stable)
+        // - Average heads: 3-4 (50% reduction from AllHeads baseline of 8)
+        // - Efficiency gain: 15-25% (vs 5-8% for standard MoH)
+        // ============================================================================
+        // SOFT ROUTING: Differentiable routing with continuous weights
+        HeadSelectionStrategy::FullyAdaptiveMoH {
+            min_heads: 1,                       // Minimum heads for simple inputs (safety constraint)
+            max_heads: 8,                       // Maximum heads for complex inputs (efficiency constraint)
+            load_balance_weight: 0.1,           // INCREASED 10x: was 0.01 (too weak)
+            complexity_loss_weight: 0.1,        // INCREASED 10x: was 0.01 (too weak)
+            sparsity_weight: 0.01,              // INCREASED 10x: was 0.001 (too weak)
         }
+
+        // Alternative: Standard MoH (for comparison)
+        // HeadSelectionStrategy::MixtureOfHeads {
+        //     num_shared_heads: 2,
+        //     num_active_routed_heads: 4,
+        //     load_balance_weight: 0.01,
+        //     threshold_p_base: 0.4,
+        //     dynamic_loss_weight_base: 5e-5,
+        //     use_learned_threshold: true,
+        //     target_avg_routed_heads: 3.5,
+        //     confidence_threshold: 0.4,
+        //     use_confidence_fallback: false,
+        // }
     };
 
     // Alternative configurations:

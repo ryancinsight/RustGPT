@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::EMBEDDING_DIM;
 use crate::adam::Adam;
 use crate::cop::ContextualPositionEncoding;
-use crate::head_router::HeadRouter;
+use crate::head_router::{RouterType, HeadRouterStandard, FullyAdaptiveHeadRouter};
 use crate::llm::Layer;
 use crate::model_config::{HeadSelectionStrategy, WindowAdaptationStrategy};
 use crate::rope::RotaryEmbedding;
@@ -82,11 +82,11 @@ pub struct SelfAttention {
     #[serde(skip)]
     last_attention_entropy: Option<f32>,
 
-    /// Head selection strategy (AllHeads, MixtureOfHeads, StaticPruning)
+    /// Head selection strategy (AllHeads, MixtureOfHeads, StaticPruning, FullyAdaptiveMoH)
     head_selection: HeadSelectionStrategy,
 
     /// Router for Mixture-of-Heads (if enabled)
-    router: Option<HeadRouter>,
+    router: Option<RouterType>,
 
     /// Cached head activation mask from last forward pass (for backward)
     #[serde(skip)]
@@ -484,7 +484,7 @@ impl SelfAttention {
                 use_confidence_fallback,
             } => {
                 let num_routed_heads = self.num_heads - num_shared_heads;
-                self.router = Some(HeadRouter::new(
+                self.router = Some(RouterType::Standard(HeadRouterStandard::new(
                     self.embedding_dim,
                     *num_shared_heads,
                     num_routed_heads,
@@ -497,12 +497,41 @@ impl SelfAttention {
                     *target_avg_routed_heads,
                     *confidence_threshold,
                     *use_confidence_fallback,
-                ));
+                )));
+            }
+            HeadSelectionStrategy::FullyAdaptiveMoH {
+                min_heads,
+                max_heads,
+                load_balance_weight,
+                complexity_loss_weight,
+                sparsity_weight,
+            } => {
+                self.router = Some(RouterType::FullyAdaptive(FullyAdaptiveHeadRouter::new(
+                    self.embedding_dim,
+                    self.num_heads,
+                    *min_heads,
+                    *max_heads,
+                    *load_balance_weight,
+                    *complexity_loss_weight,
+                    *sparsity_weight,
+                )));
             }
             _ => {
                 self.router = None;
             }
         }
+    }
+
+    /// Get the total auxiliary loss from the router (if MoH is enabled)
+    ///
+    /// For standard MoH: load balance + dynamic loss
+    /// For fully adaptive MoH: load balance + complexity + sparsity loss
+    ///
+    /// Returns 0.0 if MoH is not enabled or no routing has been performed yet.
+    pub fn get_auxiliary_loss(&self) -> f32 {
+        self.router
+            .as_ref()
+            .map_or(0.0, |r| r.compute_auxiliary_loss())
     }
 
     /// Get the load balance loss from the router (if MoH is enabled)
@@ -511,16 +540,27 @@ impl SelfAttention {
     pub fn get_load_balance_loss(&self) -> f32 {
         self.router
             .as_ref()
-            .map_or(0.0, |r| r.compute_load_balance_loss())
+            .map_or(0.0, |r| match r {
+                RouterType::Standard(router) => router.compute_load_balance_loss(),
+                RouterType::FullyAdaptive(router) => router.compute_load_balance_loss(),
+            })
     }
 
     /// Get the dynamic loss (entropy minimization) from the router (if MoH is enabled)
+    ///
+    /// For Fully Adaptive MoH, this returns complexity + sparsity losses instead of entropy.
     ///
     /// Returns 0.0 if MoH is not enabled or no routing has been performed yet.
     pub fn get_dynamic_loss(&self) -> f32 {
         self.router
             .as_ref()
-            .map_or(0.0, |r| r.compute_dynamic_loss())
+            .map_or(0.0, |r| match r {
+                RouterType::Standard(router) => router.compute_dynamic_loss(),
+                RouterType::FullyAdaptive(router) => {
+                    // CRITICAL FIX: Include complexity and sparsity losses
+                    router.compute_complexity_loss() + router.compute_sparsity_loss()
+                }
+            })
     }
 
     /// Get the adaptive dynamic loss weight from the router (if MoH is enabled)
@@ -533,7 +573,10 @@ impl SelfAttention {
     pub fn get_dynamic_loss_weight(&self, training_progress: f32) -> f32 {
         self.router
             .as_ref()
-            .map_or(0.0, |r| r.dynamic_loss_weight(training_progress))
+            .map_or(0.0, |r| match r {
+                RouterType::Standard(router) => router.dynamic_loss_weight(training_progress),
+                RouterType::FullyAdaptive(_) => 0.0, // Not applicable
+            })
     }
 
     /// Get average number of active routed heads per token (if MoH is enabled)
@@ -542,7 +585,13 @@ impl SelfAttention {
     pub fn get_avg_active_routed_heads(&self) -> f32 {
         self.router
             .as_ref()
-            .map_or(0.0, |r| r.avg_active_routed_heads())
+            .map_or(0.0, |r| match r {
+                RouterType::Standard(router) => router.avg_active_routed_heads(),
+                RouterType::FullyAdaptive(router) => {
+                    let (avg_heads, _, _, _, _) = router.routing_stats();
+                    avg_heads
+                }
+            })
     }
 
     /// Get threshold statistics (min, max, mean, std) from the router (if MoH is enabled)
@@ -551,18 +600,38 @@ impl SelfAttention {
     pub fn get_threshold_stats(&self) -> (f32, f32, f32, f32) {
         self.router
             .as_ref()
-            .map_or((0.0, 0.0, 0.0, 0.0), |r| r.threshold_stats())
+            .map_or((0.0, 0.0, 0.0, 0.0), |r| match r {
+                RouterType::Standard(router) => router.threshold_stats(),
+                RouterType::FullyAdaptive(router) => {
+                    // Get threshold stats from routing_stats method
+                    let (_, _, _, _, avg_threshold) = router.routing_stats();
+                    // For fully adaptive, we return avg as all values since we don't track min/max separately
+                    (avg_threshold, avg_threshold, avg_threshold, 0.0)
+                }
+            })
     }
 
-    /// Update threshold predictor if MoH with learned predictor is enabled
+    /// Update router parameters (threshold predictor for standard MoH, all params for fully adaptive)
+    ///
+    /// # Arguments
+    ///
+    /// * `lr` - Learning rate for parameter updates
+    pub fn update_router(&mut self, lr: f32) {
+        if let Some(router) = &mut self.router {
+            match router {
+                RouterType::Standard(r) => r.update_threshold_predictor(lr),
+                RouterType::FullyAdaptive(r) => r.backward(lr),
+            }
+        }
+    }
+
+    /// Update threshold predictor if MoH with learned predictor is enabled (deprecated, use update_router)
     ///
     /// # Arguments
     ///
     /// * `lr` - Learning rate for predictor updates
     pub fn update_threshold_predictor(&mut self, lr: f32) {
-        if let Some(router) = &mut self.router {
-            router.update_threshold_predictor(lr);
-        }
+        self.update_router(lr);
     }
 
     /// Check if this layer has a learned threshold predictor
@@ -578,7 +647,8 @@ impl SelfAttention {
     pub fn get_confidence_stats(&self) -> (f32, f32, f32) {
         self.router
             .as_ref()
-            .map_or((0.0, 0.0, 0.0), |r| r.confidence_stats())
+            .and_then(|r| r.confidence_stats())
+            .unwrap_or((0.0, 0.0, 0.0))
     }
 
     /// Get complexity statistics (avg, min, max) from the router (if MoH is enabled)
@@ -587,7 +657,8 @@ impl SelfAttention {
     pub fn get_complexity_stats(&self) -> (f32, f32, f32) {
         self.router
             .as_ref()
-            .map_or((0.0, 0.0, 0.0), |r| r.complexity_stats())
+            .and_then(|r| r.complexity_stats())
+            .unwrap_or((0.0, 0.0, 0.0))
     }
 
     /// Get predictor weight norm (for tracking convergence)
@@ -924,27 +995,24 @@ impl Layer for SelfAttention {
             self.window_size
         };
 
-        // Compute head activation mask if MoH is enabled
-        let head_mask = if let Some(router) = &mut self.router {
-            let mask = router.route(input);
-            self.cached_head_mask = Some(mask.clone());
-            Some(mask)
+        // Compute head activation weights if MoH is enabled (soft weights for differentiable routing)
+        let head_weights = if let Some(router) = &mut self.router {
+            Some(router.route(input))
         } else {
-            // AllHeads or StaticPruning: create mask based on strategy
+            // AllHeads or StaticPruning: create weights based on strategy
             match &self.head_selection {
-                HeadSelectionStrategy::AllHeads => None, // All heads active
+                HeadSelectionStrategy::AllHeads => None, // All heads active (weight = 1.0)
                 HeadSelectionStrategy::StaticPruning { num_active_heads } => {
-                    // Only first K heads active
-                    let mut mask = Array2::<bool>::from_elem((seq_len, self.num_heads), false);
+                    // Only first K heads active (weight = 1.0), rest inactive (weight = 0.0)
+                    let mut weights = Array2::<f32>::zeros((seq_len, self.num_heads));
                     for token_idx in 0..seq_len {
                         for head_idx in 0..*num_active_heads {
-                            mask[[token_idx, head_idx]] = true;
+                            weights[[token_idx, head_idx]] = 1.0;
                         }
                     }
-                    self.cached_head_mask = Some(mask.clone());
-                    Some(mask)
+                    Some(weights)
                 }
-                HeadSelectionStrategy::MixtureOfHeads { .. } => {
+                HeadSelectionStrategy::MixtureOfHeads { .. } | HeadSelectionStrategy::FullyAdaptiveMoH { .. } => {
                     // Should not reach here (router should be initialized)
                     None
                 }
@@ -1011,16 +1079,15 @@ impl Layer for SelfAttention {
         }
 
         // Process each query head with its corresponding KV head (GQA grouping)
-        // Apply head masking if enabled (MoH or StaticPruning)
+        // Apply head weighting if enabled (MoH or StaticPruning)
         let head_outputs: Vec<Array2<f32>> = queries
             .iter()
             .enumerate()
             .map(|(h, q)| {
-                // Check if this head is active
-                let is_head_active = if let Some(mask) = &head_mask {
-                    // Check if ANY token activates this head (for per-token routing)
-                    // We'll apply per-token masking later during concatenation
-                    mask.column(h).iter().any(|&active| active)
+                // Check if this head is active (for optimization: skip computation if all weights are 0)
+                let is_head_active = if let Some(weights) = &head_weights {
+                    // Check if ANY token has non-zero weight for this head
+                    weights.column(h).iter().any(|&w| w > 0.0)
                 } else {
                     true // AllHeads: all heads always active
                 };
@@ -1058,26 +1125,28 @@ impl Layer for SelfAttention {
             .collect();
 
         // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
-        // Apply per-token masking if MoH is enabled
+        // Apply per-token soft weighting if MoH is enabled (differentiable routing)
         let mut output = Array2::zeros((seq_len, emb_dim));
         for (h, head_output) in head_outputs.iter().enumerate().take(self.num_heads) {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
 
-            // Apply per-token masking if head_mask is present
-            if let Some(mask) = &head_mask {
-                // For each token, only include this head's output if it's active
+            // Apply per-token soft weighting if head_weights is present
+            if let Some(weights) = &head_weights {
+                // For each token, scale this head's output by its soft weight
                 for token_idx in 0..seq_len {
-                    if mask[[token_idx, h]] {
+                    let weight = weights[[token_idx, h]];
+                    if weight > 0.0 {
                         let head_row = head_output.row(token_idx);
+                        let weighted_row = head_row.mapv(|x| x * weight);
                         output
                             .slice_mut(ndarray::s![token_idx, start_col..end_col])
-                            .assign(&head_row);
+                            .assign(&weighted_row);
                     }
                     // else: leave as zeros (head inactive for this token)
                 }
             } else {
-                // No masking: assign all head outputs
+                // No weighting: assign all head outputs (weight = 1.0)
                 output
                     .slice_mut(ndarray::s![.., start_col..end_col])
                     .assign(head_output);
@@ -1186,6 +1255,12 @@ impl Layer for SelfAttention {
                 .step(&mut head.w_v, &param_grads[idx + 2], lr);
             idx += 3;
         }
+
+        // CRITICAL FIX: Update router parameters using auxiliary loss gradients
+        if let Some(router) = &mut self.router {
+            router.backward(lr);
+        }
+
         Ok(())
     }
 }
