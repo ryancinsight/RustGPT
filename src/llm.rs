@@ -61,6 +61,22 @@ impl LayerEnum {
             _ => None,
         }
     }
+
+    /// Downcast to TRMBlock layer if this is a TRMBlock variant
+    pub fn as_trm_block(&self) -> Option<&crate::trm::TinyRecursiveModel> {
+        match self {
+            LayerEnum::TRMBlock(layer) => Some(layer.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Downcast to mutable TRMBlock layer if this is a TRMBlock variant
+    pub fn as_trm_block_mut(&mut self) -> Option<&mut crate::trm::TinyRecursiveModel> {
+        match self {
+            LayerEnum::TRMBlock(layer) => Some(layer.as_mut()),
+            _ => None,
+        }
+    }
 }
 
 impl Layer for LayerEnum {
@@ -416,6 +432,8 @@ impl LLM {
                     attn_layer.set_epoch_info(epoch, epochs);
                 } else if let Some(moe_layer) = layer.as_attention_moe_mut() {
                     moe_layer.set_epoch_info(epoch, epochs);
+                } else if let Some(trm_block) = layer.as_trm_block_mut() {
+                    trm_block.set_epoch_info(epoch, epochs);
                 }
             }
 
@@ -522,6 +540,41 @@ impl LLM {
                             has_learned_predictor = true;
                         }
 
+                        moh_layer_count += 1;
+                    }
+                } else if let Some(trm_block) = layer.as_trm_block() {
+                    // For TRM, get MoH stats from internal attention layer
+                    let (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm) = trm_block.get_moh_stats();
+                    if avg_routed > 0.0 {
+                        let dyn_weight = 0.0; // TRM doesn't have dynamic loss weight yet
+                        moh_layers_stats.push((layer_idx, avg_routed, mean_thresh, dyn_weight));
+
+                        // Track threshold range (approximate from mean)
+                        threshold_range_min = threshold_range_min.min(mean_thresh - 0.1);
+                        threshold_range_max = threshold_range_max.max(mean_thresh + 0.1);
+
+                        // Track confidence statistics
+                        total_conf_avg += conf_avg;
+                        total_conf_min = total_conf_min.min(conf_min);
+                        total_fallback_pct += fallback_pct;
+
+                        // Track complexity statistics
+                        total_complexity_avg += complexity_avg;
+                        total_complexity_min = total_complexity_min.min(complexity_avg);
+                        total_complexity_max = total_complexity_max.max(complexity_avg);
+
+                        // Track predictor weight norm
+                        total_pred_norm += pred_norm;
+
+                        // Track temperature statistics (for fully adaptive MoH)
+                        if let Some((temp_avg, temp_min, temp_max)) = trm_block.get_temperature_stats() {
+                            total_temp_avg += temp_avg;
+                            total_temp_min = total_temp_min.min(temp_min);
+                            total_temp_max = total_temp_max.max(temp_max);
+                            has_temperature_stats = true;
+                        }
+
+                        has_learned_predictor = true;
                         moh_layer_count += 1;
                     }
                 } else if let Some(moe_layer) = layer.as_attention_moe() {
@@ -821,6 +874,14 @@ impl LLM {
                 // Dynamic loss (weighted by adaptive dynamic_loss_weight)
                 let dyn_loss = attn_layer.get_dynamic_loss();
                 let dyn_weight = attn_layer.get_dynamic_loss_weight(training_progress);
+                batch_loss += dyn_loss * dyn_weight;
+            } else if let Some(trm_block) = layer.as_trm_block() {
+                // For TRM, get auxiliary losses from internal attention layer
+                let lb_loss = trm_block.get_load_balance_loss();
+                batch_loss += lb_loss;
+
+                let dyn_loss = trm_block.get_dynamic_loss();
+                let dyn_weight = trm_block.get_dynamic_loss_weight(training_progress);
                 batch_loss += dyn_loss * dyn_weight;
             } else if let Some(moe_layer) = layer.as_attention_moe() {
                 // For AttentionMoE, add auxiliary loss (includes both MoE routing and MoH routing losses)
