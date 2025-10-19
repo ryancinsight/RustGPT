@@ -318,6 +318,21 @@ impl RouterType {
         }
     }
 
+    /// Get temperature statistics (only for fully adaptive router)
+    pub fn temperature_stats(&self) -> Option<(f32, f32, f32)> {
+        match self {
+            RouterType::Standard(_) => None,
+            RouterType::FullyAdaptive(router) => {
+                let stats = router.get_temperature_stats();
+                if stats.0 > 0.0 {
+                    Some(stats)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Get complexity statistics for both standard and fully adaptive routers
     pub fn complexity_stats(&self) -> Option<(f32, f32, f32)> {
         match self {
@@ -1175,11 +1190,12 @@ pub struct FullyAdaptiveHeadRouter {
     /// Weight for sparsity loss
     sparsity_weight: f32,
 
-    /// Temperature for soft routing (controls sharpness of sigmoid gating)
-    /// Higher values = sharper transitions (more discrete-like)
-    /// Lower values = smoother transitions (more continuous)
-    /// Typical range: 1.0-10.0, default: 5.0
-    temperature: f32,
+    /// Temperature predictor weights: (embedding_dim, 1)
+    /// Predicts per-token temperature for soft routing gating
+    w_temperature: Array2<f32>,
+
+    /// Temperature predictor bias
+    temperature_bias: f32,
 
     /// Optimizer for router weights
     router_optimizer: Adam,
@@ -1189,6 +1205,9 @@ pub struct FullyAdaptiveHeadRouter {
 
     /// Optimizer for threshold predictor
     threshold_optimizer: Adam,
+
+    /// Optimizer for temperature predictor
+    temperature_optimizer: Adam,
 
     /// Cached routing probabilities for backward pass
     #[serde(skip)]
@@ -1201,6 +1220,10 @@ pub struct FullyAdaptiveHeadRouter {
     /// Cached thresholds for backward pass
     #[serde(skip)]
     cached_thresholds: Option<Array1<f32>>,
+
+    /// Cached temperatures for backward pass
+    #[serde(skip)]
+    cached_temperatures: Option<Array1<f32>>,
 
     /// Cached soft weights for backward pass (differentiable routing)
     #[serde(skip)]
@@ -1265,6 +1288,15 @@ impl FullyAdaptiveHeadRouter {
         });
         let threshold_bias = 0.0;
 
+        // Xavier initialization for temperature predictor
+        // Initialize to output ~5.0 initially: sigmoid(0) = 0.5 → 1.0 + 0.5 * 9.0 = 5.5
+        let temperature_std = (2.0 / (embedding_dim + 1) as f32).sqrt() * 0.5;  // Smaller std for stability
+        let temperature_normal = Normal::new(0.0, temperature_std).unwrap();
+        let w_temperature = Array2::from_shape_fn((embedding_dim, 1), |_| {
+            temperature_normal.sample(&mut rng)
+        });
+        let temperature_bias = 0.0;
+
         Self {
             num_heads,
             embedding_dim,
@@ -1273,18 +1305,21 @@ impl FullyAdaptiveHeadRouter {
             complexity_bias,
             w_threshold,
             threshold_bias,
+            w_temperature,
+            temperature_bias,
             min_heads,
             max_heads,
             load_balance_weight,
             complexity_loss_weight,
             sparsity_weight,
-            temperature: 5.0, // Default temperature for soft routing
             router_optimizer: Adam::new((num_heads, embedding_dim)),
             complexity_optimizer: Adam::new((embedding_dim, 1)),
             threshold_optimizer: Adam::new((embedding_dim, 1)),
+            temperature_optimizer: Adam::new((embedding_dim, 1)),
             cached_routing_probs: None,
             cached_complexity_scores: None,
             cached_thresholds: None,
+            cached_temperatures: None,
             cached_soft_weights: None,
             cached_target_heads: None,
             cached_input: None,
@@ -1332,6 +1367,13 @@ impl FullyAdaptiveHeadRouter {
             0.3 + sigmoid * 0.5  // Map [0, 1] → [0.3, 0.8]
         });
 
+        // 3.5. Predict per-token temperatures [1.0, 10.0]
+        let temp_logits = input.dot(&self.w_temperature).into_shape(seq_len).unwrap();
+        let temperatures = temp_logits.mapv(|x| {
+            let sigmoid = 1.0 / (1.0 + (-(x + self.temperature_bias)).exp());
+            1.0 + sigmoid * 9.0  // Map [0, 1] → [1.0, 10.0]
+        });
+
         // 4. Compute routing probabilities for all heads
         let routing_logits = input.dot(&self.w_router.t());
         let routing_probs = routing::softmax(&routing_logits);
@@ -1343,6 +1385,7 @@ impl FullyAdaptiveHeadRouter {
         for token_idx in 0..seq_len {
             let token_probs = routing_probs.row(token_idx);
             let token_threshold = thresholds[token_idx];
+            let token_temperature = temperatures[token_idx];
 
             // Sort heads by probability (descending)
             let mut sorted_indices: Vec<usize> = (0..self.num_heads).collect();
@@ -1358,11 +1401,11 @@ impl FullyAdaptiveHeadRouter {
                 // Soft gating: sigmoid((cumulative_prob - threshold) * temperature)
                 // When cumulative_prob < threshold: gating ≈ 0 (head inactive)
                 // When cumulative_prob > threshold: gating ≈ 1 (head active)
-                // Temperature controls sharpness of transition
-                let gating = 1.0 / (1.0 + (-(cumulative_prob - token_threshold) * self.temperature).exp());
+                // Temperature controls sharpness of transition (now per-token adaptive)
+                let gating = 1.0 / (1.0 + (-(cumulative_prob - token_threshold) * token_temperature).exp());
 
                 // Soft weight = routing_prob * gating
-                // This is differentiable w.r.t. both routing_probs and threshold
+                // This is differentiable w.r.t. routing_probs, threshold, AND temperature
                 soft_weights[[token_idx, head_idx]] = token_probs[head_idx] * gating;
             }
 
@@ -1381,6 +1424,7 @@ impl FullyAdaptiveHeadRouter {
         self.cached_routing_probs = Some(routing_probs);
         self.cached_complexity_scores = Some(complexity_scores);
         self.cached_thresholds = Some(thresholds);
+        self.cached_temperatures = Some(temperatures);
         self.cached_soft_weights = Some(soft_weights.clone());
         self.cached_target_heads = Some(target_heads);
         self.cached_input = Some(input.clone());
@@ -1499,12 +1543,27 @@ impl FullyAdaptiveHeadRouter {
 
     /// Get combined weight norm of all predictors
     ///
-    /// Returns the average L2 norm of router, complexity, and threshold predictor weights
+    /// Returns the average L2 norm of router, complexity, threshold, and temperature predictor weights
     pub fn get_predictor_weight_norm(&self) -> f32 {
         let complexity_norm = self.w_complexity.iter().map(|&x| x * x).sum::<f32>().sqrt();
         let threshold_norm = self.w_threshold.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let temperature_norm = self.w_temperature.iter().map(|&x| x * x).sum::<f32>().sqrt();
         let router_norm = self.w_router.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        (complexity_norm + threshold_norm + router_norm) / 3.0
+        (complexity_norm + threshold_norm + temperature_norm + router_norm) / 4.0
+    }
+
+    /// Get temperature statistics from the last routing operation
+    ///
+    /// Returns: (avg_temperature, min_temperature, max_temperature)
+    pub fn get_temperature_stats(&self) -> (f32, f32, f32) {
+        if let Some(temperatures) = &self.cached_temperatures {
+            let avg_temp = temperatures.sum() / temperatures.len() as f32;
+            let min_temp = temperatures.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_temp = temperatures.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            (avg_temp, min_temp, max_temp)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
     }
 
     /// Backward pass: compute gradients and update parameters
@@ -1519,9 +1578,9 @@ impl FullyAdaptiveHeadRouter {
         // Soft routing: gradients flow through continuous soft weights
         // The auxiliary losses provide additional training signal
 
-        if let (Some(input), Some(soft_weights), Some(routing_probs), Some(complexity_scores), Some(target_heads)) =
+        if let (Some(input), Some(soft_weights), Some(routing_probs), Some(complexity_scores), Some(target_heads), Some(thresholds)) =
             (&self.cached_input, &self.cached_soft_weights, &self.cached_routing_probs,
-             &self.cached_complexity_scores, &self.cached_target_heads) {
+             &self.cached_complexity_scores, &self.cached_target_heads, &self.cached_thresholds) {
 
             let seq_len = input.nrows();
 
@@ -1565,10 +1624,82 @@ impl FullyAdaptiveHeadRouter {
             // For now, keep thresholds relatively stable (small gradients)
             threshold_grads *= 0.1;
 
+            // 4. Temperature predictor gradients: based on gating function derivative
+            let mut temperature_grads = Array2::zeros((self.embedding_dim, 1));
+            if let Some(temperatures) = &self.cached_temperatures {
+                // Gating function: g = sigmoid((cumulative_prob - threshold) * temperature)
+                // Derivative: ∂g/∂temp = g * (1 - g) * (cumulative_prob - threshold)
+                //
+                // We want to adjust temperature to improve soft weight alignment with targets
+                // Strategy: compute gradient based on how gating affects soft weights
+
+                for token_idx in 0..seq_len {
+                    let token_probs = routing_probs.row(token_idx);
+                    let token_threshold = thresholds[token_idx];
+                    let token_temperature = temperatures[token_idx];
+                    let target = target_heads[token_idx];
+                    let actual_soft_heads: f32 = soft_weights.row(token_idx).sum();
+
+                    // Error signal: difference between actual and target head count
+                    let head_error = actual_soft_heads - target;
+
+                    // Sort heads by probability to compute cumulative probs
+                    let mut sorted_indices: Vec<usize> = (0..self.num_heads).collect();
+                    sorted_indices.sort_by(|&a, &b| {
+                        token_probs[b].partial_cmp(&token_probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    // Compute gradient contribution from each head
+                    let mut cumulative_prob = 0.0;
+                    let mut temp_grad_contribution = 0.0;
+
+                    for &head_idx in &sorted_indices {
+                        cumulative_prob += token_probs[head_idx];
+
+                        // Recompute gating for this head
+                        let z = (cumulative_prob - token_threshold) * token_temperature;
+                        let gating = 1.0 / (1.0 + (-z).exp());
+
+                        // Derivative of gating w.r.t. temperature
+                        let dgating_dtemp = gating * (1.0 - gating) * (cumulative_prob - token_threshold);
+
+                        // Soft weight = routing_prob * gating
+                        // ∂soft_weight/∂temp = routing_prob * ∂gating/∂temp
+                        let dweight_dtemp = token_probs[head_idx] * dgating_dtemp;
+
+                        // Accumulate gradient: push temperature to reduce head_error
+                        // If using too many heads (head_error > 0): increase temp (sharper)
+                        // If using too few heads (head_error < 0): decrease temp (smoother)
+                        temp_grad_contribution += head_error * dweight_dtemp;
+                    }
+
+                    // Map temperature gradient back to temperature logits
+                    // Temperature = 1.0 + sigmoid(logit) * 9.0
+                    // ∂temp/∂logit = sigmoid'(logit) * 9.0 = sigmoid * (1 - sigmoid) * 9.0
+                    let temp_logit = (token_temperature - 1.0) / 9.0; // Inverse of sigmoid mapping
+                    let sigmoid_val = temp_logit; // Approximate
+                    let dtemp_dlogit = sigmoid_val * (1.0 - sigmoid_val) * 9.0;
+
+                    // Chain rule: ∂loss/∂logit = ∂loss/∂temp * ∂temp/∂logit
+                    let logit_grad = temp_grad_contribution * dtemp_dlogit;
+
+                    // Accumulate gradient for temperature predictor weights
+                    for dim_idx in 0..self.embedding_dim {
+                        temperature_grads[[dim_idx, 0]] += logit_grad * input[[token_idx, dim_idx]];
+                    }
+                }
+
+                temperature_grads /= seq_len as f32;
+
+                // Apply conservative scaling to prevent instability
+                temperature_grads *= 0.01; // Small learning rate for temperature
+            }
+
             // Update parameters using Adam optimizer
             self.router_optimizer.step(&mut self.w_router, &router_grads, lr);
             self.complexity_optimizer.step(&mut self.w_complexity, &complexity_grads, lr * 0.1); // Slower learning for complexity
             self.threshold_optimizer.step(&mut self.w_threshold, &threshold_grads, lr * 0.1); // Slower learning for threshold
+            self.temperature_optimizer.step(&mut self.w_temperature, &temperature_grads, lr * 0.1); // Slower learning for temperature
         }
     }
 
@@ -1577,6 +1708,7 @@ impl FullyAdaptiveHeadRouter {
         self.num_heads * self.embedding_dim  // w_router
             + self.embedding_dim + 1          // w_complexity + bias
             + self.embedding_dim + 1          // w_threshold + bias
+            + self.embedding_dim + 1          // w_temperature + bias
     }
 }
 

@@ -670,6 +670,15 @@ impl SelfAttention {
             .map_or(0.0, |r| r.predictor_weight_norm())
     }
 
+    /// Get temperature statistics (avg, min, max) from the router (if fully adaptive MoH is enabled)
+    ///
+    /// Returns None if MoH is not enabled or not using learned temperature.
+    pub fn get_temperature_stats(&self) -> Option<(f32, f32, f32)> {
+        self.router
+            .as_ref()
+            .and_then(|r| r.temperature_stats())
+    }
+
     /// Get all MoH statistics in one call
     ///
     /// Returns (avg_routed_heads, mean_threshold, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm)
