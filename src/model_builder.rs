@@ -500,6 +500,7 @@ fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         config.use_swiglu,
         config.max_seq_len,
         config.head_selection.clone(),
+        None, // adaptive_depth_config: None for now (fixed depth mode)
     );
 
     layers.push(LayerEnum::TRMBlock(Box::new(trm_block)));
