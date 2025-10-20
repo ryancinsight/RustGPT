@@ -7,7 +7,7 @@ use crate::{
     errors::Result,
     feed_forward::FeedForward,
     llm::Layer,
-    model_config::HeadSelectionStrategy,
+    model_config::{AdaptiveDepthConfig, HeadSelectionStrategy},
     rms_norm::RMSNorm,
     self_attention::SelfAttention,
     swiglu::SwiGLU,
@@ -125,6 +125,45 @@ pub struct TinyRecursiveModel {
 
     /// Whether to use SwiGLU (true) or standard FeedForward (false)
     use_swiglu: bool,
+
+    // ===== Adaptive Recursive Depth Fields =====
+    /// Whether adaptive depth is enabled
+    adaptive_depth_enabled: bool,
+
+    /// Maximum recursive depth (when adaptive depth is enabled)
+    max_recursive_depth: usize,
+
+    /// Cumulative halting probability threshold (e.g., 0.95)
+    halt_threshold: f32,
+
+    /// Weight for ponder loss (penalizes excessive depth)
+    ponder_loss_weight: f32,
+
+    /// Halting predictor weights: (embedding_dim, 1)
+    /// Predicts per-sequence halting probability at each step
+    w_halt: Array2<f32>,
+
+    /// Halting predictor bias
+    b_halt: f32,
+
+    /// Optimizer for halting predictor
+    halt_optimizer: Adam,
+
+    /// Actual depths used per sequence in last forward pass
+    #[serde(skip)]
+    actual_depths: Vec<usize>,
+
+    /// Average depth used in last forward pass
+    #[serde(skip)]
+    avg_depth: f32,
+
+    /// Cached halting probabilities for backward pass
+    #[serde(skip)]
+    cached_halt_probs: Vec<Array1<f32>>,
+
+    /// Cached pooled states for backward pass (for halting predictor gradients)
+    #[serde(skip)]
+    cached_pooled_states: Vec<Array2<f32>>,
 }
 
 impl TinyRecursiveModel {
@@ -140,6 +179,7 @@ impl TinyRecursiveModel {
     /// * `use_swiglu` - Whether to use SwiGLU (true) or standard FeedForward (false)
     /// * `max_seq_len` - Maximum sequence length
     /// * `head_selection` - Head selection strategy (AllHeads, MoH, or FullyAdaptiveMoH)
+    /// * `adaptive_depth_config` - Optional adaptive depth configuration (enables ACT mechanism)
     pub fn new(
         embedding_dim: usize,
         hidden_dim: usize,
@@ -149,6 +189,7 @@ impl TinyRecursiveModel {
         use_swiglu: bool,
         max_seq_len: usize,
         head_selection: HeadSelectionStrategy,
+        adaptive_depth_config: Option<AdaptiveDepthConfig>,
     ) -> Self {
         // Create attention layer with GQA support
         let kv_heads = num_kv_heads.unwrap_or(num_heads);
@@ -194,6 +235,40 @@ impl TinyRecursiveModel {
         let attention_scale_optimizer = Adam::new((recursive_depth, 1));
         let ffn_scale_optimizer = Adam::new((recursive_depth, 1));
 
+        // Initialize adaptive depth components
+        let (adaptive_enabled, max_depth, halt_thresh, ponder_weight, w_halt, b_halt) =
+            if let Some(config) = adaptive_depth_config {
+                // Adaptive depth enabled
+                let mut rng = rand::thread_rng();
+                use rand::Rng;
+
+                // Initialize halting predictor weights with small random values
+                let w = Array2::from_shape_fn((embedding_dim, 1), |_|
+                    rng.gen_range(-0.01..0.01));
+
+                // Initialize bias to 0 (sigmoid(0) = 0.5, neutral starting point)
+                let b = 0.0;
+
+                (
+                    true,
+                    config.max_depth,
+                    config.halt_threshold,
+                    config.ponder_weight,
+                    w,
+                    b,
+                )
+            } else {
+                // Fixed depth mode (current behavior)
+                (
+                    false,
+                    recursive_depth,
+                    0.95,
+                    0.0,
+                    Array2::zeros((embedding_dim, 1)),
+                    0.0,
+                )
+            };
+
         Self {
             attention,
             norm1,
@@ -213,6 +288,18 @@ impl TinyRecursiveModel {
             max_epochs: 100,
             embedding_dim,
             use_swiglu,
+            // Adaptive recursive depth (configured or disabled)
+            adaptive_depth_enabled: adaptive_enabled,
+            max_recursive_depth: max_depth,
+            halt_threshold: halt_thresh,
+            ponder_loss_weight: ponder_weight,
+            w_halt,
+            b_halt,
+            halt_optimizer: Adam::new((embedding_dim, 1)),
+            actual_depths: Vec::new(),
+            avg_depth: 0.0,
+            cached_halt_probs: Vec::new(),
+            cached_pooled_states: Vec::new(),
         }
     }
 
