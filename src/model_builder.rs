@@ -500,7 +500,7 @@ fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         config.use_swiglu,
         config.max_seq_len,
         config.head_selection.clone(),
-        Some(AdaptiveDepthConfig::default()), // Enable adaptive recursive depth
+        None, // Disable adaptive depth - use fixed depth=5 for baseline validation
     );
 
     layers.push(LayerEnum::TRMBlock(Box::new(trm_block)));
