@@ -250,11 +250,11 @@ impl TinyRecursiveModel {
                 let w = Array2::from_shape_fn((embedding_dim, 1), |_|
                     rng.gen_range(-0.01..0.01));
 
-                // Initialize bias to start at ~6-7 steps (reasonable middle ground)
-                // We want: cumulative_prob ≈ 0.95 after 6-7 steps
-                // If p_halt = 0.15 per step: 6 steps → 0.90, 7 steps → 1.05 (halts at 7)
-                // sigmoid(x) = 0.15 → x = ln(0.15/0.85) ≈ -1.73
-                let b = -1.7;
+                // Initialize bias to start at ~5 steps (matches baseline fixed depth)
+                // We want: cumulative_prob ≈ 0.95 after 5 steps
+                // If p_halt = 0.19 per step: 5 steps → 0.95 (halts at 5)
+                // sigmoid(x) = 0.19 → x = ln(0.19/0.81) ≈ -1.45
+                let b = -1.45;
 
                 (
                     true,
@@ -494,30 +494,39 @@ impl Layer for TinyRecursiveModel {
                 // Just use x directly as the pooled state
                 self.cached_pooled_states.push(x.clone());
 
-                // Compute complexity score based on hidden state norm
-                // High norm = high activation = complex input = need more steps
-                // Low norm = low activation = simple input = can halt early
-                let complexity_scores: Vec<f32> = (0..batch_size)
-                    .map(|i| {
-                        let row = x.row(i);
-                        // L2 norm of hidden state
-                        let norm = row.iter().map(|&v| v * v).sum::<f32>().sqrt();
-                        // Normalize by embedding_dim to get per-dimension activation
-                        norm / (x.shape()[1] as f32).sqrt()
-                    })
-                    .collect();
+                // Compute confidence proxy: variance in hidden states
+                // Low variance = confident/stable representation = can halt early
+                // High variance = uncertain/unstable = need more steps
+                let mut confidence_scores = Vec::with_capacity(batch_size);
+                for i in 0..batch_size {
+                    let row = x.row(i);
+                    let mean = row.sum() / row.len() as f32;
+                    let variance = row.iter()
+                        .map(|&v| (v - mean).powi(2))
+                        .sum::<f32>() / row.len() as f32;
+                    // Normalize variance to [0, 1] range (higher = more confident)
+                    // Use negative exponential to map variance to confidence
+                    let confidence = (-variance).exp();
+                    confidence_scores.push(confidence);
+                }
 
                 // Compute halting logits: W_halt · x + b_halt
                 let halt_logits_2d = x.dot(&self.w_halt); // (batch_size, 1)
                 let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (batch_size,)
-                let halt_logits = halt_logits + self.b_halt; // Add bias
+                let mut halt_logits = halt_logits + self.b_halt; // Add bias
+
+                // Confidence-aware halting: increase p_halt for confident predictions
+                // If confidence is high, encourage halting (increase logit)
+                // If confidence is low, discourage halting (decrease logit)
+                for i in 0..batch_size {
+                    let confidence = confidence_scores[i];
+                    // Scale logit by confidence: high confidence → higher p_halt
+                    // Add confidence boost: logit += confidence * scale
+                    halt_logits[i] += (confidence - 0.5) * 2.0; // Scale to [-1, 1] range
+                }
 
                 // Apply sigmoid: p_halt = sigmoid(logits)
                 let p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
-
-                // Note: Removed complexity-aware halting for now
-                // Let the model learn halting behavior from task loss + ponder loss
-                // The halting predictor (W_halt, b_halt) can learn to use complexity implicitly
 
                 // Update cumulative probabilities (only for active sequences)
                 for i in 0..batch_size {
