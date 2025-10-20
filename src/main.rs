@@ -493,7 +493,7 @@ fn main() -> llm::Result<()> {
     println!(
         "Pre-training on {} examples for {} epochs with learning rate {}",
         dataset.pretraining_data.len(),
-        100,
+        10,
         0.0005
     );
 
@@ -509,13 +509,13 @@ fn main() -> llm::Result<()> {
         .map(|s| s.as_str())
         .collect();
 
-    llm.train_with_batch_size(pretraining_examples, 100, 0.0001, 8)?;
+    llm.train_with_batch_size(pretraining_examples, 10, 0.0001, 8)?;
 
     println!("\n=== INSTRUCTION TUNING ===");
     // Use same LR as pre-training
-    // Full 100 epochs for TRM+MoH validation
+    // Quick 10 epochs for adaptive depth validation
     let instruction_lr = 0.0001;
-    let instruction_epochs = 100;
+    let instruction_epochs = 10;
     println!(
         "Instruction tuning on {} examples for {} epochs with learning rate {}",
         dataset.chat_training_data.len(),
