@@ -669,14 +669,21 @@ impl LLM {
                     String::new()
                 };
 
+                // Only show DynW if it's non-zero (Standard MoH only)
+                let dyn_weight_str = if first.3 > 1e-10 {
+                    format!(" | DynW: {:.2e}", first.3)
+                } else {
+                    String::new()
+                };
+
                 if moh_layers_stats.len() > 2 {
                     let mid = &moh_layers_stats[moh_layers_stats.len() / 2];
                     moh_stats = format!(
-                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}{}",
+                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p{}{}{}{}{}{}",
                         first.0, first.1, first.2,
                         mid.0, mid.1, mid.2,
                         last.0, last.1, last.2,
-                        first.3,
+                        dyn_weight_str,
                         threshold_range_str,
                         confidence_str,
                         predictor_str,
@@ -685,10 +692,10 @@ impl LLM {
                     );
                 } else {
                     moh_stats = format!(
-                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | DynW: {:.2e}{}{}{}{}{}",
+                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p{}{}{}{}{}{}",
                         first.0, first.1, first.2,
                         last.0, last.1, last.2,
-                        first.3,
+                        dyn_weight_str,
                         threshold_range_str,
                         confidence_str,
                         predictor_str,
