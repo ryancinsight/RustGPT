@@ -544,7 +544,8 @@ impl LLM {
                     }
                 } else if let Some(trm_block) = layer.as_trm_block() {
                     // For TRM, get MoH stats from internal attention layer
-                    let (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm) = trm_block.get_moh_stats();
+                    let (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct,
+                         complexity_avg, complexity_min, complexity_max, pred_norm) = trm_block.get_moh_stats();
                     if avg_routed > 0.0 {
                         let dyn_weight = 0.0; // TRM doesn't have dynamic loss weight yet
                         moh_layers_stats.push((layer_idx, avg_routed, mean_thresh, dyn_weight));
@@ -558,10 +559,10 @@ impl LLM {
                         total_conf_min = total_conf_min.min(conf_min);
                         total_fallback_pct += fallback_pct;
 
-                        // Track complexity statistics
+                        // Track complexity statistics (now with proper min/max)
                         total_complexity_avg += complexity_avg;
-                        total_complexity_min = total_complexity_min.min(complexity_avg);
-                        total_complexity_max = total_complexity_max.max(complexity_avg);
+                        total_complexity_min = total_complexity_min.min(complexity_min);
+                        total_complexity_max = total_complexity_max.max(complexity_max);
 
                         // Track predictor weight norm
                         total_pred_norm += pred_norm;
