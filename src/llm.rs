@@ -1055,9 +1055,9 @@ impl LLM {
         let scale_clamped = scale.clamp(0.3, 3.0);
         let adaptive_lr = base_lr * scale_clamped;
 
-        // Log adaptive LR for all layers to monitor balance
+        // Log adaptive LR for debugging (use RUST_LOG=debug to see)
         if layer_idx <= 2 || layer_idx >= 12 {
-            tracing::info!(
+            tracing::debug!(
                 layer_idx = layer_idx,
                 layer_type = layer.layer_type(),
                 grad_norm = grad_norm,
