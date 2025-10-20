@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{s, Array1, Array2, Axis};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -139,12 +139,22 @@ pub struct TinyRecursiveModel {
     /// Weight for ponder loss (penalizes excessive depth)
     ponder_loss_weight: f32,
 
-    /// Halting predictor weights: (embedding_dim, 1)
-    /// Predicts per-sequence halting probability at each step
+    /// Attention weights for context aggregation: (embedding_dim, 1)
+    /// Used to compute attention scores over sequence for context-aware halting
+    w_attn: Array2<f32>,
+
+    /// Halting predictor weights: (embedding_dim * 2, 1)
+    /// Projects concatenated [token_features, context] to halting logit
     w_halt: Array2<f32>,
 
     /// Halting predictor bias
     b_halt: f32,
+
+    /// Gumbel-Softmax temperature for attention (starts high, anneals down)
+    gumbel_temperature: f32,
+
+    /// Optimizer for attention weights
+    attn_optimizer: Adam,
 
     /// Optimizer for halting predictor
     halt_optimizer: Adam,
@@ -165,9 +175,13 @@ pub struct TinyRecursiveModel {
     #[serde(skip)]
     cached_halt_probs: Vec<Array1<f32>>,
 
-    /// Cached pooled states for backward pass (for halting predictor gradients)
+    /// Cached attention weights (Gumbel-Softmax) for backward pass (for halting predictor gradients)
     #[serde(skip)]
-    cached_pooled_states: Vec<Array2<f32>>,
+    cached_attn_weights: Vec<Array1<f32>>,
+
+    /// Cached context vectors for backward pass
+    #[serde(skip)]
+    cached_contexts: Vec<Array1<f32>>,
 }
 
 impl TinyRecursiveModel {
@@ -240,31 +254,39 @@ impl TinyRecursiveModel {
         let ffn_scale_optimizer = Adam::new((recursive_depth, 1));
 
         // Initialize adaptive depth components
-        let (adaptive_enabled, max_depth, halt_thresh, ponder_weight, w_halt, b_halt) =
+        let (adaptive_enabled, max_depth, halt_thresh, ponder_weight, w_attn, w_halt, b_halt, gumbel_temp) =
             if let Some(config) = adaptive_depth_config {
                 // Adaptive depth enabled
                 let mut rng = rand::thread_rng();
                 use rand::Rng;
 
-                // Initialize halting predictor weights with small random values
-                let w = Array2::from_shape_fn((embedding_dim, 1), |_|
+                // Initialize attention weights for context aggregation (Gumbel-Softmax)
+                let w_a = Array2::from_shape_fn((embedding_dim, 1), |_|
+                    rng.gen_range(-0.01..0.01));
+
+                // Initialize halting predictor weights for concatenated [token, context]
+                // Input dim is now embedding_dim * 2 (token features + context)
+                let w_h = Array2::from_shape_fn((embedding_dim * 2, 1), |_|
                     rng.gen_range(-0.01..0.01));
 
                 // Initialize bias to start at ~4 steps with STRONG halting signal
-                // Problem: Previous init (-1.45) led to depth rising to 10 and staying there
-                // Solution: Start with HIGHER p_halt so model learns to REDUCE depth, not increase it
                 // Target: p_halt = 0.25 per step → 4 steps to reach 0.95 threshold
                 // sigmoid(x) = 0.25 → x = ln(0.25/0.75) ≈ -1.10
-                // This gives stronger halting pressure, forcing model to learn when MORE depth is needed
                 let b = -1.10;
+
+                // Gumbel-Softmax temperature: start high (1.0) for exploration
+                // Will anneal down during training for sharper attention
+                let temp = 1.0;
 
                 (
                     true,
                     config.max_depth,
                     config.halt_threshold,
                     config.ponder_weight,
-                    w,
+                    w_a,
+                    w_h,
                     b,
+                    temp,
                 )
             } else {
                 // Fixed depth mode (current behavior)
@@ -274,7 +296,9 @@ impl TinyRecursiveModel {
                     0.95,
                     0.0,
                     Array2::zeros((embedding_dim, 1)),
+                    Array2::zeros((embedding_dim * 2, 1)),
                     0.0,
+                    1.0,
                 )
             };
 
@@ -302,14 +326,18 @@ impl TinyRecursiveModel {
             max_recursive_depth: max_depth,
             halt_threshold: halt_thresh,
             ponder_loss_weight: ponder_weight,
+            w_attn,
             w_halt,
             b_halt,
-            halt_optimizer: Adam::new((embedding_dim, 1)),
+            gumbel_temperature: gumbel_temp,
+            attn_optimizer: Adam::new((embedding_dim, 1)),
+            halt_optimizer: Adam::new((embedding_dim * 2, 1)),
             actual_depths: Vec::new(),
             avg_depth: 0.0,
             steps_taken: 0,
             cached_halt_probs: Vec::new(),
-            cached_pooled_states: Vec::new(),
+            cached_attn_weights: Vec::new(),
+            cached_contexts: Vec::new(),
         }
     }
 
@@ -317,6 +345,42 @@ impl TinyRecursiveModel {
     pub fn set_epoch_info(&mut self, current_epoch: usize, max_epochs: usize) {
         self.current_epoch = current_epoch;
         self.max_epochs = max_epochs;
+    }
+
+    /// Gumbel-Softmax: differentiable approximation to categorical sampling
+    ///
+    /// Formula: softmax((log(π_i) + g_i) / τ)
+    /// where g_i ~ Gumbel(0, 1) and τ is temperature
+    ///
+    /// Properties:
+    /// - τ → 0: approaches one-hot (argmax)
+    /// - τ → ∞: approaches uniform distribution
+    /// - Differentiable w.r.t. logits (maintains gradient flow)
+    fn gumbel_softmax(logits: &Array1<f32>, temperature: f32, training: bool) -> Array1<f32> {
+        if training {
+            // Sample Gumbel noise: g ~ -log(-log(U)) where U ~ Uniform(0, 1)
+            let mut rng = rand::thread_rng();
+            use rand::Rng;
+            let gumbel_noise: Array1<f32> = Array1::from_shape_fn(logits.len(), |_| {
+                let u: f32 = rng.gen_range(1e-10..1.0); // Avoid log(0)
+                -(-u.ln()).ln()
+            });
+
+            // Add Gumbel noise and scale by temperature
+            let perturbed = (logits + &gumbel_noise) / temperature;
+
+            // Apply softmax
+            let max_val = perturbed.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp_vals = perturbed.mapv(|x| (x - max_val).exp());
+            let sum_exp = exp_vals.sum();
+            exp_vals / sum_exp
+        } else {
+            // Inference: use standard softmax (no noise)
+            let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp_vals = logits.mapv(|x| (x - max_val).exp());
+            let sum_exp = exp_vals.sum();
+            exp_vals / sum_exp
+        }
     }
 
     /// Get gradient statistics for logging
@@ -430,7 +494,8 @@ impl Layer for TinyRecursiveModel {
         self.cached_attention_outputs.clear();
         self.cached_ffn_outputs.clear();
         self.cached_halt_probs.clear();
-        self.cached_pooled_states.clear();
+        self.cached_attn_weights.clear();
+        self.cached_contexts.clear();
 
         // Initialize state
         let mut x = input.clone();
@@ -490,26 +555,57 @@ impl Layer for TinyRecursiveModel {
             x = &x + &(&ffn_out * ffn_scale);
             self.cached_states.push(x.clone());
 
-            // Compute halting probability (adaptive depth only)
+            // Compute halting probability with Gumbel-Softmax attention (adaptive depth only)
             if self.adaptive_depth_enabled {
-                // x is already (batch_size, embedding_dim) - no pooling needed
-                // Just use x directly as the pooled state
-                self.cached_pooled_states.push(x.clone());
+                // Step 1: Compute attention logits over sequence positions
+                // attn_logits = x · W_attn  →  (seq_len, 1)
+                let attn_logits_2d = x.dot(&self.w_attn);
+                let attn_logits = attn_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
 
-                // Compute halting logits: W_halt · x + b_halt
-                let halt_logits_2d = x.dot(&self.w_halt); // (batch_size, 1)
-                let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (batch_size,)
+                // Step 2: Apply Gumbel-Softmax to get differentiable attention weights
+                // Training: adds Gumbel noise for exploration
+                // Inference: standard softmax (deterministic)
+                let training = self.current_epoch < self.max_epochs; // Simple training flag
+                let attn_weights = Self::gumbel_softmax(&attn_logits, self.gumbel_temperature, training);
+                self.cached_attn_weights.push(attn_weights.clone());
+
+                // Step 3: Aggregate sequence context using attention weights
+                // context = Σ(attn_weights[i] * x[i])  →  (embedding_dim,)
+                let mut context: Array1<f32> = Array1::zeros(self.embedding_dim);
+                for i in 0..batch_size {
+                    let token_features = x.row(i);
+                    let weighted_features = token_features.mapv(|v| v * attn_weights[i]);
+                    context = &context + &weighted_features;
+                }
+                self.cached_contexts.push(context.clone());
+
+                // Step 4: Concatenate per-token features with global context
+                // For each token: [token_features, context]  →  (seq_len, embedding_dim * 2)
+                let mut combined = Array2::zeros((batch_size, self.embedding_dim * 2));
+                for i in 0..batch_size {
+                    // First half: token-specific features
+                    combined.slice_mut(s![i, ..self.embedding_dim])
+                        .assign(&x.row(i));
+                    // Second half: global context (same for all tokens)
+                    combined.slice_mut(s![i, self.embedding_dim..])
+                        .assign(&context);
+                }
+
+                // Step 5: Compute halting logits from concatenated features
+                // halt_logits = combined · W_halt + b_halt  →  (seq_len, 1)
+                let halt_logits_2d = combined.dot(&self.w_halt);
+                let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
                 let halt_logits = halt_logits + self.b_halt; // Add bias
 
-                // Apply sigmoid: p_halt = sigmoid(logits)
+                // Step 6: Apply sigmoid to get halting probabilities
                 let p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
 
-                // Update cumulative probabilities (only for active sequences)
+                // Step 7: Update cumulative probabilities and check for halting
                 for i in 0..batch_size {
                     if active_mask[i] {
                         cumulative_probs[i] += p_halt[i];
 
-                        // Check if sequence should halt
+                        // Check if token should halt
                         if cumulative_probs[i] >= self.halt_threshold {
                             active_mask[i] = false;
                         }
@@ -767,50 +863,102 @@ impl Layer for TinyRecursiveModel {
             .map(|&s| s.clamp(0.01, 0.5))
             .collect();
 
-        // Update halting predictor (adaptive depth only)
+        // Update halting predictor with Gumbel-Softmax attention (adaptive depth only)
         if self.adaptive_depth_enabled && !self.cached_halt_probs.is_empty() {
             // Compute ponder loss gradient
             // Ponder loss: L_ponder = (avg_depth / max_depth) * ponder_weight
             // Gradient: dL/d(avg_depth) = ponder_weight / max_depth
             let ponder_grad_scale = self.ponder_loss_weight / self.max_recursive_depth as f32;
 
-            // Backpropagate through halting predictor
+            // Get batch size (seq_len) from first cached state
+            let batch_size = self.cached_states[0].shape()[0];
+
+            // Initialize gradients
+            let mut w_attn_grad = Array2::zeros(self.w_attn.dim());
             let mut w_halt_grad = Array2::zeros(self.w_halt.dim());
             let mut b_halt_grad = 0.0;
 
-            let batch_size = self.cached_pooled_states[0].shape()[0];
+            // Backpropagate through each recursive step
+            for step_idx in 0..self.cached_halt_probs.len() {
+                let halt_prob = &self.cached_halt_probs[step_idx];
+                let attn_weights = &self.cached_attn_weights[step_idx];
+                let context = &self.cached_contexts[step_idx];
+                let x = &self.cached_states[step_idx * 2 + 1]; // State after attention sublayer
 
-            for (step_idx, (halt_prob, pooled_state)) in self.cached_halt_probs.iter()
-                .zip(self.cached_pooled_states.iter())
-                .enumerate()
-            {
                 // Gradient of sigmoid: d(sigmoid(x))/dx = sigmoid(x) * (1 - sigmoid(x))
                 let sigmoid_grad = halt_prob.mapv(|p| p * (1.0 - p));
 
                 // Gradient from ponder loss (encourage fewer steps)
-                // Each sequence contributes to average depth
                 let ponder_contrib = sigmoid_grad.mapv(|g| g * ponder_grad_scale / batch_size as f32);
 
-                // Accumulate gradients for w_halt and b_halt
+                // Backprop through halting predictor: halt_logits = combined · W_halt + b_halt
+                // where combined = [x, context] (concatenated)
                 for i in 0..batch_size {
-                    let state_vec = pooled_state.row(i);
                     let grad_scalar = ponder_contrib[i];
 
-                    // Gradient for w_halt: outer product of state and scalar gradient
-                    for j in 0..state_vec.len() {
-                        w_halt_grad[[j, 0]] += state_vec[j] * grad_scalar;
+                    // Gradient for W_halt (first half: token features)
+                    let token_features = x.row(i);
+                    for j in 0..self.embedding_dim {
+                        w_halt_grad[[j, 0]] += token_features[j] * grad_scalar;
                     }
 
-                    // Gradient for b_halt: sum of scalar gradients
+                    // Gradient for W_halt (second half: context)
+                    for j in 0..self.embedding_dim {
+                        w_halt_grad[[self.embedding_dim + j, 0]] += context[j] * grad_scalar;
+                    }
+
+                    // Gradient for b_halt
                     b_halt_grad += grad_scalar;
+                }
+
+                // Backprop through context aggregation: context = Σ(attn_weights[i] * x[i])
+                // Gradient w.r.t. attention weights
+                let mut grad_attn_weights: Array1<f32> = Array1::zeros(batch_size);
+                for i in 0..batch_size {
+                    // Sum over all tokens that use this context
+                    for j in 0..batch_size {
+                        let grad_scalar: f32 = ponder_contrib[j];
+                        // Gradient flows through W_halt (second half)
+                        for k in 0..self.embedding_dim {
+                            let x_val: f32 = x[[i, k]];
+                            let w_val: f32 = w_halt_grad[[self.embedding_dim + k, 0]];
+                            grad_attn_weights[i] += x_val * w_val * grad_scalar;
+                        }
+                    }
+                }
+
+                // Backprop through Gumbel-Softmax: attn_weights = softmax((x · W_attn) / temp)
+                // Gradient of softmax: dL/dy_i = y_i * (dL/dy_i - Σ_j y_j * dL/dy_j)
+                let sum_weighted_grad: f32 = (0..batch_size)
+                    .map(|i| attn_weights[i] * grad_attn_weights[i])
+                    .sum();
+
+                let grad_attn_logits: Array1<f32> = Array1::from_shape_fn(batch_size, |i| {
+                    let attn_w: f32 = attn_weights[i];
+                    let grad_w: f32 = grad_attn_weights[i];
+                    attn_w * (grad_w - sum_weighted_grad) / self.gumbel_temperature
+                });
+
+                // Backprop through attention logits: attn_logits = x · W_attn
+                for i in 0..batch_size {
+                    let token_features = x.row(i);
+                    let grad_scalar: f32 = grad_attn_logits[i];
+                    for j in 0..self.embedding_dim {
+                        let feat_val: f32 = token_features[j];
+                        w_attn_grad[[j, 0]] += feat_val * grad_scalar;
+                    }
                 }
             }
 
-            // Update halting predictor parameters using Adam optimizer
-            // Use same learning rate as other parameters (no scaling)
-            // The ponder_weight already controls the gradient magnitude
+            // Update parameters using Adam optimizer
+            self.attn_optimizer.step(&mut self.w_attn, &w_attn_grad, lr);
             self.halt_optimizer.step(&mut self.w_halt, &w_halt_grad, lr);
             self.b_halt -= lr * b_halt_grad;
+
+            // Anneal Gumbel-Softmax temperature: τ_t = max(0.5, exp(-0.01 * epoch))
+            // Starts at 1.0, decays to 0.5 over ~70 epochs
+            let target_temp = (0.5_f32).max((-0.01 * self.current_epoch as f32).exp());
+            self.gumbel_temperature = target_temp;
         }
 
         Ok(())
