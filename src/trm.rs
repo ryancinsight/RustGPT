@@ -250,8 +250,10 @@ impl TinyRecursiveModel {
                 let w = Array2::from_shape_fn((embedding_dim, 1), |_|
                     rng.gen_range(-0.01..0.01));
 
-                // Initialize bias to 0 (sigmoid(0) = 0.5, neutral starting point)
-                let b = 0.0;
+                // Initialize bias to large negative value to start at max_depth
+                // sigmoid(-5) ≈ 0.007, so model will use max_depth initially
+                // As training progresses, model learns to increase bias for simple inputs
+                let b = -5.0;
 
                 (
                     true,
@@ -486,13 +488,37 @@ impl Layer for TinyRecursiveModel {
                 // Just use x directly as the pooled state
                 self.cached_pooled_states.push(x.clone());
 
+                // Compute complexity score based on hidden state norm
+                // High norm = high activation = complex input = need more steps
+                // Low norm = low activation = simple input = can halt early
+                let complexity_scores: Vec<f32> = (0..batch_size)
+                    .map(|i| {
+                        let row = x.row(i);
+                        // L2 norm of hidden state
+                        let norm = row.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                        // Normalize by embedding_dim to get per-dimension activation
+                        norm / (x.shape()[1] as f32).sqrt()
+                    })
+                    .collect();
+
                 // Compute halting logits: W_halt · x + b_halt
                 let halt_logits_2d = x.dot(&self.w_halt); // (batch_size, 1)
                 let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (batch_size,)
                 let halt_logits = halt_logits + self.b_halt; // Add bias
 
                 // Apply sigmoid: p_halt = sigmoid(logits)
-                let p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
+                let mut p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
+
+                // Complexity-aware halting: reduce halting probability for complex inputs
+                // If complexity > threshold (e.g., 0.5), reduce p_halt to encourage more steps
+                for i in 0..batch_size {
+                    let complexity = complexity_scores[i];
+                    if complexity > 0.5 {
+                        // High complexity: reduce halting probability
+                        // Scale down by (1 - complexity), so high complexity → low p_halt
+                        p_halt[i] *= (1.0 - complexity).max(0.1); // Keep at least 10% to avoid getting stuck
+                    }
+                }
 
                 // Update cumulative probabilities (only for active sequences)
                 for i in 0..batch_size {
@@ -594,10 +620,8 @@ impl Layer for TinyRecursiveModel {
                 norm2_param_grads_acc = Some(norm2_param_grads.iter().map(|g| g * depth_scale).collect());
             }
 
-            // Gradient through FFN (need to recompute normed input for FFN)
-            let normed_ffn_input = &self.cached_states[state_idx]; // This is x_before_ffn, need to apply norm
-            // Actually, we need to compute the normalized version
-            // For now, use a dummy computation - we'll need to cache normalized inputs too
+            // Gradient through FFN
+            // FFN's compute_gradients expects unnormalized input and gradient from norm
             let (grad_ffn_input, ffn_param_grads) = if self.use_swiglu {
                 self.feed_forward_swiglu.as_ref().unwrap().compute_gradients(x_before_ffn, &grad_normed)
             } else {
