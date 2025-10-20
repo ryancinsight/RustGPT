@@ -157,6 +157,10 @@ pub struct TinyRecursiveModel {
     #[serde(skip)]
     avg_depth: f32,
 
+    /// Actual number of steps taken in last forward pass (for backward pass)
+    #[serde(skip)]
+    steps_taken: usize,
+
     /// Cached halting probabilities for backward pass
     #[serde(skip)]
     cached_halt_probs: Vec<Array1<f32>>,
@@ -298,6 +302,7 @@ impl TinyRecursiveModel {
             halt_optimizer: Adam::new((embedding_dim, 1)),
             actual_depths: Vec::new(),
             avg_depth: 0.0,
+            steps_taken: 0,
             cached_halt_probs: Vec::new(),
             cached_pooled_states: Vec::new(),
         }
@@ -477,17 +482,12 @@ impl Layer for TinyRecursiveModel {
 
             // Compute halting probability (adaptive depth only)
             if self.adaptive_depth_enabled {
-                // Pool sequence dimension: mean over seq_len (axis 1)
-                // x shape: (batch_size, seq_len, embedding_dim)
-                // We need to average over seq_len to get (batch_size, embedding_dim)
-                let x_shape = x.shape();
-                let pooled = x.mean_axis(Axis(1)).unwrap(); // (batch_size, embedding_dim) as Array1
-                // Convert to Array2 for consistency
-                let pooled_2d = pooled.into_shape((x_shape[0], x_shape[2])).unwrap();
-                self.cached_pooled_states.push(pooled_2d.clone());
+                // x is already (batch_size, embedding_dim) - no pooling needed
+                // Just use x directly as the pooled state
+                self.cached_pooled_states.push(x.clone());
 
-                // Compute halting logits: W_halt · pooled + b_halt
-                let halt_logits_2d = pooled_2d.dot(&self.w_halt); // (batch_size, 1)
+                // Compute halting logits: W_halt · x + b_halt
+                let halt_logits_2d = x.dot(&self.w_halt); // (batch_size, 1)
                 let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (batch_size,)
                 let halt_logits = halt_logits + self.b_halt; // Add bias
 
@@ -509,6 +509,9 @@ impl Layer for TinyRecursiveModel {
                 self.cached_halt_probs.push(p_halt);
             }
         }
+
+        // Store steps taken for backward pass
+        self.steps_taken = steps_taken;
 
         // Track actual depth used (adaptive depth only)
         if self.adaptive_depth_enabled {
@@ -547,7 +550,7 @@ impl Layer for TinyRecursiveModel {
         let mut ffn_param_grads_acc: Option<Vec<Array2<f32>>> = None;
         let mut norm2_param_grads_acc: Option<Vec<Array2<f32>>> = None;
 
-        // Gradients for step scales
+        // Gradients for step scales (use recursive_depth size, not steps_taken)
         let mut attention_scale_grads = vec![0.0; self.recursive_depth];
         let mut ffn_scale_grads = vec![0.0; self.recursive_depth];
 
@@ -558,19 +561,23 @@ impl Layer for TinyRecursiveModel {
         //    - Forward: x = x + scale * sublayer_out (scale ≈ 0 initially)
         //    - Backward: grad_x flows through both paths, but scaled path is small
         //    - As scales grow during training, gradient flow increases naturally
-        let depth_scale = 1.0 / self.recursive_depth as f32;
+        let depth_scale = 1.0 / self.steps_taken as f32;
 
-        // Backpropagate through recursive steps in reverse
-        for step in (0..self.recursive_depth).rev() {
+        // Backpropagate through recursive steps in reverse (use actual steps taken)
+        for step in (0..self.steps_taken).rev() {
             let state_idx = step * 2 + 1; // Index in cached_states after attention
 
             // FFN sublayer backward
             let x_before_ffn = &self.cached_states[state_idx];
             let ffn_out = &self.cached_ffn_outputs[step];
-            let ffn_scale = self.ffn_step_scales[step];
+            let scale_idx = step.min(self.recursive_depth - 1);
+            let ffn_scale = self.ffn_step_scales[scale_idx];
 
             // Gradient w.r.t. FFN scale: sum(grad_x * ffn_out)
-            ffn_scale_grads[step] = (&grad_x * ffn_out).sum();
+            // Only accumulate gradient if step is within scale vector bounds
+            if step < self.recursive_depth {
+                ffn_scale_grads[step] = (&grad_x * ffn_out).sum();
+            }
 
             // Gradient w.r.t. FFN output
             let grad_ffn_out = &grad_x * ffn_scale;
@@ -614,10 +621,13 @@ impl Layer for TinyRecursiveModel {
             let state_idx = step * 2; // Index in cached_states before attention
             let x_before_attn = &self.cached_states[state_idx];
             let attn_out = &self.cached_attention_outputs[step];
-            let attn_scale = self.attention_step_scales[step];
+            let attn_scale = self.attention_step_scales[scale_idx];
 
             // Gradient w.r.t. attention scale
-            attention_scale_grads[step] = (&grad_x * attn_out).sum();
+            // Only accumulate gradient if step is within scale vector bounds
+            if step < self.recursive_depth {
+                attention_scale_grads[step] = (&grad_x * attn_out).sum();
+            }
 
             // Gradient w.r.t. attention output
             let grad_attn_out = &grad_x * attn_scale;

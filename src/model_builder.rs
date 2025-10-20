@@ -7,7 +7,7 @@ use crate::{
     layer_norm::LayerNorm,
     llm::{Layer, LayerEnum},
     moe::MoELayer,
-    model_config::{ArchitectureType, ModelConfig},
+    model_config::{AdaptiveDepthConfig, ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     rms_norm::RMSNorm,
     self_attention::SelfAttention,
@@ -500,7 +500,7 @@ fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         config.use_swiglu,
         config.max_seq_len,
         config.head_selection.clone(),
-        None, // adaptive_depth_config: None for now (fixed depth mode)
+        Some(AdaptiveDepthConfig::default()), // Enable adaptive recursive depth
     );
 
     layers.push(LayerEnum::TRMBlock(Box::new(trm_block)));

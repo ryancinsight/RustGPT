@@ -42,7 +42,7 @@ pub use errors::{ModelError, Result};
 pub use gradient_clipping::{
     AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping, L2GradientClipping,
 };
-pub use head_router::HeadRouter;
+pub use head_router::{RouterType, HeadRouterStandard, FullyAdaptiveHeadRouter};
 pub use hrm::HRMBlock;
 pub use hrm_high_level::HighLevelModule;
 pub use hrm_low_level::LowLevelModule;
