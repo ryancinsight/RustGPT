@@ -368,6 +368,40 @@ impl TinyRecursiveModel {
     pub fn get_dynamic_loss_weight(&self, training_progress: f32) -> f32 {
         self.attention.get_dynamic_loss_weight(training_progress)
     }
+
+    /// Get ponder loss (penalizes excessive depth in adaptive mode)
+    ///
+    /// Ponder loss = (avg_depth / max_depth) * ponder_weight
+    /// Encourages the model to use fewer recursive steps when possible.
+    ///
+    /// Returns 0.0 if adaptive depth is disabled or no forward pass has been run.
+    pub fn get_ponder_loss(&self) -> f32 {
+        if self.adaptive_depth_enabled && !self.actual_depths.is_empty() {
+            (self.avg_depth / self.max_recursive_depth as f32) * self.ponder_loss_weight
+        } else {
+            0.0
+        }
+    }
+
+    /// Get depth statistics for logging (adaptive depth only)
+    ///
+    /// Returns (avg_depth, min_depth, max_depth) or None if adaptive depth is disabled.
+    ///
+    /// # Example
+    /// ```
+    /// if let Some((avg, min, max)) = trm.get_depth_stats() {
+    ///     println!("Depth: avg={:.1} [{}-{}]", avg, min, max);
+    /// }
+    /// ```
+    pub fn get_depth_stats(&self) -> Option<(f32, usize, usize)> {
+        if self.adaptive_depth_enabled && !self.actual_depths.is_empty() {
+            let min_depth = *self.actual_depths.iter().min().unwrap();
+            let max_depth = *self.actual_depths.iter().max().unwrap();
+            Some((self.avg_depth, min_depth, max_depth))
+        } else {
+            None
+        }
+    }
 }
 
 impl Layer for TinyRecursiveModel {
@@ -380,20 +414,50 @@ impl Layer for TinyRecursiveModel {
         self.cached_states.clear();
         self.cached_attention_outputs.clear();
         self.cached_ffn_outputs.clear();
+        self.cached_halt_probs.clear();
+        self.cached_pooled_states.clear();
 
         // Initialize state
         let mut x = input.clone();
         self.cached_states.push(x.clone());
 
+        // Determine actual recursive depth and initialize adaptive depth tracking
+        let (actual_depth, batch_size) = if self.adaptive_depth_enabled {
+            let batch_size = input.shape()[0];
+            (self.max_recursive_depth, batch_size)
+        } else {
+            (self.recursive_depth, 0)
+        };
+
+        // Track halting for adaptive depth
+        let mut cumulative_probs: Array1<f32> = if self.adaptive_depth_enabled {
+            Array1::zeros(batch_size)
+        } else {
+            Array1::zeros(1) // Dummy array for non-adaptive mode
+        };
+        let mut active_mask = if self.adaptive_depth_enabled {
+            vec![true; batch_size]
+        } else {
+            vec![] // Empty vec for non-adaptive mode
+        };
+
         // Apply transformer block recursively
-        for step in 0..self.recursive_depth {
+        let mut steps_taken = 0;
+        for step in 0..actual_depth {
+            // Check if all sequences have halted (adaptive depth only)
+            if self.adaptive_depth_enabled && !active_mask.iter().any(|&a| a) {
+                break; // All sequences halted, stop early
+            }
+
+            steps_taken += 1;
+
             // Attention sublayer with Pre-LN
             let normed = self.norm1.forward(&x);
             let attn_out = self.attention.forward(&normed);
             self.cached_attention_outputs.push(attn_out.clone());
 
             // Residual connection with adaptive scaling
-            let attn_scale = self.attention_step_scales[step];
+            let attn_scale = self.attention_step_scales[step.min(self.recursive_depth - 1)];
             x = &x + &(&attn_out * attn_scale);
             self.cached_states.push(x.clone());
 
@@ -407,9 +471,63 @@ impl Layer for TinyRecursiveModel {
             self.cached_ffn_outputs.push(ffn_out.clone());
 
             // Residual connection with adaptive scaling
-            let ffn_scale = self.ffn_step_scales[step];
+            let ffn_scale = self.ffn_step_scales[step.min(self.recursive_depth - 1)];
             x = &x + &(&ffn_out * ffn_scale);
             self.cached_states.push(x.clone());
+
+            // Compute halting probability (adaptive depth only)
+            if self.adaptive_depth_enabled {
+                // Pool sequence dimension: mean over seq_len (axis 1)
+                // x shape: (batch_size, seq_len, embedding_dim)
+                // We need to average over seq_len to get (batch_size, embedding_dim)
+                let x_shape = x.shape();
+                let pooled = x.mean_axis(Axis(1)).unwrap(); // (batch_size, embedding_dim) as Array1
+                // Convert to Array2 for consistency
+                let pooled_2d = pooled.into_shape((x_shape[0], x_shape[2])).unwrap();
+                self.cached_pooled_states.push(pooled_2d.clone());
+
+                // Compute halting logits: W_halt · pooled + b_halt
+                let halt_logits_2d = pooled_2d.dot(&self.w_halt); // (batch_size, 1)
+                let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (batch_size,)
+                let halt_logits = halt_logits + self.b_halt; // Add bias
+
+                // Apply sigmoid: p_halt = sigmoid(logits)
+                let p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
+
+                // Update cumulative probabilities (only for active sequences)
+                for i in 0..batch_size {
+                    if active_mask[i] {
+                        cumulative_probs[i] += p_halt[i];
+
+                        // Check if sequence should halt
+                        if cumulative_probs[i] >= self.halt_threshold {
+                            active_mask[i] = false;
+                        }
+                    }
+                }
+
+                self.cached_halt_probs.push(p_halt);
+            }
+        }
+
+        // Track actual depth used (adaptive depth only)
+        if self.adaptive_depth_enabled {
+            let depths: Vec<usize> = (0..batch_size)
+                .map(|i| {
+                    // Find first step where cumulative_p >= threshold
+                    let mut cum_p = 0.0;
+                    for (step_idx, p_halt) in self.cached_halt_probs.iter().enumerate() {
+                        cum_p += p_halt[i];
+                        if cum_p >= self.halt_threshold {
+                            return step_idx + 1; // Halted at this step (1-indexed)
+                        }
+                    }
+                    steps_taken // Reached max depth without halting
+                })
+                .collect();
+
+            self.actual_depths = depths;
+            self.avg_depth = self.actual_depths.iter().sum::<usize>() as f32 / batch_size as f32;
         }
 
         x
@@ -630,6 +748,52 @@ impl Layer for TinyRecursiveModel {
         self.ffn_step_scales = ffn_scales_2d.column(0).iter()
             .map(|&s| s.clamp(0.01, 0.5))
             .collect();
+
+        // Update halting predictor (adaptive depth only)
+        if self.adaptive_depth_enabled && !self.cached_halt_probs.is_empty() {
+            // Compute ponder loss gradient
+            // Ponder loss: L_ponder = (avg_depth / max_depth) * ponder_weight
+            // Gradient: dL/d(avg_depth) = ponder_weight / max_depth
+            let ponder_grad_scale = self.ponder_loss_weight / self.max_recursive_depth as f32;
+
+            // Backpropagate through halting predictor
+            let mut w_halt_grad = Array2::zeros(self.w_halt.dim());
+            let mut b_halt_grad = 0.0;
+
+            let batch_size = self.cached_pooled_states[0].shape()[0];
+
+            for (step_idx, (halt_prob, pooled_state)) in self.cached_halt_probs.iter()
+                .zip(self.cached_pooled_states.iter())
+                .enumerate()
+            {
+                // Gradient of sigmoid: d(sigmoid(x))/dx = sigmoid(x) * (1 - sigmoid(x))
+                let sigmoid_grad = halt_prob.mapv(|p| p * (1.0 - p));
+
+                // Gradient from ponder loss (encourage fewer steps)
+                // Each sequence contributes to average depth
+                let ponder_contrib = sigmoid_grad.mapv(|g| g * ponder_grad_scale / batch_size as f32);
+
+                // Accumulate gradients for w_halt and b_halt
+                for i in 0..batch_size {
+                    let state_vec = pooled_state.row(i);
+                    let grad_scalar = ponder_contrib[i];
+
+                    // Gradient for w_halt: outer product of state and scalar gradient
+                    for j in 0..state_vec.len() {
+                        w_halt_grad[[j, 0]] += state_vec[j] * grad_scalar;
+                    }
+
+                    // Gradient for b_halt: sum of scalar gradients
+                    b_halt_grad += grad_scalar;
+                }
+            }
+
+            // Update halting predictor parameters using Adam optimizer
+            // Use conservative learning rate (0.01 scale factor)
+            let halt_lr = lr * 0.01;
+            self.halt_optimizer.step(&mut self.w_halt, &w_halt_grad, halt_lr);
+            self.b_halt -= halt_lr * b_halt_grad;
+        }
 
         Ok(())
     }

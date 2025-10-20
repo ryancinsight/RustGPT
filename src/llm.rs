@@ -702,7 +702,15 @@ impl LLM {
             for layer in self.network.iter() {
                 if let LayerEnum::TRMBlock(trm) = layer {
                     let scales = trm.get_step_scales();
-                    trm_stats = format!(" | TRM: {}", scales);
+
+                    // Add depth statistics if adaptive depth is enabled
+                    let depth_info = if let Some((avg, min, max)) = trm.get_depth_stats() {
+                        format!(" Depth: avg={:.1} [{}-{}]", avg, min, max)
+                    } else {
+                        String::new()
+                    };
+
+                    trm_stats = format!(" | TRM: {}{}", scales, depth_info);
                     break;
                 }
             }
@@ -883,6 +891,10 @@ impl LLM {
                 let dyn_loss = trm_block.get_dynamic_loss();
                 let dyn_weight = trm_block.get_dynamic_loss_weight(training_progress);
                 batch_loss += dyn_loss * dyn_weight;
+
+                // Add ponder loss (adaptive recursive depth)
+                let ponder_loss = trm_block.get_ponder_loss();
+                batch_loss += ponder_loss;
             } else if let Some(moe_layer) = layer.as_attention_moe() {
                 // For AttentionMoE, add auxiliary loss (includes both MoE routing and MoH routing losses)
                 let aux_loss = moe_layer.get_auxiliary_loss();
