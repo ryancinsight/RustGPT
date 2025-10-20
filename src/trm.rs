@@ -250,11 +250,13 @@ impl TinyRecursiveModel {
                 let w = Array2::from_shape_fn((embedding_dim, 1), |_|
                     rng.gen_range(-0.01..0.01));
 
-                // Initialize bias to start at ~5 steps (matches baseline fixed depth)
-                // We want: cumulative_prob ≈ 0.95 after 5 steps
-                // If p_halt = 0.19 per step: 5 steps → 0.95 (halts at 5)
-                // sigmoid(x) = 0.19 → x = ln(0.19/0.81) ≈ -1.45
-                let b = -1.45;
+                // Initialize bias to start at ~4 steps with STRONG halting signal
+                // Problem: Previous init (-1.45) led to depth rising to 10 and staying there
+                // Solution: Start with HIGHER p_halt so model learns to REDUCE depth, not increase it
+                // Target: p_halt = 0.25 per step → 4 steps to reach 0.95 threshold
+                // sigmoid(x) = 0.25 → x = ln(0.25/0.75) ≈ -1.10
+                // This gives stronger halting pressure, forcing model to learn when MORE depth is needed
+                let b = -1.10;
 
                 (
                     true,
@@ -494,36 +496,10 @@ impl Layer for TinyRecursiveModel {
                 // Just use x directly as the pooled state
                 self.cached_pooled_states.push(x.clone());
 
-                // Compute confidence proxy: variance in hidden states
-                // Low variance = confident/stable representation = can halt early
-                // High variance = uncertain/unstable = need more steps
-                let mut confidence_scores = Vec::with_capacity(batch_size);
-                for i in 0..batch_size {
-                    let row = x.row(i);
-                    let mean = row.sum() / row.len() as f32;
-                    let variance = row.iter()
-                        .map(|&v| (v - mean).powi(2))
-                        .sum::<f32>() / row.len() as f32;
-                    // Normalize variance to [0, 1] range (higher = more confident)
-                    // Use negative exponential to map variance to confidence
-                    let confidence = (-variance).exp();
-                    confidence_scores.push(confidence);
-                }
-
                 // Compute halting logits: W_halt · x + b_halt
                 let halt_logits_2d = x.dot(&self.w_halt); // (batch_size, 1)
                 let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (batch_size,)
-                let mut halt_logits = halt_logits + self.b_halt; // Add bias
-
-                // Confidence-aware halting: increase p_halt for confident predictions
-                // If confidence is high, encourage halting (increase logit)
-                // If confidence is low, discourage halting (decrease logit)
-                for i in 0..batch_size {
-                    let confidence = confidence_scores[i];
-                    // Scale logit by confidence: high confidence → higher p_halt
-                    // Add confidence boost: logit += confidence * scale
-                    halt_logits[i] += (confidence - 0.5) * 2.0; // Scale to [-1, 1] range
-                }
+                let halt_logits = halt_logits + self.b_halt; // Add bias
 
                 // Apply sigmoid: p_halt = sigmoid(logits)
                 let p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
