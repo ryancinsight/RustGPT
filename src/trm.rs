@@ -250,10 +250,11 @@ impl TinyRecursiveModel {
                 let w = Array2::from_shape_fn((embedding_dim, 1), |_|
                     rng.gen_range(-0.01..0.01));
 
-                // Initialize bias to large negative value to start at max_depth
-                // sigmoid(-5) ≈ 0.007, so model will use max_depth initially
-                // As training progresses, model learns to increase bias for simple inputs
-                let b = -5.0;
+                // Initialize bias to start at ~6-7 steps (reasonable middle ground)
+                // We want: cumulative_prob ≈ 0.95 after 6-7 steps
+                // If p_halt = 0.15 per step: 6 steps → 0.90, 7 steps → 1.05 (halts at 7)
+                // sigmoid(x) = 0.15 → x = ln(0.15/0.85) ≈ -1.73
+                let b = -1.7;
 
                 (
                     true,
@@ -512,18 +513,11 @@ impl Layer for TinyRecursiveModel {
                 let halt_logits = halt_logits + self.b_halt; // Add bias
 
                 // Apply sigmoid: p_halt = sigmoid(logits)
-                let mut p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
+                let p_halt = halt_logits.mapv(|x| 1.0 / (1.0 + (-x).exp()));
 
-                // Complexity-aware halting: reduce halting probability for complex inputs
-                // If complexity > threshold (e.g., 0.5), reduce p_halt to encourage more steps
-                for i in 0..batch_size {
-                    let complexity = complexity_scores[i];
-                    if complexity > 0.5 {
-                        // High complexity: reduce halting probability
-                        // Scale down by (1 - complexity), so high complexity → low p_halt
-                        p_halt[i] *= (1.0 - complexity).max(0.1); // Keep at least 10% to avoid getting stuck
-                    }
-                }
+                // Note: Removed complexity-aware halting for now
+                // Let the model learn halting behavior from task loss + ponder loss
+                // The halting predictor (W_halt, b_halt) can learn to use complexity implicitly
 
                 // Update cumulative probabilities (only for active sequences)
                 for i in 0..batch_size {
@@ -828,10 +822,10 @@ impl Layer for TinyRecursiveModel {
             }
 
             // Update halting predictor parameters using Adam optimizer
-            // Use conservative learning rate (0.01 scale factor)
-            let halt_lr = lr * 0.01;
-            self.halt_optimizer.step(&mut self.w_halt, &w_halt_grad, halt_lr);
-            self.b_halt -= halt_lr * b_halt_grad;
+            // Use same learning rate as other parameters (no scaling)
+            // The ponder_weight already controls the gradient magnitude
+            self.halt_optimizer.step(&mut self.w_halt, &w_halt_grad, lr);
+            self.b_halt -= lr * b_halt_grad;
         }
 
         Ok(())

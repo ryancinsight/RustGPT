@@ -300,7 +300,7 @@ impl Default for AdaptiveDepthConfig {
         Self {
             max_depth: 10,  // Allow up to 10 recursive steps
             halt_threshold: 0.95,
-            ponder_weight: 0.001,  // Very low weight to prioritize quality over efficiency
+            ponder_weight: 0.01,  // Increased from 0.001 to provide stronger learning signal
         }
     }
 }
