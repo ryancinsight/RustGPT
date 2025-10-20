@@ -348,10 +348,15 @@ impl TinyRecursiveModel {
 
     /// Get MoH statistics from internal attention layer
     ///
-    /// Returns (avg_routed_heads, mean_threshold, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm)
-    /// Returns (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) if MoH is not enabled.
-    pub fn get_moh_stats(&self) -> (f32, f32, f32, f32, f32, f32, f32) {
-        self.attention.get_moh_stats()
+    /// Returns (avg_routed_heads, mean_threshold, conf_avg, conf_min, fallback_pct, complexity_avg, complexity_min, complexity_max, pred_norm)
+    /// Returns (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) if MoH is not enabled.
+    pub fn get_moh_stats(&self) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+        let (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm) =
+            self.attention.get_moh_stats();
+        let (_, complexity_min, complexity_max) = self.attention.get_complexity_stats();
+
+        (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct,
+         complexity_avg, complexity_min, complexity_max, pred_norm)
     }
 
     /// Get temperature statistics from internal attention layer

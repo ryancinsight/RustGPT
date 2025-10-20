@@ -338,11 +338,10 @@ impl RouterType {
         match self {
             RouterType::Standard(router) => router.cached_complexity_stats,
             RouterType::FullyAdaptive(router) => {
-                // Get complexity stats from routing_stats method
-                let (_, _, _, avg_complexity, _) = router.routing_stats();
-                if avg_complexity > 0.0 {
-                    // Return avg as all values since we don't track min/max separately
-                    Some((avg_complexity, avg_complexity, avg_complexity))
+                // Get complexity stats with proper min/max tracking
+                let (avg, min, max) = router.get_complexity_stats();
+                if avg > 0.0 {
+                    Some((avg, min, max))
                 } else {
                     None
                 }
@@ -1538,6 +1537,21 @@ impl FullyAdaptiveHeadRouter {
             (avg_heads, min_heads, max_heads, avg_complexity, avg_threshold)
         } else {
             (0.0, 0, 0, 0.0, 0.0)
+        }
+    }
+
+    /// Get complexity statistics (avg, min, max)
+    ///
+    /// Returns (0.0, 0.0, 0.0) if no routing has been performed yet.
+    pub fn get_complexity_stats(&self) -> (f32, f32, f32) {
+        if let Some(complexity) = &self.cached_complexity_scores {
+            let seq_len = complexity.len();
+            let avg = complexity.sum() / seq_len as f32;
+            let min = complexity.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = complexity.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            (avg, min, max)
+        } else {
+            (0.0, 0.0, 0.0)
         }
     }
 
