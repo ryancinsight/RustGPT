@@ -298,9 +298,9 @@ pub struct AdaptiveDepthConfig {
 impl Default for AdaptiveDepthConfig {
     fn default() -> Self {
         Self {
-            max_depth: 10,
+            max_depth: 10,  // Aggressive: allow up to 10 recursive steps
             halt_threshold: 0.95,
-            ponder_weight: 0.01,
+            ponder_weight: 0.05,  // 5× higher ponder weight to encourage efficiency
         }
     }
 }
