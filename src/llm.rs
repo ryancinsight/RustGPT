@@ -17,15 +17,14 @@ use crate::{
 pub enum LayerEnum {
     Embeddings(Embeddings),
     SelfAttention(Box<crate::self_attention::SelfAttention>),
-    FeedForward(Box<crate::feed_forward::FeedForward>),
+    // Removed FeedForward variant; SwiGLU is the only FFN
     SwiGLU(Box<crate::swiglu::SwiGLU>),
-    MoE(Box<crate::moe::MoELayer>),
+
     LayerNorm(crate::layer_norm::LayerNorm),
     RMSNorm(crate::rms_norm::RMSNorm),
     DynamicTanhNorm(crate::dynamic_tanh_norm::DynamicTanhNorm),
     OutputProjection(OutputProjection),
-    HyperMixerBlock(Box<crate::hypermixer::HyperMixerBlock>),
-    HRMBlock(Box<crate::hrm::HRMBlock>),
+
     TRMBlock(Box<crate::trm::TinyRecursiveModel>),
 }
 
@@ -69,15 +68,14 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.layer_type(),
             LayerEnum::SelfAttention(layer) => layer.layer_type(),
-            LayerEnum::FeedForward(layer) => layer.layer_type(),
+            // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.layer_type(),
-            LayerEnum::MoE(layer) => layer.layer_type(),
+
             LayerEnum::LayerNorm(layer) => layer.layer_type(),
             LayerEnum::RMSNorm(layer) => layer.layer_type(),
             LayerEnum::DynamicTanhNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
-            LayerEnum::HyperMixerBlock(layer) => layer.layer_type(),
-            LayerEnum::HRMBlock(layer) => layer.layer_type(),
+
             LayerEnum::TRMBlock(layer) => layer.layer_type(),
         }
     }
@@ -86,15 +84,14 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.forward(input),
             LayerEnum::SelfAttention(layer) => layer.forward(input),
-            LayerEnum::FeedForward(layer) => layer.forward(input),
+            // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.forward(input),
-            LayerEnum::MoE(layer) => layer.forward(input),
+
             LayerEnum::LayerNorm(layer) => layer.forward(input),
             LayerEnum::RMSNorm(layer) => layer.forward(input),
             LayerEnum::DynamicTanhNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
-            LayerEnum::HyperMixerBlock(layer) => layer.forward(input),
-            LayerEnum::HRMBlock(layer) => layer.forward(input),
+
             LayerEnum::TRMBlock(layer) => layer.forward(input),
         }
     }
@@ -107,15 +104,14 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::SelfAttention(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::FeedForward(layer) => layer.compute_gradients(input, output_grads),
+            // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::MoE(layer) => layer.compute_gradients(input, output_grads),
+
             LayerEnum::LayerNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::RMSNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::DynamicTanhNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::HyperMixerBlock(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::HRMBlock(layer) => layer.compute_gradients(input, output_grads),
+
             LayerEnum::TRMBlock(layer) => layer.compute_gradients(input, output_grads),
         }
     }
@@ -124,15 +120,14 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::FeedForward(layer) => layer.apply_gradients(param_grads, lr),
+            // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::MoE(layer) => layer.apply_gradients(param_grads, lr),
+
             LayerEnum::LayerNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::RMSNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::DynamicTanhNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::HyperMixerBlock(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::HRMBlock(layer) => layer.apply_gradients(param_grads, lr),
+
             LayerEnum::TRMBlock(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
@@ -141,15 +136,14 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.backward(grads, lr),
             LayerEnum::SelfAttention(layer) => layer.backward(grads, lr),
-            LayerEnum::FeedForward(layer) => layer.backward(grads, lr),
+            // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.backward(grads, lr),
-            LayerEnum::MoE(layer) => layer.backward(grads, lr),
+
             LayerEnum::LayerNorm(layer) => layer.backward(grads, lr),
             LayerEnum::RMSNorm(layer) => layer.backward(grads, lr),
             LayerEnum::DynamicTanhNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
-            LayerEnum::HyperMixerBlock(layer) => layer.backward(grads, lr),
-            LayerEnum::HRMBlock(layer) => layer.backward(grads, lr),
+
             LayerEnum::TRMBlock(layer) => layer.backward(grads, lr),
         }
     }
@@ -158,16 +152,14 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::Embeddings(layer) => layer.parameters(),
             LayerEnum::SelfAttention(layer) => layer.parameters(),
-            LayerEnum::FeedForward(layer) => layer.parameters(),
+            // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.parameters(),
-            LayerEnum::MoE(layer) => layer.parameters(),
+
             LayerEnum::LayerNorm(layer) => layer.parameters(),
             LayerEnum::RMSNorm(layer) => layer.parameters(),
             LayerEnum::DynamicTanhNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
-            LayerEnum::HyperMixerBlock(layer) => layer.parameters(),
             LayerEnum::TRMBlock(layer) => layer.parameters(),
-            LayerEnum::HRMBlock(layer) => layer.parameters(),
         }
     }
 }
@@ -665,29 +657,15 @@ impl LLM {
                 }
             }
 
-            // Log HyperMixer statistics if present
-            let mut hypermixer_stats = String::new();
-            let mut hypermixer_count = 0;
-            for layer in self.network.iter() {
-                if let LayerEnum::HyperMixerBlock(hm) = layer {
-                    if hypermixer_count == 0 {
-                        // Log first block
-                        hypermixer_stats = format!(" | HM: {}", hm.get_scales());
-                    }
-                    hypermixer_count += 1;
-                }
-            }
-
             info!(
                 epoch = epoch,
                 loss = avg_loss,
                 grad_norm = avg_grad_norm,
                 learning_rate = effective_lr,
-                "Training epoch completed{}{}{}{}",
+                "Training epoch completed{}{}{}",
                 warmup_status,
                 moh_stats,
-                trm_stats,
-                hypermixer_stats
+                trm_stats
             );
 
         }
@@ -1153,108 +1131,6 @@ impl LLM {
         grads
     }
 
-    /// Generate text using beam search
-    ///
-    /// This method uses beam search to generate text, which explores multiple
-    /// hypotheses in parallel and can produce higher quality output than greedy decoding.
-    ///
-    /// # Arguments
-    /// * `text` - Input text to condition generation on
-    /// * `config` - Beam search configuration
-    ///
-    /// # Returns
-    /// Generated text as a String
-    pub fn generate_with_beam_search(
-        &mut self,
-        text: &str,
-        config: &crate::beam_search::BeamSearchConfig,
-    ) -> String {
-        use crate::beam_search::BeamSearchState;
-
-        // Tokenize the input text
-        let initial_tokens = self.tokenize(text);
-
-        // Safety check: ensure we have at least one token
-        if initial_tokens.is_empty() {
-            return String::new();
-        }
-
-        // Initialize beam search state
-        let mut state = BeamSearchState::new(initial_tokens.clone(), config.beam_width);
-
-        let end_token = self.vocab.encode("</s>").unwrap();
-
-        // Generate tokens
-        for step in 0..config.max_length {
-            if state.is_done() {
-                break;
-            }
-
-            // Collect predictions for all active beams
-            let active_beams: Vec<&BeamHypothesis> =
-                state.beams.iter().filter(|b| !b.is_complete).collect();
-            let num_active = active_beams.len();
-            if num_active == 0 {
-                break;
-            }
-
-            let seq_len = active_beams[0].tokens.len();
-            let mut token_matrix = Array2::<f32>::zeros((num_active, seq_len));
-
-            for (i, beam) in active_beams.iter().enumerate() {
-                for (j, &token) in beam.tokens.iter().enumerate() {
-                    token_matrix[[i, j]] = token as f32;
-                }
-            }
-
-            let mut input = token_matrix;
-
-            // Forward pass through network (batched)
-            for layer in &mut self.network {
-                input = layer.forward(&input);
-            }
-
-            let logits = input; // shape (num_active, vocab_size)
-
-            // Extract predictions for each beam
-            let predictions: Vec<Array1<f32>> =
-                (0..num_active).map(|i| logits.row(i).to_owned()).collect();
-
-            // Compute entropy for adaptive beam width
-            if config.use_adaptive_beam && !predictions.is_empty() {
-                let entropy = state.compute_entropy(&predictions);
-                state.adapt_beam_width(entropy, config);
-            }
-
-            // Expand beams with new predictions
-            state.expand(&predictions, config, self.vocab.words.len());
-
-            // Mark complete beams
-            state.mark_complete(end_token, initial_tokens.len() + step + 1);
-        }
-
-        // Get the best hypothesis
-        let best = state.get_best(config);
-
-        if let Some(hypothesis) = best {
-            // Skip the initial tokens (input) and convert to text
-            let output_tokens = &hypothesis.tokens[initial_tokens.len()..];
-
-            if output_tokens.is_empty() {
-                return String::new();
-            }
-
-            // Convert token_ids to strings
-            let token_strs = output_tokens
-                .iter()
-                .map(|&t| self.vocab.decode.get(&t).unwrap().as_str())
-                .collect::<Vec<&str>>();
-
-            token_strs.join(" ")
-        } else {
-            String::new()
-        }
-    }
 
     /// Save model to JSON format (human-readable, larger file size)
     pub fn save_json(&self, path: &str) -> Result<()> {
@@ -1316,5 +1192,3 @@ impl LLM {
         }
     }
 }
-
-pub use crate::beam_search::*;

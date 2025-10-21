@@ -27,7 +27,7 @@ pub struct VersionedModel {
 pub struct ModelMetadata {
     /// Timestamp when model was saved (ISO 8601 format)
     pub saved_at: String,
-    /// Model architecture type (e.g., "Transformer", "HyperMixer", "HRM")
+    /// Model architecture type (e.g., "Transformer" or "TRM")
     pub architecture: String,
     /// Number of parameters
     pub num_parameters: usize,
@@ -273,19 +273,13 @@ impl LLM {
             .network
             .iter()
             .any(|l| matches!(l, crate::llm::LayerEnum::SelfAttention(_)));
-        let has_hypermixer = self
+        let has_trm = self
             .network
             .iter()
-            .any(|l| matches!(l, crate::llm::LayerEnum::HyperMixerBlock(_)));
-        let has_hrm = self
-            .network
-            .iter()
-            .any(|l| matches!(l, crate::llm::LayerEnum::HRMBlock(_)));
+            .any(|l| matches!(l, crate::llm::LayerEnum::TRMBlock(_)));
 
-        if has_hrm {
-            "HRM".to_string()
-        } else if has_hypermixer {
-            "HyperMixer".to_string()
+        if has_trm {
+            "TRM".to_string()
         } else if has_self_attention {
             "Transformer".to_string()
         } else {

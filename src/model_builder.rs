@@ -1,11 +1,9 @@
 use crate::{
     embeddings::Embeddings,
-    feed_forward::FeedForward,
-    hrm::HRMBlock,
-    hypermixer::HyperMixerBlock,
+    // feed_forward::FeedForward, // Removed: using SwiGLU exclusively
+
     layer_norm::LayerNorm,
     llm::{Layer, LayerEnum},
-    moe::MoELayer,
     model_config::{AdaptiveDepthConfig, ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     rms_norm::RMSNorm,
@@ -18,7 +16,7 @@ use crate::{
 
 /// Build a network based on the provided configuration
 ///
-/// This function constructs Transformer, HyperMixer, or HRM architecture
+/// This function constructs Transformer or TRM architecture
 /// based on the configuration, allowing for easy A/B comparison between
 /// different approaches.
 ///
@@ -39,12 +37,7 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         ArchitectureType::Transformer => {
             build_transformer_layers(&mut layers, config);
         }
-        ArchitectureType::HyperMixer => {
-            build_hypermixer_layers(&mut layers, config);
-        }
-        ArchitectureType::HRM => {
-            build_hrm_layers(&mut layers, config);
-        }
+
         ArchitectureType::TRM => {
             build_trm_layers(&mut layers, config);
         }
@@ -64,7 +57,7 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 /// Creates the Pre-LN transformer architecture with:
 /// - Self-attention layers (with optional RoPE/CoPE)
 /// - Layer normalization or RMSNorm (based on config)
-/// - Feedforward networks or SwiGLU (based on config)
+/// - SwiGLU feedforward (exclusively)
 /// - Residual connections (handled within layers)
 /// - Final normalization layer (required for Pre-LN stability)
 ///
@@ -119,18 +112,8 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
         }
 
-        // Feedforward layer (MoE, SwiGLU, or FeedForward based on config)
-        if config.use_moe {
-            // Use Mixture of Experts
-            layers.push(LayerEnum::MoE(Box::new(MoELayer::new(
-                config.embedding_dim,
-                config.expert_hidden_dim,
-                config.num_experts,
-                config.num_active_experts,
-                config.moe_load_balance_weight,
-                config.moe_router_z_loss_weight,
-            ))));
-        } else if config.use_swiglu {
+        // Feedforward layer (SwiGLU only)
+        {
             // Use SwiGLU (optionally with dynamic swish)
             let mut swiglu = SwiGLU::new(
                 config.embedding_dim,
@@ -140,12 +123,6 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
                 swiglu.enable_dynamic_swish();
             }
             layers.push(LayerEnum::SwiGLU(Box::new(swiglu)));
-        } else {
-            // Use standard FeedForward
-            layers.push(LayerEnum::FeedForward(Box::new(FeedForward::new(
-                config.embedding_dim,
-                config.hidden_dim,
-            ))));
         }
 
         // Normalization after feedforward (LayerNorm or RMSNorm based on config)
@@ -159,7 +136,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     }
 
     // Final normalization layer (critical for Pre-LN Transformer stability)
-    // Avoid adding a duplicate norm if the last layer is already a normalization
+    // Avoid duplicate norm if the last layer is already a normalization
     let last_is_norm = matches!(
         layers.last(),
         Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
@@ -176,51 +153,6 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 
 }
 
-/// Build HyperMixer architecture layers (Following arxiv.org/abs/2203.03691)
-///
-/// Creates the HyperMixer architecture with:
-/// - Token mixing via hypernetwork-generated MLP (content-aware mixing)
-/// - Channel mixing with SwiGLU (similar to feedforward)
-/// - RMS normalization (Pre-LN style)
-/// - ReZero-style adaptive residual scaling
-fn build_hypermixer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    let hypernetwork_hidden_dim = config.get_hypernetwork_hidden_dim();
-
-    for _ in 0..config.num_layers {
-        // HyperMixer block (combines token mixing + channel mixing + norms + adaptive scaling)
-        let mut hypermixer_block = HyperMixerBlock::new(
-            config.embedding_dim,
-            config.hidden_dim,
-            config.max_seq_len,
-            hypernetwork_hidden_dim,
-            config.use_swiglu, // Use SwiGLU in channel mixing (recommended)
-        );
-
-        // Enable dynamically learned Swish in channel mixing when configured
-        if config.use_swiglu && config.use_dynamic_swish {
-            hypermixer_block.channel_mixing.enable_dynamic_swish();
-        }
-
-        layers.push(LayerEnum::HyperMixerBlock(Box::new(hypermixer_block)));
-    }
-
-    // Final normalization layer (critical for HyperMixer stability)
-    // Avoid duplicate norm if the last layer is already normalization
-    let last_is_norm = matches!(
-        layers.last(),
-        Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
-    );
-    if !last_is_norm {
-        if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
-        } else if config.use_rms_norm {
-            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-        } else {
-            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
-        }
-    }
-
-}
 
 /// Print architecture summary
 ///
@@ -238,12 +170,6 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("  Number of Layers: {}", config.num_layers);
     println!("  Max Sequence Length: {}", config.max_seq_len);
 
-    if config.architecture == ArchitectureType::HyperMixer {
-        println!(
-            "  Hypernetwork Hidden Dim: {}",
-            config.get_hypernetwork_hidden_dim()
-        );
-    }
 
     // Modern LLM Enhancements
     println!("\n🚀 Modern LLM Enhancements:");
@@ -258,11 +184,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     }
 
     // Activation
-    if config.use_swiglu {
-        println!("  ✓ SwiGLU (gated activation, no bias)");
-    } else {
-        println!("  • FeedForward with ReLU (standard)");
-    }
+    println!("  ✓ SwiGLU (gated activation, no bias)");
 
     // Positional Encoding
     use crate::model_config::PositionalEncodingType;
@@ -422,7 +344,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     // Architecture Alignment
     println!("\n🎯 Architecture Alignment:");
     let has_rms = config.use_rms_norm;
-    let has_swiglu = config.use_swiglu;
+    let has_swiglu = true; // SwiGLU is always enabled
     let has_rope = matches!(config.positional_encoding, PositionalEncodingType::RoPE);
     let has_cope = matches!(
         config.positional_encoding,
@@ -455,34 +377,10 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("\n════════════════════════════════════════════════════════════════\n");
 }
 
-/// Build HRM architecture layers
+/// Legacy note: HRM architecture removed
 ///
-/// Creates a single HRM block that internally contains N×T effective depth
-/// through hierarchical convergence.
-///
-/// # Arguments
-/// * `layers` - Mutable vector to append layers to
-/// * `config` - Model configuration with HRM parameters
-///
-/// # HRM Configuration
-/// - `num_layers` stores N (number of high-level cycles)
-/// - `hypernetwork_hidden_dim` stores T (low-level steps per cycle)
-/// - `hidden_dim` is used for Transformer blocks within HRM modules
-fn build_hrm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    let num_high_cycles = config.get_num_high_cycles();
-    let low_steps_per_cycle = config.get_low_steps_per_cycle();
-
-    // Create single HRM block (contains N×T effective depth internally)
-    let hrm_block = HRMBlock::new(
-        config.embedding_dim,
-        config.hidden_dim,
-        num_high_cycles,
-        low_steps_per_cycle,
-        config.max_seq_len,
-    );
-
-    layers.push(LayerEnum::HRMBlock(Box::new(hrm_block)));
-}
+/// This section previously described HRM-specific layer construction, which
+/// has been removed. Supported architectures: Transformer and TRM.
 
 /// Build TRM (Tiny Recursive Model) architecture layers
 ///
@@ -497,7 +395,6 @@ fn build_hrm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 ///
 /// # TRM Configuration
 /// - `num_layers` stores recursive depth (D)
-/// - `use_swiglu` determines FFN type (SwiGLU vs FeedForward)
 /// - `use_rms_norm` determines normalization type (RMSNorm vs LayerNorm)
 ///
 /// # Gradient Stability
@@ -516,7 +413,7 @@ fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         num_heads,
         Some(num_kv_heads),
         recursive_depth,
-        config.use_swiglu,
+        // removed use_swiglu (SwiGLU is always used)
         config.max_seq_len,
         config.head_selection.clone(),
         None, // Disable adaptive depth - use fixed depth=5 for baseline validation
@@ -552,30 +449,14 @@ mod tests {
 
         let layers = build_network(&config, &vocab);
 
-        // Should have: Embeddings + (Attention + Norm + FF + Norm) * 2 + FinalNorm + OutputProjection
-        // = 1 + 4*2 + 1 + 1 = 11 layers
-        assert_eq!(layers.len(), 11);
+        // Should have: Embeddings + (Attention + Norm + FF + Norm) * 2 + OutputProjection
+        // Final norm deduped when last layer is already normalization
+        // = 1 + 4*2 + 1 = 10 layers
+        assert_eq!(layers.len(), 10);
 
         // Check first and last layers
         assert_eq!(layers[0].layer_type(), "Embeddings");
         assert_eq!(layers[layers.len() - 1].layer_type(), "OutputProjection");
     }
 
-    #[test]
-    fn test_build_hypermixer_network() {
-        let vocab = Vocab::new(vec!["a", "b", "c"]);
-        let config = ModelConfig::hypermixer(128, 256, 2, 80, Some(32), Some(8));
-
-        let layers = build_network(&config, &vocab);
-
-        // Should have: Embeddings + HyperMixerBlock * 2 + FinalNorm + OutputProjection
-        // = 1 + 2 + 1 + 1 = 5 layers
-        assert_eq!(layers.len(), 5);
-
-        // Check first and last layers
-        assert_eq!(layers[0].layer_type(), "Embeddings");
-        assert_eq!(layers[1].layer_type(), "HyperMixerBlock");
-        assert_eq!(layers[2].layer_type(), "HyperMixerBlock");
-        assert_eq!(layers[layers.len() - 1].layer_type(), "OutputProjection");
-    }
 }

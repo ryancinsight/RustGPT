@@ -15,7 +15,6 @@ fn main() {
     println!("📋 Configuration 1: Original Transformer (Baseline)\n");
     let mut config1 = ModelConfig::transformer(512, 2048, 6, 512, None, Some(8));
     config1.use_rms_norm = false;
-    config1.use_swiglu = false;
     config1.positional_encoding = PositionalEncodingType::Learned;
     config1.num_kv_heads = None;
     config1.window_size = None;
@@ -28,7 +27,6 @@ fn main() {
     println!("📋 Configuration 2: LLaMA 1/2 7B Style\n");
     let mut config2 = ModelConfig::transformer(512, 2048, 6, 2048, None, Some(8));
     config2.use_rms_norm = true;
-    config2.use_swiglu = true;
     config2.positional_encoding = PositionalEncodingType::RoPE;
     config2.num_kv_heads = None; // MHA
     config2.window_size = None; // Full attention
@@ -41,7 +39,6 @@ fn main() {
     println!("📋 Configuration 3: LLaMA 2 70B Style (with GQA)\n");
     let mut config3 = ModelConfig::transformer(512, 2048, 6, 4096, None, Some(8));
     config3.use_rms_norm = true;
-    config3.use_swiglu = true;
     config3.positional_encoding = PositionalEncodingType::RoPE;
     config3.num_kv_heads = Some(4); // GQA
     config3.window_size = None; // Full attention
@@ -54,7 +51,6 @@ fn main() {
     println!("📋 Configuration 4: Mistral 7B Style ⭐ (Complete Modern Stack)\n");
     let mut config4 = ModelConfig::transformer(512, 2048, 6, 8192, None, Some(8));
     config4.use_rms_norm = true;
-    config4.use_swiglu = true;
     config4.positional_encoding = PositionalEncodingType::RoPE;
     config4.num_kv_heads = Some(4); // GQA
     config4.window_size = Some(4096); // Sliding Window
@@ -67,7 +63,6 @@ fn main() {
     println!("📋 Configuration 5: Aggressive Efficiency (Maximum Speed)\n");
     let mut config5 = ModelConfig::transformer(512, 2048, 6, 4096, None, Some(8));
     config5.use_rms_norm = true;
-    config5.use_swiglu = true;
     config5.positional_encoding = PositionalEncodingType::RoPE;
     config5.num_kv_heads = Some(2); // Aggressive GQA (4x reduction)
     config5.window_size = Some(1024); // Small window (very fast)

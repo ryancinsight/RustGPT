@@ -50,7 +50,7 @@ use crate::llm::Layer;
 ///
 /// - Zhang & Sennrich (2019): "Root Mean Square Layer Normalization"
 /// - Touvron et al. (2023): "LLaMA: Open and Efficient Foundation Language Models"
-/// - HRM Paper (2025): Uses RMSNorm for stability in hierarchical reasoning
+/// - Recent architectures use RMSNorm for stability in deep networks
 ///
 /// # Example
 ///

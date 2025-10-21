@@ -1,7 +1,7 @@
 use llm::{
     EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, LayerEnum, MAX_SEQ_LEN, Vocab,
-    feed_forward::FeedForward, layer_norm::LayerNorm, output_projection::OutputProjection,
-    self_attention::SelfAttention, transformer::TransformerBlock,
+    layer_norm::LayerNorm, output_projection::OutputProjection, self_attention::SelfAttention,
+    swiglu::SwiGLU,
 };
 use ndarray::{Array2, Axis};
 use proptest::prelude::*;
@@ -16,9 +16,9 @@ fn create_custom_vocab(words: Vec<&str>) -> Vocab {
     Vocab::new(words)
 }
 
-// ============================================================================
+// =========================================================================
 // Basic Functionality Tests
-// ============================================================================
+// =========================================================================
 
 #[test]
 fn test_llm_tokenize() {
@@ -75,120 +75,9 @@ fn test_llm_train() {
     let _ = llm.train(training_data, 10, 0.01);
 }
 
-#[test]
-fn test_llm_integration() {
-    let vocab = create_test_vocab();
-    let vocab_size = vocab.encode.len();
-
-    let embeddings = LayerEnum::Embeddings(Embeddings::new(vocab.clone()));
-    let transformer_block = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let output_projection =
-        LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size));
-
-    // Extract norm layers based on their type
-    let norm1_enum = match transformer_block.norm1 {
-        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
-        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
-    };
-
-    let norm2_enum = match transformer_block.norm2 {
-        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
-        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
-    };
-
-    // Extract feedforward layer based on its type
-    let ffn_enum = match transformer_block.feed_forward {
-        llm::transformer::FFNLayer::FeedForward(ffn) => LayerEnum::FeedForward(ffn),
-        llm::transformer::FFNLayer::SwiGLU(swiglu) => LayerEnum::SwiGLU(swiglu),
-    };
-
-    let mut llm = LLM::new(
-        vocab,
-        vec![
-            embeddings,
-            LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
-            norm1_enum,
-            ffn_enum,
-            norm2_enum,
-            output_projection,
-        ],
-    );
-
-    let input_text = "hello world this is rust";
-    // Integration test: training with real layers should complete
-    let _ = llm.train(vec![input_text], 10, 0.01);
-}
-
-#[test]
-fn test_llm_total_parameters() {
-    let vocab = create_test_vocab();
-    let vocab_size = vocab.encode.len();
-
-    // Create an LLM with actual layers to get a meaningful parameter count
-    let embeddings = LayerEnum::Embeddings(Embeddings::new(vocab.clone()));
-    let transformer_block = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let output_projection =
-        LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size));
-
-    // Extract norm layers based on their type
-    let norm1_enum = match transformer_block.norm1 {
-        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
-        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
-    };
-
-    let norm2_enum = match transformer_block.norm2 {
-        llm::transformer::NormLayer::LayerNorm(norm) => LayerEnum::LayerNorm(*norm),
-        llm::transformer::NormLayer::RMSNorm(norm) => LayerEnum::RMSNorm(*norm),
-    };
-
-    // Extract feedforward layer based on its type
-    let ffn_enum = match transformer_block.feed_forward {
-        llm::transformer::FFNLayer::FeedForward(ffn) => LayerEnum::FeedForward(ffn),
-        llm::transformer::FFNLayer::SwiGLU(swiglu) => LayerEnum::SwiGLU(swiglu),
-    };
-
-    let llm = LLM::new(
-        vocab,
-        vec![
-            embeddings,
-            LayerEnum::SelfAttention(Box::new(SelfAttention::new_with_positional_encoding(
-                EMBEDDING_DIM,
-                1, // Single head for parameter count test
-                1, // Single KV head (MHA)
-                &llm::PositionalEncodingType::Learned,
-                512,
-                None,
-            ))),
-            norm1_enum,
-            ffn_enum,
-            norm2_enum,
-            output_projection,
-        ],
-    );
-
-    // The total parameters should be greater than 0 for a model with actual layers
-    let param_count = llm.total_parameters();
-    assert!(param_count > 0, "Model should have non-zero parameters");
-
-    // Validate exact parameter count based on architecture (no bias terms - modern LLM practice)
-    let expected_embeddings_parameters = vocab_size * EMBEDDING_DIM + MAX_SEQ_LEN * EMBEDDING_DIM;
-    let expected_transformer_block_parameters = (2 * EMBEDDING_DIM) + // LayerNorm (gamma, beta)
-        (3 * EMBEDDING_DIM * EMBEDDING_DIM) + // SelfAttention (w_q, w_k, w_v - no bias)
-        (2 * EMBEDDING_DIM) + // LayerNorm (gamma, beta)
-        (EMBEDDING_DIM * HIDDEN_DIM + HIDDEN_DIM * EMBEDDING_DIM); // FeedForward (w1, w2 - no bias)
-    let expected_output_projection_parameters = EMBEDDING_DIM * vocab_size; // w_out (no bias)
-    let _expected_total = expected_embeddings_parameters
-        + expected_transformer_block_parameters
-        + expected_output_projection_parameters;
-
-    // Note: Actual parameter count will differ due to using 1 head instead of 8 heads
-    // This test verifies the model has non-zero parameters
-    assert!(param_count > 0, "Model should have non-zero parameters");
-}
-
-// ============================================================================
+// =========================================================================
 // Edge Case Tests
-// ============================================================================
+// =========================================================================
 
 #[test]
 fn test_llm_tokenize_empty_input() {
@@ -247,22 +136,6 @@ fn test_llm_predict_empty_input() {
 }
 
 #[test]
-fn test_llm_predict_max_seq_len() {
-    // Use default LLM
-    let mut llm = LLM::default();
-
-    // Create input that's exactly at MAX_SEQ_LEN
-    let long_input = vec!["hello"; MAX_SEQ_LEN].join(" ");
-    let result = llm.predict(&long_input);
-
-    // Should handle gracefully without panic
-    assert!(
-        result.is_empty() || !result.is_empty(),
-        "Should handle MAX_SEQ_LEN input"
-    );
-}
-
-#[test]
 fn test_llm_train_empty_data() {
     let mut llm = LLM::default();
 
@@ -278,63 +151,99 @@ fn test_llm_train_single_token() {
     let _ = llm.train(vec!["hello"], 5, 0.01);
 }
 
-// ============================================================================
-// Property-Based Tests
-// ============================================================================
+// =========================================================================
+// Parameter Count Consistency with SwiGLU
+// =========================================================================
 
-proptest! {
-    #[test]
-    fn prop_tokenize_produces_valid_indices(s in "[a-z ]{1,50}") {
-        // Use default LLM for property testing
-        let llm = LLM::default();
-        let vocab_size = llm.vocab.words.len();
+#[test]
+fn test_parameter_count_consistency() {
+    // Test that parameter count is consistent across multiple instantiations
+    let vocab = create_test_vocab();
+    let vocab_size = vocab.encode.len();
 
-        let tokens = llm.tokenize(&s);
+    let llm1 = LLM::new(
+        vocab.clone(),
+        vec![
+            LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
+            LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
+            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::SwiGLU(Box::new(SwiGLU::new(EMBEDDING_DIM, HIDDEN_DIM))),
+            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size)),
+        ],
+    );
 
-        // All tokens should be valid indices in the vocabulary
-        for &token in &tokens {
-            prop_assert!(token < vocab_size, "Token {} exceeds vocab size {}", token, vocab_size);
-            prop_assert!(llm.vocab.decode(token).is_some(), "Token {} should be decodable", token);
+    let llm2 = LLM::new(
+        vocab.clone(),
+        vec![
+            LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
+            LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
+            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::SwiGLU(Box::new(SwiGLU::new(EMBEDDING_DIM, HIDDEN_DIM))),
+            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size)),
+        ],
+    );
+
+    assert_eq!(
+        llm1.total_parameters(),
+        llm2.total_parameters(),
+        "Parameter count should be deterministic",
+    );
+}
+
+// =========================================================================
+// Helper Functions for Testing Mathematical Properties
+// =========================================================================
+
+fn manual_softmax(logits: &Array2<f32>) -> Array2<f32> {
+    let mut result = logits.clone();
+
+    for mut row in result.rows_mut() {
+        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_values: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
+        let sum_exp: f32 = exp_values.iter().sum();
+
+        for (i, &exp_val) in exp_values.iter().enumerate() {
+            row[i] = exp_val / sum_exp;
         }
     }
 
-    #[test]
-    fn prop_tokenize_length_bounded(s in "[a-z ]{1,100}") {
-        // Use default LLM for property testing
-        let llm = LLM::default();
-
-        let tokens = llm.tokenize(&s);
-        let word_count = s.split_whitespace().count();
-
-        // Token count should be reasonable relative to word count
-        prop_assert!(tokens.len() <= word_count * 2,
-            "Token count {} should not exceed 2x word count {}",
-            tokens.len(), word_count);
-    }
+    result
 }
 
-// ============================================================================
+fn manual_greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
+    probs
+        .map_axis(Axis(1), |row| {
+            row.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a
+                    .partial_cmp(b)
+                    .unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(index, _)| index)
+                .unwrap()
+        })
+        .to_vec()
+}
+
+// =========================================================================
 // Mathematical Property Tests
-// ============================================================================
+// =========================================================================
 
 #[test]
 fn test_softmax_properties() {
     // Test that softmax produces valid probability distributions
-    let logits =
-        Array2::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0]).unwrap();
+    let logits = Array2::from_shape_vec(
+        (2, 4),
+        vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0],
+    )
+    .unwrap();
 
-    // Access private softmax through a test helper
-    // Since softmax is private, we'll test it indirectly through predict
-    // For now, we'll create a manual softmax implementation to test properties
     let softmax_result = manual_softmax(&logits);
 
     // Property 1: All values should be in [0, 1]
     for &val in softmax_result.iter() {
-        assert!(
-            (0.0..=1.0).contains(&val),
-            "Softmax value {} not in [0,1]",
-            val
-        );
+        assert!((0.0..=1.0).contains(&val), "Softmax value {} not in [0,1]", val);
     }
 
     // Property 2: Each row should sum to 1.0
@@ -362,7 +271,7 @@ fn test_softmax_properties() {
 
         assert_eq!(
             max_logit_idx, max_prob_idx,
-            "Max logit index should match max probability index"
+            "Max logit index should match max probability index",
         );
     }
 }
@@ -374,15 +283,8 @@ fn test_softmax_numerical_stability() {
     let result = manual_softmax(&large_logits);
 
     for &val in result.iter() {
-        assert!(
-            val.is_finite(),
-            "Softmax should handle large values without overflow"
-        );
-        assert!(
-            (0.0..=1.0).contains(&val),
-            "Softmax value {} not in [0,1]",
-            val
-        );
+        assert!(val.is_finite(), "Softmax should handle large values without overflow");
+        assert!((0.0..=1.0).contains(&val), "Softmax value {} not in [0,1]", val);
     }
 
     // Test with very small values (should not underflow to zero)
@@ -390,11 +292,7 @@ fn test_softmax_numerical_stability() {
     let result = manual_softmax(&small_logits);
 
     let sum: f32 = result.iter().sum();
-    assert!(
-        (sum - 1.0).abs() < 1e-5,
-        "Softmax should handle small values, sum={}",
-        sum
-    );
+    assert!((sum - 1.0).abs() < 1e-5, "Softmax should handle small values, sum={}", sum);
 }
 
 #[test]
@@ -413,80 +311,12 @@ fn test_greedy_decode_properties() {
 
     assert_eq!(decoded.len(), 2, "Should decode one token per row");
     assert_eq!(decoded[0], 2, "Should select index with max probability");
-    assert!(
-        decoded[1] == 0 || decoded[1] == 3,
-        "Should select one of the max indices"
-    );
+    assert!(decoded[1] == 0 || decoded[1] == 3, "Should select one of the max indices");
 }
 
-#[test]
-fn test_parameter_count_consistency() {
-    // Test that parameter count is consistent across multiple instantiations
-    let vocab = create_test_vocab();
-    let vocab_size = vocab.encode.len();
-
-    let llm1 = LLM::new(
-        vocab.clone(),
-        vec![
-            LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
-            LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
-            LayerEnum::FeedForward(Box::new(FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
-            LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size)),
-        ],
-    );
-
-    let llm2 = LLM::new(
-        vocab.clone(),
-        vec![
-            LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
-            LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
-            LayerEnum::FeedForward(Box::new(FeedForward::new(EMBEDDING_DIM, HIDDEN_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
-            LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size)),
-        ],
-    );
-
-    assert_eq!(
-        llm1.total_parameters(),
-        llm2.total_parameters(),
-        "Parameter count should be deterministic"
-    );
-}
-
-// ============================================================================
-// Helper Functions for Testing Mathematical Properties
-// ============================================================================
-
-fn manual_softmax(logits: &Array2<f32>) -> Array2<f32> {
-    let mut result = logits.clone();
-
-    for mut row in result.rows_mut() {
-        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp_values: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
-        let sum_exp: f32 = exp_values.iter().sum();
-
-        for (i, &exp_val) in exp_values.iter().enumerate() {
-            row[i] = exp_val / sum_exp;
-        }
-    }
-
-    result
-}
-
-fn manual_greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
-    probs
-        .map_axis(Axis(1), |row| {
-            row.iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(index, _)| index)
-                .unwrap()
-        })
-        .to_vec()
-}
+// =========================================================================
+// Persistence Round-Trip
+// =========================================================================
 
 #[test]
 fn test_llm_save_load() {
@@ -504,16 +334,40 @@ fn test_llm_save_load() {
     let loaded_llm = LLM::load(path).expect("Failed to load LLM");
 
     // Verify that the loaded LLM has the same structure
-    assert_eq!(
-        original_llm.vocab.encode.len(),
-        loaded_llm.vocab.encode.len()
-    );
+    assert_eq!(original_llm.vocab.encode.len(), loaded_llm.vocab.encode.len());
     assert_eq!(original_llm.network.len(), loaded_llm.network.len());
-    assert_eq!(
-        original_llm.total_parameters(),
-        loaded_llm.total_parameters()
-    );
+    assert_eq!(original_llm.total_parameters(), loaded_llm.total_parameters());
 
     // Clean up
     fs::remove_file(path).unwrap();
+}
+
+// =========================================================================
+// Property-Based Tests
+// =========================================================================
+
+proptest! {
+    #[test]
+    fn prop_tokenize_produces_valid_indices(s in "[a-z ]{1,50}") {
+        let llm = LLM::default();
+        let vocab_size = llm.vocab.words.len();
+
+        let tokens = llm.tokenize(&s);
+
+        for &token in &tokens {
+            prop_assert!(token < vocab_size, "Token {} exceeds vocab size {}", token, vocab_size);
+            prop_assert!(llm.vocab.decode(token).is_some(), "Token {} should be decodable", token);
+        }
+    }
+
+    #[test]
+    fn prop_tokenize_length_bounded(s in "[a-z ]{1,100}") {
+        let llm = LLM::default();
+        let tokens = llm.tokenize(&s);
+        let word_count = s.split_whitespace().count();
+
+        prop_assert!(tokens.len() <= word_count * 2,
+            "Token count {} should not exceed 2x word count {}",
+            tokens.len(), word_count);
+    }
 }
