@@ -1,5 +1,9 @@
 # Hierarchical Reasoning Model (HRM) - Research Summary
 
+> Archived Notice: HRM has been removed from the codebase as of 2025-10-21.
+> This document remains for historical reference only.
+> Supported architectures: Transformer and TRM.
+
 ## Project: RustGPT - HRM Architecture Integration
 ### Date: 2025-10-15
 ### Research Phase: Complete

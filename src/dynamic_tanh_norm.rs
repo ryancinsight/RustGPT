@@ -52,22 +52,18 @@ impl DynamicTanhNorm {
     /// Forward normalization: y = tanh(alpha * x) ⊙ gamma + beta
     pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
         let a = self.alpha[[0, 0]];
-        let tanh_scaled = input.mapv(|x| (a * x).tanh());
 
-        // Cache input for backward
+        // Cache input for backward (needed for gradient computation)
         self.cached_input = Some(input.clone());
 
-        // Apply per-feature scale and bias with broadcasting
-        let mut out = tanh_scaled; 
+        // Single-pass compute without temporaries using Zip + broadcast
+        let mut out = Array2::<f32>::zeros(input.raw_dim());
         ndarray::Zip::from(&mut out)
+            .and(input)
             .and_broadcast(&self.gamma)
-            .for_each(|o, &g| {
-                *o *= g;
-            });
-        ndarray::Zip::from(&mut out)
             .and_broadcast(&self.beta)
-            .for_each(|o, &b| {
-                *o += b;
+            .for_each(|o, &x, &g, &b| {
+                *o = (a * x).tanh() * g + b;
             });
         out
     }
@@ -89,26 +85,27 @@ impl Layer for DynamicTanhNorm {
             .expect("forward must be called before compute_gradients");
 
         let a = self.alpha[[0, 0]];
-        let tanh_scaled = input.mapv(|x| (a * x).tanh());
-        let sech2 = tanh_scaled.mapv(|t| 1.0 - t * t);
+        let mut grad_input = Array2::<f32>::zeros(input.raw_dim());
+        let d = input.ncols();
+        let mut grad_gamma = Array2::<f32>::zeros((1, d));
+        let mut grad_beta = Array2::<f32>::zeros((1, d));
+        let mut grad_alpha_scalar = 0.0f32;
 
-        // Gradients w.r.t. gamma and beta (sum over tokens)
-        let grad_gamma = (&tanh_scaled * output_grads)
-            .sum_axis(Axis(0))
-            .insert_axis(Axis(0));
-        let grad_beta = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0));
+        // Single-pass accumulation without intermediate arrays
+        ndarray::Zip::indexed(&mut grad_input)
+            .and(input)
+            .and(output_grads)
+            .and_broadcast(&self.gamma)
+            .for_each(|(_, j), o, &x, &dy, &g| {
+                let t = (a * x).tanh();
+                let s2 = 1.0 - t * t; // sech^2(alpha * x)
+                *o = (g * dy) * s2 * a; // grad w.r.t. input
+                grad_gamma[[0, j]] += t * dy; // grad w.r.t. gamma
+                grad_beta[[0, j]] += dy;      // grad w.r.t. beta
+                grad_alpha_scalar += (g * dy) * s2 * x; // grad w.r.t. alpha (scalar)
+            });
 
-        // Gradient w.r.t. input: (dL/dy ⊙ gamma) ⊙ sech^2(alpha x) ⊙ alpha
-        let grad_input = {
-            let mut tmp = &self.gamma * output_grads; // broadcast over features
-            tmp = tmp * &sech2;
-            tmp.mapv(|v| v * a)
-        };
-
-        // Gradient w.r.t. alpha: sum((dL/dy ⊙ gamma) ⊙ sech^2(alpha x) ⊙ x)
-        let grad_alpha_scalar = ((&self.gamma * output_grads) * &sech2 * input).sum();
         let grad_alpha = Array2::from_shape_vec((1, 1), vec![grad_alpha_scalar]).unwrap();
-
         (grad_input, vec![grad_alpha, grad_gamma, grad_beta])
     }
 

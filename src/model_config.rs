@@ -5,10 +5,6 @@ use serde::{Deserialize, Serialize};
 pub enum ArchitectureType {
     /// Standard Transformer with self-attention mechanism
     Transformer,
-    /// HyperMixer with dynamic token mixing via hypernetworks
-    HyperMixer,
-    /// Hierarchical Reasoning Model with two-level recurrent architecture
-    HRM,
     /// Tiny Recursive Model with weight sharing across depth
     TRM,
 }
@@ -262,6 +258,7 @@ pub enum HeadSelectionStrategy {
 ///
 /// # Example
 /// ```rust
+/// use llm::model_config::AdaptiveDepthConfig;
 /// let config = AdaptiveDepthConfig {
 ///     max_depth: 10,           // Allow up to 10 recursive steps
 ///     halt_threshold: 0.95,    // Stop when 95% cumulative probability
@@ -340,9 +337,7 @@ pub struct ModelConfig {
     /// Default: false (disabled by default)
     pub use_dynamic_tanh_norm: bool,
 
-    /// Use SwiGLU instead of ReLU-based FeedForward (modern LLM practice)
-    /// Default: false (use FeedForward for backward compatibility)
-    pub use_swiglu: bool,
+
     // Add dynamic swish flag to control learned Swish alpha
     pub use_dynamic_swish: bool,
 
@@ -417,98 +412,7 @@ pub struct ModelConfig {
     /// Default: AllHeads (backward compatible)
     pub head_selection: HeadSelectionStrategy,
 
-    /// Use Mixture of Experts (MoE) instead of standard feedforward layers
-    ///
-    /// If true, replaces SwiGLU/FeedForward with sparse MoE layers
-    /// Each MoE layer contains multiple expert networks with learned routing
-    ///
-    /// Benefits:
-    /// - Increased model capacity without proportional compute increase
-    /// - Sparse activation (only k out of N experts active per token)
-    /// - Better specialization through expert routing
-    ///
-    /// Default: false (use standard feedforward for backward compatibility)
-    pub use_moe: bool,
 
-    /// Number of expert networks in each MoE layer
-    ///
-    /// Only used when use_moe = true
-    /// Typical values: 4, 8, 16
-    ///
-    /// Default: 4 (balance between capacity and complexity)
-    pub num_experts: usize,
-
-    /// Number of experts to activate per token (k in top-k routing)
-    ///
-    /// Only used when use_moe = true
-    /// Typical values: 1 (Switch Transformers), 2 (Mixtral)
-    ///
-    /// Default: 2 (Mixtral-style, more stable than top-1)
-    pub num_active_experts: usize,
-
-    /// Hidden dimension for each expert network
-    ///
-    /// Only used when use_moe = true
-    /// Should be smaller than hidden_dim to maintain parameter count
-    /// Typical: hidden_dim / num_experts or hidden_dim / (num_experts / 2)
-    ///
-    /// Default: hidden_dim / 4 (for 4 experts, maintains ~same params)
-    pub expert_hidden_dim: usize,
-
-    /// Weight for MoE load balance loss
-    ///
-    /// Only used when use_moe = true
-    /// Encourages uniform expert utilization
-    ///
-    /// Default: 0.01 (standard in literature)
-    pub moe_load_balance_weight: f32,
-
-    /// Weight for MoE router z-loss
-    ///
-    /// Only used when use_moe = true
-    /// Prevents routing logits from growing too large
-    ///
-    /// Default: 0.001 (standard in literature)
-    pub moe_router_z_loss_weight: f32,
-
-    /// Use Mixture-of-Heads (MoH) within each expert of Mixture-of-Experts (MoE)
-    ///
-    /// Creates hierarchical adaptive routing: MoE → Experts → MoH → Heads
-    /// Each attention expert uses MoH for dynamic head selection
-    ///
-    /// Only used when use_moe = true
-    ///
-    /// Benefits:
-    /// - Hierarchical routing provides interpretable attention patterns
-    /// - Each expert can specialize its head usage
-    /// - Combines MoE capacity scaling with MoH efficiency
-    ///
-    /// Default: false (standard MoE without MoH)
-    pub use_moh_in_experts: bool,
-
-    /// Number of always-active shared heads per expert (when use_moh_in_experts = true)
-    ///
-    /// Only used when use_moh_in_experts = true
-    /// Shared heads capture common knowledge across all tokens
-    ///
-    /// Default: 2 (balance between stability and adaptivity)
-    pub expert_moh_num_shared_heads: usize,
-
-    /// Number of adaptively-routed heads per expert (when use_moh_in_experts = true)
-    ///
-    /// Only used when use_moh_in_experts = true
-    /// Routed heads specialize for specific patterns
-    ///
-    /// Default: 4 (balance between capacity and efficiency)
-    pub expert_moh_num_routed_heads: usize,
-
-    /// Enable learned threshold predictor for expert MoH (when use_moh_in_experts = true)
-    ///
-    /// Only used when use_moh_in_experts = true
-    /// Allows per-token adaptive thresholds for expert head routing
-    ///
-    /// Default: true (use learned predictor for maximum adaptivity)
-    pub expert_moh_use_learned_threshold: bool,
 }
 
 impl ModelConfig {
@@ -531,7 +435,6 @@ impl ModelConfig {
             num_heads,
             use_rms_norm: true, // Modern default: RMSNorm
             use_dynamic_tanh_norm: false, // Disabled by default
-            use_swiglu: true,   // Modern default: SwiGLU
             use_dynamic_swish: false, // Disabled by default
             positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
             num_kv_heads: None,
@@ -542,102 +445,6 @@ impl ModelConfig {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
             head_selection: HeadSelectionStrategy::AllHeads,
-            use_moe: false,
-            num_experts: 4,
-            num_active_experts: 2,
-            expert_hidden_dim: hidden_dim / 4,
-            moe_load_balance_weight: 0.01,
-            moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false,
-            expert_moh_num_shared_heads: 2,
-            expert_moh_num_routed_heads: 4,
-            expert_moh_use_learned_threshold: true,
-        }
-    }
-
-    /// Create a new HyperMixer configuration with modern defaults
-    pub fn hypermixer(
-        embedding_dim: usize,
-        hidden_dim: usize,
-        num_layers: usize,
-        max_seq_len: usize,
-        hypernetwork_hidden_dim: Option<usize>,
-        num_heads: Option<usize>,
-    ) -> Self {
-        Self {
-            architecture: ArchitectureType::HyperMixer,
-            embedding_dim,
-            hidden_dim,
-            num_layers,
-            hypernetwork_hidden_dim,
-            max_seq_len,
-            num_heads,
-            use_rms_norm: true,
-            use_dynamic_tanh_norm: false,
-            use_swiglu: true,
-            use_dynamic_swish: false,
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
-            num_kv_heads: None,
-            window_size: None,
-            use_adaptive_window: false,
-            min_window_size: 512,
-            max_window_size: 4096,
-            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::AllHeads,
-            use_moe: false,
-            num_experts: 4,
-            num_active_experts: 2,
-            expert_hidden_dim: hidden_dim / 4,
-            moe_load_balance_weight: 0.01,
-            moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false,
-            expert_moh_num_shared_heads: 2,
-            expert_moh_num_routed_heads: 4,
-            expert_moh_use_learned_threshold: true,
-        }
-    }
-
-    /// Create a new HRM configuration with modern defaults
-    pub fn hrm(
-        embedding_dim: usize,
-        hidden_dim: usize,
-        num_layers: usize,
-        max_seq_len: usize,
-        hypernetwork_hidden_dim: Option<usize>,
-        num_heads: Option<usize>,
-    ) -> Self {
-        Self {
-            architecture: ArchitectureType::HRM,
-            embedding_dim,
-            hidden_dim,
-            num_layers,
-            hypernetwork_hidden_dim,
-            max_seq_len,
-            num_heads,
-            use_rms_norm: true,
-            use_dynamic_tanh_norm: false,
-            use_swiglu: true,
-            use_dynamic_swish: false,
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
-            num_kv_heads: None,
-            window_size: None,
-            use_adaptive_window: false,
-            min_window_size: 512,
-            max_window_size: 4096,
-            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::AllHeads,
-            use_moe: false,
-            num_experts: 4,
-            num_active_experts: 2,
-            expert_hidden_dim: hidden_dim / 4,
-            moe_load_balance_weight: 0.01,
-            moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false,
-            expert_moh_num_shared_heads: 2,
-            expert_moh_num_routed_heads: 4,
-            expert_moh_use_learned_threshold: true,
         }
     }
 
@@ -659,7 +466,7 @@ impl ModelConfig {
             num_heads,
             use_rms_norm: true,
             use_dynamic_tanh_norm: false,
-            use_swiglu: true,
+
             use_dynamic_swish: false,
             positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
             num_kv_heads: None,
@@ -670,16 +477,6 @@ impl ModelConfig {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
             head_selection: HeadSelectionStrategy::AllHeads,
-            use_moe: false,
-            num_experts: 4,
-            num_active_experts: 2,
-            expert_hidden_dim: hidden_dim / 4,
-            moe_load_balance_weight: 0.01,
-            moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false,
-            expert_moh_num_shared_heads: 2,
-            expert_moh_num_routed_heads: 4,
-            expert_moh_use_learned_threshold: true,
         }
     }
 }
@@ -703,26 +500,10 @@ impl ModelConfig {
     }
 
     pub fn get_hypernetwork_hidden_dim(&self) -> usize {
-        // For HyperMixer this is the hypernetwork hidden dimension.
-        // For HRM we overload this field to represent low-level steps per cycle.
         // Provide a reasonable default if not specified.
-        match self.architecture {
-            ArchitectureType::HyperMixer => self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4),
-            ArchitectureType::HRM => self.hypernetwork_hidden_dim.unwrap_or(2),
-            _ => self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4),
-        }
+        self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4)
     }
 
-    pub fn get_num_high_cycles(&self) -> usize {
-        // In HRM, num_layers stores the number of high-level cycles (N)
-        self.num_layers
-    }
-
-    pub fn get_low_steps_per_cycle(&self) -> usize {
-        // In HRM, we reuse hypernetwork_hidden_dim to store low-level steps per cycle (T)
-        // Default to 2 when not provided
-        self.hypernetwork_hidden_dim.unwrap_or(2)
-    }
 
     pub fn get_recursive_depth(&self) -> usize {
         // In TRM, num_layers stores the recursive depth

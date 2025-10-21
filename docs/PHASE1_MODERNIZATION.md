@@ -394,7 +394,7 @@ if j > i {
 
 **Phase 4 Total**: 9 hours
 
-**Phase 4 Status**: ✅ **COMPLETE** (Primary + Secondary Objectives)
+**Phase 4 Status**: ✅ **COMPLETE**
 
 **Primary Objective - Adaptive Window Sizing**:
 - Added `WindowAdaptationStrategy` enum with 4 strategies:
@@ -416,26 +416,6 @@ if j > i {
 
 **Documentation**: See `docs/ADAPTIVE_WINDOW_IMPLEMENTATION.md`
 
-**Secondary Objective - Adaptive Beam Search**:
-- Created `src/beam_search.rs` with full beam search implementation
-- Implemented `BeamSearchConfig` with 7 configuration options
-- Implemented `BeamSearchState` for managing beam hypotheses
-- Implemented `BeamHypothesis` for tracking individual beams
-- Added `generate_with_beam_search()` method to `LLM` struct
-- Implemented adaptive beam width based on softmax entropy
-- Implemented beam scoring using log probabilities
-- Implemented beam pruning to keep top-k candidates
-- Added 15 comprehensive tests in `tests/beam_search_test.rs`
-- Updated `main.rs` with beam search configuration
-- Updated interactive mode to optionally use beam search
-
-**Benefits**:
-- Better generation quality (explores multiple hypotheses)
-- Adaptive beam width reduces computation when model is confident
-- Configurable trade-off between quality and speed
-- Matches modern LLM inference capabilities
-
-**Documentation**: See `docs/BEAM_SEARCH_IMPLEMENTATION.md`
 
 ### Overall Progress
 
@@ -445,9 +425,9 @@ if j > i {
 - ✅ Phase 1: Core Modernization (RMSNorm, SwiGLU, RoPE, No Bias)
 - ✅ Phase 2: Group-Query Attention (GQA)
 - ✅ Phase 3: Sliding Window Attention
-- ✅ Phase 4: Adaptive Window Attention + Adaptive Beam Search
+- ✅ Phase 4: Adaptive Window Attention
 
-**Architecture Achievement**: 🎉 **Mistral 7B + Adaptive Window + Beam Search Complete!**
+**Architecture Achievement**: 🎉 **Mistral 7B + Adaptive Window Complete!**
 
 **Test Coverage**: 203 tests passing, 0 failures, 0 warnings
 

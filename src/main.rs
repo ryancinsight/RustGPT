@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::Parser;
 use llm::{
-    ArchitectureType, BeamSearchConfig, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
+    ArchitectureType, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
     HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, PositionalEncodingType, Vocab,
     WindowAdaptationStrategy, build_network, gradient_clipping::L2GradientClipping,
     print_architecture_summary,
@@ -45,10 +45,10 @@ fn main() -> llm::Result<()> {
     //   - Better than static MLPMixer due to input-dependent mixing
     // ============================================================================
 
-    // Choose architecture: Transformer, HyperMixer, HRM, or TRM
-    //let architecture = ArchitectureType::HyperMixer; // HyperMixer (refined with TRM learnings)
+    // Choose architecture: Transformer or TRM
+
     //let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
-    //let architecture = ArchitectureType::HRM; // Hierarchical Reasoning Model
+    
     let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing) - TESTING FULLY ADAPTIVE MOH
 
     // ============================================================================
@@ -87,7 +87,7 @@ fn main() -> llm::Result<()> {
     //   - Used in LLaMA, PaLM, Mistral
     // ============================================================================
 
-    let use_swiglu = true; // Set to true to use SwiGLU, false for FeedForward
+
 
     // ============================================================================
     // POSITIONAL ENCODING CONFIGURATION
@@ -329,27 +329,14 @@ fn main() -> llm::Result<()> {
     //   - Configurable trade-off between quality and speed
     // ============================================================================
 
-    let use_beam_search: bool = true; // Enable beam search (false = greedy decoding)
-    let beam_width: usize = 4; // Number of hypotheses to maintain
-    let use_adaptive_beam: bool = true; // Enable adaptive beam width
-    let min_beam_width: usize = 1; // Minimum beam width
-    let max_beam_width: usize = 8; // Maximum beam width
-    let beam_max_length: usize = 100; // Maximum generation length
-    let beam_temperature: f32 = 1.0; // Sampling temperature
 
     // Create model configuration
     let mut config = match architecture {
         ArchitectureType::Transformer => {
             ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None, Some(8))
         }
-        ArchitectureType::HyperMixer => {
-            // HyperMixer with hypernetwork hidden dim = embedding_dim / 4 and 8 heads
-            ModelConfig::hypermixer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None, Some(8))
-        }
-        ArchitectureType::HRM => {
-            // HRM with N=2 cycles, T=2 steps per cycle, hidden_dim=192 for parameter efficiency
-            ModelConfig::hrm(EMBEDDING_DIM, 192, 2, MAX_SEQ_LEN, Some(2), Some(8))
-        }
+
+
         ArchitectureType::TRM => {
             // TRM with recursive_depth=5 (single block applied 5 times)
             // Parameter efficient: O(1) params regardless of depth
@@ -360,7 +347,7 @@ fn main() -> llm::Result<()> {
     // Apply modern LLM enhancements configuration
     config.use_rms_norm = use_rms_norm;
     config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
-    config.use_swiglu = use_swiglu;
+
     config.use_dynamic_swish = true;
     config.positional_encoding = positional_encoding;
     config.num_kv_heads = num_kv_heads;
@@ -401,55 +388,7 @@ fn main() -> llm::Result<()> {
     //   - use_moe = true, num_experts = 8, num_active_experts = 2: Higher capacity
     // ============================================================================
 
-    let use_moe: bool = false; // Enable MoE (false = standard feedforward) - DISABLED: See docs/MOE_IMPLEMENTATION_STATUS.md
-    let num_experts: usize = 4; // Total number of experts
-    let num_active_experts: usize = 2; // Experts to activate per token (top-k)
-    let expert_hidden_dim: usize = HIDDEN_DIM / 2; // Hidden dim for each expert (128, so 2 experts = 256 total)
 
-    config.use_moe = use_moe;
-    config.num_experts = num_experts;
-    config.num_active_experts = num_active_experts;
-    config.expert_hidden_dim = expert_hidden_dim;
-    config.moe_load_balance_weight = 0.0; // Disable load balance loss for debugging
-    config.moe_router_z_loss_weight = 0.0; // Disable router z-loss for debugging
-
-    // ============================================================================
-    // HIERARCHICAL ADAPTIVE ROUTING (MOH + MOE)
-    // ============================================================================
-    // Enable both MoH (attention) and MoE (FFN) for hierarchical adaptive routing
-    //
-    // When both are enabled, creates complementary routing:
-    //   - MoH: Routes tokens to attention heads (efficiency)
-    //   - MoE: Routes tokens to FFN experts (capacity scaling)
-    //
-    // Configuration:
-    //   - use_moh_in_experts: Enable hierarchical routing (both MoH and MoE)
-    //   - Shares adaptive mechanisms: warm-up, annealing, gradient smoothing
-    //   - Independent routing decisions for attention and FFN
-    //
-    // Benefits:
-    //   - Complementary optimizations (attention efficiency + FFN capacity)
-    //   - Shared adaptive mechanisms reduce complexity
-    //   - Hierarchical logging shows both routing patterns
-    //
-    // Note: Currently disabled - MoH is working well standalone
-    // ============================================================================
-
-    let use_moh_in_experts: bool = false; // DISABLED: Hierarchical MoH-in-MoE produces wrong output even with ALL experts active
-    // Optimized settings: more shared heads for stability, fewer routed for simplicity
-    let expert_moh_num_shared_heads: usize = 6;
-    let expert_moh_num_routed_heads: usize = 2;
-    let expert_moh_use_learned_threshold: bool = true;
-
-    config.use_moh_in_experts = use_moh_in_experts;
-    config.expert_moh_num_shared_heads = expert_moh_num_shared_heads;
-    config.expert_moh_num_routed_heads = expert_moh_num_routed_heads;
-    config.expert_moh_use_learned_threshold = expert_moh_use_learned_threshold;
-
-    // TEST: Use ALL experts active (no sparsity) to verify architecture works
-    // If this produces correct output, then the problem is sparse activation
-    // If this still produces wrong output, then the problem is the architecture itself
-    config.num_active_experts = config.num_experts; // 4 active out of 4 total = 100% activation
 
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
@@ -538,29 +477,8 @@ fn main() -> llm::Result<()> {
     if args.interactive {
         println!("\n--- Interactive Mode ---");
         println!("Type a prompt and press Enter to generate text.");
-        if use_beam_search {
-            println!(
-                "Using beam search (beam_width={}, adaptive={})",
-                beam_width, use_adaptive_beam
-            );
-        } else {
-            println!("Using greedy decoding");
-        }
+        println!("Using greedy decoding");
         println!("Type 'exit' to quit.");
-
-        // Create beam search config if enabled
-        let beam_config = if use_beam_search {
-            Some(
-                BeamSearchConfig::new()
-                    .with_beam_width(beam_width)
-                    .with_adaptive_beam(use_adaptive_beam)
-                    .with_beam_range(min_beam_width, max_beam_width)
-                    .with_max_length(beam_max_length)
-                    .with_temperature(beam_temperature),
-            )
-        } else {
-            None
-        };
 
         let mut input = String::new();
         loop {
@@ -586,13 +504,7 @@ fn main() -> llm::Result<()> {
             // Generate prediction based on user input with "User:" prefix
             let formatted_input = format!("User: {}", trimmed_input);
 
-            let prediction = if let Some(ref config) = beam_config {
-                // Use beam search
-                llm.generate_with_beam_search(&formatted_input, config)
-            } else {
-                // Use greedy decoding
-                llm.predict(&formatted_input)
-            };
+            let prediction = llm.predict(&formatted_input);
 
             println!("Model output: {}", prediction);
         }

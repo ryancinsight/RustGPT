@@ -1,10 +1,10 @@
-# ✅ PHASE 4 COMPLETE - ADAPTIVE WINDOW ATTENTION + BEAM SEARCH
+# ✅ PHASE 4 COMPLETE - ADAPTIVE WINDOW ATTENTION
 
 ## 🎉 Executive Summary
 
 **Phase 4 of the Transformer Modernization initiative is now 100% complete!**
 
-Both the primary objective (Adaptive Window Attention) and secondary objective (Adaptive Beam Search) have been successfully implemented, tested, documented, and integrated with full visibility. Combined with Phase 1 (RMSNorm + SwiGLU + RoPE + No Bias), Phase 2 (GQA), and Phase 3 (Sliding Window), **RustGPT now has the Mistral 7B architecture PLUS adaptive window sizing AND adaptive beam search** - making it significantly more advanced than the baseline Mistral 7B!
+Adaptive Window Attention has been successfully implemented, tested, documented, and integrated with full visibility. Combined with Phase 1 (RMSNorm + SwiGLU + RoPE + No Bias), Phase 2 (GQA), and Phase 3 (Sliding Window), RustGPT now has the Mistral 7B architecture plus adaptive window sizing — making it significantly more advanced than the baseline Mistral 7B!
 
 ---
 
@@ -128,53 +128,12 @@ Architecture summary now displays adaptive window configuration:
 
 ---
 
-## 🚀 What Was Implemented (Secondary Objective)
-
-### Adaptive Beam Search
-
-Beam search for high-quality text generation with adaptive beam width:
-
-#### Key Features
-- **Fixed Beam Width**: Maintain constant number of hypotheses
-- **Adaptive Beam Width**: Dynamically adjust based on prediction confidence
-- **Beam Scoring**: Cumulative log probabilities with length normalization
-- **Temperature Sampling**: Control randomness of predictions
-
-#### Configuration Options
-```rust
-pub struct BeamSearchConfig {
-    pub beam_width: usize,           // Initial beam width (default: 4)
-    pub use_adaptive_beam: bool,     // Enable adaptive beam (default: false)
-    pub min_beam_width: usize,       // Minimum beam width (default: 1)
-    pub max_beam_width: usize,       // Maximum beam width (default: 8)
-    pub adaptation_threshold: f32,   // Entropy threshold (default: 0.5)
-    pub max_length: usize,           // Max generation length (default: 100)
-    pub temperature: f32,            // Sampling temperature (default: 1.0)
-}
-```
-
-#### Adaptive Strategy
-- **High entropy** (uncertain predictions) → increase beam width
-- **Low entropy** (confident predictions) → decrease beam width
-- Saves computation when model is confident
-- Improves quality when model is uncertain
-
-#### Usage Example
-```rust
-let config = BeamSearchConfig::new()
-    .with_beam_width(4)
-    .with_adaptive_beam(true)
-    .with_beam_range(2, 8)
-    .with_max_length(50);
-
-let output = llm.generate_with_beam_search("User: Hello", &config);
-```
 
 ## 🧪 Testing
 
 ### Test Coverage
 
-**27 comprehensive tests** (12 adaptive window + 15 beam search):
+**12 adaptive window tests**:
 
 **Adaptive Window Tests** in `tests/adaptive_window_test.rs`:
 
@@ -194,23 +153,6 @@ let output = llm.generate_with_beam_search("User: Hello", &config);
 14. ✅ `test_attention_entropy_low_shrinks_window` - Low entropy → min window
 15. ✅ `test_attention_entropy_mid_maps_to_mid_window` - Mid entropy → mid window
 
-**Beam Search Tests** in `tests/beam_search_test.rs`:
-
-1. ✅ `test_beam_search_config_default` - Default configuration
-2. ✅ `test_beam_search_config_builder` - Builder pattern
-3. ✅ `test_beam_hypothesis_creation` - Hypothesis creation
-4. ✅ `test_beam_hypothesis_normalized_score` - Score normalization
-5. ✅ `test_beam_search_state_initialization` - State initialization
-6. ✅ `test_beam_search_state_expand` - Beam expansion
-7. ✅ `test_beam_search_state_mark_complete` - Completion marking
-8. ✅ `test_beam_search_state_is_done` - Done checking
-9. ✅ `test_beam_search_state_get_best` - Best hypothesis selection
-10. ✅ `test_beam_search_state_compute_entropy` - Entropy computation
-11. ✅ `test_beam_search_state_adapt_beam_width` - Adaptive beam width
-12. ✅ `test_beam_search_state_adapt_beam_width_bounds` - Bounds enforcement
-13. ✅ `test_beam_search_generation_basic` - Basic generation
-14. ✅ `test_beam_search_generation_with_adaptive_beam` - Adaptive generation
-15. ✅ `test_beam_search_with_temperature` - Temperature sampling
 
 ### Test Results
 
@@ -224,7 +166,7 @@ let output = llm.generate_with_beam_search("User: Hello", &config);
 Run tests:
 ```bash
 cargo test --test adaptive_window_test
-cargo test --test beam_search_test
+
 cargo test --no-fail-fast
 ```
 
@@ -387,7 +329,7 @@ RustGPT now implements:
 3. **Task-Specific Strategies**: Different strategies for different tasks
 4. **Hierarchical Windows**: Multiple window sizes at different layers
 5. **Dynamic Min/Max**: Adjust bounds based on available memory
-6. **Adaptive Beam Search**: Dynamic beam width for inference (secondary objective)
+
 
 ---
 

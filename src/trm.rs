@@ -5,7 +5,7 @@ use tracing::{info, warn};
 use crate::{
     adam::Adam,
     errors::Result,
-    feed_forward::FeedForward,
+    // feed_forward::FeedForward, // Removed
     llm::Layer,
     model_config::{AdaptiveDepthConfig, HeadSelectionStrategy},
     rms_norm::RMSNorm,
@@ -74,8 +74,7 @@ pub struct TinyRecursiveModel {
     /// Feedforward layer (reused recursively)
     #[serde(skip)]
     feed_forward_swiglu: Option<SwiGLU>,
-    #[serde(skip)]
-    feed_forward_standard: Option<FeedForward>,
+    // #[serde(skip)] feed_forward_standard removed
 
     /// Normalization after feedforward
     norm2: RMSNorm,
@@ -84,9 +83,6 @@ pub struct TinyRecursiveModel {
     recursive_depth: usize,
 
     /// Adaptive residual scaling for attention sublayer per step (learned)
-    /// Initialized: scale[step] = 0.5 + 0.5 * (step / recursive_depth)
-    /// Early steps: smaller scales (0.5) to prevent explosion
-    /// Late steps: larger scales (1.0) to prevent vanishing
     attention_step_scales: Vec<f32>,
 
     /// Adaptive residual scaling for FFN sublayer per step (learned)
@@ -123,63 +119,29 @@ pub struct TinyRecursiveModel {
     /// Embedding dimension
     embedding_dim: usize,
 
-    /// Whether to use SwiGLU (true) or standard FeedForward (false)
-    use_swiglu: bool,
+    // use_swiglu removed; SwiGLU is always used
 
     // ===== Adaptive Recursive Depth Fields =====
-    /// Whether adaptive depth is enabled
     adaptive_depth_enabled: bool,
-
-    /// Maximum recursive depth (when adaptive depth is enabled)
     max_recursive_depth: usize,
-
-    /// Cumulative halting probability threshold (e.g., 0.95)
     halt_threshold: f32,
-
-    /// Weight for ponder loss (penalizes excessive depth)
     ponder_loss_weight: f32,
-
-    /// Attention weights for context aggregation: (embedding_dim, 1)
-    /// Used to compute attention scores over sequence for context-aware halting
     w_attn: Array2<f32>,
-
-    /// Halting predictor weights: (embedding_dim * 2, 1)
-    /// Projects concatenated [token_features, context] to halting logit
     w_halt: Array2<f32>,
-
-    /// Halting predictor bias
     b_halt: f32,
-
-    /// Gumbel-Softmax temperature for attention (starts high, anneals down)
     gumbel_temperature: f32,
-
-    /// Optimizer for attention weights
     attn_optimizer: Adam,
-
-    /// Optimizer for halting predictor
     halt_optimizer: Adam,
-
-    /// Actual depths used per sequence in last forward pass
     #[serde(skip)]
     actual_depths: Vec<usize>,
-
-    /// Average depth used in last forward pass
     #[serde(skip)]
     avg_depth: f32,
-
-    /// Actual number of steps taken in last forward pass (for backward pass)
     #[serde(skip)]
     steps_taken: usize,
-
-    /// Cached halting probabilities for backward pass
     #[serde(skip)]
     cached_halt_probs: Vec<Array1<f32>>,
-
-    /// Cached attention weights (Gumbel-Softmax) for backward pass (for halting predictor gradients)
     #[serde(skip)]
     cached_attn_weights: Vec<Array1<f32>>,
-
-    /// Cached context vectors for backward pass
     #[serde(skip)]
     cached_contexts: Vec<Array1<f32>>,
 }
@@ -204,7 +166,7 @@ impl TinyRecursiveModel {
         num_heads: usize,
         num_kv_heads: Option<usize>,
         recursive_depth: usize,
-        use_swiglu: bool,
+        // use_swiglu: bool, // Removed
         max_seq_len: usize,
         head_selection: HeadSelectionStrategy,
         adaptive_depth_config: Option<AdaptiveDepthConfig>,
@@ -228,22 +190,10 @@ impl TinyRecursiveModel {
         let norm1 = RMSNorm::new(embedding_dim);
         let norm2 = RMSNorm::new(embedding_dim);
 
-        // Create feedforward layer
-        let (feed_forward_swiglu, feed_forward_standard) = if use_swiglu {
-            (Some(SwiGLU::new(embedding_dim, hidden_dim)), None)
-        } else {
-            (None, Some(FeedForward::new(embedding_dim, hidden_dim)))
-        };
+        // Create feedforward layer (SwiGLU only)
+        let feed_forward_swiglu = Some(SwiGLU::new(embedding_dim, hidden_dim));
 
         // Initialize adaptive step scales using ReZero-inspired approach
-        // ReZero (Bachlechner et al., 2020): Initialize residual scales to 0
-        // This allows the network to start as identity and gradually learn transformations
-        // Benefits:
-        // 1. No gradient explosion at initialization (identity mapping)
-        // 2. Scales grow during training as needed
-        // 3. Natural gradient flow through skip connections
-        //
-        // We use small positive values instead of pure 0 to allow some initial gradient flow
         let initial_scale = 0.01; // Small but non-zero for initial learning signal
 
         let attention_step_scales: Vec<f32> = vec![initial_scale; recursive_depth];
@@ -256,57 +206,32 @@ impl TinyRecursiveModel {
         // Initialize adaptive depth components
         let (adaptive_enabled, max_depth, halt_thresh, ponder_weight, w_attn, w_halt, b_halt, gumbel_temp) =
             if let Some(config) = adaptive_depth_config {
-                // Adaptive depth enabled
-                let mut rng = rand::thread_rng();
-                use rand::Rng;
-
-                // Initialize attention weights for context aggregation (Gumbel-Softmax)
-                let w_a = Array2::from_shape_fn((embedding_dim, 1), |_|
-                    rng.gen_range(-0.01..0.01));
-
-                // Initialize halting predictor weights for concatenated [token, context]
-                // Input dim is now embedding_dim * 2 (token features + context)
-                let w_h = Array2::from_shape_fn((embedding_dim * 2, 1), |_|
-                    rng.gen_range(-0.01..0.01));
-
-                // Initialize bias to start at ~4 steps with STRONG halting signal
-                // Target: p_halt = 0.25 per step → 4 steps to reach 0.95 threshold
-                // sigmoid(x) = 0.25 → x = ln(0.25/0.75) ≈ -1.10
-                let b = -1.10;
-
-                // Gumbel-Softmax temperature: start high (1.0) for exploration
-                // Will anneal down during training for sharper attention
-                let temp = 1.0;
-
-                (
-                    true,
-                    config.max_depth,
-                    config.halt_threshold,
-                    config.ponder_weight,
-                    w_a,
-                    w_h,
-                    b,
-                    temp,
-                )
+                let adaptive_enabled = true;
+                let max_depth = config.max_depth;
+                let halt_thresh = config.halt_threshold;
+                let ponder_weight = config.ponder_weight;
+                let w_attn = Array2::zeros((embedding_dim, 1));
+                let w_halt = Array2::zeros((embedding_dim * 2, 1));
+                let b_halt = 0.0;
+                let gumbel_temp = 1.0;
+                (adaptive_enabled, max_depth, halt_thresh, ponder_weight, w_attn, w_halt, b_halt, gumbel_temp)
             } else {
-                // Fixed depth mode (current behavior)
-                (
-                    false,
-                    recursive_depth,
-                    0.95,
-                    0.0,
-                    Array2::zeros((embedding_dim, 1)),
-                    Array2::zeros((embedding_dim * 2, 1)),
-                    0.0,
-                    1.0,
-                )
+                let adaptive_enabled = false;
+                let max_depth = recursive_depth;
+                let halt_thresh = 1.0;
+                let ponder_weight = 0.0;
+                let w_attn = Array2::zeros((embedding_dim, 1));
+                let w_halt = Array2::zeros((embedding_dim * 2, 1));
+                let b_halt = 0.0;
+                let gumbel_temp = 1.0;
+                (adaptive_enabled, max_depth, halt_thresh, ponder_weight, w_attn, w_halt, b_halt, gumbel_temp)
             };
 
         Self {
             attention,
             norm1,
             feed_forward_swiglu,
-            feed_forward_standard,
+            // feed_forward_standard: None, // Removed
             norm2,
             recursive_depth,
             attention_step_scales,
@@ -320,8 +245,7 @@ impl TinyRecursiveModel {
             current_epoch: 0,
             max_epochs: 100,
             embedding_dim,
-            use_swiglu,
-            // Adaptive recursive depth (configured or disabled)
+            // use_swiglu,
             adaptive_depth_enabled: adaptive_enabled,
             max_recursive_depth: max_depth,
             halt_threshold: halt_thresh,
@@ -467,7 +391,12 @@ impl TinyRecursiveModel {
     /// Returns (avg_depth, min_depth, max_depth) or None if adaptive depth is disabled.
     ///
     /// # Example
-    /// ```
+    /// ```rust
+    /// use llm::model_config::{AdaptiveDepthConfig, HeadSelectionStrategy};
+    /// use llm::trm::TinyRecursiveModel;
+    /// let trm = TinyRecursiveModel::new(
+    ///     64, 128, 4, None, 3, true, 80, HeadSelectionStrategy::AllHeads, Some(AdaptiveDepthConfig::default()),
+    /// );
     /// if let Some((avg, min, max)) = trm.get_depth_stats() {
     ///     println!("Depth: avg={:.1} [{}-{}]", avg, min, max);
     /// }
@@ -543,10 +472,8 @@ impl Layer for TinyRecursiveModel {
 
             // FFN sublayer with Pre-LN
             let normed = self.norm2.forward(&x);
-            let ffn_out = if self.use_swiglu {
+            let ffn_out = {
                 self.feed_forward_swiglu.as_mut().unwrap().forward(&normed)
-            } else {
-                self.feed_forward_standard.as_mut().unwrap().forward(&normed)
             };
             self.cached_ffn_outputs.push(ffn_out.clone());
 
@@ -594,7 +521,7 @@ impl Layer for TinyRecursiveModel {
                 // Step 5: Compute halting logits from concatenated features
                 // halt_logits = combined · W_halt + b_halt  →  (seq_len, 1)
                 let halt_logits_2d = combined.dot(&self.w_halt);
-                let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+                let halt_logits = halt_logits_2d.column(0).to_owned(); // (seq_len,)
                 let halt_logits = halt_logits + self.b_halt; // Add bias
 
                 // Step 6: Apply sigmoid to get halting probabilities
@@ -702,10 +629,8 @@ impl Layer for TinyRecursiveModel {
 
             // Gradient through FFN
             // FFN's compute_gradients expects unnormalized input and gradient from norm
-            let (grad_ffn_input, ffn_param_grads) = if self.use_swiglu {
+            let (grad_ffn_input, ffn_param_grads) = {
                 self.feed_forward_swiglu.as_ref().unwrap().compute_gradients(x_before_ffn, &grad_normed)
-            } else {
-                self.feed_forward_standard.as_ref().unwrap().compute_gradients(x_before_ffn, &grad_normed)
             };
 
             // Accumulate FFN gradients (normalize by recursive depth)
@@ -803,12 +728,7 @@ impl Layer for TinyRecursiveModel {
         let norm_params = 1; // RMSNorm has 1 parameter (gamma)
 
         // For SwiGLU: W_gate, W_up, W_down (3 matrices)
-        // For FeedForward: W1, W2, bias1, bias2 (4 parameters)
-        let ffn_params = if self.use_swiglu {
-            3 // W_gate, W_up, W_down
-        } else {
-            4 // W1, W2, bias1, bias2
-        };
+        let ffn_params = 3; // SwiGLU-only: W_gate, W_up, W_down
 
         // Split parameter gradients
         let mut idx = 0;
@@ -822,11 +742,7 @@ impl Layer for TinyRecursiveModel {
         idx += norm_params;
 
         // Apply FFN gradients
-        if self.use_swiglu {
-            self.feed_forward_swiglu.as_mut().unwrap().apply_gradients(&param_grads[idx..idx + ffn_params], lr)?;
-        } else {
-            self.feed_forward_standard.as_mut().unwrap().apply_gradients(&param_grads[idx..idx + ffn_params], lr)?;
-        }
+        self.feed_forward_swiglu.as_mut().unwrap().apply_gradients(&param_grads[idx..idx + ffn_params], lr)?;
         idx += ffn_params;
 
         // Apply norm2 gradients
@@ -973,11 +889,7 @@ impl Layer for TinyRecursiveModel {
     fn parameters(&self) -> usize {
         let attention_params = self.attention.parameters();
         let norm_params = self.norm1.parameters() + self.norm2.parameters();
-        let ffn_params = if self.use_swiglu {
-            self.feed_forward_swiglu.as_ref().unwrap().parameters()
-        } else {
-            self.feed_forward_standard.as_ref().unwrap().parameters()
-        };
+        let ffn_params = self.feed_forward_swiglu.as_ref().unwrap().parameters();
         let scale_params = self.recursive_depth * 2; // attention_step_scales + ffn_step_scales
 
         attention_params + norm_params + ffn_params + scale_params

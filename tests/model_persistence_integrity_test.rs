@@ -1,4 +1,5 @@
-use llm::{LLM, VersionedModel};
+use llm::model_persistence::VersionedModel;
+use llm::LLM;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -206,7 +207,7 @@ fn test_checksum_hex_format() {
 
     // Verify checksum is valid hex (64 characters for SHA256)
     assert_eq!(versioned.checksum.len(), 64);
-    assert!(versioned.checksum.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(versioned.checksum.chars().all(|c: char| c.is_ascii_hexdigit()));
 }
 
 #[test]
@@ -237,7 +238,6 @@ fn test_architecture_detection() {
     assert!(
         versioned.metadata.architecture == "Transformer"
             || versioned.metadata.architecture == "HyperMixer"
-            || versioned.metadata.architecture == "HRM"
             || versioned.metadata.architecture == "Unknown"
     );
 }
