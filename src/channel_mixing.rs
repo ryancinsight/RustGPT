@@ -105,6 +105,28 @@ impl ChannelMixingMLP {
             }
         }
     }
+
+    /// Enable dynamically learned Swish inside SwiGLU when active
+    pub fn enable_dynamic_swish(&mut self) {
+        if self.use_swiglu {
+            if let Some(swiglu) = self.swiglu.as_mut() {
+                swiglu.enable_dynamic_swish();
+            }
+        }
+    }
+
+    /// Number of parameter gradient arrays expected for this layer
+    /// - ReLU MLP: 4 (w1, b1, w2, b2)
+    /// - SwiGLU: 3 (w1, w2, w_out)
+    /// - SwiGLU + dynamic swish: 4 (w1, w2, w_out, alpha)
+    pub fn num_param_grads(&self) -> usize {
+        if self.use_swiglu {
+            let swiglu = self.swiglu.as_ref().expect("SwiGLU must exist when use_swiglu=true");
+            if swiglu.use_dynamic_swish { 4 } else { 3 }
+        } else {
+            4
+        }
+    }
 }
 
 impl Layer for ChannelMixingMLP {

@@ -49,7 +49,7 @@ fn main() -> llm::Result<()> {
     //let architecture = ArchitectureType::HyperMixer; // HyperMixer (refined with TRM learnings)
     //let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
     //let architecture = ArchitectureType::HRM; // Hierarchical Reasoning Model
-    let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing) - TESTING FULLY ADAPTIVE MOH
+    let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing) - TESTING FULLY ADAPTIVE MOH
 
     // ============================================================================
     // NORMALIZATION CONFIGURATION
@@ -67,7 +67,8 @@ fn main() -> llm::Result<()> {
     //   - Used in LLaMA, PaLM, Mistral, GPT-NeoX
     // ============================================================================
 
-    let use_rms_norm = true; // Set to true to use RMSNorm, false for LayerNorm
+    let use_rms_norm = false; // Set to true to use RMSNorm, false for LayerNorm
+    let use_dynamic_tanh_norm = true;
 
     // ============================================================================
     // FEEDFORWARD CONFIGURATION
@@ -347,7 +348,7 @@ fn main() -> llm::Result<()> {
         }
         ArchitectureType::HRM => {
             // HRM with N=2 cycles, T=2 steps per cycle, hidden_dim=192 for parameter efficiency
-            ModelConfig::hrm(EMBEDDING_DIM, 192, 2, 2, MAX_SEQ_LEN)
+            ModelConfig::hrm(EMBEDDING_DIM, 192, 2, MAX_SEQ_LEN, Some(2), Some(8))
         }
         ArchitectureType::TRM => {
             // TRM with recursive_depth=5 (single block applied 5 times)
@@ -358,7 +359,9 @@ fn main() -> llm::Result<()> {
 
     // Apply modern LLM enhancements configuration
     config.use_rms_norm = use_rms_norm;
+    config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
     config.use_swiglu = use_swiglu;
+    config.use_dynamic_swish = true;
     config.positional_encoding = positional_encoding;
     config.num_kv_heads = num_kv_heads;
     config.window_size = window_size;
@@ -509,12 +512,12 @@ fn main() -> llm::Result<()> {
         .map(|s| s.as_str())
         .collect();
 
-    llm.train_with_batch_size(pretraining_examples, 100, 0.0001, 8)?;
+    llm.train_with_batch_size(pretraining_examples, 100, 0.001, 128)?;
 
     println!("\n=== INSTRUCTION TUNING ===");
     // Use same LR as pre-training
     // 100 epochs for adaptive depth validation
-    let instruction_lr = 0.0001;
+    let instruction_lr = 0.0005;
     let instruction_epochs = 100;
     println!(
         "Instruction tuning on {} examples for {} epochs with learning rate {}",
@@ -523,7 +526,7 @@ fn main() -> llm::Result<()> {
         instruction_lr
     );
 
-    llm.train_with_batch_size(chat_training_examples, instruction_epochs, instruction_lr, 4)?;
+    llm.train_with_batch_size(chat_training_examples, instruction_epochs, instruction_lr, 8)?;
 
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", string);

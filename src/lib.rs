@@ -1,6 +1,6 @@
 pub mod activations;
 pub mod adam;
-pub mod attention_moe;
+
 pub mod beam_search;
 pub mod channel_mixing;
 pub mod cop;
@@ -23,6 +23,7 @@ pub mod model_config;
 pub mod model_persistence;
 pub mod output_projection;
 pub mod rms_norm;
+pub mod dynamic_tanh_norm;
 pub mod rope;
 pub mod routing;
 pub mod self_attention;
@@ -33,7 +34,7 @@ pub mod trm;
 pub mod vocab;
 // Re-export key structs for easier access
 pub use adam::Adam;
-pub use attention_moe::{AttentionExpert, AttentionMoELayer, AttentionRouter};
+
 pub use beam_search::{BeamHypothesis, BeamSearchConfig, BeamSearchState};
 pub use channel_mixing::ChannelMixingMLP;
 pub use dataset_loader::{Dataset, DatasetType};

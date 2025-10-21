@@ -4,7 +4,7 @@ use ndarray::Array2;
 #[test]
 fn test_hypermixer_gradient_stability() {
     // Create a small HyperMixer block for testing
-    let mut hypermixer = HyperMixerBlock::new(64, 128, 10, 16, 4);
+    let mut hypermixer = HyperMixerBlock::new(64, 128, 10, 16, true);
 
     // Create some test input
     let input = Array2::from_elem((8, 64), 0.1);
@@ -40,7 +40,7 @@ fn test_hypermixer_gradient_stability() {
 #[test]
 fn test_hypermixer_training_stability() {
     // Create a small HyperMixer block
-    let mut hypermixer = HyperMixerBlock::new(32, 64, 5, 8, 4);
+    let mut hypermixer = HyperMixerBlock::new(32, 64, 5, 8, true);
 
     // Training loop to check for stability
     let input = Array2::from_elem((4, 32), 0.1);

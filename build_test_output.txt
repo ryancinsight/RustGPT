@@ -1,0 +1,336 @@
+       Fresh unicode-ident v1.0.19
+       Fresh cfg-if v1.0.3
+       Fresh autocfg v1.5.0
+       Fresh windows-link v0.2.1
+       Fresh once_cell v1.21.3
+       Fresh version_check v0.9.5
+       Fresh regex-syntax v0.8.8
+       Fresh utf8parse v0.2.2
+       Fresh anstyle v1.0.13
+       Fresh once_cell_polyfill v1.70.1
+       Fresh colorchoice v1.0.4
+       Fresh lazy_static v1.5.0
+       Fresh memchr v2.7.5
+       Fresh is_terminal_polyfill v1.70.1
+       Fresh proc-macro2 v1.0.101
+       Fresh windows-sys v0.61.2
+       Fresh anstyle-parse v0.2.7
+       Fresh tracing-core v0.1.34
+       Fresh regex-automata v0.4.13
+       Fresh rawpointer v0.2.1
+       Fresh virtue v0.0.18
+       Fresh heck v0.5.0
+       Fresh pin-project-lite v0.2.16
+       Fresh ryu v1.0.20
+       Fresh itoa v1.0.15
+       Fresh quote v1.0.40
+       Fresh getrandom v0.3.3
+       Fresh windows_x86_64_gnu v0.53.1
+       Fresh libm v0.2.15
+       Fresh serde_core v1.0.225
+       Fresh zerocopy v0.8.27
+       Fresh typenum v1.19.0
+       Fresh crossbeam-utils v0.8.21
+       Fresh log v0.4.28
+       Fresh clap_lex v0.7.6
+       Fresh strsim v0.11.1
+       Fresh nu-ansi-term v0.50.3
+       Fresh matchers v0.2.0
+       Fresh bincode_derive v2.0.1
+       Fresh csv-core v0.1.12
+       Fresh thread_local v1.1.9
+       Fresh sharded-slab v0.1.7
+       Fresh unty v0.0.4
+       Fresh fastrand v2.3.0
+       Fresh syn v2.0.106
+       Fresh windows-targets v0.53.5
+       Fresh num-traits v0.2.19
+       Fresh rand_core v0.9.3
+       Fresh ppv-lite86 v0.2.21
+       Fresh generic-array v0.14.9
+       Fresh crossbeam-epoch v0.9.18
+       Fresh tracing-log v0.2.0
+       Fresh matrixmultiply v0.3.10
+       Fresh smallvec v1.15.1
+       Fresh cpufeatures v0.2.17
+       Fresh either v1.15.0
+       Fresh tempfile v3.23.0
+       Fresh serde_json v1.0.145
+       Fresh fnv v1.0.7
+       Fresh bit-vec v0.8.0
+       Fresh quick-error v1.2.3
+       Fresh wait-timeout v0.2.1
+       Fresh bitflags v2.9.4
+       Fresh unarray v0.1.4
+       Fresh serde_derive v1.0.225
+       Fresh windows-sys v0.60.2
+       Fresh rand_chacha v0.9.0
+       Fresh tracing-attributes v0.1.30
+       Fresh crypto-common v0.1.6
+       Fresh crossbeam-deque v0.8.6
+       Fresh block-buffer v0.10.4
+       Fresh num-complex v0.4.6
+       Fresh num-integer v0.1.46
+       Fresh clap_derive v4.5.49
+       Fresh thiserror-impl v1.0.69
+       Fresh rusty-fork v0.3.1
+       Fresh rand_xorshift v0.4.0
+       Fresh bit-set v0.8.0
+       Fresh serde v1.0.225
+       Fresh anstyle-query v1.1.4
+       Fresh anstyle-wincon v3.0.10
+       Fresh rand v0.9.2
+       Fresh tracing v0.1.41
+       Fresh rayon-core v1.13.0
+       Fresh digest v0.10.7
+       Fresh thiserror v1.0.69
+       Fresh anstream v0.6.21
+       Fresh sha2 v0.10.9
+       Fresh tracing-subscriber v0.3.20
+       Fresh rand_distr v0.5.1
+       Fresh bincode v2.0.1
+       Fresh ndarray v0.16.1
+       Fresh rayon v1.11.0
+       Fresh csv v1.3.1
+       Fresh chrono v0.4.42
+       Fresh proptest v1.8.0
+       Fresh clap_builder v4.5.49
+       Fresh clap v4.5.49
+       Dirty llm v0.1.0 (D:\RustGPT): couldn't read metadata for file `target\debug\deps\libllm-80286caa876c924c.rlib`
+   Compiling llm v0.1.0 (D:\RustGPT)
+     Running `C:\Users\RyanClanton\.rustup\toolchains\nightly-x86_64-pc-windows-gnu\bin\rustc.exe --crate-name llm --edition=2024 src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values())" -C metadata=762e6cba6c7ff77c -C extra-filename=-80286caa876c924c --out-dir D:\RustGPT\target\debug\deps -C incremental=D:\RustGPT\target\debug\incremental -L dependency=D:\RustGPT\target\debug\deps --extern bincode=D:\RustGPT\target\debug\deps\libbincode-6cba95fd41cb33ff.rmeta --extern chrono=D:\RustGPT\target\debug\deps\libchrono-209f6876d1ad9234.rmeta --extern clap=D:\RustGPT\target\debug\deps\libclap-c1426df764a0d347.rmeta --extern csv=D:\RustGPT\target\debug\deps\libcsv-bd8ee3a165a1d9c7.rmeta --extern ndarray=D:\RustGPT\target\debug\deps\libndarray-457d1e9d97aa65ea.rmeta --extern rand=D:\RustGPT\target\debug\deps\librand-4f2c91015ab0246a.rmeta --extern rand_distr=D:\RustGPT\target\debug\deps\librand_distr-dc9e47620d9a7fce.rmeta --extern rayon=D:\RustGPT\target\debug\deps\librayon-9203cc972dc2573d.rmeta --extern serde=D:\RustGPT\target\debug\deps\libserde-a03558789eafb9ed.rmeta --extern serde_json=D:\RustGPT\target\debug\deps\libserde_json-b0ea2c887c0159b4.rmeta --extern sha2=D:\RustGPT\target\debug\deps\libsha2-53c2bbdaa4dbc451.rmeta --extern thiserror=D:\RustGPT\target\debug\deps\libthiserror-a228e27a7fc836a3.rmeta --extern tracing=D:\RustGPT\target\debug\deps\libtracing-09e3cec7539d1cdb.rmeta --extern tracing_subscriber=D:\RustGPT\target\debug\deps\libtracing_subscriber-709eb3df284290ae.rmeta -L native=C:\Users\RyanClanton\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_gnu-0.53.1\lib`
+     Running `C:\Users\RyanClanton\.rustup\toolchains\nightly-x86_64-pc-windows-gnu\bin\rustc.exe --crate-name llm --edition=2024 src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values())" -C metadata=2320dd40ff18c996 -C extra-filename=-a1b5907d2736c241 --out-dir D:\RustGPT\target\debug\deps -C incremental=D:\RustGPT\target\debug\incremental -L dependency=D:\RustGPT\target\debug\deps --extern bincode=D:\RustGPT\target\debug\deps\libbincode-6cba95fd41cb33ff.rlib --extern chrono=D:\RustGPT\target\debug\deps\libchrono-209f6876d1ad9234.rlib --extern clap=D:\RustGPT\target\debug\deps\libclap-c1426df764a0d347.rlib --extern csv=D:\RustGPT\target\debug\deps\libcsv-bd8ee3a165a1d9c7.rlib --extern ndarray=D:\RustGPT\target\debug\deps\libndarray-457d1e9d97aa65ea.rlib --extern proptest=D:\RustGPT\target\debug\deps\libproptest-8e6e594a2274c24e.rlib --extern rand=D:\RustGPT\target\debug\deps\librand-4f2c91015ab0246a.rlib --extern rand_distr=D:\RustGPT\target\debug\deps\librand_distr-dc9e47620d9a7fce.rlib --extern rayon=D:\RustGPT\target\debug\deps\librayon-9203cc972dc2573d.rlib --extern serde=D:\RustGPT\target\debug\deps\libserde-a03558789eafb9ed.rlib --extern serde_json=D:\RustGPT\target\debug\deps\libserde_json-b0ea2c887c0159b4.rlib --extern sha2=D:\RustGPT\target\debug\deps\libsha2-53c2bbdaa4dbc451.rlib --extern tempfile=D:\RustGPT\target\debug\deps\libtempfile-c42ef7561395934d.rlib --extern thiserror=D:\RustGPT\target\debug\deps\libthiserror-a228e27a7fc836a3.rlib --extern tracing=D:\RustGPT\target\debug\deps\libtracing-09e3cec7539d1cdb.rlib --extern tracing_subscriber=D:\RustGPT\target\debug\deps\libtracing_subscriber-709eb3df284290ae.rlib -L native=C:\Users\RyanClanton\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_gnu-0.53.1\lib`
+warning: unused import: `AdaptiveDepthConfig`
+ --> src\model_builder.rs:9:20
+  |
+9 |     model_config::{AdaptiveDepthConfig, ArchitectureType, ModelConfig},
+  |                    ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Axis`
+ --> src\token_mixing.rs:1:23
+  |
+1 | use ndarray::{Array2, Axis};
+  |                       ^^^^
+
+warning: unused import: `Axis`
+ --> src\trm.rs:1:34
+  |
+1 | use ndarray::{s, Array1, Array2, Axis};
+  |                                  ^^^^
+
+warning: unused imports: `info` and `warn`
+ --> src\trm.rs:3:15
+  |
+3 | use tracing::{info, warn};
+  |               ^^^^  ^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src\trm.rs:260:37
+    |
+260 |                 let mut rng = rand::thread_rng();
+    |                                     ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src\trm.rs:362:33
+    |
+362 |             let mut rng = rand::thread_rng();
+    |                                 ^^^^^^^^^^
+
+error[E0271]: type mismatch resolving `<OwnedRepr<f32> as RawData>::Elem == &&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+  --> src\feed_forward.rs:63:16
+   |
+63 |         output += &input; // residual connection (in-place)
+   |                ^^ expected `&&ArrayBase<OwnedRepr<f32>, ...>`, found `f32`
+   |
+   = note: expected reference `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+                   found type `f32`
+   = note: required for `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>` to implement `AddAssign<&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>>`
+
+error[E0277]: the trait bound `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>: ScalarOperand` is not satisfied
+  --> src\feed_forward.rs:63:16
+   |
+63 |         output += &input; // residual connection (in-place)
+   |                ^^ the trait `ScalarOperand` is not implemented for `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+   |
+   = note: required for `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>` to implement `AddAssign<&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>>`
+help: consider removing the borrow
+   |
+63 -         output += &input; // residual connection (in-place)
+63 +         output += input; // residual connection (in-place)
+   |
+
+error[E0277]: cannot add-assign `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>` to `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+  --> src\feed_forward.rs:63:16
+   |
+63 |         output += &input; // residual connection (in-place)
+   |                ^^ no implementation for `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>> += &&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+   |
+   = help: the trait `AddAssign` is not implemented for `&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+   = note: required for `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>` to implement `AddAssign<&&ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>>`
+help: consider removing the borrow
+   |
+63 -         output += &input; // residual connection (in-place)
+63 +         output += input; // residual connection (in-place)
+   |
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\head_router.rs:129:47
+    |
+129 |         let logits = input.dot(&self.weights).into_shape(input.nrows()).unwrap();
+    |                                               ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1350:63
+     |
+1350 |         let complexity_logits = input.dot(&self.w_complexity).into_shape(seq_len).unwrap();
+     |                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1363:61
+     |
+1363 |         let threshold_logits = input.dot(&self.w_threshold).into_shape(seq_len).unwrap();
+     |                                                             ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1370:58
+     |
+1370 |         let temp_logits = input.dot(&self.w_temperature).into_shape(seq_len).unwrap();
+     |                                                          ^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> src\self_attention.rs:1044:51
+     |
+1044 |     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+     |        -------                                    ^^^^^^^^^^^ expected `ArrayBase<OwnedRepr<f32>, ...>`, found `()`
+     |        |
+     |        implicitly returns `()` as its body has no tail or `return` expression
+     |
+     = note: expected struct `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>>`
+             found unit type `()`
+help: consider returning the local binding `output`
+     |
+1178 ~         output += input;
+1179 ~         output // residual connection in-place
+     |
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:265:25
+    |
+265 |                     rng.gen_range(-0.01..0.01));
+    |                         ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:270:25
+    |
+270 |                     rng.gen_range(-0.01..0.01));
+    |                         ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:365:34
+    |
+365 |                 let u: f32 = rng.gen_range(1e-10..1.0); // Avoid log(0)
+    |                                  ^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\trm.rs:563:50
+    |
+563 |                 let attn_logits = attn_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+    |                                                  ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\trm.rs:597:50
+    |
+597 |                 let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+    |                                                  ^^^^^^^^^^
+
+warning: unused variable: `router`
+   --> src\head_router.rs:274:34
+    |
+274 |             RouterType::Standard(router) => {
+    |                                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_router`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `entropy_range`
+   --> src\head_router.rs:770:13
+    |
+770 |         let entropy_range = (max_entropy - min_entropy).max(1e-6);
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_entropy_range`
+
+warning: unused variable: `target`
+    --> src\head_router.rs:1623:21
+     |
+1623 |                 let target = target_heads[token_idx];
+     |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: variable does not need to be mutable
+   --> src\hypermixer.rs:151:13
+    |
+151 |         let mut grad_x2 = output_grads.clone();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\moe.rs:686:13
+    |
+686 |         let mut input_grads = output_grads.clone();
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `expert_idx`
+   --> src\moe.rs:696:18
+    |
+696 |             for (expert_idx, weight) in indices.iter().zip(weights.iter()) {
+    |                  ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expert_idx`
+
+warning: unused variable: `weighted_grad`
+   --> src\moe.rs:698:21
+    |
+698 |                 let weighted_grad = &token_grad * *weight;
+    |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_weighted_grad`
+
+warning: unused variable: `input`
+   --> src\token_mixing.rs:188:13
+    |
+188 |         let input = self.cached_input.as_ref().expect("forward must be called first");
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+warning: unused variable: `hidden_post_gelu`
+   --> src\token_mixing.rs:193:13
+    |
+193 |         let hidden_post_gelu = self.cached_hidden_post_gelu.as_ref().unwrap();
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hidden_post_gelu`
+
+warning: unused variable: `param_grads`
+   --> src\token_mixing.rs:220:9
+    |
+220 |         param_grads: &[Array2<f32>],
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_param_grads`
+
+warning: unused variable: `lr`
+   --> src\token_mixing.rs:221:9
+    |
+221 |         lr: f32,
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_lr`
+
+Some errors have detailed explanations: E0271, E0277, E0308.
+For more information about an error, try `rustc --explain E0271`.
+warning: `llm` (lib) generated 26 warnings
+error: could not compile `llm` (lib) due to 4 previous errors; 26 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `C:\Users\RyanClanton\.rustup\toolchains\nightly-x86_64-pc-windows-gnu\bin\rustc.exe --crate-name llm --edition=2024 src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values())" -C metadata=762e6cba6c7ff77c -C extra-filename=-80286caa876c924c --out-dir D:\RustGPT\target\debug\deps -C incremental=D:\RustGPT\target\debug\incremental -L dependency=D:\RustGPT\target\debug\deps --extern bincode=D:\RustGPT\target\debug\deps\libbincode-6cba95fd41cb33ff.rmeta --extern chrono=D:\RustGPT\target\debug\deps\libchrono-209f6876d1ad9234.rmeta --extern clap=D:\RustGPT\target\debug\deps\libclap-c1426df764a0d347.rmeta --extern csv=D:\RustGPT\target\debug\deps\libcsv-bd8ee3a165a1d9c7.rmeta --extern ndarray=D:\RustGPT\target\debug\deps\libndarray-457d1e9d97aa65ea.rmeta --extern rand=D:\RustGPT\target\debug\deps\librand-4f2c91015ab0246a.rmeta --extern rand_distr=D:\RustGPT\target\debug\deps\librand_distr-dc9e47620d9a7fce.rmeta --extern rayon=D:\RustGPT\target\debug\deps\librayon-9203cc972dc2573d.rmeta --extern serde=D:\RustGPT\target\debug\deps\libserde-a03558789eafb9ed.rmeta --extern serde_json=D:\RustGPT\target\debug\deps\libserde_json-b0ea2c887c0159b4.rmeta --extern sha2=D:\RustGPT\target\debug\deps\libsha2-53c2bbdaa4dbc451.rmeta --extern thiserror=D:\RustGPT\target\debug\deps\libthiserror-a228e27a7fc836a3.rmeta --extern tracing=D:\RustGPT\target\debug\deps\libtracing-09e3cec7539d1cdb.rmeta --extern tracing_subscriber=D:\RustGPT\target\debug\deps\libtracing_subscriber-709eb3df284290ae.rmeta -L native=C:\Users\RyanClanton\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_gnu-0.53.1\lib` (exit code: 1)
+warning: build failed, waiting for other jobs to finish...
+warning: `llm` (lib test) generated 26 warnings (26 duplicates)
+error: could not compile `llm` (lib test) due to 4 previous errors; 26 warnings emitted
+
+Caused by:
+  process didn't exit successfully: `C:\Users\RyanClanton\.rustup\toolchains\nightly-x86_64-pc-windows-gnu\bin\rustc.exe --crate-name llm --edition=2024 src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --test --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values())" -C metadata=2320dd40ff18c996 -C extra-filename=-a1b5907d2736c241 --out-dir D:\RustGPT\target\debug\deps -C incremental=D:\RustGPT\target\debug\incremental -L dependency=D:\RustGPT\target\debug\deps --extern bincode=D:\RustGPT\target\debug\deps\libbincode-6cba95fd41cb33ff.rlib --extern chrono=D:\RustGPT\target\debug\deps\libchrono-209f6876d1ad9234.rlib --extern clap=D:\RustGPT\target\debug\deps\libclap-c1426df764a0d347.rlib --extern csv=D:\RustGPT\target\debug\deps\libcsv-bd8ee3a165a1d9c7.rlib --extern ndarray=D:\RustGPT\target\debug\deps\libndarray-457d1e9d97aa65ea.rlib --extern proptest=D:\RustGPT\target\debug\deps\libproptest-8e6e594a2274c24e.rlib --extern rand=D:\RustGPT\target\debug\deps\librand-4f2c91015ab0246a.rlib --extern rand_distr=D:\RustGPT\target\debug\deps\librand_distr-dc9e47620d9a7fce.rlib --extern rayon=D:\RustGPT\target\debug\deps\librayon-9203cc972dc2573d.rlib --extern serde=D:\RustGPT\target\debug\deps\libserde-a03558789eafb9ed.rlib --extern serde_json=D:\RustGPT\target\debug\deps\libserde_json-b0ea2c887c0159b4.rlib --extern sha2=D:\RustGPT\target\debug\deps\libsha2-53c2bbdaa4dbc451.rlib --extern tempfile=D:\RustGPT\target\debug\deps\libtempfile-c42ef7561395934d.rlib --extern thiserror=D:\RustGPT\target\debug\deps\libthiserror-a228e27a7fc836a3.rlib --extern tracing=D:\RustGPT\target\debug\deps\libtracing-09e3cec7539d1cdb.rlib --extern tracing_subscriber=D:\RustGPT\target\debug\deps\libtracing_subscriber-709eb3df284290ae.rlib -L native=C:\Users\RyanClanton\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_gnu-0.53.1\lib` (exit code: 1)

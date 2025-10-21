@@ -72,8 +72,9 @@ let attention = SelfAttention::new_with_adaptive_window(
 
 **How it works**:
 1. Compute attention entropy: `H = -Σ p(i,j) * log(p(i,j))`
-2. Normalize entropy to [0, 1] range
-3. Map to window size: `window = min_window + (max_window - min_window) * normalized_entropy`
+2. Smooth with EMA: `H_smooth = α·H + (1−α)·H_prev` (default `α = 0.2`)
+3. Normalize by theoretical max entropy `ln(W)` (using current window or `seq_len`)
+4. Map to window size: `window = min_window + (max_window - min_window) * normalized_entropy`
 
 **Example**:
 ```rust
@@ -90,6 +91,13 @@ let attention = SelfAttention::new_with_adaptive_window(
 .strategy(WindowAdaptationStrategy::AttentionEntropy)
 .build();
 ```
+
+#### Monitoring & Debugging
+
+- `SelfAttention::get_current_window_size()` returns the last computed adaptive window size.
+- In debug builds and tests, helpers are available:
+  - `set_last_attention_entropy_for_test(entropy)` to inject entropy
+  - `recompute_window_for_test(seq_len)` to recompute window from injected entropy
 
 ### 3. PerplexityBased (Future Enhancement)
 

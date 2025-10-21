@@ -1,5 +1,4 @@
 use crate::{
-    attention_moe::AttentionMoELayer,
     embeddings::Embeddings,
     feed_forward::FeedForward,
     hrm::HRMBlock,
@@ -14,6 +13,7 @@ use crate::{
     swiglu::SwiGLU,
     trm::TinyRecursiveModel,
     vocab::Vocab,
+    dynamic_tanh_norm::DynamicTanhNorm,
 };
 
 /// Build a network based on the provided configuration
@@ -74,23 +74,6 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let num_kv_heads = config.get_num_kv_heads();
 
     for layer_idx in 0..config.num_layers {
-        // Check if we should use hierarchical MoH-in-MoE for attention
-        if config.use_moh_in_experts {
-            // Use AttentionMoE: MoE of attention experts, each with MoH
-            let attention_moe = AttentionMoELayer::new(
-                config.embedding_dim,
-                config.num_experts,
-                config.num_active_experts,
-                config.expert_moh_num_shared_heads,
-                config.expert_moh_num_routed_heads,
-                num_kv_heads,
-                config.expert_moh_use_learned_threshold,
-                config.moe_load_balance_weight,
-                config.moe_router_z_loss_weight,
-            );
-
-            layers.push(LayerEnum::AttentionMoE(Box::new(attention_moe)));
-        } else {
             // Standard self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
             let mut attention = SelfAttention::new_with_positional_encoding(
                 config.embedding_dim,
@@ -114,6 +97,9 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
                 );
             }
 
+            // Configure entropy EMA alpha for adaptive windowing
+            attention.set_entropy_ema_alpha(config.entropy_ema_alpha);
+
             // Set head selection strategy (MoH, AllHeads, or StaticPruning)
             // Pass layer_idx for layer-wise adaptive thresholds
             attention.set_head_selection(config.head_selection.clone(), layer_idx);
@@ -123,10 +109,11 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             // consistent gradient flow across all layers
 
             layers.push(LayerEnum::SelfAttention(Box::new(attention)));
-        }
 
         // Normalization after attention (LayerNorm or RMSNorm based on config)
-        if config.use_rms_norm {
+        if config.use_dynamic_tanh_norm {
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        } else if config.use_rms_norm {
             layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
         } else {
             layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
@@ -144,11 +131,15 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
                 config.moe_router_z_loss_weight,
             ))));
         } else if config.use_swiglu {
-            // Use SwiGLU
-            layers.push(LayerEnum::SwiGLU(Box::new(SwiGLU::new(
+            // Use SwiGLU (optionally with dynamic swish)
+            let mut swiglu = SwiGLU::new(
                 config.embedding_dim,
                 config.hidden_dim,
-            ))));
+            );
+            if config.use_dynamic_swish {
+                swiglu.enable_dynamic_swish();
+            }
+            layers.push(LayerEnum::SwiGLU(Box::new(swiglu)));
         } else {
             // Use standard FeedForward
             layers.push(LayerEnum::FeedForward(Box::new(FeedForward::new(
@@ -158,7 +149,9 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         }
 
         // Normalization after feedforward (LayerNorm or RMSNorm based on config)
-        if config.use_rms_norm {
+        if config.use_dynamic_tanh_norm {
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        } else if config.use_rms_norm {
             layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
         } else {
             layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
@@ -166,13 +159,21 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     }
 
     // Final normalization layer (critical for Pre-LN Transformer stability)
-    // Reference: "On Layer Normalization in the Transformer Architecture" (Xiong et al., 2020)
-    // Pre-LN requires a final norm before the output projection to stabilize gradients
-    if config.use_rms_norm {
-        layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-    } else {
-        layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+    // Avoid adding a duplicate norm if the last layer is already a normalization
+    let last_is_norm = matches!(
+        layers.last(),
+        Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
+    );
+    if !last_is_norm {
+        if config.use_dynamic_tanh_norm {
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        } else if config.use_rms_norm {
+            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
+        } else {
+            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+        }
     }
+
 }
 
 /// Build HyperMixer architecture layers (Following arxiv.org/abs/2203.03691)
@@ -187,7 +188,7 @@ fn build_hypermixer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 
     for _ in 0..config.num_layers {
         // HyperMixer block (combines token mixing + channel mixing + norms + adaptive scaling)
-        let hypermixer_block = HyperMixerBlock::new(
+        let mut hypermixer_block = HyperMixerBlock::new(
             config.embedding_dim,
             config.hidden_dim,
             config.max_seq_len,
@@ -195,15 +196,30 @@ fn build_hypermixer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             config.use_swiglu, // Use SwiGLU in channel mixing (recommended)
         );
 
+        // Enable dynamically learned Swish in channel mixing when configured
+        if config.use_swiglu && config.use_dynamic_swish {
+            hypermixer_block.channel_mixing.enable_dynamic_swish();
+        }
+
         layers.push(LayerEnum::HyperMixerBlock(Box::new(hypermixer_block)));
     }
 
-    // Add final normalization layer (critical for Pre-LN stability)
-    if config.use_rms_norm {
-        layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-    } else {
-        layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+    // Final normalization layer (critical for HyperMixer stability)
+    // Avoid duplicate norm if the last layer is already normalization
+    let last_is_norm = matches!(
+        layers.last(),
+        Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
+    );
+    if !last_is_norm {
+        if config.use_dynamic_tanh_norm {
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        } else if config.use_rms_norm {
+            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
+        } else {
+            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+        }
     }
+
 }
 
 /// Print architecture summary
@@ -233,7 +249,9 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("\n🚀 Modern LLM Enhancements:");
 
     // Normalization
-    if config.use_rms_norm {
+    if config.use_dynamic_tanh_norm {
+        println!("  ✓ DynamicTanhNorm (adaptive, tanh-based)");
+    } else if config.use_rms_norm {
         println!("  ✓ RMSNorm (50% param reduction vs LayerNorm)");
     } else {
         println!("  • LayerNorm (standard)");
@@ -292,6 +310,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                 .window_size
                 .map_or("None".to_string(), |w| w.to_string())
         );
+        println!("    - Entropy EMA Alpha: {}", config.entropy_ema_alpha);
         println!("    - Adapts dynamically based on context");
     } else if let Some(window_size) = config.window_size {
         println!("  ✓ Sliding Window Attention");
@@ -506,10 +525,19 @@ fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     layers.push(LayerEnum::TRMBlock(Box::new(trm_block)));
 
     // Add final normalization layer (critical for Pre-LN stability)
-    if config.use_rms_norm {
-        layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-    } else {
-        layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+    // Avoid duplicate norm if the last layer is already normalization
+    let last_is_norm = matches!(
+        layers.last(),
+        Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
+    );
+    if !last_is_norm {
+        if config.use_dynamic_tanh_norm {
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        } else if config.use_rms_norm {
+            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
+        } else {
+            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
+        }
     }
 }
 
@@ -524,9 +552,9 @@ mod tests {
 
         let layers = build_network(&config, &vocab);
 
-        // Should have: Embeddings + (Attention + Norm + FF + Norm) * 2 + OutputProjection
-        // = 1 + 4*2 + 1 = 10 layers
-        assert_eq!(layers.len(), 10);
+        // Should have: Embeddings + (Attention + Norm + FF + Norm) * 2 + FinalNorm + OutputProjection
+        // = 1 + 4*2 + 1 + 1 = 11 layers
+        assert_eq!(layers.len(), 11);
 
         // Check first and last layers
         assert_eq!(layers[0].layer_type(), "Embeddings");
@@ -540,9 +568,9 @@ mod tests {
 
         let layers = build_network(&config, &vocab);
 
-        // Should have: Embeddings + HyperMixerBlock * 2 + OutputProjection
-        // = 1 + 2 + 1 = 4 layers
-        assert_eq!(layers.len(), 4);
+        // Should have: Embeddings + HyperMixerBlock * 2 + FinalNorm + OutputProjection
+        // = 1 + 2 + 1 + 1 = 5 layers
+        assert_eq!(layers.len(), 5);
 
         // Check first and last layers
         assert_eq!(layers[0].layer_type(), "Embeddings");

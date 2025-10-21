@@ -4,6 +4,7 @@
 //! in the RustGPT LLM, including the new adaptive techniques.
 
 use llm::{AdaptiveClippingConfig, AdaptiveGradientClipping, L2GradientClipping, LLM};
+use llm::gradient_clipping::ClippingType;
 
 fn main() {
     println!("=== Adaptive Gradient Clipping Demo ===\n");
@@ -27,14 +28,14 @@ fn main() {
 
     // Example 2: Adaptive clipping with custom config
     let custom_config = AdaptiveClippingConfig {
-        agc_threshold: 0.02, // More aggressive AGC
+        threshold: 0.02, // More aggressive adaptive threshold
         use_centralization: true,
-        use_agc: true,
-        l2_threshold: 10.0, // Higher fallback
+        adaptive_factor: 1.0,
+        fallback_clipping: ClippingType::L2(10.0), // Higher fallback
     };
     let adaptive_clipper = Box::new(AdaptiveGradientClipping::new(custom_config));
     llm.set_gradient_clipping(adaptive_clipper);
-    println!("   - Set to Adaptive clipping with custom config (AGC threshold = 0.02)");
+    println!("   - Set to Adaptive clipping with custom config (threshold = 0.02)");
 
     // Example 3: Disable clipping entirely
     llm.disable_gradient_clipping();

@@ -33,12 +33,12 @@ pub struct TokenMixingMLP {
 
     /// Cached values for backward pass
     cached_input: Option<Array2<f32>>,
-    cached_transposed_input: Option<Array2<f32>>,
+    // removed cached_transposed_input (unused)
     cached_w1: Option<Array2<f32>>,
     cached_w2: Option<Array2<f32>>,
     cached_hidden_pre_gelu: Option<Array2<f32>>,
     cached_hidden_post_gelu: Option<Array2<f32>>,
-    cached_output_transposed: Option<Array2<f32>>,
+    // removed cached_output_transposed (unused)
 }
 
 impl TokenMixingMLP {
@@ -72,12 +72,12 @@ impl TokenMixingMLP {
             embedding_dim,
             hidden_dim,
             cached_input: None,
-            cached_transposed_input: None,
+            // removed cached_transposed_input
             cached_w1: None,
             cached_w2: None,
             cached_hidden_pre_gelu: None,
             cached_hidden_post_gelu: None,
-            cached_output_transposed: None,
+            // removed cached_output_transposed
         }
     }
 
@@ -140,32 +140,28 @@ impl TokenMixingMLP {
         }
 
         // Transpose input to operate on sequence dimension: [embedding_dim, seq_len]
-        let transposed_input = input.t().to_owned();
+        // Use a view-backed transpose to avoid allocation
+        let transposed_input_view = input.view().reversed_axes();
 
-        // Apply W1: [embedding_dim, seq_len] @ [embedding_dim, hidden_dim]^T = [seq_len, hidden_dim]
-        // Actually: [hidden_dim, embedding_dim] @ [embedding_dim, seq_len] = [hidden_dim, seq_len]
-        let hidden_pre_gelu = w1.t().dot(&transposed_input);
+        // Apply W1: [hidden_dim, embedding_dim] @ [embedding_dim, seq_len] = [hidden_dim, seq_len]
+        let hidden_pre_gelu = w1.t().dot(&transposed_input_view);
 
-        // Apply GELU activation
+        // Apply GELU activation (produce a separate array; keep pre-GELU cached)
         let mut hidden_post_gelu = hidden_pre_gelu.clone();
         for elem in hidden_post_gelu.iter_mut() {
             *elem = Self::gelu(*elem);
         }
 
-        // Apply W2: [hidden_dim, embedding_dim] @ [hidden_dim, seq_len] = [embedding_dim, seq_len]
-        let output_transposed = w2.t().dot(&hidden_post_gelu);
-
-        // Transpose back: [seq_len, embedding_dim]
-        let output = output_transposed.t().to_owned();
+        // Compute output directly without a transpose-owned allocation:
+        // [seq_len, hidden_dim] @ [hidden_dim, embedding_dim] = [seq_len, embedding_dim]
+        let output = hidden_post_gelu.t().dot(&w2);
 
         // Cache for backward pass
         self.cached_input = Some(input.clone());
-        self.cached_transposed_input = Some(transposed_input);
         self.cached_w1 = Some(w1);
         self.cached_w2 = Some(w2);
         self.cached_hidden_pre_gelu = Some(hidden_pre_gelu);
         self.cached_hidden_post_gelu = Some(hidden_post_gelu);
-        self.cached_output_transposed = Some(output_transposed);
 
         output
     }
@@ -190,17 +186,17 @@ impl Layer for TokenMixingMLP {
 
         // Get cached values
         let input = self.cached_input.as_ref().expect("forward must be called first");
-        let transposed_input = self.cached_transposed_input.as_ref().unwrap();
+        // removed transposed_input (unused)
         let w1 = self.cached_w1.as_ref().unwrap();
         let w2 = self.cached_w2.as_ref().unwrap();
         let hidden_pre_gelu = self.cached_hidden_pre_gelu.as_ref().unwrap();
         let hidden_post_gelu = self.cached_hidden_post_gelu.as_ref().unwrap();
 
-        // Transpose output_grads: [embedding_dim, seq_len]
-        let grad_output_t = output_grads.t().to_owned();
+        // Transpose output_grads via view to avoid allocation: [embedding_dim, seq_len]
+        let grad_output_t_view = output_grads.view().reversed_axes();
 
         // Backward through W2^T: grad_hidden_post_gelu = W2 @ grad_output_t
-        let grad_hidden_post_gelu = w2.dot(&grad_output_t);
+        let grad_hidden_post_gelu = w2.dot(&grad_output_t_view);
 
         // Backward through GELU
         let mut grad_hidden_pre_gelu = grad_hidden_post_gelu.clone();
@@ -209,16 +205,9 @@ impl Layer for TokenMixingMLP {
             *elem *= Self::gelu_derivative(pre_gelu_val);
         }
 
-        // Backward through W1^T: grad_transposed_input = W1 @ grad_hidden_pre_gelu
-        let grad_transposed_input = w1.dot(&grad_hidden_pre_gelu);
-
-        // Transpose back to get input gradients: [seq_len, embedding_dim]
-        let grad_input = grad_transposed_input.t().to_owned();
-
-        // Compute gradients for hypernetwork parameters
-        // grad_w1 = grad_hidden_pre_gelu @ transposed_input^T
-        // grad_w2 = grad_output_t @ hidden_post_gelu^T
-        // These will be backpropagated through the hypernetworks
+        // Compute input gradients directly to avoid a transpose-owned allocation:
+        // [seq_len, hidden_dim] @ [hidden_dim, embedding_dim] = [seq_len, embedding_dim]
+        let grad_input = grad_hidden_pre_gelu.t().dot(&w1.t());
 
         // For now, return empty parameter gradients (hypernetworks handle their own gradients)
         let param_grads = vec![];

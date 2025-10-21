@@ -1,6 +1,6 @@
 use std::f32;
 
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2, ArrayBase, Ix2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,8 @@ use crate::head_router::{RouterType, HeadRouterStandard, FullyAdaptiveHeadRouter
 use crate::llm::Layer;
 use crate::model_config::{HeadSelectionStrategy, WindowAdaptationStrategy};
 use crate::rope::RotaryEmbedding;
+
+fn default_entropy_ema_alpha() -> f32 { 0.2 }
 
 /// Positional encoding variant used in attention
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -82,6 +84,10 @@ pub struct SelfAttention {
     #[serde(skip)]
     last_attention_entropy: Option<f32>,
 
+    /// EMA alpha for attention entropy smoothing
+    #[serde(default = "default_entropy_ema_alpha")]
+    entropy_ema_alpha: f32,
+
     /// Head selection strategy (AllHeads, MixtureOfHeads, StaticPruning, FullyAdaptiveMoH)
     head_selection: HeadSelectionStrategy,
 
@@ -132,8 +138,8 @@ impl AttentionHead {
 
         // Apply RoPE to Q and K if enabled
         if let Some(rope_emb) = rope {
-            q = rope_emb.apply(&q);
-            k = rope_emb.apply(&k);
+            rope_emb.apply_inplace(&mut q);
+            rope_emb.apply_inplace(&mut k);
         }
 
         (q, k, v)
@@ -161,16 +167,18 @@ impl AttentionHead {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
                 // Sliding window masking: prevent attention to tokens outside window
-                else if let Some(window) = window_size
-                    && j < i.saturating_sub(window)
-                {
-                    scores[[i, j]] = f32::NEG_INFINITY;
+                else if let Some(window) = window_size {
+                    if j < i.saturating_sub(window) {
+                        scores[[i, j]] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
 
-        let weights = self.softmax(&scores);
-        weights.dot(v)
+        // In-place softmax to avoid allocating weights
+        SelfAttention::softmax_inplace(&mut scores);
+        // Use scores (now weights) directly
+        scores.dot(v)
     }
 
     /// Compute attention with additional position bias (for CoPE)
@@ -199,40 +207,63 @@ impl AttentionHead {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
                 // Sliding window masking: prevent attention to tokens outside window
-                else if let Some(window) = window_size
-                    && j < i.saturating_sub(window)
-                {
-                    scores[[i, j]] = f32::NEG_INFINITY;
+                else if let Some(window) = window_size {
+                    if j < i.saturating_sub(window) {
+                        scores[[i, j]] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
 
-        let weights = self.softmax(&scores);
-        weights.dot(v)
+        // In-place softmax with position bias
+        SelfAttention::softmax_inplace(&mut scores);
+        scores.dot(v)
     }
 
     /// Apply softmax to attention scores
     fn softmax(&self, scores: &Array2<f32>) -> Array2<f32> {
-        let mut result = scores.clone();
+         let mut result = scores.clone();
 
-        // Apply softmax row-wise
-        for mut row in result.rows_mut() {
-            let max_val = row.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-            // Calculate exp for each element
-            let exp_values: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
-            let sum_exp: f32 = exp_values.iter().sum();
+         // Apply softmax row-wise
+         for mut row in result.rows_mut() {
+             let max_val = row.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+             // Calculate exp for each element
+             let exp_values: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
+             let sum_exp: f32 = exp_values.iter().sum();
 
-            // Normalize by sum
-            for (i, &exp_val) in exp_values.iter().enumerate() {
-                row[i] = exp_val / sum_exp;
-            }
-        }
+             // Normalize by sum
+             for (i, &exp_val) in exp_values.iter().enumerate() {
+                 row[i] = exp_val / sum_exp;
+             }
+         }
 
-        result
-    }
+         result
+     }
 }
 
 impl SelfAttention {
+    /// Apply softmax to attention scores (in-place, row-wise)
+    fn softmax_inplace(scores: &mut Array2<f32>) {
+        for mut row in scores.outer_iter_mut() {
+            // Find max for numerical stability
+            let mut max_val = f32::NEG_INFINITY;
+            for &x in row.iter() {
+                if x > max_val { max_val = x; }
+            }
+            // Subtract max, exponentiate, and accumulate sum
+            let mut sum_exp = 0.0f32;
+            for x in row.iter_mut() {
+                let e = (*x - max_val).exp();
+                *x = e;
+                sum_exp += e;
+            }
+            // Normalize
+            let norm = sum_exp.max(1e-12);
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
     /// Initializes multi-head self-attention
     /// num_heads defaults to 8 (standard transformer)
     pub fn new(embedding_dim: usize) -> Self {
@@ -335,6 +366,7 @@ impl SelfAttention {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             current_window_size: None,
             last_attention_entropy: None,
+            entropy_ema_alpha: 0.2,
             head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
             router: None,
             cached_head_mask: None,
@@ -419,6 +451,7 @@ impl SelfAttention {
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             current_window_size: None,
             last_attention_entropy: None,
+            entropy_ema_alpha: 0.2,
             head_selection: HeadSelectionStrategy::AllHeads, // Default for backward compatibility
             router: None,
             cached_head_mask: None,
@@ -446,6 +479,7 @@ impl SelfAttention {
             min_window_size: 512,
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+            entropy_ema_alpha: default_entropy_ema_alpha(),
         }
     }
 
@@ -721,6 +755,29 @@ impl SelfAttention {
         self.max_window_size = max_size;
         self.window_adaptation_strategy = strategy;
     }
+
+    pub fn set_entropy_ema_alpha(&mut self, alpha: f32) {
+        self.entropy_ema_alpha = alpha;
+    }
+
+    /// Expose current adaptive window size (for monitoring and tests)
+    pub fn get_current_window_size(&self) -> Option<usize> {
+        self.current_window_size
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    /// Test-only setter to inject entropy for adaptation tests
+    pub fn set_last_attention_entropy_for_test(&mut self, entropy: f32) {
+        self.last_attention_entropy = Some(entropy);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    /// Test-only method to recompute window using current entropy without running forward
+    pub fn recompute_window_for_test(&mut self, seq_len: usize) -> usize {
+        let ws = self.compute_adaptive_window_size(seq_len);
+        self.current_window_size = Some(ws);
+        ws
+    }
 }
 
 /// Builder for SelfAttention with adaptive window configuration
@@ -735,6 +792,8 @@ pub struct AdaptiveWindowBuilder {
     min_window_size: usize,
     max_window_size: usize,
     window_adaptation_strategy: WindowAdaptationStrategy,
+    // EMA alpha for smoothing attention entropy in adaptive strategy
+    entropy_ema_alpha: f32,
 }
 
 impl AdaptiveWindowBuilder {
@@ -750,6 +809,12 @@ impl AdaptiveWindowBuilder {
 
     pub fn strategy(mut self, strategy: WindowAdaptationStrategy) -> Self {
         self.window_adaptation_strategy = strategy;
+        self
+    }
+
+    // Configure EMA alpha for entropy smoothing
+    pub fn entropy_ema_alpha(mut self, alpha: f32) -> Self {
+        self.entropy_ema_alpha = alpha;
         self
     }
 
@@ -798,6 +863,7 @@ impl AdaptiveWindowBuilder {
             window_adaptation_strategy: self.window_adaptation_strategy,
             current_window_size: None,
             last_attention_entropy: None,
+            entropy_ema_alpha: self.entropy_ema_alpha,
             head_selection: HeadSelectionStrategy::AllHeads,
             router: None,
             cached_head_mask: None,
@@ -828,8 +894,15 @@ impl SelfAttention {
                 // Higher entropy (diffuse attention) → larger window
                 // Lower entropy (focused attention) → smaller window
                 if let Some(entropy) = self.last_attention_entropy {
-                    // Normalize entropy to [0, 1] range (assuming max entropy ~= 4.0 for typical attention)
-                    let normalized_entropy = (entropy / 4.0).min(1.0);
+                    // Normalize entropy using theoretical max entropy for current effective window
+                    // Max entropy for a uniform distribution over W tokens is ln(W)
+                    let ref_window = self.current_window_size.unwrap_or(seq_len).max(2);
+                    let max_entropy = (ref_window as f32).ln();
+                    let normalized_entropy = if max_entropy > 1e-6 {
+                        (entropy / max_entropy).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
 
                     // Map entropy to window size: high entropy → max window, low entropy → min window
                     let window_range = self.max_window_size - self.min_window_size;
@@ -881,12 +954,16 @@ impl SelfAttention {
     }
 
     /// Compute gradients for a single attention head
-    fn compute_head_gradients(
+    fn compute_head_gradients<S>(
         &self,
         head_idx: usize,
-        head_input: &Array2<f32>,
-        head_output_grad: &Array2<f32>,
-    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        head_input: ArrayView2<f32>,
+        head_output_grad: &ArrayBase<S, Ix2>,
+        softmax_scratch: &mut Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>)
+    where
+        S: ndarray::Data<Elem = f32>,
+    {
         let head = &self.heads[head_idx];
         let head_dim = head.head_dim;
 
@@ -901,8 +978,8 @@ impl SelfAttention {
                 // No-op: positional encoding handled in Embeddings layer
             }
             PositionalEncodingVariant::RoPE(rope) => {
-                q = rope.apply(&q);
-                k = rope.apply(&k);
+                rope.apply_inplace(&mut q);
+                rope.apply_inplace(&mut k);
             }
             PositionalEncodingVariant::CoPE(_) => {
                 // CoPE is applied differently in the forward pass
@@ -922,26 +999,29 @@ impl SelfAttention {
                     scores[[i, j]] = f32::NEG_INFINITY;
                 }
                 // Sliding window masking: prevent attention to tokens outside window
-                else if let Some(window) = self.window_size
-                    && j < i.saturating_sub(window)
-                {
-                    scores[[i, j]] = f32::NEG_INFINITY;
+                else if let Some(window) = self.window_size {
+                    if j < i.saturating_sub(window) {
+                        scores[[i, j]] = f32::NEG_INFINITY;
+                    }
                 }
             }
         }
 
-        let attn_weights = head.softmax(&scores);
+        // In-place softmax and use a view for weights
+        Self::softmax_inplace(&mut scores);
+        let attn_weights = scores.view();
 
         // Backward pass
         let grad_attn_weights = head_output_grad.dot(&v.t());
         let grad_v = attn_weights.t().dot(head_output_grad);
 
-        // Softmax backward
-        let grad_scores = Self::softmax_backward(&attn_weights, &grad_attn_weights);
+        // Softmax backward into reusable buffer
+        Self::softmax_backward_into(&attn_weights, &grad_attn_weights, softmax_scratch);
+        let grad_scores_view = softmax_scratch.view();
 
         // Q, K gradients
-        let grad_q = grad_scores.dot(&k) / dk.sqrt();
-        let grad_k = grad_scores.t().dot(&q) / dk.sqrt();
+        let grad_q = grad_scores_view.dot(&k) / dk.sqrt();
+        let grad_k = grad_scores_view.t().dot(&q) / dk.sqrt();
 
         // Weight gradients
         let grad_w_q = head_input.t().dot(&grad_q);
@@ -955,11 +1035,19 @@ impl SelfAttention {
         (grad_input, vec![grad_w_q, grad_w_k, grad_w_v])
     }
 
-    /// Softmax backward pass for attention
-    fn softmax_backward(softmax_output: &Array2<f32>, grad_output: &Array2<f32>) -> Array2<f32> {
-        let mut grad_input = Array2::zeros(softmax_output.dim());
+    /// Softmax backward: write into provided output buffer
+    fn softmax_backward_into<S1, S2>(
+        softmax_output: &ArrayBase<S1, Ix2>,
+        grad_output: &ArrayBase<S2, Ix2>,
+        out: &mut Array2<f32>,
+    )
+    where
+        S1: ndarray::Data<Elem = f32>,
+        S2: ndarray::Data<Elem = f32>,
+    {
+        assert_eq!(out.dim(), softmax_output.dim());
 
-        for ((mut grad_row, softmax_row), grad_out_row) in grad_input
+        for ((mut out_row, softmax_row), grad_out_row) in out
             .outer_iter_mut()
             .zip(softmax_output.outer_iter())
             .zip(grad_output.outer_iter())
@@ -971,7 +1059,7 @@ impl SelfAttention {
                 .map(|(&y_i, &dy_i)| y_i * dy_i)
                 .sum::<f32>();
 
-            for ((g, &y_i), &dy_i) in grad_row
+            for ((g, &y_i), &dy_i) in out_row
                 .iter_mut()
                 .zip(softmax_row.iter())
                 .zip(grad_out_row.iter())
@@ -979,8 +1067,20 @@ impl SelfAttention {
                 *g = y_i * (dy_i - dot);
             }
         }
+    }
 
-        grad_input
+    /// Softmax backward pass for attention (allocating)
+    fn softmax_backward<S1, S2>(
+        softmax_output: &ArrayBase<S1, Ix2>,
+        grad_output: &ArrayBase<S2, Ix2>,
+    ) -> Array2<f32>
+    where
+        S1: ndarray::Data<Elem = f32>,
+        S2: ndarray::Data<Elem = f32>,
+    {
+        let mut out = Array2::zeros(softmax_output.dim());
+        Self::softmax_backward_into(softmax_output, grad_output, &mut out);
+        out
     }
 }
 
@@ -1028,141 +1128,178 @@ impl Layer for SelfAttention {
             }
         };
 
-        // Split input into heads: (seq_len, emb_dim) -> num_heads × (seq_len, head_dim)
-        let mut head_inputs = Vec::new();
-        for h in 0..self.num_heads {
-            let start_col = h * head_dim;
-            let end_col = (h + 1) * head_dim;
-            let head_input = input.slice(ndarray::s![.., start_col..end_col]).to_owned();
-            head_inputs.push(head_input);
-        }
+        // Split input into heads using zero-copy views: (seq_len, emb_dim) -> num_heads × (seq_len, head_dim)
+        let head_inputs: Vec<_> = (0..self.num_heads)
+            .map(|h| {
+                let start_col = h * head_dim;
+                let end_col = (h + 1) * head_dim;
+                input.slice(ndarray::s![.., start_col..end_col])
+            })
+            .collect();
 
         // For GQA: compute K, V only for num_kv_heads, then share across query groups
         let queries_per_kv = self.num_heads / self.num_kv_heads;
 
-        // Compute all queries
-        let mut queries: Vec<Array2<f32>> = Vec::new();
-        for (h, head_input) in head_inputs.iter().enumerate() {
-            let mut q = head_input.dot(&self.heads[h].w_q);
-            // Apply RoPE to queries if enabled
-            match &self.positional_encoding {
-                PositionalEncodingVariant::Learned => {
-                    // No-op: positional encoding handled in Embeddings layer
-                }
-                PositionalEncodingVariant::RoPE(rope) => {
-                    q = rope.apply(&q);
-                }
-                PositionalEncodingVariant::CoPE(_) => {
-                    // CoPE is applied later in attention computation
-                }
-            }
-            queries.push(q);
-        }
-
         // Compute K, V for each KV head (only num_kv_heads, not num_heads)
-        let mut keys: Vec<Array2<f32>> = Vec::new();
-        let mut values: Vec<Array2<f32>> = Vec::new();
+        let mut keys: Vec<Array2<f32>> = Vec::with_capacity(self.num_kv_heads);
+        let mut values: Vec<Array2<f32>> = Vec::with_capacity(self.num_kv_heads);
         for kv_idx in 0..self.num_kv_heads {
             // Use the first query head in each group to compute K, V
             let head_idx = kv_idx * queries_per_kv;
-            let head_input = &head_inputs[head_idx];
+            let head_input_view = head_inputs[head_idx].view();
 
-            let mut k = head_input.dot(&self.heads[head_idx].w_k);
-            let v = head_input.dot(&self.heads[head_idx].w_v);
+            let mut k = head_input_view.dot(&self.heads[head_idx].w_k);
+            let v = head_input_view.dot(&self.heads[head_idx].w_v);
 
             // Apply RoPE to keys if enabled
             match &self.positional_encoding {
-                PositionalEncodingVariant::Learned => {
-                    // No-op: positional encoding handled in Embeddings layer
-                }
+                PositionalEncodingVariant::Learned => {}
                 PositionalEncodingVariant::RoPE(rope) => {
-                    k = rope.apply(&k);
+                    rope.apply_inplace(&mut k);
                 }
-                PositionalEncodingVariant::CoPE(_) => {
-                    // CoPE is applied later in attention computation
-                }
+                PositionalEncodingVariant::CoPE(_) => {}
             }
 
             keys.push(k);
             values.push(v);
         }
 
-        // Process each query head with its corresponding KV head (GQA grouping)
-        // Apply head weighting if enabled (MoH or StaticPruning)
-        let head_outputs: Vec<Array2<f32>> = queries
-            .iter()
-            .enumerate()
-            .map(|(h, q)| {
-                // Check if this head is active (for optimization: skip computation if all weights are 0)
-                let is_head_active = if let Some(weights) = &head_weights {
-                    // Check if ANY token has non-zero weight for this head
-                    weights.column(h).iter().any(|&w| w > 0.0)
-                } else {
-                    true // AllHeads: all heads always active
-                };
-
-                if !is_head_active {
-                    // Head is completely inactive: return zeros
-                    Array2::zeros((seq_len, head_dim))
-                } else {
-                    // Determine which KV head this query head uses
-                    let kv_idx = h / queries_per_kv;
-                    let k = &keys[kv_idx];
-                    let v = &values[kv_idx];
-
-                    // Compute attention for this head with adaptive or fixed sliding window
-                    // For CoPE, we need to add position logits to attention scores
-                    match &self.positional_encoding {
-                        PositionalEncodingVariant::CoPE(cope_heads) => {
-                            // Apply CoPE: compute position logits and add to attention scores
-                            let position_logits = cope_heads[h].apply(q, k);
-                            self.heads[h].attention_with_position_bias(
-                                q,
-                                k,
-                                v,
-                                &position_logits,
-                                effective_window_size,
-                            )
-                        }
-                        _ => {
-                            // Standard attention (Learned or RoPE)
-                            self.heads[h].attention(q, k, v, effective_window_size)
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        // Concatenate head outputs: num_heads × (seq_len, head_dim) -> (seq_len, emb_dim)
-        // Apply per-token soft weighting if MoH is enabled (differentiable routing)
+        // Stream per-head computation and write directly into output to avoid intermediate allocations
         let mut output = Array2::zeros((seq_len, emb_dim));
-        for (h, head_output) in head_outputs.iter().enumerate().take(self.num_heads) {
+        let should_collect_entropy = self.use_adaptive_window
+            && matches!(self.window_adaptation_strategy, WindowAdaptationStrategy::AttentionEntropy);
+        let mut entropy_acc = 0.0f32;
+        let mut entropy_heads = 0usize;
+
+        for h in 0..self.num_heads {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
 
-            // Apply per-token soft weighting if head_weights is present
+            // Skip completely inactive heads when weights are provided
+            let is_head_active = if let Some(weights) = &head_weights {
+                weights.column(h).iter().any(|&w| w > 0.0)
+            } else {
+                true
+            };
+            if !is_head_active {
+                continue;
+            }
+
+            // Compute Q for this head (on the fly)
+            let mut q = head_inputs[h].dot(&self.heads[h].w_q);
+            match &self.positional_encoding {
+                PositionalEncodingVariant::Learned => {}
+                PositionalEncodingVariant::RoPE(rope) => {
+                    rope.apply_inplace(&mut q);
+                }
+                PositionalEncodingVariant::CoPE(_) => {}
+            }
+
+            // Select corresponding KV head
+            let kv_idx = h / queries_per_kv;
+            let k = &keys[kv_idx];
+            let v = &values[kv_idx];
+
+            // Compute attention output for this head, optionally collecting entropy
+            let head_out = match &self.positional_encoding {
+                PositionalEncodingVariant::CoPE(cope_heads) => {
+                    let position_logits = cope_heads[h].apply(&q, k);
+
+                    if should_collect_entropy {
+                        // Reproduce attention with position bias to access weights
+                        let dk = (head_dim as f32).sqrt();
+                        let k_t = k.t();
+                        let mut scores = q.dot(&k_t) / dk;
+                        scores += &position_logits;
+
+                        // Apply causal + sliding window masking
+                        for i in 0..seq_len {
+                            for j in 0..seq_len {
+                                if j > i {
+                                    scores[[i, j]] = f32::NEG_INFINITY;
+                                } else if let Some(window) = effective_window_size {
+                                    if j < i.saturating_sub(window) {
+                                        scores[[i, j]] = f32::NEG_INFINITY;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Softmax to get weights
+                        SelfAttention::softmax_inplace(&mut scores);
+                        // Collect entropy for this head
+                        entropy_acc += self.compute_attention_entropy(&scores);
+                        entropy_heads += 1;
+                        // Use weights directly
+                        scores.dot(v)
+                    } else {
+                        self.heads[h].attention_with_position_bias(&q, k, v, &position_logits, effective_window_size)
+                    }
+                }
+                _ => {
+                    if should_collect_entropy {
+                        // Reproduce attention to access weights
+                        let dk = (head_dim as f32).sqrt();
+                        let k_t = k.t();
+                        let mut scores = q.dot(&k_t) / dk;
+
+                        // Apply causal + sliding window masking
+                        for i in 0..seq_len {
+                            for j in 0..seq_len {
+                                if j > i {
+                                    scores[[i, j]] = f32::NEG_INFINITY;
+                                } else if let Some(window) = effective_window_size {
+                                    if j < i.saturating_sub(window) {
+                                        scores[[i, j]] = f32::NEG_INFINITY;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Softmax to get weights
+                        SelfAttention::softmax_inplace(&mut scores);
+                        // Collect entropy for this head
+                        entropy_acc += self.compute_attention_entropy(&scores);
+                        entropy_heads += 1;
+                        // Use weights directly
+                        scores.dot(v)
+                    } else {
+                        self.heads[h].attention(&q, k, v, effective_window_size)
+                    }
+                }
+            };
+
+            // Write into output with optional per-token weighting, avoiding temporary arrays
             if let Some(weights) = &head_weights {
-                // For each token, scale this head's output by its soft weight
                 for token_idx in 0..seq_len {
                     let weight = weights[[token_idx, h]];
                     if weight > 0.0 {
-                        let head_row = head_output.row(token_idx);
-                        let weighted_row = head_row.mapv(|x| x * weight);
-                        output
-                            .slice_mut(ndarray::s![token_idx, start_col..end_col])
-                            .assign(&weighted_row);
+                        let mut out_row = output.slice_mut(ndarray::s![token_idx, start_col..end_col]);
+                        let head_row = head_out.row(token_idx);
+                        ndarray::Zip::from(&mut out_row).and(head_row).for_each(|o, &hval| {
+                            *o = hval * weight;
+                        });
                     }
-                    // else: leave as zeros (head inactive for this token)
                 }
             } else {
-                // No weighting: assign all head outputs (weight = 1.0)
                 output
                     .slice_mut(ndarray::s![.., start_col..end_col])
-                    .assign(head_output);
+                    .assign(&head_out);
             }
         }
 
-        output + input // residual connection
+        // Update entropy EMA after processing heads
+        if should_collect_entropy && entropy_heads > 0 {
+            let measured_entropy = entropy_acc / entropy_heads as f32;
+            let alpha = self.entropy_ema_alpha;
+            self.last_attention_entropy = Some(match self.last_attention_entropy {
+                Some(prev) => prev * (1.0 - alpha) + measured_entropy * alpha,
+                None => measured_entropy,
+            });
+        }
+
+        output += input; // residual connection in-place
+        output
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
@@ -1197,43 +1334,35 @@ impl Layer for SelfAttention {
         let (seq_len, emb_dim) = (input.shape()[0], input.shape()[1]);
         let head_dim = emb_dim / self.num_heads;
 
-        // Split output gradients into heads
-        let mut head_grads = Vec::new();
+        // Stream per-head gradients using zero-copy views
+        let mut all_param_grads = Vec::new();
+        let mut input_grads = Array2::zeros((seq_len, emb_dim));
+        // Reusable scratch buffer for softmax_backward: [seq_len, seq_len]
+        let mut softmax_scratch = Array2::<f32>::zeros((seq_len, seq_len));
+
         for h in 0..self.num_heads {
             let start_col = h * head_dim;
             let end_col = (h + 1) * head_dim;
-            let head_grad = output_grads
-                .slice(ndarray::s![.., start_col..end_col])
-                .to_owned();
-            head_grads.push(head_grad);
-        }
 
-        let mut all_param_grads = Vec::new();
-        let mut input_grads = Array2::zeros((seq_len, emb_dim));
+            let head_input_view: ndarray::ArrayView2<f32> = input.slice(ndarray::s![.., start_col..end_col]);
+            let head_grad_view: ndarray::ArrayView2<f32> = output_grads.slice(ndarray::s![.., start_col..end_col]);
 
-        // Compute gradients for each head
-        for (h, head_grad) in head_grads.into_iter().enumerate() {
-            let head_input = input
-                .slice(ndarray::s![.., h * head_dim..(h + 1) * head_dim])
-                .to_owned();
             let (head_input_grad, head_param_grads) =
-                self.compute_head_gradients(h, &head_input, &head_grad);
+                self.compute_head_gradients(h, head_input_view, &head_grad_view, &mut softmax_scratch);
 
             // Store parameter gradients
             all_param_grads.extend(head_param_grads);
 
             // Concatenate input gradients
-            let start_col = h * head_dim;
-            let end_col = (h + 1) * head_dim;
             input_grads
                 .slice_mut(ndarray::s![.., start_col..end_col])
                 .assign(&head_input_grad);
         }
 
-        // Add residual connection gradient
-        let total_input_grads = input_grads + output_grads;
+        // In-place add residual connection gradient (avoid allocation)
+        input_grads += output_grads;
 
-        (total_input_grads, all_param_grads)
+        (input_grads, all_param_grads)
     }
 
     fn apply_gradients(

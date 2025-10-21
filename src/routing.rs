@@ -18,7 +18,7 @@
 //!
 //! When MoE is implemented, ExpertRouter will use these same utilities,
 //! ensuring consistent behavior and reducing code duplication.
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2, Axis, ArrayBase, Ix2};
 
 /// Select Top-K indices for each row in the scores matrix
 ///
@@ -101,10 +101,13 @@ pub fn top_k_indices(scores: &Array2<f32>, k: usize) -> Vec<Vec<usize>> {
 /// let loss = compute_load_balance_loss(&scores, &mask);
 /// // Loss will be low if distribution is balanced
 /// ```
-pub fn compute_load_balance_loss(
+pub fn compute_load_balance_loss<S>(
     routing_scores: &Array2<f32>,
-    activation_mask: &Array2<bool>,
-) -> f32 {
+    activation_mask: &ArrayBase<S, Ix2>,
+) -> f32
+where
+    S: ndarray::Data<Elem = bool>,
+{
     let (batch_size, num_candidates) = routing_scores.dim();
 
     if batch_size == 0 || num_candidates == 0 {

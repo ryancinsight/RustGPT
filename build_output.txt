@@ -1,0 +1,293 @@
+   Compiling llm v0.1.0 (D:\RustGPT)
+error: expected expression, found `+`
+   --> src\self_attention.rs:174:1
+    |
+174 | +        SelfAttention::softmax_inplace(&mut scores);
+    | ^ expected expression
+
+error: expected expression, found `+`
+   --> src\self_attention.rs:215:1
+    |
+215 | +        SelfAttention::softmax_inplace(&mut scores);
+    | ^ expected expression
+
+error: non-item in item list
+   --> src\self_attention.rs:219:1
+    |
+102 | impl AttentionHead {
+    |                    - item list starts here
+...
+219 | -    /// Apply softmax to attention scores (in-place, row-wise)
+    | ^ non-item starts here
+...
+262 | }
+    | - item list ends here
+
+warning: unused import: `AdaptiveDepthConfig`
+  --> src\model_builder.rs:10:20
+   |
+10 |     model_config::{AdaptiveDepthConfig, ArchitectureType, ModelConfig},
+   |                    ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `Axis`
+ --> src\token_mixing.rs:1:23
+  |
+1 | use ndarray::{Array2, Axis};
+  |                       ^^^^
+
+warning: unused import: `Axis`
+ --> src\trm.rs:1:34
+  |
+1 | use ndarray::{s, Array1, Array2, Axis};
+  |                                  ^^^^
+
+warning: unused imports: `info` and `warn`
+ --> src\trm.rs:3:15
+  |
+3 | use tracing::{info, warn};
+  |               ^^^^  ^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src\trm.rs:260:37
+    |
+260 |                 let mut rng = rand::thread_rng();
+    |                                     ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src\trm.rs:362:33
+    |
+362 |             let mut rng = rand::thread_rng();
+    |                                 ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\head_router.rs:129:47
+    |
+129 |         let logits = input.dot(&self.weights).into_shape(input.nrows()).unwrap();
+    |                                               ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1350:63
+     |
+1350 |         let complexity_logits = input.dot(&self.w_complexity).into_shape(seq_len).unwrap();
+     |                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1363:61
+     |
+1363 |         let threshold_logits = input.dot(&self.w_threshold).into_shape(seq_len).unwrap();
+     |                                                             ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1370:58
+     |
+1370 |         let temp_logits = input.dot(&self.w_temperature).into_shape(seq_len).unwrap();
+     |                                                          ^^^^^^^^^^
+
+error[E0599]: no function or associated item named `softmax_inplace` found for struct `AttentionHead` in the current scope
+   --> src\self_attention.rs:173:16
+    |
+28  | pub struct AttentionHead {
+    | ------------------------ function or associated item `softmax_inplace` not found for this struct
+...
+173 | -        Self::softmax_inplace(&mut scores);
+    |                ^^^^^^^^^^^^^^^ function or associated item not found in `AttentionHead`
+    |
+note: if you're trying to build a new `AttentionHead`, consider using `AttentionHead::new` which returns `AttentionHead`
+   --> src\self_attention.rs:104:5
+    |
+104 |     fn new(head_dim: usize) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `softmax_inplace` found for struct `AttentionHead` in the current scope
+   --> src\self_attention.rs:214:16
+    |
+28  | pub struct AttentionHead {
+    | ------------------------ function or associated item `softmax_inplace` not found for this struct
+...
+214 | -        Self::softmax_inplace(&mut scores);
+    |                ^^^^^^^^^^^^^^^ function or associated item not found in `AttentionHead`
+    |
+note: if you're trying to build a new `AttentionHead`, consider using `AttentionHead::new` which returns `AttentionHead`
+   --> src\self_attention.rs:104:5
+    |
+104 |     fn new(head_dim: usize) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `softmax_inplace` found for struct `SelfAttention` in the current scope
+   --> src\self_attention.rs:966:15
+    |
+44  | pub struct SelfAttention {
+    | ------------------------ function or associated item `softmax_inplace` not found for this struct
+...
+966 |         Self::softmax_inplace(&mut scores);
+    |               ^^^^^^^^^^^^^^^ function or associated item not found in `SelfAttention`
+    |
+note: if you're trying to build a new `SelfAttention` consider using one of the following associated functions:
+      SelfAttention::new
+      SelfAttention::new_with_heads
+      SelfAttention::new_with_config
+      SelfAttention::new_with_gqa
+      SelfAttention::new_with_positional_encoding
+   --> src\self_attention.rs:267:5
+    |
+267 |       pub fn new(embedding_dim: usize) -> Self {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+272 |       pub fn new_with_heads(embedding_dim: usize, num_heads: usize) -> Self {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+284 | /     pub fn new_with_config(
+285 | |         embedding_dim: usize,
+286 | |         num_heads: usize,
+287 | |         use_rope: bool,
+288 | |         max_seq_len: usize,
+289 | |     ) -> Self {
+    | |_____________^
+...
+317 | /     pub fn new_with_gqa(
+318 | |         embedding_dim: usize,
+319 | |         num_heads: usize,
+320 | |         num_kv_heads: usize,
+...   |
+323 | |         window_size: Option<usize>,
+324 | |     ) -> Self {
+    | |_____________^
+...
+393 | /     pub fn new_with_positional_encoding(
+394 | |         embedding_dim: usize,
+395 | |         num_heads: usize,
+396 | |         num_kv_heads: usize,
+...   |
+399 | |         window_size: Option<usize>,
+400 | |     ) -> Self {
+    | |_____________^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:265:25
+    |
+265 |                     rng.gen_range(-0.01..0.01));
+    |                         ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:270:25
+    |
+270 |                     rng.gen_range(-0.01..0.01));
+    |                         ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:365:34
+    |
+365 |                 let u: f32 = rng.gen_range(1e-10..1.0); // Avoid log(0)
+    |                                  ^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\trm.rs:563:50
+    |
+563 |                 let attn_logits = attn_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+    |                                                  ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\trm.rs:597:50
+    |
+597 |                 let halt_logits = halt_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+    |                                                  ^^^^^^^^^^
+
+warning: unused variable: `seq_len`
+   --> src\attention_moe.rs:285:14
+    |
+285 |         let (seq_len, num_experts) = probs.dim();
+    |              ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_seq_len`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `base_lr`
+   --> src\attention_moe.rs:490:47
+    |
+490 |     fn compute_expert_adaptive_lrs(&mut self, base_lr: f32) {
+    |                                               ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_base_lr`
+
+warning: unused variable: `router`
+   --> src\head_router.rs:274:34
+    |
+274 |             RouterType::Standard(router) => {
+    |                                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_router`
+
+warning: unused variable: `entropy_range`
+   --> src\head_router.rs:768:13
+    |
+768 |         let entropy_range = (max_entropy - min_entropy).max(1e-6);
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_entropy_range`
+
+warning: unused variable: `target`
+    --> src\head_router.rs:1623:21
+     |
+1623 |                 let target = target_heads[token_idx];
+     |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: variable does not need to be mutable
+   --> src\hypermixer.rs:151:13
+    |
+151 |         let mut grad_x2 = output_grads.clone();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `expert_idx`
+   --> src\moe.rs:696:18
+    |
+696 |             for (expert_idx, weight) in indices.iter().zip(weights.iter()) {
+    |                  ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expert_idx`
+
+warning: unused variable: `weighted_grad`
+   --> src\moe.rs:698:21
+    |
+698 |                 let weighted_grad = &token_grad * *weight;
+    |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_weighted_grad`
+
+warning: variable does not need to be mutable
+   --> src\moe.rs:686:13
+    |
+686 |         let mut input_grads = output_grads.clone();
+    |             ----^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `input`
+   --> src\token_mixing.rs:192:13
+    |
+192 |         let input = self.cached_input.as_ref().expect("forward must be called first");
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_input`
+
+warning: unused variable: `transposed_input`
+   --> src\token_mixing.rs:193:13
+    |
+193 |         let transposed_input = self.cached_transposed_input.as_ref().unwrap();
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_transposed_input`
+
+warning: unused variable: `hidden_post_gelu`
+   --> src\token_mixing.rs:197:13
+    |
+197 |         let hidden_post_gelu = self.cached_hidden_post_gelu.as_ref().unwrap();
+    |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hidden_post_gelu`
+
+warning: unused variable: `param_grads`
+   --> src\token_mixing.rs:231:9
+    |
+231 |         param_grads: &[Array2<f32>],
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_param_grads`
+
+warning: unused variable: `lr`
+   --> src\token_mixing.rs:232:9
+    |
+232 |         lr: f32,
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_lr`
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `llm` (lib) generated 29 warnings
+error: could not compile `llm` (lib) due to 6 previous errors; 29 warnings emitted
