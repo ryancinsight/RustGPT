@@ -39,11 +39,24 @@ impl LayerNorm {
 
         // Cache values for backward pass
         self.cached_input = Some(input.clone());
-        self.cached_mean = Some(mean.clone());
-        self.cached_std = Some(std.clone());
+        self.cached_mean = Some(mean);
+        self.cached_std = Some(std);
 
-        let normalized = (input - &mean) / (&std + self.epsilon);
-        &self.gamma * &normalized + &self.beta
+        let numer = input - self.cached_mean.as_ref().unwrap();
+        let denom = self.cached_std.as_ref().unwrap().mapv(|x| x + self.epsilon);
+        let mut normalized = numer / &denom;
+        // Broadcast-aware in-place scale and bias
+        ndarray::Zip::from(&mut normalized)
+            .and_broadcast(&self.gamma)
+            .for_each(|n, &g| {
+                *n *= g;
+            });
+        ndarray::Zip::from(&mut normalized)
+            .and_broadcast(&self.beta)
+            .for_each(|n, &b| {
+                *n += b;
+            });
+        normalized
     }
 }
 

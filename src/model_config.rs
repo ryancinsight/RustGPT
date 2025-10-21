@@ -55,6 +55,7 @@ pub enum WindowAdaptationStrategy {
 
     /// Adapt based on attention entropy: larger windows when attention is diffuse
     /// More sophisticated, responds to attention patterns
+    /// - Used in LLaMA, PaLM, GPT-NeoX, Mistral
     AttentionEntropy,
 
     /// Adapt based on prediction perplexity: larger windows when uncertain
@@ -335,9 +336,15 @@ pub struct ModelConfig {
     /// Default: false (use LayerNorm for backward compatibility)
     pub use_rms_norm: bool,
 
+    /// Use DynamicTanhNorm instead of LayerNorm/RMSNorm (experimental alternative)
+    /// Default: false (disabled by default)
+    pub use_dynamic_tanh_norm: bool,
+
     /// Use SwiGLU instead of ReLU-based FeedForward (modern LLM practice)
     /// Default: false (use FeedForward for backward compatibility)
     pub use_swiglu: bool,
+    // Add dynamic swish flag to control learned Swish alpha
+    pub use_dynamic_swish: bool,
 
     /// Positional encoding type to use
     /// Default: CoPE (modern default for best performance)
@@ -396,6 +403,9 @@ pub struct ModelConfig {
     ///
     /// Default: SequenceLengthBased (simplest and most stable)
     pub window_adaptation_strategy: WindowAdaptationStrategy,
+
+    #[serde(default = "entropy_ema_alpha_default_model")]
+    pub entropy_ema_alpha: f32,
 
     /// Strategy for selecting which attention heads to activate
     ///
@@ -503,13 +513,6 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     /// Create a new Transformer configuration with modern defaults
-    ///
-    /// Modern defaults (as of 2024):
-    /// - RMSNorm (faster, more stable than LayerNorm)
-    /// - SwiGLU (better than ReLU/GELU)
-    /// - CoPE positional encoding (better than RoPE/Learned)
-    /// - MHA (can be changed to GQA via num_kv_heads)
-    /// - Full attention (can be changed via window_size)
     pub fn transformer(
         embedding_dim: usize,
         hidden_dim: usize,
@@ -527,25 +530,28 @@ impl ModelConfig {
             max_seq_len,
             num_heads,
             use_rms_norm: true, // Modern default: RMSNorm
+            use_dynamic_tanh_norm: false, // Disabled by default
             use_swiglu: true,   // Modern default: SwiGLU
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
-            num_kv_heads: None,         // Default to MHA (can be changed to GQA)
-            window_size: None, // Default to full attention (can be changed to sliding window)
-            use_adaptive_window: false, // Default to fixed window
-            min_window_size: 512, // Reasonable minimum
-            max_window_size: 4096, // Mistral 7B style
+            use_dynamic_swish: false, // Disabled by default
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
+            num_kv_heads: None,
+            window_size: None,
+            use_adaptive_window: false,
+            min_window_size: 512,
+            max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads (can be changed to MoH)
-            use_moe: false, // Default to standard feedforward (can be changed to MoE)
-            num_experts: 4, // 4 experts (balance between capacity and complexity)
-            num_active_experts: 2, // Top-2 routing (Mixtral-style)
-            expert_hidden_dim: hidden_dim / 4, // Maintain parameter count
-            moe_load_balance_weight: 0.01, // Standard load balance weight
-            moe_router_z_loss_weight: 0.001, // Standard router z-loss weight
-            use_moh_in_experts: false, // Default to standard MoE without MoH
-            expert_moh_num_shared_heads: 2, // 2 shared heads per expert
-            expert_moh_num_routed_heads: 4, // 4 routed heads per expert
-            expert_moh_use_learned_threshold: true, // Use learned predictor
+            entropy_ema_alpha: 0.2,
+            head_selection: HeadSelectionStrategy::AllHeads,
+            use_moe: false,
+            num_experts: 4,
+            num_active_experts: 2,
+            expert_hidden_dim: hidden_dim / 4,
+            moe_load_balance_weight: 0.01,
+            moe_router_z_loss_weight: 0.001,
+            use_moh_in_experts: false,
+            expert_moh_num_shared_heads: 2,
+            expert_moh_num_routed_heads: 4,
+            expert_moh_use_learned_threshold: true,
         }
     }
 
@@ -566,130 +572,76 @@ impl ModelConfig {
             hypernetwork_hidden_dim,
             max_seq_len,
             num_heads,
-            use_rms_norm: true, // Modern default: RMSNorm
-            use_swiglu: true,   // Modern default: SwiGLU
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
-            num_kv_heads: None,                                                // Default to MHA
-            window_size: None,          // Default to full attention
-            use_adaptive_window: false, // Default to fixed window
-            min_window_size: 512,       // Reasonable minimum
-            max_window_size: 4096,      // Mistral 7B style
+            use_rms_norm: true,
+            use_dynamic_tanh_norm: false,
+            use_swiglu: true,
+            use_dynamic_swish: false,
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
+            num_kv_heads: None,
+            window_size: None,
+            use_adaptive_window: false,
+            min_window_size: 512,
+            max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
-            use_moe: false, // Default to standard feedforward
+            entropy_ema_alpha: 0.2,
+            head_selection: HeadSelectionStrategy::AllHeads,
+            use_moe: false,
             num_experts: 4,
             num_active_experts: 2,
             expert_hidden_dim: hidden_dim / 4,
             moe_load_balance_weight: 0.01,
             moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false, // Default to standard MoE without MoH
-            expert_moh_num_shared_heads: 2, // 2 shared heads per expert
-            expert_moh_num_routed_heads: 4, // 4 routed heads per expert
-            expert_moh_use_learned_threshold: true, // Use learned predictor
+            use_moh_in_experts: false,
+            expert_moh_num_shared_heads: 2,
+            expert_moh_num_routed_heads: 4,
+            expert_moh_use_learned_threshold: true,
         }
     }
 
-    /// Get the hypernetwork hidden dimension, using default if not specified
-    pub fn get_hypernetwork_hidden_dim(&self) -> usize {
-        self.hypernetwork_hidden_dim
-            .unwrap_or(self.embedding_dim / 4)
-    }
-
-    /// Get the number of attention heads, using default if not specified
-    pub fn get_num_heads(&self) -> usize {
-        self.num_heads.unwrap_or(8) // Same as standard transformers
-    }
-
-    /// Get the number of key-value heads for GQA
-    /// If None, returns num_heads (standard MHA)
-    /// If Some(n), returns n (GQA with n KV heads)
-    pub fn get_num_kv_heads(&self) -> usize {
-        self.num_kv_heads.unwrap_or_else(|| self.get_num_heads())
-    }
-
-    /// Create a new HRM configuration
-    ///
-    /// # Arguments
-    ///
-    /// * `embedding_dim` - Dimension of embeddings (e.g., 128)
-    /// * `hidden_dim` - Hidden dimension for Transformer layers (e.g., 192)
-    /// * `num_high_cycles` - Number of high-level cycles N (e.g., 2)
-    /// * `low_steps_per_cycle` - Low-level steps per cycle T (e.g., 2)
-    /// * `max_seq_len` - Maximum sequence length (e.g., 80)
-    ///
-    /// # Returns
-    ///
-    /// A new `ModelConfig` for HRM architecture
-    ///
-    /// # Note
-    ///
-    /// - `num_layers` stores N (number of high-level cycles)
-    /// - `hypernetwork_hidden_dim` stores T (low-level steps per cycle)
+    /// Create a new HRM configuration with modern defaults
     pub fn hrm(
         embedding_dim: usize,
         hidden_dim: usize,
-        num_high_cycles: usize,
-        low_steps_per_cycle: usize,
+        num_layers: usize,
         max_seq_len: usize,
+        hypernetwork_hidden_dim: Option<usize>,
+        num_heads: Option<usize>,
     ) -> Self {
         Self {
             architecture: ArchitectureType::HRM,
             embedding_dim,
             hidden_dim,
-            num_layers: num_high_cycles,
-            hypernetwork_hidden_dim: Some(low_steps_per_cycle),
+            num_layers,
+            hypernetwork_hidden_dim,
             max_seq_len,
-            num_heads: None,
-            use_rms_norm: true, // Modern default: RMSNorm
-            use_swiglu: true,   // Modern default: SwiGLU
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
-            num_kv_heads: None,                                                // Default to MHA
-            window_size: None,          // Default to full attention
-            use_adaptive_window: false, // Default to fixed window
-            min_window_size: 512,       // Reasonable minimum
-            max_window_size: 4096,      // Mistral 7B style
+            num_heads,
+            use_rms_norm: true,
+            use_dynamic_tanh_norm: false,
+            use_swiglu: true,
+            use_dynamic_swish: false,
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
+            num_kv_heads: None,
+            window_size: None,
+            use_adaptive_window: false,
+            min_window_size: 512,
+            max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
-            use_moe: false, // Default to standard feedforward
+            entropy_ema_alpha: 0.2,
+            head_selection: HeadSelectionStrategy::AllHeads,
+            use_moe: false,
             num_experts: 4,
             num_active_experts: 2,
             expert_hidden_dim: hidden_dim / 4,
             moe_load_balance_weight: 0.01,
             moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false, // Default to standard MoE without MoH
-            expert_moh_num_shared_heads: 2, // 2 shared heads per expert
-            expert_moh_num_routed_heads: 4, // 4 routed heads per expert
-            expert_moh_use_learned_threshold: true, // Use learned predictor
+            use_moh_in_experts: false,
+            expert_moh_num_shared_heads: 2,
+            expert_moh_num_routed_heads: 4,
+            expert_moh_use_learned_threshold: true,
         }
     }
 
-    /// Get the number of high-level cycles (N) for HRM
-    pub fn get_num_high_cycles(&self) -> usize {
-        self.num_layers
-    }
-
-    /// Get the number of low-level steps per cycle (T) for HRM
-    pub fn get_low_steps_per_cycle(&self) -> usize {
-        self.hypernetwork_hidden_dim.unwrap_or(2)
-    }
-
     /// Create a new TRM (Tiny Recursive Model) configuration
-    ///
-    /// TRM applies a single transformer block recursively multiple times,
-    /// achieving parameter efficiency through weight sharing.
-    ///
-    /// # Arguments
-    ///
-    /// * `embedding_dim` - Embedding dimension
-    /// * `hidden_dim` - Hidden dimension for feedforward layer
-    /// * `recursive_depth` - Number of times to apply the block recursively
-    /// * `max_seq_len` - Maximum sequence length
-    /// * `num_heads` - Number of attention heads (optional, defaults to 8)
-    ///
-    /// # Note
-    ///
-    /// - `num_layers` stores the recursive depth
-    /// - Modern defaults: RMSNorm, SwiGLU, CoPE
     pub fn trm(
         embedding_dim: usize,
         hidden_dim: usize,
@@ -701,41 +653,79 @@ impl ModelConfig {
             architecture: ArchitectureType::TRM,
             embedding_dim,
             hidden_dim,
-            num_layers: recursive_depth, // Store recursive depth in num_layers
+            num_layers: recursive_depth,
             hypernetwork_hidden_dim: None,
             max_seq_len,
             num_heads,
-            use_rms_norm: true, // Modern default: RMSNorm
-            use_swiglu: true,   // Modern default: SwiGLU
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 }, // Modern default: CoPE
-            num_kv_heads: None,         // Default to MHA (can be changed to GQA)
-            window_size: None, // Default to full attention
-            use_adaptive_window: false, // Default to fixed window
-            min_window_size: 512,       // Reasonable minimum
-            max_window_size: 4096,      // Reasonable maximum
+            use_rms_norm: true,
+            use_dynamic_tanh_norm: false,
+            use_swiglu: true,
+            use_dynamic_swish: false,
+            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
+            num_kv_heads: None,
+            window_size: None,
+            use_adaptive_window: false,
+            min_window_size: 512,
+            max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            head_selection: HeadSelectionStrategy::AllHeads, // Default to all heads
-            use_moe: false,             // Default to standard feedforward
-            num_experts: 4,             // Default number of experts
-            num_active_experts: 2,      // Default top-k
-            expert_hidden_dim: hidden_dim / 2, // Default expert hidden dim
+            entropy_ema_alpha: 0.2,
+            head_selection: HeadSelectionStrategy::AllHeads,
+            use_moe: false,
+            num_experts: 4,
+            num_active_experts: 2,
+            expert_hidden_dim: hidden_dim / 4,
             moe_load_balance_weight: 0.01,
             moe_router_z_loss_weight: 0.001,
-            use_moh_in_experts: false, // Default to standard architecture
+            use_moh_in_experts: false,
             expert_moh_num_shared_heads: 2,
             expert_moh_num_routed_heads: 4,
             expert_moh_use_learned_threshold: true,
         }
-    }
-
-    /// Get the recursive depth for TRM
-    pub fn get_recursive_depth(&self) -> usize {
-        self.num_layers
     }
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self::transformer(128, 256, 3, 80, None, Some(8))
+    }
+}
+
+// Provide serde default value for entropy_ema_alpha
+fn entropy_ema_alpha_default_model() -> f32 { 0.2 }
+
+impl ModelConfig {
+    pub fn get_num_heads(&self) -> usize {
+        self.num_heads.unwrap_or(8)
+    }
+
+    pub fn get_num_kv_heads(&self) -> usize {
+        self.num_kv_heads.unwrap_or(self.get_num_heads())
+    }
+
+    pub fn get_hypernetwork_hidden_dim(&self) -> usize {
+        // For HyperMixer this is the hypernetwork hidden dimension.
+        // For HRM we overload this field to represent low-level steps per cycle.
+        // Provide a reasonable default if not specified.
+        match self.architecture {
+            ArchitectureType::HyperMixer => self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4),
+            ArchitectureType::HRM => self.hypernetwork_hidden_dim.unwrap_or(2),
+            _ => self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4),
+        }
+    }
+
+    pub fn get_num_high_cycles(&self) -> usize {
+        // In HRM, num_layers stores the number of high-level cycles (N)
+        self.num_layers
+    }
+
+    pub fn get_low_steps_per_cycle(&self) -> usize {
+        // In HRM, we reuse hypernetwork_hidden_dim to store low-level steps per cycle (T)
+        // Default to 2 when not provided
+        self.hypernetwork_hidden_dim.unwrap_or(2)
+    }
+
+    pub fn get_recursive_depth(&self) -> usize {
+        // In TRM, num_layers stores the recursive depth
+        self.num_layers
     }
 }

@@ -53,14 +53,15 @@ impl Layer for FeedForward {
         let hidden_pre_activation = input.dot(&self.w1);
         let hidden_post_activation = hidden_pre_activation.mapv(|x| x.max(0.0)); // ReLU
 
-        let output = hidden_post_activation.dot(&self.w2);
+        let mut output = hidden_post_activation.dot(&self.w2);
 
         // Cache values
         self.input = Some(input.clone());
         self.hidden_pre_activation = Some(hidden_pre_activation);
         self.hidden_post_activation = Some(hidden_post_activation);
 
-        output + input // residual connection (no LayerNorm here)
+        output += input; // residual connection (in-place)
+        output
     }
 
     fn compute_gradients(

@@ -161,13 +161,16 @@ impl RMSNorm {
         // Normalize: x / rms
         let normalized = input / &rms;
 
+        // Prepare output first to avoid cloning normalized for cache
+        let output = &self.gamma * &normalized;
+
         // Cache values for backward pass
         self.cached_input = Some(input.clone());
         self.cached_rms = Some(rms);
-        self.cached_normalized = Some(normalized.clone());
+        self.cached_normalized = Some(normalized);
 
         // Scale by gamma: y = normalized * γ
-        &self.gamma * &normalized
+        output
     }
 }
 

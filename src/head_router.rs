@@ -490,6 +490,8 @@ pub struct HeadRouterStandard {
     cached_complexity_stats: Option<(f32, f32, f32)>,
 }
 
+pub type HeadRouter = HeadRouterStandard;
+
 impl HeadRouterStandard {
     /// Create a new head router with fully adaptive routing
     ///
@@ -859,12 +861,10 @@ impl HeadRouterStandard {
             &self.cached_routing_scores_routed,
             &self.cached_activation_mask,
         ) {
-            // Extract routed head portion of mask
-            let routed_mask = mask
-                .slice(ndarray::s![.., self.num_shared_heads..])
-                .to_owned();
+            // Extract routed head portion of mask as a view (avoid clone)
+            let routed_mask_view = mask.slice(ndarray::s![.., self.num_shared_heads..]);
 
-            routing::compute_load_balance_loss(routed_scores, &routed_mask)
+            routing::compute_load_balance_loss(routed_scores, &routed_mask_view)
         } else {
             0.0
         }
@@ -948,15 +948,18 @@ impl HeadRouterStandard {
     pub fn dynamic_loss_weight(&self, training_progress: f32) -> f32 {
         let current_avg = self.avg_active_routed_heads();
 
+        // If no routing has been performed yet, return base weight
+        if current_avg == 0.0 {
+            return self.dynamic_loss_weight_base;
+        }
+
         // 1. Sparsity-based adaptation
         let sparsity_multiplier = if current_avg > self.target_avg_routed_heads {
             // Using too many heads → increase penalty
             (current_avg / self.target_avg_routed_heads).min(2.0)
-        } else if current_avg > 0.0 {
+        } else {
             // Using fewer heads → decrease penalty
             (current_avg / self.target_avg_routed_heads).powi(2).max(0.5)
-        } else {
-            1.0
         };
 
         // 2. Training progress annealing (start HIGH, decrease over time) - ADAPTIVE
@@ -1750,17 +1753,17 @@ mod tests {
         let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
-        let mask = router.route(&input);
+        let mask = router.route_discrete(&input);
 
         assert_eq!(mask.shape(), &[10, 8]);
     }
 
     #[test]
     fn test_head_router_shared_heads_always_active() {
-        let mut router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
-        let mask = router.route(&input);
+        let mask = router.route_discrete(&input);
 
         // Check that first 2 heads (shared) are always active
         for token_idx in 0..10 {
@@ -1771,10 +1774,10 @@ mod tests {
 
     #[test]
     fn test_head_router_adaptive_routing() {
-        let mut router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
-        let mask = router.route(&input);
+        let mask = router.route_discrete(&input);
 
         // With adaptive routing, each token should have 2 shared + variable routed heads
         for token_idx in 0..10 {
@@ -1792,10 +1795,10 @@ mod tests {
 
     #[test]
     fn test_head_router_load_balance_loss() {
-        let mut router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
-        router.route(&input);
+        router.route_discrete(&input);
         let loss = router.compute_load_balance_loss();
 
         // Loss should be finite and non-negative
@@ -1805,10 +1808,10 @@ mod tests {
 
     #[test]
     fn test_head_router_dynamic_loss() {
-        let mut router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
-        router.route(&input);
+        router.route_discrete(&input);
         let loss = router.compute_dynamic_loss();
 
         // Loss should be finite and non-negative (entropy is always >= 0)
@@ -1819,8 +1822,8 @@ mod tests {
     #[test]
     fn test_head_router_layer_wise_thresholds() {
         // Test that different layers get different base thresholds
-        let router_early = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0);  // Layer 0
-        let router_late = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 10, false, 3.0); // Layer 10
+        let router_early = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);  // Layer 0
+        let router_late = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 10, false, 3.0, 0.4, false); // Layer 10
 
         // Early layers should have higher threshold (more heads)
         // Late layers should have lower threshold (fewer heads)
@@ -1831,10 +1834,10 @@ mod tests {
 
     #[test]
     fn test_head_router_learned_threshold() {
-        let mut router = HeadRouter::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, true, 3.0);
+        let mut router = HeadRouterStandard::new(128, 2, 6, 4, 0.01, 0.5, 1e-4, 0, true, 3.0, 0.4, false);
         let input = Array2::ones((10, 128));
 
-        router.route(&input);
+        router.route_discrete(&input);
 
         // With learned threshold, should have per-token thresholds
         let (min, max, mean, _std) = router.threshold_stats();
@@ -1847,6 +1850,6 @@ mod tests {
     #[should_panic(expected = "must be <=")]
     fn test_head_router_invalid_k() {
         // Should panic: num_active_routed_heads > num_routed_heads
-        HeadRouter::new(128, 2, 6, 10, 0.01, 0.5, 1e-4, 0, false, 3.0);
+        HeadRouterStandard::new(128, 2, 6, 10, 0.01, 0.5, 1e-4, 0, false, 3.0, 0.4, false);
     }
 }

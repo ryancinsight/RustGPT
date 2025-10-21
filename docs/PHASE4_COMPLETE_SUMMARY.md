@@ -38,9 +38,9 @@ Four adaptation strategies implemented:
 - **Overhead**: ~0% (simple arithmetic)
 
 #### AttentionEntropy
-- **Formula**: Window size based on attention distribution entropy
+- **Formula**: EMA-smoothed attention entropy normalized by `ln(W)`
 - **Use case**: Dynamic context windows, attention-aware adaptation
-- **Overhead**: ~1-2% (entropy computation)
+- **Overhead**: ~1-2% (entropy + smoothing)
 
 #### PerplexityBased (Placeholder)
 - **Formula**: Window size based on prediction perplexity
@@ -190,6 +190,9 @@ let output = llm.generate_with_beam_search("User: Hello", &config);
 10. ✅ `test_adaptive_window_perplexity_based_strategy` - PerplexityBased strategy
 11. ✅ `test_adaptive_window_fixed_strategy` - Fixed strategy
 12. ✅ `test_adaptive_window_vs_fixed_window` - Comparison with Phase 3
+13. ✅ `test_attention_entropy_high_expands_window` - High entropy → max window
+14. ✅ `test_attention_entropy_low_shrinks_window` - Low entropy → min window
+15. ✅ `test_attention_entropy_mid_maps_to_mid_window` - Mid entropy → mid window
 
 **Beam Search Tests** in `tests/beam_search_test.rs`:
 

@@ -13,7 +13,7 @@ fn test_adaptive_window_sequence_length_based() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -37,7 +37,7 @@ fn test_adaptive_window_min_max_bounds() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -66,7 +66,7 @@ fn test_adaptive_window_with_gqa() {
         EMBEDDING_DIM,
         8,
         4, // GQA: 4 KV heads
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -89,7 +89,7 @@ fn test_adaptive_window_with_rope() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::RoPE,
+        true,
         512,
         None,
     )
@@ -112,7 +112,7 @@ fn test_adaptive_window_with_gqa_and_rope() {
         EMBEDDING_DIM,
         8,
         4, // GQA
-        &PositionalEncodingType::RoPE,
+        true,
         512,
         None,
     )
@@ -134,7 +134,7 @@ fn test_adaptive_window_backward_pass() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -160,7 +160,7 @@ fn test_adaptive_window_training_stability() {
         EMBEDDING_DIM,
         8,
         4,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -189,7 +189,7 @@ fn test_adaptive_window_different_sequence_lengths() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -215,7 +215,7 @@ fn test_adaptive_window_attention_entropy_strategy() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -232,13 +232,83 @@ fn test_adaptive_window_attention_entropy_strategy() {
 }
 
 #[test]
+fn test_attention_entropy_high_expands_window() {
+    let seq_len = TEST_SEQ_LEN;
+    let mut attention = SelfAttention::new_with_adaptive_window(
+        EMBEDDING_DIM,
+        8,
+        8,
+        false,
+        512,
+        None,
+    )
+    .min_window_size(10)
+    .max_window_size(50)
+    .strategy(WindowAdaptationStrategy::AttentionEntropy)
+    .build();
+
+    // Inject very high entropy; normalization should clamp to 1.0 and use max window
+    attention.set_last_attention_entropy_for_test(10.0);
+    let ws = attention.recompute_window_for_test(seq_len);
+    assert_eq!(ws, 50);
+    assert_eq!(attention.get_current_window_size(), Some(50));
+}
+
+#[test]
+fn test_attention_entropy_low_shrinks_window() {
+    let seq_len = TEST_SEQ_LEN;
+    let mut attention = SelfAttention::new_with_adaptive_window(
+        EMBEDDING_DIM,
+        8,
+        8,
+        false,
+        512,
+        None,
+    )
+    .min_window_size(10)
+    .max_window_size(50)
+    .strategy(WindowAdaptationStrategy::AttentionEntropy)
+    .build();
+
+    // Inject very low entropy; normalization should be near 0.0 and use min window
+    attention.set_last_attention_entropy_for_test(0.001);
+    let ws = attention.recompute_window_for_test(seq_len);
+    assert_eq!(ws, 10);
+    assert_eq!(attention.get_current_window_size(), Some(10));
+}
+
+#[test]
+fn test_attention_entropy_mid_maps_to_mid_window() {
+    let seq_len = 32; // ln(32) ~ 3.465
+    let mut attention = SelfAttention::new_with_adaptive_window(
+        EMBEDDING_DIM,
+        8,
+        8,
+        false,
+        512,
+        None,
+    )
+    .min_window_size(10)
+    .max_window_size(50)
+    .strategy(WindowAdaptationStrategy::AttentionEntropy)
+    .build();
+
+    // Half of theoretical max entropy → mid window
+    let half_max_entropy = (seq_len as f32).ln() * 0.5;
+    attention.set_last_attention_entropy_for_test(half_max_entropy);
+    let ws = attention.recompute_window_for_test(seq_len);
+    let expected = 10 + ((50 - 10) as f32 * 0.5) as usize; // 30
+    assert_eq!(ws, expected);
+}
+
+#[test]
 fn test_adaptive_window_perplexity_based_strategy() {
     // Test PerplexityBased strategy (will fallback to SequenceLengthBased for now)
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )
@@ -261,7 +331,7 @@ fn test_adaptive_window_fixed_strategy() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         Some(30), // Fixed window size
     )
@@ -284,7 +354,7 @@ fn test_adaptive_window_vs_fixed_window() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::Learned,
+        false,
         512,
         None,
     )

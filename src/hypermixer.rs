@@ -204,8 +204,8 @@ impl Layer for HyperMixerBlock {
         lr: f32,
     ) -> crate::errors::Result<()> {
         // Calculate expected number of gradient arrays (not scalar parameters)
-        // norm1: 1, token_mixing: 0 (hypernetworks handle their own), norm2: 1, channel_mixing: 3 or 4, scales: 2
-        let channel_grad_arrays = if self.channel_mixing.use_swiglu { 3 } else { 4 };
+        // norm1: 1, token_mixing: 0 (hypernetworks handle their own), norm2: 1, channel_mixing: variable, scales: 2
+        let channel_grad_arrays = self.channel_mixing.num_param_grads();
         let expected_grad_arrays = 1 + 0 + 1 + channel_grad_arrays + 2;
 
         if param_grads.len() != expected_grad_arrays {
@@ -236,7 +236,7 @@ impl Layer for HyperMixerBlock {
         self.norm2.apply_gradients(norm2_params, lr)?;
         idx += 1;
 
-        // Apply channel mixing gradients (3 arrays for SwiGLU, 4 for standard)
+        // Apply channel mixing gradients (count depends on activation)
         let channel_params = &param_grads[idx..idx + channel_grad_arrays];
         self.channel_mixing.apply_gradients(channel_params, lr)?;
         idx += channel_grad_arrays;

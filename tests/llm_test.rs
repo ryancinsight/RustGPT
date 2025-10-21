@@ -106,7 +106,7 @@ fn test_llm_integration() {
         vocab,
         vec![
             embeddings,
-            LayerEnum::SelfAttention(Box::new(transformer_block.attention)),
+            LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
             norm1_enum,
             ffn_enum,
             norm2_enum,

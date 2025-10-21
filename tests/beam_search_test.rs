@@ -55,7 +55,7 @@ fn test_beam_hypothesis_normalized_score() {
     let hypothesis = BeamHypothesis::new(tokens, score);
 
     // Normalized score = score / length = -4.0 / 4 = -1.0
-    assert_eq!(hypothesis.normalized_score(), -1.0);
+    assert_eq!(hypothesis.normalized_score(1.0), -1.0);
 }
 
 #[test]

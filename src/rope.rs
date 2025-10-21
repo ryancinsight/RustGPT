@@ -165,6 +165,30 @@ impl RotaryEmbedding {
         output
     }
 
+    /// Apply rotary positional embedding in-place to input tensor
+    ///
+    /// This avoids allocating a new array and rotates pairs of dimensions directly.
+    pub fn apply_inplace(&self, x: &mut Array2<f32>) {
+        let (seq_len, dim) = (x.shape()[0], x.shape()[1]);
+        assert_eq!(dim, self.dim, "Input dimension must match RoPE dimension");
+        assert!(
+            seq_len <= self.max_seq_len,
+            "Sequence length exceeds maximum"
+        );
+
+        for pos in 0..seq_len {
+            for i in 0..(dim / 2) {
+                let x1 = x[[pos, 2 * i]];
+                let x2 = x[[pos, 2 * i + 1]];
+                let cos = self.cos_cached[[pos, i]];
+                let sin = self.sin_cached[[pos, i]];
+
+                x[[pos, 2 * i]] = x1 * cos - x2 * sin;
+                x[[pos, 2 * i + 1]] = x1 * sin + x2 * cos;
+            }
+        }
+    }
+
     /// Get the embedding dimension
     pub fn dim(&self) -> usize {
         self.dim

@@ -2,7 +2,7 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attention_moe::AttentionMoELayer, feed_forward::FeedForward, layer_norm::LayerNorm,
+    feed_forward::FeedForward, layer_norm::LayerNorm,
     llm::Layer, rms_norm::RMSNorm, self_attention::SelfAttention, swiglu::SwiGLU,
 };
 
@@ -77,7 +77,6 @@ impl NormLayer {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum AttentionLayer {
     SelfAttention(Box<SelfAttention>),
-    AttentionMoE(Box<AttentionMoELayer>),
 }
 
 impl AttentionLayer {
@@ -86,36 +85,25 @@ impl AttentionLayer {
         AttentionLayer::SelfAttention(Box::new(SelfAttention::new(embedding_dim)))
     }
 
-    /// Create a new AttentionMoE layer
+    /// Backward-compat: build SelfAttention when AttentionMoE was requested
     pub fn attention_moe(
         embedding_dim: usize,
-        num_experts: usize,
-        num_active_experts: usize,
-        num_shared_heads: usize,
-        num_routed_heads: usize,
-        num_kv_heads: usize,
-        use_learned_threshold: bool,
-        load_balance_weight: f32,
-        router_z_loss_weight: f32,
+        _num_experts: usize,
+        _num_active_experts: usize,
+        _num_shared_heads: usize,
+        _num_routed_heads: usize,
+        _num_kv_heads: usize,
+        _use_learned_threshold: bool,
+        _load_balance_weight: f32,
+        _router_z_loss_weight: f32,
     ) -> Self {
-        AttentionLayer::AttentionMoE(Box::new(AttentionMoELayer::new(
-            embedding_dim,
-            num_experts,
-            num_active_experts,
-            num_shared_heads,
-            num_routed_heads,
-            num_kv_heads,
-            use_learned_threshold,
-            load_balance_weight,
-            router_z_loss_weight,
-        )))
+        AttentionLayer::SelfAttention(Box::new(SelfAttention::new(embedding_dim)))
     }
 
     /// Set epoch information for warm-up and annealing
     pub fn set_epoch_info(&mut self, current_epoch: usize, max_epochs: usize) {
         match self {
             AttentionLayer::SelfAttention(attn) => attn.set_epoch_info(current_epoch, max_epochs),
-            AttentionLayer::AttentionMoE(moe) => moe.set_epoch_info(current_epoch, max_epochs),
         }
     }
 
@@ -126,16 +114,12 @@ impl AttentionLayer {
                 let stats = attn.get_moh_stats();
                 vec![(0, stats.0, stats.1, stats.2, stats.3, stats.4, stats.5, stats.6)]
             }
-            AttentionLayer::AttentionMoE(moe) => moe.get_expert_moh_stats(),
         }
     }
 
-    /// Get auxiliary loss (for MoE routing)
+    /// Get auxiliary loss (no-op without AttentionMoE)
     pub fn get_aux_loss(&self) -> f32 {
-        match self {
-            AttentionLayer::SelfAttention(_) => 0.0,
-            AttentionLayer::AttentionMoE(moe) => moe.get_auxiliary_loss(),
-        }
+        0.0
     }
 
     /// Compute gradients (for compatibility with Layer trait)
@@ -165,17 +149,12 @@ impl Layer for AttentionLayer {
     fn layer_type(&self) -> &str {
         match self {
             AttentionLayer::SelfAttention(_) => "SelfAttention",
-            AttentionLayer::AttentionMoE(_) => "AttentionMoE",
         }
     }
 
     fn parameters(&self) -> usize {
         match self {
             AttentionLayer::SelfAttention(attn) => attn.parameters(),
-            AttentionLayer::AttentionMoE(_moe) => {
-                // TODO: Implement parameter counting for AttentionMoE
-                0
-            }
         }
     }
 
@@ -186,10 +165,6 @@ impl Layer for AttentionLayer {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match self {
             AttentionLayer::SelfAttention(attn) => attn.compute_gradients(input, output_grads),
-            AttentionLayer::AttentionMoE(_) => {
-                // AttentionMoE uses backward() directly
-                panic!("AttentionMoE does not support compute_gradients - use backward() instead");
-            }
         }
     }
 
@@ -200,24 +175,18 @@ impl Layer for AttentionLayer {
     ) -> crate::errors::Result<()> {
         match self {
             AttentionLayer::SelfAttention(attn) => attn.apply_gradients(param_grads, lr),
-            AttentionLayer::AttentionMoE(_) => {
-                // AttentionMoE uses backward() directly
-                panic!("AttentionMoE does not support apply_gradients - use backward() instead");
-            }
         }
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         match self {
             AttentionLayer::SelfAttention(attn) => attn.forward(input),
-            AttentionLayer::AttentionMoE(moe) => moe.forward(input),
         }
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         match self {
             AttentionLayer::SelfAttention(attn) => attn.backward(grads, lr),
-            AttentionLayer::AttentionMoE(moe) => moe.backward(grads, lr),
         }
     }
 }
@@ -284,7 +253,9 @@ impl FFNLayer {
     pub fn num_param_grads(&self) -> usize {
         match self {
             FFNLayer::FeedForward(_) => 2, // w1, w2 (no biases - modern LLM practice)
-            FFNLayer::SwiGLU(_) => 3,      // w1, w2, w3 (no biases)
+            FFNLayer::SwiGLU(swiglu) => {
+                if swiglu.use_dynamic_swish { 4 } else { 3 }
+            }
         }
     }
 }
