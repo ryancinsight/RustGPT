@@ -2,9 +2,9 @@ use std::io::Write;
 
 use clap::Parser;
 use llm::{
-    ArchitectureType, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
+    ArchitectureType, AttentionType, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
     HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, PositionalEncodingType, Vocab,
-    WindowAdaptationStrategy, build_network, gradient_clipping::L2GradientClipping,
+    WindowAdaptationStrategy, build_network,
     print_architecture_summary,
 };
 
@@ -49,25 +49,9 @@ fn main() -> llm::Result<()> {
 
     //let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
     
-    let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing) - TESTING FULLY ADAPTIVE MOH
+    let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing)
 
-    // ============================================================================
-    // NORMALIZATION CONFIGURATION
-    // ============================================================================
-    // Toggle between LayerNorm and RMSNorm for comparison
-    //
-    // LayerNorm: Standard normalization (mean centering + std normalization)
-    //   - Parameters: gamma (scale) + beta (bias)
-    //   - Used in original Transformer
-    //
-    // RMSNorm: Modern normalization (RMS normalization only)
-    //   - Parameters: gamma (scale) only (50% reduction)
-    //   - ~10-15% faster than LayerNorm
-    //   - Better training stability
-    //   - Used in LLaMA, PaLM, Mistral, GPT-NeoX
-    // ============================================================================
 
-    let use_rms_norm = false; // Set to true to use RMSNorm, false for LayerNorm
     let use_dynamic_tanh_norm = true;
 
     // ============================================================================
@@ -295,9 +279,7 @@ fn main() -> llm::Result<()> {
         // }
     };
 
-    // Alternative configurations:
-    // let head_selection = HeadSelectionStrategy::AllHeads; // Standard MHA (baseline)
-    // let head_selection = HeadSelectionStrategy::StaticPruning { num_active_heads: 6 }; // Fixed pruning
+    // Alternative configurations: (Mixture-of-Heads variants only)
 
     // ============================================================================
     // BEAM SEARCH CONFIGURATION (Phase 4 - Secondary Objective)
@@ -345,10 +327,8 @@ fn main() -> llm::Result<()> {
     };
 
     // Apply modern LLM enhancements configuration
-    config.use_rms_norm = use_rms_norm;
     config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
 
-    config.use_dynamic_swish = true;
     config.positional_encoding = positional_encoding;
     config.num_kv_heads = num_kv_heads;
     config.window_size = window_size;
@@ -357,6 +337,9 @@ fn main() -> llm::Result<()> {
     config.max_window_size = max_window_size;
     config.window_adaptation_strategy = window_adaptation_strategy;
     config.head_selection = head_selection;
+
+    // Set attention mechanism: use PolyAttention as an alternative to SelfAttention
+    config.attention = AttentionType::PolyAttention { degree_p: 3 };
 
     // ============================================================================
     // MIXTURE OF EXPERTS (MoE) CONFIGURATION
@@ -408,8 +391,7 @@ fn main() -> llm::Result<()> {
 
     let mut vocab_words: Vec<String> = vocab_set.into_iter().collect();
     vocab_words.sort(); // Sort for deterministic ordering
-    let vocab_words_refs: Vec<&str> = vocab_words.iter().map(|s: &String| s.as_str()).collect();
-    let vocab = Vocab::new(vocab_words_refs);
+    let vocab = Vocab::new(vocab_words);
 
     // Build network based on configuration
     let network = build_network(&config, &vocab);
@@ -420,8 +402,6 @@ fn main() -> llm::Result<()> {
     // Create LLM with the configured network
     let mut llm = LLM::new(vocab, network);
 
-    // Configure gradient clipping to prevent gradient explosion
-    llm.set_gradient_clipping(Box::new(L2GradientClipping::new(100.0)));
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
@@ -451,12 +431,12 @@ fn main() -> llm::Result<()> {
         .map(|s| s.as_str())
         .collect();
 
-    llm.train_with_batch_size(pretraining_examples, 100, 0.001, 128)?;
+    llm.train_with_batch_size(pretraining_examples, 100, 0.001, 256)?;
 
     println!("\n=== INSTRUCTION TUNING ===");
     // Use same LR as pre-training
     // 100 epochs for adaptive depth validation
-    let instruction_lr = 0.0005;
+    let instruction_lr = 0.001;
     let instruction_epochs = 100;
     println!(
         "Instruction tuning on {} examples for {} epochs with learning rate {}",
@@ -465,7 +445,7 @@ fn main() -> llm::Result<()> {
         instruction_lr
     );
 
-    llm.train_with_batch_size(chat_training_examples, instruction_epochs, instruction_lr, 8)?;
+    llm.train_with_batch_size(chat_training_examples, instruction_epochs, instruction_lr, 64)?;
 
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", string);

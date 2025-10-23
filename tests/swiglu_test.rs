@@ -7,8 +7,8 @@ fn test_swiglu_basic_properties() {
     let swiglu = SwiGLU::new(128, 512);
 
     // Test parameter count (no bias terms)
-    // Parameters: W₁ (128×512) + W₂ (128×512) + W₃ (512×128) = 196,608
-    assert_eq!(swiglu.parameters(), 128 * 512 * 3);
+    // Parameters: W₁ (128×512) + W₂ (128×512) + W₃ (512×128) + α_swish (512) + α_gate (512) + β_gate (512) = 198,144
+    assert_eq!(swiglu.parameters(), 128 * 512 * 3 + 512 * 3);
 
     // Test layer type
     assert_eq!(swiglu.layer_type(), "SwiGLU");
@@ -65,10 +65,13 @@ fn test_swiglu_gradient_flow() {
 
     // Check gradient shapes
     assert_eq!(input_grads.shape(), &[5, 32]);
-    assert_eq!(param_grads.len(), 3); // W₁, W₂, W₃
+    assert_eq!(param_grads.len(), 6); // W₁, W₂, W₃, α_swish, α_gate, β_gate
     assert_eq!(param_grads[0].shape(), &[32, 128]); // grad_w1
     assert_eq!(param_grads[1].shape(), &[32, 128]); // grad_w2
     assert_eq!(param_grads[2].shape(), &[128, 32]); // grad_w3
+    assert_eq!(param_grads[3].shape(), &[1, 128]); // grad_alpha_swish
+    assert_eq!(param_grads[4].shape(), &[1, 128]); // grad_alpha_gate
+    assert_eq!(param_grads[5].shape(), &[1, 128]); // grad_beta_gate
 
     // Gradients should not be all zeros
     assert!(
@@ -181,8 +184,8 @@ fn test_swiglu_parameter_efficiency() {
     let hidden_dim = 512;
     let swiglu = SwiGLU::new(embedding_dim, hidden_dim);
 
-    // SwiGLU: W₁ + W₂ + W₃ = 3 * embedding_dim * hidden_dim
-    let expected_params = 3 * embedding_dim * hidden_dim;
+    // SwiGLU: W₁ + W₂ + W₃ + α_swish + α_gate + β_gate = 3 * embedding_dim * hidden_dim + 3 * hidden_dim
+    let expected_params = 3 * embedding_dim * hidden_dim + hidden_dim * 3;
     assert_eq!(swiglu.parameters(), expected_params);
 
     // Compare with FeedForward (ReLU-based) which has biases
@@ -289,7 +292,7 @@ fn test_swiglu_backward_updates_parameters() {
     // After multiple updates, parameters should have changed
     // We can't directly test this without exposing internal state,
     // but we can verify that backward pass completes without errors
-    assert_eq!(swiglu.parameters(), 8 * 32 * 3);
+    assert_eq!(swiglu.parameters(), 8 * 32 * 3 + 32 * 3);
 }
 
 #[test]

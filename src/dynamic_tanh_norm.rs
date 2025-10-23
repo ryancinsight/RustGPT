@@ -1,4 +1,4 @@
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::adam::Adam;
@@ -15,7 +15,7 @@ use crate::llm::Layer;
 /// - `gamma`: per-feature scale (shape: [1, d])
 /// - `beta`: per-feature bias (shape: [1, d])
 ///
-/// This provides a lightweight alternative to LayerNorm/RMSNorm without computing
+/// This provides a lightweight normalization alternative without computing
 /// batch statistics, while retaining adaptive scaling via `alpha`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DynamicTanhNorm {

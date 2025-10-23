@@ -613,7 +613,7 @@ Total: ~27M (matches!)
 **Mitigation**: Calculate exact counts before implementation, validate in tests
 
 ### Risk 3: Training Divergence
-**Mitigation**: Use same initialization as Transformer, add gradient clipping
+**Mitigation**: Use same initialization as Transformer; monitor gradient norms and adjust LR/batch size
 
 ### Risk 4: Integration Bugs
 **Mitigation**: Comprehensive tests, incremental integration, existing tests as regression suite

@@ -156,8 +156,8 @@ Consider using different learning rates for:
 - Main model: 0.0001
 - Router predictors: 0.001 (10x higher)
 
-### **Phase 4: Gradient Clipping**
-The high gradient norms (60+) suggest we may need gradient clipping despite the design goal of avoiding it.
+### **Phase 4: Stability Controls**
+If gradient norms spike (e.g., >60), reduce learning rate, adjust batch size, and monitor norm statistics; avoid introducing new clipping mechanisms.
 
 ---
 

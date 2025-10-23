@@ -2,16 +2,13 @@ use crate::{
     embeddings::Embeddings,
     // feed_forward::FeedForward, // Removed: using SwiGLU exclusively
 
-    layer_norm::LayerNorm,
     llm::{Layer, LayerEnum},
-    model_config::{AdaptiveDepthConfig, ArchitectureType, ModelConfig},
+    model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
-    rms_norm::RMSNorm,
-    self_attention::SelfAttention,
     swiglu::SwiGLU,
-    trm::TinyRecursiveModel,
     vocab::Vocab,
     dynamic_tanh_norm::DynamicTanhNorm,
+    poly_attention::PolyAttention,
 };
 
 /// Build a network based on the provided configuration
@@ -39,14 +36,15 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         }
 
         ArchitectureType::TRM => {
-            build_trm_layers(&mut layers, config);
+            // TRM path removed; reuse transformer path with PolyAttention-only
+            build_transformer_layers(&mut layers, config);
         }
     }
 
     // Add output projection layer (common to all architectures)
     layers.push(LayerEnum::OutputProjection(OutputProjection::new(
         config.embedding_dim,
-        vocab.words.len(),
+        vocab.size(),
     )));
 
     layers
@@ -56,99 +54,47 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 ///
 /// Creates the Pre-LN transformer architecture with:
 /// - Self-attention layers (with optional RoPE/CoPE)
-/// - Layer normalization or RMSNorm (based on config)
+/// - DynamicTanhNorm normalization
 /// - SwiGLU feedforward (exclusively)
 /// - Residual connections (handled within layers)
 /// - Final normalization layer (required for Pre-LN stability)
-///
-/// Reference: "On Layer Normalization in the Transformer Architecture" (Xiong et al., 2020)
 fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let num_heads = config.get_num_heads();
-    let num_kv_heads = config.get_num_kv_heads();
 
-    for layer_idx in 0..config.num_layers {
-            // Standard self-attention layer (with positional encoding, GQA, Sliding Window, and Adaptive Window)
-            let mut attention = SelfAttention::new_with_positional_encoding(
-                config.embedding_dim,
-                num_heads,
-                num_kv_heads,
-                &config.positional_encoding,
-                config.max_seq_len,
-                if config.use_adaptive_window {
-                    None
-                } else {
-                    config.window_size
-                },
-            );
+    for _layer_idx in 0..config.num_layers {
+        // Always build PolyAttention layers
+        let poly = PolyAttention::new(
+            config.embedding_dim,
+            num_heads,
+            config.get_poly_degree_p(),
+        );
+        layers.push(LayerEnum::PolyAttention(Box::new(poly)));
 
-            // Enable adaptive window if configured
-            if config.use_adaptive_window {
-                attention.enable_adaptive_window(
-                    config.min_window_size,
-                    config.max_window_size,
-                    config.window_adaptation_strategy,
-                );
-            }
-
-            // Configure entropy EMA alpha for adaptive windowing
-            attention.set_entropy_ema_alpha(config.entropy_ema_alpha);
-
-            // Set head selection strategy (MoH, AllHeads, or StaticPruning)
-            // Pass layer_idx for layer-wise adaptive thresholds
-            attention.set_head_selection(config.head_selection.clone(), layer_idx);
-
-            // Gradient clipping is handled globally in the training loop via AdaptiveGradientClipper
-            // Per-layer gradient clipping is disabled to avoid double-clipping and maintain
-            // consistent gradient flow across all layers
-
-            layers.push(LayerEnum::SelfAttention(Box::new(attention)));
-
-        // Normalization after attention (LayerNorm or RMSNorm based on config)
-        if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
-        } else if config.use_rms_norm {
-            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-        } else {
-            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
-        }
+        // Normalization after attention (always DynamicTanhNorm)
+        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
 
         // Feedforward layer (SwiGLU only)
         {
-            // Use SwiGLU (optionally with dynamic swish)
-            let mut swiglu = SwiGLU::new(
+            let swiglu = SwiGLU::new(
                 config.embedding_dim,
                 config.hidden_dim,
             );
-            if config.use_dynamic_swish {
-                swiglu.enable_dynamic_swish();
-            }
+
             layers.push(LayerEnum::SwiGLU(Box::new(swiglu)));
         }
 
-        // Normalization after feedforward (LayerNorm or RMSNorm based on config)
-        if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
-        } else if config.use_rms_norm {
-            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-        } else {
-            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
-        }
+        // Normalization after feedforward (always DynamicTanhNorm)
+        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
     }
 
     // Final normalization layer (critical for Pre-LN Transformer stability)
     // Avoid duplicate norm if the last layer is already a normalization
     let last_is_norm = matches!(
         layers.last(),
-        Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
+        Some(LayerEnum::DynamicTanhNorm(_))
     );
     if !last_is_norm {
-        if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
-        } else if config.use_rms_norm {
-            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-        } else {
-            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
-        }
+        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
     }
 
 }
@@ -159,7 +105,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 /// Displays information about the constructed network for debugging
 /// and comparison purposes.
 pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
-    println!("\n╔════════════════════════════════════════════════════════════════╗");
+    println!("\n╔════════════════════════════════════════════════════════════════╝");
     println!("║          MODEL ARCHITECTURE SUMMARY                            ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
 
@@ -175,13 +121,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("\n🚀 Modern LLM Enhancements:");
 
     // Normalization
-    if config.use_dynamic_tanh_norm {
-        println!("  ✓ DynamicTanhNorm (adaptive, tanh-based)");
-    } else if config.use_rms_norm {
-        println!("  ✓ RMSNorm (50% param reduction vs LayerNorm)");
-    } else {
-        println!("  • LayerNorm (standard)");
-    }
+    println!("  ✓ DynamicTanhNorm (adaptive, tanh-based)");
 
     // Activation
     println!("  ✓ SwiGLU (gated activation, no bias)");
@@ -191,9 +131,6 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     match &config.positional_encoding {
         PositionalEncodingType::Learned => {
             println!("  • Learned Positional Embeddings (standard)");
-        }
-        PositionalEncodingType::RoPE => {
-            println!("  ✓ RoPE (zero params, better extrapolation)");
         }
         PositionalEncodingType::CoPE { max_pos } => {
             println!(
@@ -247,9 +184,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     // Head Selection Strategy (Mixture-of-Heads)
     use crate::model_config::HeadSelectionStrategy;
     match &config.head_selection {
-        HeadSelectionStrategy::AllHeads => {
-            println!("  • All Heads Active (standard MHA)");
-        }
+
         HeadSelectionStrategy::MixtureOfHeads {
             num_shared_heads,
             num_active_routed_heads: _,
@@ -308,13 +243,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
             }
             println!("    - Expected Efficiency Gain: 30-50%");
         }
-        HeadSelectionStrategy::StaticPruning { num_active_heads } => {
-            let compute_savings =
-                ((num_heads - num_active_heads) as f32 / num_heads as f32 * 100.0) as usize;
-            println!("  • Static Head Pruning (ablation study)");
-            println!("    - Active Heads: {}/{}", num_active_heads, num_heads);
-            println!("    - Compute Savings: ~{}%", compute_savings);
-        }
+
         HeadSelectionStrategy::FullyAdaptiveMoH {
             min_heads,
             max_heads,
@@ -343,25 +272,12 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     // Architecture Alignment
     println!("\n🎯 Architecture Alignment:");
-    let has_rms = config.use_rms_norm;
-    let has_swiglu = true; // SwiGLU is always enabled
-    let has_rope = matches!(config.positional_encoding, PositionalEncodingType::RoPE);
     let has_cope = matches!(
         config.positional_encoding,
         PositionalEncodingType::CoPE { .. }
     );
-    let has_gqa = num_kv_heads < num_heads;
-    let has_window = config.window_size.is_some();
 
-    if has_rms && has_swiglu && has_rope && !has_gqa && !has_window {
-        println!("  Matches: LLaMA 1/2 7B, PaLM");
-    } else if has_rms && has_swiglu && has_rope && has_gqa && !has_window {
-        println!("  Matches: LLaMA 2 70B");
-    } else if has_rms && has_swiglu && has_rope && has_gqa && has_window {
-        println!("  Matches: Mistral 7B ⭐");
-    } else if !has_rms && !has_swiglu && !has_rope && !has_gqa && !has_window {
-        println!("  Matches: Original Transformer, GPT-2");
-    } else if has_cope {
+    if has_cope {
         println!("  Custom Configuration with CoPE (Research/Experimental) 🔬");
     } else {
         println!("  Custom Configuration");
@@ -395,48 +311,13 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 ///
 /// # TRM Configuration
 /// - `num_layers` stores recursive depth (D)
-/// - `use_rms_norm` determines normalization type (RMSNorm vs LayerNorm)
+/// - `use_dynamic_tanh_norm` determines normalization type
 ///
 /// # Gradient Stability
 /// - Adaptive residual scaling prevents vanishing/exploding gradients
 /// - Per-step gradient tracking for analysis
-/// - No gradient clipping required (handled by adaptive mechanisms)
-fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    let recursive_depth = config.get_recursive_depth();
-    let num_heads = config.get_num_heads();
-    let num_kv_heads = config.get_num_kv_heads();
 
-    // Create single TRM block (contains recursive depth internally)
-    let trm_block = TinyRecursiveModel::new(
-        config.embedding_dim,
-        config.hidden_dim,
-        num_heads,
-        Some(num_kv_heads),
-        recursive_depth,
-        // removed use_swiglu (SwiGLU is always used)
-        config.max_seq_len,
-        config.head_selection.clone(),
-        None, // Disable adaptive depth - use fixed depth=5 for baseline validation
-    );
-
-    layers.push(LayerEnum::TRMBlock(Box::new(trm_block)));
-
-    // Add final normalization layer (critical for Pre-LN stability)
-    // Avoid duplicate norm if the last layer is already normalization
-    let last_is_norm = matches!(
-        layers.last(),
-        Some(LayerEnum::DynamicTanhNorm(_)) | Some(LayerEnum::RMSNorm(_)) | Some(LayerEnum::LayerNorm(_))
-    );
-    if !last_is_norm {
-        if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
-        } else if config.use_rms_norm {
-            layers.push(LayerEnum::RMSNorm(RMSNorm::new(config.embedding_dim)));
-        } else {
-            layers.push(LayerEnum::LayerNorm(LayerNorm::new(config.embedding_dim)));
-        }
-    }
-}
+// TRM builder removed; TRM architecture is routed to transformer build path using PolyAttention-only.
 
 #[cfg(test)]
 mod tests {
@@ -459,4 +340,99 @@ mod tests {
         assert_eq!(layers[layers.len() - 1].layer_type(), "OutputProjection");
     }
 
+}
+
+
+#[cfg(any())]
+pub fn build_network(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
+    match config.architecture {
+        ArchitectureType::Transformer => build_transformer_layers(config, vocab_size),
+        ArchitectureType::TRM => build_trm_layers(config, vocab_size),
+    }
+}
+
+#[cfg(any())]
+fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
+    let mut layers: Vec<LayerEnum> = Vec::new();
+    layers.push(LayerEnum::Embeddings(Embeddings::new(vocab_size, config.embedding_dim)));
+
+    // Positional encoding could be inserted here based on config.positional_encoding
+    match config.positional_encoding {
+        PositionalEncodingType::Learned => {
+            // TODO: implement learned positional embeddings if needed
+        }
+        PositionalEncodingType::CoPE { .. } => {
+            // CoPE is integrated within attention modules as needed
+        }
+    }
+
+    // Build attention + FFN blocks
+    for _ in 0..config.num_layers {
+        match config.attention {
+            AttentionType::SelfAttention => {
+                layers.push(LayerEnum::SelfAttention(SelfAttention::new(
+                    config.get_num_heads(),
+                    config.embedding_dim,
+                    config.num_kv_heads,
+                    config.window_size,
+                    config.use_adaptive_window,
+                    config.min_window_size,
+                    config.max_window_size,
+                    config.window_adaptation_strategy,
+                    config.entropy_ema_alpha,
+                    &config.head_selection,
+                )));
+            }
+            AttentionType::PolyAttention { degree_p } => {
+                layers.push(LayerEnum::PolyAttention(PolyAttention::new(
+                    config.get_num_heads(),
+                    config.embedding_dim,
+                    degree_p,
+                    config.window_size,
+                    config.use_adaptive_window,
+                    config.min_window_size,
+                    config.max_window_size,
+                    config.window_adaptation_strategy,
+                )));
+            }
+        }
+
+        if config.use_dynamic_tanh_norm {
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        }
+
+        layers.push(LayerEnum::SwiGLU(SwiGLU::new(config.embedding_dim, config.hidden_dim)));
+    }
+
+    // Output projection to vocab size
+    layers.push(LayerEnum::OutputProjection(OutputProjection::new(config.embedding_dim, vocab_size)));
+
+    layers
+}
+
+#[cfg(any())]
+fn build_trm_layers(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
+    let mut layers: Vec<LayerEnum> = Vec::new();
+
+    // Embedding layer
+    layers.push(LayerEnum::Embeddings(Embeddings::new(vocab_size, config.embedding_dim)));
+
+    // TRM block which encapsulates recursive attention/ffn internally
+    layers.push(LayerEnum::TRMBlock(TinyRecursiveModel::new(
+        config.embedding_dim,
+        config.hidden_dim,
+        config.get_recursive_depth(),
+        config.get_num_heads(),
+        config.num_kv_heads,
+        config.window_size,
+        config.use_adaptive_window,
+        config.min_window_size,
+        config.max_window_size,
+        config.window_adaptation_strategy,
+    )));
+
+    // Output projection
+    layers.push(LayerEnum::OutputProjection(OutputProjection::new(config.embedding_dim, vocab_size)));
+
+    layers
 }

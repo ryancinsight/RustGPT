@@ -107,7 +107,7 @@ let scale_lr = 0.0001; // 10x smaller than main LR (0.001)
 
 ### 1. **Exceptional Gradient Stability** ✅
 - Gradient norm: 1.41 (best among all architectures)
-- No gradient clipping required
+- Stable without auxiliary stabilization techniques
 - Stable training from epoch 0 to 100
 - ReZero initialization prevents explosion
 

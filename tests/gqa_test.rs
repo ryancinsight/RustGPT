@@ -76,6 +76,7 @@ fn test_gqa_invalid_kv_heads() {
 #[test]
 fn test_gqa_parameter_reduction() {
     let head_dim = EMBEDDING_DIM / 8;
+    let cope_params = 8 * (64 + 1) * head_dim;
     let mha = SelfAttention::new_with_positional_encoding(
         EMBEDDING_DIM,
         8,
@@ -85,7 +86,7 @@ fn test_gqa_parameter_reduction() {
         None,
     );
     let mha_params = mha.parameters();
-    let expected_mha = 8 * head_dim * head_dim + 8 * 2 * head_dim * head_dim;
+    let expected_mha = 8 * head_dim * head_dim + 8 * 2 * head_dim * head_dim + cope_params;
     assert_eq!(mha_params, expected_mha);
     let gqa = SelfAttention::new_with_positional_encoding(
         EMBEDDING_DIM,
@@ -96,7 +97,7 @@ fn test_gqa_parameter_reduction() {
         None,
     );
     let gqa_params = gqa.parameters();
-    let expected_gqa = 8 * head_dim * head_dim + 4 * 2 * head_dim * head_dim;
+    let expected_gqa = 8 * head_dim * head_dim + 4 * 2 * head_dim * head_dim + cope_params;
     assert_eq!(gqa_params, expected_gqa);
     let reduction = mha_params - gqa_params;
     let expected_reduction = 4 * 2 * head_dim * head_dim;
@@ -110,7 +111,7 @@ fn test_gqa_parameter_reduction() {
         None,
     );
     let mqa_params = mqa.parameters();
-    let expected_mqa = 8 * head_dim * head_dim + 2 * head_dim * head_dim;
+    let expected_mqa = 8 * head_dim * head_dim + 2 * head_dim * head_dim + cope_params;
     assert_eq!(mqa_params, expected_mqa);
 }
 
@@ -136,7 +137,7 @@ fn test_gqa_with_rope() {
         EMBEDDING_DIM,
         8,
         4,
-        &PositionalEncodingType::RoPE,
+        &PositionalEncodingType::CoPE { max_pos: 64 },
         512,
         None,
     );
@@ -267,7 +268,7 @@ fn test_gqa_with_rope_integration() {
         EMBEDDING_DIM,
         8,
         4,
-        &PositionalEncodingType::RoPE,
+        &PositionalEncodingType::CoPE { max_pos: 64 },
         512,
         None,
     );
@@ -290,7 +291,7 @@ fn test_gqa_with_rope_integration() {
         .zip(output_without_rope.iter())
         .map(|(a, b)| (a - b).abs())
         .sum();
-    assert!(diff > 0.0, "RoPE should change the output");
+    assert!(diff > 0.0, "CoPE should change the output");
 }
 
 #[test]
@@ -327,6 +328,7 @@ fn test_gqa_grouping_correctness() {
 #[test]
 fn test_gqa_parameter_count_consistency() {
     let head_dim = EMBEDDING_DIM / 8;
+    let cope_params = 8 * (64 + 1) * head_dim;
     for num_kv_heads in [1, 2, 4, 8] {
         let gqa = SelfAttention::new_with_positional_encoding(
             EMBEDDING_DIM,
@@ -336,7 +338,7 @@ fn test_gqa_parameter_count_consistency() {
             512,
             None,
         );
-        let expected_params = 8 * head_dim * head_dim + num_kv_heads * 2 * head_dim * head_dim;
+        let expected_params = 8 * head_dim * head_dim + num_kv_heads * 2 * head_dim * head_dim + cope_params;
         assert_eq!(
             gqa.parameters(),
             expected_params,

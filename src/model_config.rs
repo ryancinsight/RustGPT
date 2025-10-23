@@ -19,12 +19,6 @@ pub enum PositionalEncodingType {
     #[default]
     Learned,
 
-    /// RoPE (Rotary Positional Encoding): Geometric position encoding
-    /// - Parameters: Zero (no learned weights)
-    /// - Encodes relative position through rotation matrices
-    /// - Better length extrapolation (handles longer sequences)
-    /// - Used in LLaMA, PaLM, GPT-NeoX, Mistral
-    RoPE,
 
     /// CoPE (Contextual Position Encoding): Context-aware position encoding
     /// - Parameters: max_pos × head_dim learned position embeddings (max_pos << max_seq_len)
@@ -63,14 +57,13 @@ pub enum WindowAdaptationStrategy {
 ///
 /// Implements Mixture-of-Heads (MoH) for dynamic head selection per token.
 /// Based on "MoH: Multi-Head Attention as Mixture-of-Head Attention" (Skywork AI, 2024).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HeadSelectionStrategy {
     /// All heads always active (standard multi-head attention)
     /// - Zero overhead
     /// - Backward compatible
     /// - Use for baseline comparisons
-    #[default]
-    AllHeads,
+
 
     /// Mixture-of-Heads: fully adaptive dynamic head selection per token
     /// - Learned routing via router network
@@ -135,14 +128,7 @@ pub enum HeadSelectionStrategy {
         use_confidence_fallback: bool,
     },
 
-    /// Static head pruning: use only first K heads (for ablation studies)
-    /// - No routing overhead
-    /// - Fixed head selection
-    /// - Useful for comparing against dynamic routing
-    StaticPruning {
-        /// Number of heads to keep active
-        num_active_heads: usize,
-    },
+
 
     /// Fully Adaptive Mixture-of-Heads: complexity-aware dynamic head selection
     ///
@@ -239,6 +225,15 @@ pub enum HeadSelectionStrategy {
     },
 }
 
+/// Attention mechanism selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AttentionType {
+    /// Standard scaled dot-product self-attention
+    SelfAttention,
+    /// Polynomial attention layer with odd degree p (e.g., p=3)
+    PolyAttention { degree_p: usize },
+}
+
 /// Configuration for adaptive recursive depth in TRM
 ///
 /// Enables TRM to dynamically learn the optimal number of recursive steps
@@ -329,17 +324,11 @@ pub struct ModelConfig {
     /// If None, defaults to 8 (same as standard transformers)
     pub num_heads: Option<usize>,
 
-    /// Use RMSNorm instead of LayerNorm (modern LLM practice)
-    /// Default: false (use LayerNorm for backward compatibility)
-    pub use_rms_norm: bool,
-
-    /// Use DynamicTanhNorm instead of LayerNorm/RMSNorm (experimental alternative)
+    /// Use DynamicTanhNorm for normalization
     /// Default: false (disabled by default)
     pub use_dynamic_tanh_norm: bool,
 
 
-    // Add dynamic swish flag to control learned Swish alpha
-    pub use_dynamic_swish: bool,
 
     /// Positional encoding type to use
     /// Default: CoPE (modern default for best performance)
@@ -412,6 +401,8 @@ pub struct ModelConfig {
     /// Default: AllHeads (backward compatible)
     pub head_selection: HeadSelectionStrategy,
 
+    /// Attention mechanism selection (SelfAttention vs PolyAttention)
+    pub attention: AttentionType,
 
 }
 
@@ -433,9 +424,7 @@ impl ModelConfig {
             hypernetwork_hidden_dim,
             max_seq_len,
             num_heads,
-            use_rms_norm: true, // Modern default: RMSNorm
-            use_dynamic_tanh_norm: false, // Disabled by default
-            use_dynamic_swish: false, // Disabled by default
+            use_dynamic_tanh_norm: true, // Use DynamicTanhNorm
             positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
             num_kv_heads: None,
             window_size: None,
@@ -444,7 +433,18 @@ impl ModelConfig {
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::AllHeads,
+            head_selection: HeadSelectionStrategy::MixtureOfHeads {
+                num_shared_heads: 2,
+                num_active_routed_heads: 4,
+                load_balance_weight: 0.01,
+                threshold_p_base: 0.5,
+                dynamic_loss_weight_base: 0.0001,
+                use_learned_threshold: true,
+                target_avg_routed_heads: 3.0,
+                confidence_threshold: 0.6,
+                use_confidence_fallback: true,
+            },
+            attention: AttentionType::SelfAttention,
         }
     }
 
@@ -464,10 +464,8 @@ impl ModelConfig {
             hypernetwork_hidden_dim: None,
             max_seq_len,
             num_heads,
-            use_rms_norm: true,
-            use_dynamic_tanh_norm: false,
+            use_dynamic_tanh_norm: true,
 
-            use_dynamic_swish: false,
             positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
             num_kv_heads: None,
             window_size: None,
@@ -476,7 +474,18 @@ impl ModelConfig {
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::AllHeads,
+            head_selection: HeadSelectionStrategy::MixtureOfHeads {
+                num_shared_heads: 2,
+                num_active_routed_heads: 4,
+                load_balance_weight: 0.01,
+                threshold_p_base: 0.5,
+                dynamic_loss_weight_base: 0.0001,
+                use_learned_threshold: true,
+                target_avg_routed_heads: 3.0,
+                confidence_threshold: 0.6,
+                use_confidence_fallback: true,
+            },
+            attention: AttentionType::SelfAttention,
         }
     }
 }
@@ -508,5 +517,14 @@ impl ModelConfig {
     pub fn get_recursive_depth(&self) -> usize {
         // In TRM, num_layers stores the recursive depth
         self.num_layers
+    }
+
+    /// Get polynomial degree `p` for `PolyAttention`.
+    /// Defaults to 3 if attention is not explicitly set to PolyAttention.
+    pub fn get_poly_degree_p(&self) -> usize {
+        match self.attention {
+            AttentionType::PolyAttention { degree_p } => degree_p,
+            _ => 3,
+        }
     }
 }

@@ -56,19 +56,13 @@
 **Time**: 1-2 hours
 **Risk**: Low
 
-#### 2B. Adaptive Gradient Clipping
-**Benefit**: Prevent gradient spikes without over-clipping
-**Implementation**: Clip based on gradient history (moving average)
-**Time**: 1 hour
-**Risk**: Low
-
 #### 2C. Warmup Schedule Optimization
 **Benefit**: Smoother training start
 **Implementation**: Tune warmup epochs, try linear/exponential schedules
 **Time**: 30 min
 **Risk**: Very low
 
-**Recommended**: 2B + 2C (1.5 hours total)
+**Recommended**: 2C (30 min)
 
 ---
 
@@ -175,7 +169,7 @@
 **Decision Point**: If successful → Continue. If failed → Debug before proceeding.
 
 ### Session 2: Gradient Stability + Loss Optimization (2-3 hours)
-1. Implement adaptive gradient clipping (1 hour)
+1. Implement gradient norm monitoring and adjust LR/batch size (1 hour)
 2. Optimize warmup schedule (30 min)
 3. Tune learning rate schedule (1-2 hours)
 4. Run `cargo run --release` and verify:
@@ -245,7 +239,7 @@
 - Monitor gradient stability closely
 
 ### Low-Risk Changes
-- Gradient clipping (Stage 2B)
+- Gradient norm monitoring (Stage 2B)
 - Warmup schedule (Stage 2C)
 - LR schedule tuning (Stage 3A)
 - Expert tracking (Stage 4C)

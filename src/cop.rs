@@ -1,5 +1,6 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
+use crate::adam::Adam;
 
 /// Contextual Position Encoding (CoPE)
 ///
@@ -81,6 +82,9 @@ pub struct ContextualPositionEncoding {
     /// Position embeddings for integer positions [0, 1, ..., max_pos]
     /// Shape: (max_pos + 1, head_dim)
     pos_embeddings: Array2<f32>,
+
+    /// Optimizer for learned position embeddings
+    optimizer: Adam,
 }
 
 impl ContextualPositionEncoding {
@@ -119,17 +123,8 @@ impl ContextualPositionEncoding {
             head_dim,
             max_pos,
             pos_embeddings,
+            optimizer: Adam::new((max_pos + 1, head_dim)),
         }
-    }
-
-    /// Get the head dimension
-    pub fn head_dim(&self) -> usize {
-        self.head_dim
-    }
-
-    /// Get the maximum position value
-    pub fn max_pos(&self) -> usize {
-        self.max_pos
     }
 
     /// Apply contextual position encoding to compute position-aware attention logits
@@ -155,65 +150,77 @@ impl ContextualPositionEncoding {
     /// - Query or key dimension doesn't match head_dim
     /// - Query and key have different sequence lengths
     pub fn apply(&self, q: &Array2<f32>, k: &Array2<f32>) -> Array2<f32> {
+        // Delegate to window-aware implementation with no window limit
+        self.apply_with_window(q, k, None)
+    }
+    
+    /// Apply contextual position encoding with optional sliding window limit
+    pub fn apply_with_window(
+        &self,
+        q: &Array2<f32>,
+        k: &Array2<f32>,
+        window_size: Option<usize>,
+    ) -> Array2<f32> {
         let (seq_len_q, dim_q) = (q.shape()[0], q.shape()[1]);
         let (seq_len_k, dim_k) = (k.shape()[0], k.shape()[1]);
-
+    
         assert_eq!(dim_q, self.head_dim, "Query dimension must match head_dim");
         assert_eq!(dim_k, self.head_dim, "Key dimension must match head_dim");
         assert_eq!(
             seq_len_q, seq_len_k,
-            "Query and key must have same sequence length"
+            "Query and key must have same sequence length",
         );
-
+    
         let seq_len = seq_len_q;
-
-        // Step 1: Compute attention logits (q^T k) for gate computation
-        // Shape: (seq_len, seq_len)
-        let attn_logits = q.dot(&k.t());
-
-        // Step 2: Compute gates using sigmoid
-        // g_ij = σ(q_i^T k_j)
-        // Shape: (seq_len, seq_len)
-        let gates = attn_logits.mapv(|x| 1.0 / (1.0 + (-x).exp())); // sigmoid
-
-        // Step 3: Compute positions via cumulative sum
-        // p_ij = Σ(k=j to i) g_ik
-        // For each query position i, sum gates from j to i
-        let mut positions = Array2::zeros((seq_len, seq_len));
-        for i in 0..seq_len {
-            for j in 0..=i {
-                // Cumulative sum from j to i
-                let mut pos_sum = 0.0;
-                for k in j..=i {
-                    pos_sum += gates[[i, k]];
-                }
-                // Clamp to max_pos
-                positions[[i, j]] = pos_sum.min(self.max_pos as f32);
-            }
-        }
-
-        // Step 4: Compute q^T e[p] for all integer positions
-        // Shape: (seq_len, max_pos + 1)
+    
+        // Precompute q dot E^T for all integer positions (max_pos+1)
+        // Shape: (seq_len, max_pos+1)
         let q_pos = q.dot(&self.pos_embeddings.t());
+    
+        // Allocate position logits output
+        let mut pos_logits = Array2::<f32>::zeros((seq_len, seq_len));
 
-        // Step 5: Interpolate position embeddings for fractional positions
-        // z_i[p_ij] = (⌈p_ij⌉ - p_ij) * z_i[⌈p_ij⌉] + (1 - ⌈p_ij⌉ + p_ij) * z_i[⌊p_ij⌋]
-        let mut pos_logits = Array2::zeros((seq_len, seq_len));
+        // Pre-allocate reusable temporaries to reduce allocations
+        let mut g_i = Array2::<f32>::zeros((seq_len, 1));
+        let mut prefix: Vec<f32> = Vec::with_capacity(seq_len);
+
         for i in 0..seq_len {
-            for j in 0..=i {
-                let p = positions[[i, j]];
+            // Compute gates for row i: g_i = sigmoid(K @ q_i)
+            let q_i = q.row(i);
+            g_i.fill(0.0);
+            {
+                // Fill g_i column directly without intermediate vec
+                for j in 0..seq_len {
+                    let dot = k.row(j).dot(&q_i);
+                    g_i[[j, 0]] = 1.0 / (1.0 + (-dot).exp());
+                }
+            }
+
+            // Build prefix sums for gates row i
+            prefix.clear();
+            let mut acc = 0.0f32;
+            for j in 0..seq_len {
+                acc += g_i[[j, 0]];
+                // Clamp to max_pos to stay within embedding bounds
+                prefix.push(acc.min(self.max_pos as f32));
+            }
+    
+            // Compute logits only for causal region j <= i, optionally window-limited
+            let j_start = match window_size {
+                Some(w) => i.saturating_sub(w) + 1, // inclusive start index within window
+                None => 0,
+            };
+            for j in j_start..=i {
+                let p = if j == 0 { prefix[i] } else { (prefix[i] - prefix[j - 1]).max(0.0) };
                 let p_floor = p.floor() as usize;
                 let p_ceil = p.ceil() as usize;
-
-                // Ensure indices are within bounds
                 let p_floor = p_floor.min(self.max_pos);
                 let p_ceil = p_ceil.min(self.max_pos);
-
+    
                 if p_floor == p_ceil {
-                    // Integer position, no interpolation needed
+                    // Integer position
                     pos_logits[[i, j]] = q_pos[[i, p_floor]];
                 } else {
-                    // Fractional position, interpolate
                     let weight_ceil = p - p_floor as f32;
                     let weight_floor = 1.0 - weight_ceil;
                     pos_logits[[i, j]] =
@@ -221,8 +228,100 @@ impl ContextualPositionEncoding {
                 }
             }
         }
-
+        
         pos_logits
+    }
+
+    /// Compute gradients for position embeddings and the additional contribution to dL/dQ
+    /// from the CoPE position logits path. This ignores gradients through the gating function
+    /// (p_ij dependence on Q/K), focusing on direct interpolation path for stability.
+    pub fn compute_embedding_grads_and_q_contrib(
+        &self,
+        q: &Array2<f32>,
+        k: &Array2<f32>,
+        grad_pos_logits: &Array2<f32>,
+    ) -> (Array2<f32>, Array2<f32>) {
+        let (seq_len_q, dim_q) = (q.shape()[0], q.shape()[1]);
+        let (seq_len_k, dim_k) = (k.shape()[0], k.shape()[1]);
+        assert_eq!(dim_q, self.head_dim);
+        assert_eq!(dim_k, self.head_dim);
+        assert_eq!(seq_len_q, seq_len_k);
+        assert_eq!(grad_pos_logits.shape(), &[seq_len_q, seq_len_q]);
+
+        let seq_len = seq_len_q;
+
+        let mut grad_pos = Array2::<f32>::zeros((self.max_pos + 1, self.head_dim));
+        let mut grad_q_cope = Array2::<f32>::zeros((seq_len, self.head_dim));
+
+        // Pre-allocate reusable prefix vector
+        let mut prefix = Vec::with_capacity(seq_len);
+
+        for i in 0..seq_len {
+            // Compute prefix sums for row i without storing full gates matrix
+            prefix.clear();
+            let q_i = q.row(i);
+            let mut acc = 0.0f32;
+            for j in 0..seq_len {
+                let dot = q_i.dot(&k.row(j));
+                let gate = 1.0 / (1.0 + (-dot).exp());
+                acc += gate;
+                prefix.push(acc.min(self.max_pos as f32));
+            }
+
+            // Views for current q_i and grad_q_cope_i
+            let q_i = q.row(i);
+            let mut grad_q_row = grad_q_cope.row_mut(i);
+
+            for j in 0..=i {
+                let grad_scalar = grad_pos_logits[[i, j]];
+                if grad_scalar == 0.0 { continue; }
+
+                let p = if j == 0 { prefix[i] } else { (prefix[i] - prefix[j - 1]).max(0.0) };
+                let p_floor = p.floor() as usize;
+                let p_ceil = p.ceil() as usize;
+                let p_floor = p_floor.min(self.max_pos);
+                let p_ceil = p_ceil.min(self.max_pos);
+
+                let weight_ceil = p - p_floor as f32;
+                let weight_floor = 1.0 - weight_ceil;
+
+                // dL/dE[p_floor] += grad_scalar * weight_floor * q_i
+                // dL/dE[p_ceil]  += grad_scalar * weight_ceil  * q_i
+                {
+                    let mut grad_floor_row = grad_pos.row_mut(p_floor);
+                    ndarray::Zip::from(&mut grad_floor_row)
+                        .and(q_i)
+                        .for_each(|gf, &qv| { *gf += grad_scalar * weight_floor * qv; });
+                }
+                if p_ceil != p_floor {
+                    let mut grad_ceil_row = grad_pos.row_mut(p_ceil);
+                    ndarray::Zip::from(&mut grad_ceil_row)
+                        .and(q_i)
+                        .for_each(|gc, &qv| { *gc += grad_scalar * weight_ceil * qv; });
+                }
+
+                // Additional gradient on q_i from CoPE path: grad_scalar * (weight_floor * E[p_floor] + weight_ceil * E[p_ceil])
+                let e_floor = self.pos_embeddings.row(p_floor);
+                if p_ceil == p_floor {
+                    ndarray::Zip::from(&mut grad_q_row)
+                        .and(e_floor)
+                        .for_each(|gq, &ev| { *gq += grad_scalar * ev; });
+                } else {
+                    let e_ceil = self.pos_embeddings.row(p_ceil);
+                    ndarray::Zip::from(&mut grad_q_row)
+                        .and(e_floor)
+                        .and(e_ceil)
+                        .for_each(|gq, &ef, &ec| { *gq += grad_scalar * (weight_floor * ef + weight_ceil * ec); });
+                }
+            }
+        }
+
+        (grad_pos, grad_q_cope)
+    }
+
+    /// Apply gradients to learned position embeddings
+    pub fn apply_gradients(&mut self, grad_pos_embeddings: &Array2<f32>, lr: f32) {
+        self.optimizer.step(&mut self.pos_embeddings, grad_pos_embeddings, lr);
     }
 
     /// Get mutable reference to position embeddings for gradient updates
@@ -233,6 +332,16 @@ impl ContextualPositionEncoding {
     /// Get reference to position embeddings
     pub fn pos_embeddings(&self) -> &Array2<f32> {
         &self.pos_embeddings
+    }
+
+    /// Get the head dimension
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Get the maximum position value
+    pub fn max_pos(&self) -> usize {
+        self.max_pos
     }
 }
 

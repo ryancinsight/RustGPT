@@ -111,14 +111,14 @@ fn test_binary_smaller_than_json() {
 #[test]
 fn test_save_load_preserves_vocab() {
     let llm = LLM::default();
-    let original_words: Vec<String> = llm.vocab.words.clone();
+    let original_words: Vec<&str> = llm.vocab.words();
 
     let path = "test_vocab.bin";
     llm.save_binary(path).expect("Failed to save");
     let loaded = LLM::load_binary(path).expect("Failed to load");
 
     assert_eq!(
-        original_words, loaded.vocab.words,
+        original_words, loaded.vocab.words(),
         "Vocabulary words should be preserved"
     );
 

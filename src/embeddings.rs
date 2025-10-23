@@ -30,10 +30,10 @@ impl Default for Embeddings {
 impl Embeddings {
     pub fn new(vocab: Vocab) -> Self {
         Self {
-            token_embeddings: Self::init_embeddings(vocab.words.len(), EMBEDDING_DIM),
+            token_embeddings: Self::init_embeddings(vocab.size(), EMBEDDING_DIM),
             positional_embeddings: Self::init_positional_embeddings(MAX_SEQ_LEN, EMBEDDING_DIM),
             cached_input: None,
-            token_optimizer: Adam::new((vocab.words.len(), EMBEDDING_DIM)),
+            token_optimizer: Adam::new((vocab.size(), EMBEDDING_DIM)),
             positional_optimizer: Adam::new((MAX_SEQ_LEN, EMBEDDING_DIM)),
         }
     }

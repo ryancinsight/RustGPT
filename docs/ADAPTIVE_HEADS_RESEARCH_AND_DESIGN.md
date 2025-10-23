@@ -494,7 +494,7 @@ Based on MoH paper results:
 - **Mitigation**:
   1. Warm-up period (first 1000-5000 steps with AllHeads)
   2. Lower learning rate for router (0.1× main LR)
-  3. Gradient clipping for router weights
+  3. Norm monitoring and conservative optimizer settings for router weights
 - **Contingency**: Extend warm-up period
 
 **Risk 3: GQA Incompatibility**

@@ -20,7 +20,7 @@ fn test_dataset_new_json() {
     );
     assert_eq!(
         dataset.pretraining_data[0],
-        "The sun rises in the east and sets in the west </s>"
+        "The sun appears to rise in the east and set in the west due to the Earth's rotation on its axis from west to east, completing one full rotation approximately every 24 hours, a phenomenon known as diurnal motion. </s>"
     );
     assert!(dataset.chat_training_data[0].starts_with("User: What causes rain?"));
 }

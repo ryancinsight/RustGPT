@@ -1,0 +1,215 @@
+﻿cargo :    Compiling llm v0.1.0 (D:\RustGPT)
+At line:1 char:1
++ cargo build *>&1 | Out-File -FilePath build_out_full.txt -Encoding ut ...
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling llm v0.1.0 (D:\RustGPT):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: unused import: `AdaptiveDepthConfig`
+ --> src\model_builder.rs:7:20
+  |
+7 |     model_config::{AdaptiveDepthConfig, ArchitectureType, ModelConfig},
+  |                    ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Axis`
+ --> src\dynamic_tanh_norm.rs:1:23
+  |
+1 | use ndarray::{Array2, Axis};
+  |                       ^^^^
+
+warning: unused import: `Axis`
+ --> src\trm.rs:1:34
+  |
+1 | use ndarray::{s, Array1, Array2, Axis};
+  |                                  ^^^^
+
+warning: unused imports: `info` and `warn`
+ --> src\trm.rs:3:15
+  |
+3 | use tracing::{info, warn};
+  |               ^^^^  ^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+  --> src\swiglu.rs:30:29
+   |
+30 |         let mut rng = rand::thread_rng();
+   |                             ^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src\trm.rs:287:33
+    |
+287 |             let mut rng = rand::thread_rng();
+    |                                 ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\head_router.rs:129:47
+    |
+129 |         let logits = input.dot(&self.weights).into_shape(input.nrows()).unwrap();
+    |                                               ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1353:63
+     |
+1353 |         let complexity_logits = input.dot(&self.w_complexity).into_shape(seq_len).unwrap();
+     |                                                               ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1366:61
+     |
+1366 |         let threshold_logits = input.dot(&self.w_threshold).into_shape(seq_len).unwrap();
+     |                                                             ^^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+    --> src\head_router.rs:1373:58
+     |
+1373 |         let temp_logits = input.dot(&self.w_temperature).into_shape(seq_len).unwrap();
+     |                                                          ^^^^^^^^^^
+
+error[E0599]: no variant or associated item named `RoPE` found for enum `PositionalEncodingType` in the current scope
+   --> src\model_builder.rs:176:33
+    |
+176 |         PositionalEncodingType::RoPE => {
+    |                                 ^^^^ variant or associated item not found in `PositionalEncodingType`
+    |
+   ::: src\model_config.rs:14:1
+    |
+ 14 | pub enum PositionalEncodingType {
+    | ------------------------------- variant or associated item `RoPE` not found for this enum
+    |
+help: there is a variant with a similar name
+    |
+176 -         PositionalEncodingType::RoPE => {
+176 +         PositionalEncodingType::CoPE => {
+    |
+
+error[E0599]: no variant or associated item named `RoPE` found for enum `PositionalEncodingType` in the current scope
+   --> src\model_builder.rs:329:81
+    |
+329 |     let has_rope = matches!(config.positional_encoding, PositionalEncodingType::RoPE);
+    |                                                                                 ^^^^ variant or associated item not found in `PositionalEncodingType`
+    |
+   ::: src\model_config.rs:14:1
+    |
+ 14 | pub enum PositionalEncodingType {
+    | ------------------------------- variant or associated item `RoPE` not found for this enum
+    |
+help: there is a variant with a similar name
+    |
+329 -     let has_rope = matches!(config.positional_encoding, PositionalEncodingType::RoPE);
+329 +     let has_rope = matches!(config.positional_encoding, PositionalEncodingType::CoPE);
+    |
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src\trm.rs:290:34
+    |
+290 |                 let u: f32 = rng.gen_range(1e-10..1.0); // Avoid log(0)
+    |                                  ^^^^^^^^^
+
+warning: use of deprecated method `ndarray::impl_methods::<impl ndarray::ArrayBase<S, D>>::into_shape`: Use `.into_shape_with_order()` or `.to_shape()`
+   --> src\trm.rs:491:50
+    |
+491 |                 let attn_logits = attn_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+    |                                                  ^^^^^^^^^^
+
+warning: unused variable: `router`
+   --> src\head_router.rs:274:34
+    |
+274 |             RouterType::Standard(router) => {
+    |                                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_router`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `entropy_range`
+   --> src\head_router.rs:770:13
+    |
+770 |         let entropy_range = (max_entropy - min_entropy).max(1e-6);
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_entropy_range`
+
+warning: unused variable: `target`
+    --> src\head_router.rs:1626:21
+     |
+1626 |                 let target = target_heads[token_idx];
+     |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `use_rope`
+   --> src\self_attention.rs:297:9
+    |
+297 |         use_rope: bool,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_use_rope`
+
+warning: unused variable: `max_seq_len`
+   --> src\self_attention.rs:298:9
+    |
+298 |         max_seq_len: usize,
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_max_seq_len`
+
+warning: unused variable: `max_seq_len`
+   --> src\self_attention.rs:375:9
+    |
+375 |         max_seq_len: usize,
+    |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_max_seq_len`
+
+warning: variable does not need to be mutable
+   --> src\self_attention.rs:941:13
+    |
+941 |         let mut q = head_input.dot(&head.w_q);
+    |             ----^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\self_attention.rs:942:13
+    |
+942 |         let mut k = head_input.dot(&head.w_k);
+    |             ----^
+    |             |
+    |             help: remove this `mut`
+
+warning: irrefutable `if let` pattern
+    --> src\self_attention.rs:1117:16
+     |
+1117 |             if let PositionalEncodingVariant::CoPE(cope_heads) = &self.positional_encoding {
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+     = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+    --> src\self_attention.rs:1149:29
+     |
+1149 |             let grad_q = if let PositionalEncodingVariant::CoPE(cope_heads) = &self.positional_encoding {
+     |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+warning: unreachable pattern
+    --> src\self_attention.rs:1326:17
+     |
+1292 |                 PositionalEncodingVariant::CoPE(cope_heads) => {
+     |                 ------------------------------------------- matches all the relevant values
+...
+1326 |                 _ => {
+     |                 ^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: irrefutable `if let` pattern
+    --> src\self_attention.rs:1396:12
+     |
+1396 |         if let PositionalEncodingVariant::CoPE(cope_heads) = &mut self.positional_encoding {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this pattern will always match, so the `if let` is useless
+     = help: consider replacing the `if let` with a `let`
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `llm` (lib) generated 24 warnings
+error: could not compile `llm` (lib) due to 2 previous errors; 24 warnings emitted
