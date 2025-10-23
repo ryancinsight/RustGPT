@@ -377,7 +377,7 @@ impl ModelConfig {
                 confidence_threshold: 0.6,
                 use_confidence_fallback: true,
             },
-            attention: AttentionType::SelfAttention,
+            attention: AttentionType::PolyAttention { degree_p: 3 },
         }
     }
 
