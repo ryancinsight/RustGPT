@@ -5,21 +5,11 @@ use serde::{Deserialize, Serialize};
 pub enum ArchitectureType {
     /// Standard Transformer with self-attention mechanism
     Transformer,
-    /// Tiny Recursive Model with weight sharing across depth
-    TRM,
 }
 
 /// Positional encoding type for attention mechanism
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionalEncodingType {
-    /// Learned positional embeddings (standard absolute positional embeddings)
-    /// - Parameters: max_seq_len × embedding_dim learned weights
-    /// - Used in original Transformer, GPT-2, GPT-3
-    /// - Simple and effective for fixed-length contexts
-    #[default]
-    Learned,
-
-
     /// CoPE (Contextual Position Encoding): Context-aware position encoding
     /// - Parameters: max_pos × head_dim learned position embeddings (max_pos << max_seq_len)
     /// - Positions conditioned on context via gating mechanism
@@ -31,6 +21,12 @@ pub enum PositionalEncodingType {
         /// For example, max_pos=64 works well for context length 1024
         max_pos: usize,
     },
+}
+
+impl Default for PositionalEncodingType {
+    fn default() -> Self {
+        PositionalEncodingType::CoPE { max_pos: 64 }
+    }
 }
 
 /// Strategy for adapting sliding window size dynamically
@@ -64,6 +60,7 @@ pub enum HeadSelectionStrategy {
     /// - Backward compatible
     /// - Use for baseline comparisons
 
+    AllHeads,
 
     /// Mixture-of-Heads: fully adaptive dynamic head selection per token
     /// - Learned routing via router network
@@ -128,8 +125,6 @@ pub enum HeadSelectionStrategy {
         use_confidence_fallback: bool,
     },
 
-
-
     /// Fully Adaptive Mixture-of-Heads: complexity-aware dynamic head selection
     ///
     /// **Key Innovation**: No hardcoded shared/routed head split - ALL heads are routing candidates.
@@ -147,7 +142,7 @@ pub enum HeadSelectionStrategy {
     /// - ✅ **Complexity-aware** - simple inputs use 1-2 heads, complex inputs use 6-8 heads
     /// - ✅ **Better efficiency** - 15-25% speedup vs 5-8% for standard MoH
     /// - ✅ **Cleaner architecture** - fewer parameters, simpler routing logic
-    /// - ✅ **TRM-compatible** - designed for recursive models with gradient stability
+    /// - ✅ **Compatible with various architectures** - designed for gradient stability
     ///
     /// # Example Usage
     ///
@@ -234,9 +229,9 @@ pub enum AttentionType {
     PolyAttention { degree_p: usize },
 }
 
-/// Configuration for adaptive recursive depth in TRM
+/// Configuration for adaptive recursive depth
 ///
-/// Enables TRM to dynamically learn the optimal number of recursive steps
+/// Enables models to dynamically learn the optimal number of recursive steps
 /// for each input based on complexity, using Adaptive Computation Time (ACT).
 ///
 /// # Mechanism
@@ -448,46 +443,7 @@ impl ModelConfig {
         }
     }
 
-    /// Create a new TRM (Tiny Recursive Model) configuration
-    pub fn trm(
-        embedding_dim: usize,
-        hidden_dim: usize,
-        recursive_depth: usize,
-        max_seq_len: usize,
-        num_heads: Option<usize>,
-    ) -> Self {
-        Self {
-            architecture: ArchitectureType::TRM,
-            embedding_dim,
-            hidden_dim,
-            num_layers: recursive_depth,
-            hypernetwork_hidden_dim: None,
-            max_seq_len,
-            num_heads,
-            use_dynamic_tanh_norm: true,
 
-            positional_encoding: PositionalEncodingType::CoPE { max_pos: 64 },
-            num_kv_heads: None,
-            window_size: None,
-            use_adaptive_window: false,
-            min_window_size: 512,
-            max_window_size: 4096,
-            window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
-            entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::MixtureOfHeads {
-                num_shared_heads: 2,
-                num_active_routed_heads: 4,
-                load_balance_weight: 0.01,
-                threshold_p_base: 0.5,
-                dynamic_loss_weight_base: 0.0001,
-                use_learned_threshold: true,
-                target_avg_routed_heads: 3.0,
-                confidence_threshold: 0.6,
-                use_confidence_fallback: true,
-            },
-            attention: AttentionType::SelfAttention,
-        }
-    }
 }
 
 impl Default for ModelConfig {
@@ -515,7 +471,7 @@ impl ModelConfig {
 
 
     pub fn get_recursive_depth(&self) -> usize {
-        // In TRM, num_layers stores the recursive depth
+        // In recursive models, num_layers stores the recursive depth
         self.num_layers
     }
 

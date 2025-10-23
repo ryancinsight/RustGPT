@@ -2,7 +2,7 @@
 
 > Archived Notice: HRM has been removed from the codebase as of 2025-10-21.
 > This plan is kept for historical reference only.
-> Supported architectures: Transformer and TRM.
+> Supported architectures: Transformer.
 
 ## Project: RustGPT - Hierarchical Reasoning Model Integration
 ### Date: 2025-10-15

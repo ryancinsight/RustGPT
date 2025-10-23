@@ -14,7 +14,7 @@ fn main() {
     // Configuration 1: Original Transformer (Baseline)
     println!("📋 Configuration 1: Original Transformer (Baseline)\n");
     let mut config1 = ModelConfig::transformer(512, 2048, 6, 512, None, Some(8));
-    config1.positional_encoding = PositionalEncodingType::Learned;
+    config1.positional_encoding = PositionalEncodingType::CoPE { max_pos: 64 };
     config1.num_kv_heads = None;
     config1.window_size = None;
     let network1 = build_network(&config1, &vocab);

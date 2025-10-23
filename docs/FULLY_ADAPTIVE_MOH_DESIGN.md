@@ -17,7 +17,7 @@ Current MoH implementation has **hardcoded architecture**:
 - ✅ **No hardcoded shared heads** - all heads are candidates for routing
 - ✅ **Complexity-aware head count** - simple inputs use 1-3 heads, complex inputs use 5-8 heads
 - ✅ **Learned head selection** - router learns which heads AND how many heads per token
-- ✅ **Applicable to TRM and Transformer** - unified architecture
+- ✅ **Applicable to Transformer** - unified architecture
 
 ---
 
@@ -51,7 +51,7 @@ pub struct HeadRouter {
 - ❌ **Shared heads always active** - wastes computation on simple inputs
 - ❌ **Fixed split** - can't adapt shared/routed ratio per layer or task
 - ❌ **Complexity ignored** - doesn't consider input difficulty
-- ❌ **Suboptimal for TRM** - recursive depth amplifies inefficiency
+- ❌ **Suboptimal for recursive models** - recursive depth amplifies inefficiency
 
 ---
 
@@ -186,14 +186,14 @@ L_aux = L_balance + L_complexity + L_sparsity
 | **Simple Input Efficiency** | 3 heads (37.5%) | 1-2 heads (12-25%) |
 | **Complex Input Capacity** | 8 heads (100%) | 8 heads (100%) |
 | **Adaptivity** | Which routed heads | Which heads + how many |
-| **TRM Compatibility** | Not tested | Designed for TRM |
+| **Recursive Model Compatibility** | Not tested | Designed for recursive models |
 | **Parameter Overhead** | 1280 (for 8 heads, 128 dim) | 1152 (10% fewer) |
 
 **Expected Gains**:
 - **15-25% speedup** on simple inputs (vs current MoH's 5-8%)
-- **Better gradient flow** in TRM (fewer heads = less gradient splitting)
+- **Better gradient flow** in recursive models (fewer heads = less gradient splitting)
 - **Adaptive capacity** (use more heads only when needed)
-- **Unified architecture** (same code for TRM and Transformer)
+- **Unified architecture** (same code for different architectures)
 
 ---
 
@@ -349,9 +349,9 @@ let head_selection = HeadSelectionStrategy::FullyAdaptiveMoH {
 };
 ```
 
-### Phase 2: TRM Integration (3 hours)
+### Phase 2: Architecture Integration (3 hours)
 
-#### 2.1 Add Fully Adaptive MoH to TRM (2 hours)
+#### 2.1 Add Fully Adaptive MoH to Architecture (2 hours)
 
 **File**: `src/trm.rs`
 
@@ -438,7 +438,7 @@ let total_router_grad = router_grad_accumulator.iter()
 
 ### Success Criteria
 
-- ✅ **Loss**: ≤ 0.35 (20% better than TRM baseline)
+- ✅ **Loss**: ≤ 0.35 (20% better than baseline)
 - ✅ **Gradient Stability**: ≤ 2.0 (maintain stability)
 - ✅ **Efficiency**: Avg 3-4 heads (50% reduction vs AllHeads)
 - ✅ **Adaptivity**: Complexity scores correlate with input difficulty
@@ -452,7 +452,7 @@ let total_router_grad = router_grad_accumulator.iter()
 2. **Implement Phase 1** (6 hours)
 3. **Test with Transformer** (2 hours)
 4. **Implement Phase 2** (3 hours)
-5. **Test with TRM** (2 hours)
+5. **Test with Architecture** (2 hours)
 6. **Benchmark & Compare** (2 hours)
 
 **Total Estimated Time**: 15 hours

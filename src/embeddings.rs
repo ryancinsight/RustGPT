@@ -13,6 +13,7 @@ pub struct Embeddings {
     pub cached_input: Option<Array2<f32>>,
     pub token_optimizer: Adam,
     pub positional_optimizer: Adam,
+    pub use_positional: bool,
 }
 
 impl Default for Embeddings {
@@ -23,18 +24,24 @@ impl Default for Embeddings {
             cached_input: None,
             token_optimizer: Adam::new((Vocab::default_words().len(), EMBEDDING_DIM)),
             positional_optimizer: Adam::new((MAX_SEQ_LEN, EMBEDDING_DIM)),
+            use_positional: true,
         }
     }
 }
 
 impl Embeddings {
     pub fn new(vocab: Vocab) -> Self {
+        Self::new_with_positional(vocab, true)
+    }
+
+    pub fn new_with_positional(vocab: Vocab, use_positional: bool) -> Self {
         Self {
             token_embeddings: Self::init_embeddings(vocab.size(), EMBEDDING_DIM),
             positional_embeddings: Self::init_positional_embeddings(MAX_SEQ_LEN, EMBEDDING_DIM),
             cached_input: None,
             token_optimizer: Adam::new((vocab.size(), EMBEDDING_DIM)),
             positional_optimizer: Adam::new((MAX_SEQ_LEN, EMBEDDING_DIM)),
+            use_positional,
         }
     }
 
@@ -101,9 +108,13 @@ impl Embeddings {
 
     pub fn embed_tokens(&self, token_ids: &[usize]) -> Array2<f32> {
         let token_embeds = Self::get_token_embeddings(&self.token_embeddings, token_ids);
-        let position_embeds =
-            Self::get_positional_embeddings(&self.positional_embeddings, token_ids.len());
-        token_embeds + position_embeds // Element-wise sum
+        if self.use_positional {
+            let position_embeds =
+                Self::get_positional_embeddings(&self.positional_embeddings, token_ids.len());
+            token_embeds + position_embeds // Element-wise sum
+        } else {
+            token_embeds
+        }
     }
 }
 
@@ -152,15 +163,18 @@ impl Layer for Embeddings {
                 token_row += &grad_row;
             }
 
-            // Accumulate positional embedding gradients efficiently (no temp variable)
-            {
+            if self.use_positional {
+                // Accumulate positional embedding gradients efficiently (no temp variable)
                 let mut pos_row = positional_grads.row_mut(i);
                 pos_row += &grad_row;
             }
         }
 
-        // Return input gradients and parameter gradients
-        (output_grads.clone(), vec![token_grads, positional_grads])
+        if self.use_positional {
+            (output_grads.clone(), vec![token_grads, positional_grads])
+        } else {
+            (output_grads.clone(), vec![token_grads])
+        }
     }
 
     fn apply_gradients(
@@ -168,19 +182,32 @@ impl Layer for Embeddings {
         param_grads: &[Array2<f32>],
         lr: f32,
     ) -> crate::errors::Result<()> {
-        if param_grads.len() != 2 {
-            return Err(crate::errors::ModelError::GradientError {
-                message: format!(
-                    "Embeddings expected 2 parameter gradients (token + positional), got {}",
-                    param_grads.len()
-                ),
-            });
-        }
+        if self.use_positional {
+            if param_grads.len() != 2 {
+                return Err(crate::errors::ModelError::GradientError {
+                    message: format!(
+                        "Embeddings expected 2 parameter gradients (token + positional), got {}",
+                        param_grads.len()
+                    ),
+                });
+            }
 
-        self.token_optimizer
-            .step(&mut self.token_embeddings, &param_grads[0], lr);
-        self.positional_optimizer
-            .step(&mut self.positional_embeddings, &param_grads[1], lr);
+            self.token_optimizer
+                .step(&mut self.token_embeddings, &param_grads[0], lr);
+            self.positional_optimizer
+                .step(&mut self.positional_embeddings, &param_grads[1], lr);
+        } else {
+            if param_grads.len() != 1 {
+                return Err(crate::errors::ModelError::GradientError {
+                    message: format!(
+                        "Embeddings (no-positional) expected 1 parameter gradient (token), got {}",
+                        param_grads.len()
+                    ),
+                });
+            }
+            self.token_optimizer
+                .step(&mut self.token_embeddings, &param_grads[0], lr);
+        }
         Ok(())
     }
 
@@ -192,6 +219,10 @@ impl Layer for Embeddings {
     }
 
     fn parameters(&self) -> usize {
-        self.token_embeddings.len() + self.positional_embeddings.len()
+        if self.use_positional {
+            self.token_embeddings.len() + self.positional_embeddings.len()
+        } else {
+            self.token_embeddings.len()
+        }
     }
 }

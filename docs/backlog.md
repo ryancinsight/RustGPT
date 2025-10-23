@@ -1,7 +1,7 @@
 # Backlog
 
 > Note: HRM-related backlog items are archived; HRM was removed on 2025-10-21.
-> Supported architectures: Transformer and TRM.
+> Supported architectures: Transformer.
 
 ## Project: RustGPT - Educational Transformer LLM Implementation
 

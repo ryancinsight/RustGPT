@@ -27,7 +27,7 @@ pub struct VersionedModel {
 pub struct ModelMetadata {
     /// Timestamp when model was saved (ISO 8601 format)
     pub saved_at: String,
-    /// Model architecture type (e.g., "Transformer" or "TRM")
+    /// Model architecture type (e.g., "Transformer")
     pub architecture: String,
     /// Number of parameters
     pub num_parameters: usize,
