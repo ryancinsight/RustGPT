@@ -11,6 +11,8 @@ use crate::{adam::Adam, MAX_SEQ_LEN};
 use crate::llm::Layer;
 use crate::sigmoid_poly::SigmoidPoly; // [MOD] import learnable polynomial gate
 
+const DEFAULT_TILE_SIZE: usize = 128; // Fallback tile span when no sliding window is set
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyHead {
     pub w_q: Array2<f32>,
@@ -164,11 +166,13 @@ impl PolyAttention {
         let opt_beta_g = Adam::new((1, num_heads));
 
         // CoPE integration (shared pos embeddings across heads)
+        // Derive CoPE table length from sliding window if present, otherwise from default tile size.
         let use_cope = true;
-        let cope_max_pos = max_pos;
+        let derived_span = match window_size { Some(w) if w > 0 => w, _ => DEFAULT_TILE_SIZE };
+        let cope_max_pos = derived_span.saturating_sub(1);
         let normal_pe = Normal::new(0.0, 0.02).unwrap();
-        let pe = Array2::<f32>::from_shape_fn((max_pos + 1, head_dim), |_| normal_pe.sample(&mut rng));
-        let opt = Adam::new((max_pos + 1, head_dim));
+        let pe = Array2::<f32>::from_shape_fn((cope_max_pos + 1, head_dim), |_| normal_pe.sample(&mut rng));
+        let opt = Adam::new((cope_max_pos + 1, head_dim));
         let cope_pos_embeddings = Some(pe);
         let opt_cope_pos = Some(opt);
 
@@ -277,52 +281,65 @@ impl PolyAttention {
                 gate_poly.forward_scalar(z as f64) as f32
             });
 
-            with_tls_scores(n, |scores| {
-                scores.fill(0.0);
-                general_mat_mul(1.0, &q, &k.t(), 0.0, scores);
-                *scores *= dk_scale;
+            // Head-specific output projection slice
+            let start = h_idx * self.head_dim;
+            let end = start + self.head_dim;
+            let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
 
-                // Optional causal masking (in-place)
-                if causal { Self::apply_causal_mask_inplace(scores); }
-                // Optional sliding window mask (lower triangle band)
-                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
-
-                // Add CoPE position logits if enabled
-                if self.use_cope {
-                    let pos_logits = self.cope_pos_logits(&q, &k, self.window_size);
-                    *scores += &pos_logits;
-                    if causal { Self::apply_causal_mask_inplace(scores); }
-                    Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+            // Row-streaming forward to avoid materializing N×N scores
+            for i in 0..n {
+                // Determine attention band for this row under causal and optional window
+                let mut j_start = 0usize;
+                if causal { j_start = i; }
+                if let Some(w) = self.window_size {
+                    let ws = w.saturating_sub(1);
+                    let win_start = i.saturating_sub(ws);
+                    j_start = j_start.max(win_start);
                 }
 
-                // Polynomial activation in-place on scores: phi(S) = scale * (a * S^p + b)
-                let a = self.a[[0,0]];
-                let b = self.b[[0,0]];
-                let scale = self.scale[[0,0]];
-                let p_i32 = self.p as i32;
-                scores.mapv_inplace(|x| {
-                    let sp = x.powi(p_i32);
-                    scale * (a * sp + b)
-                });
+                // Build score row over band [j_start..=i]
+                let band_len = i + 1 - j_start;
+                // Accumulator for Y_h row
+                let mut y_row = Array2::<f32>::zeros((1, self.head_dim));
 
-                // keep masked positions zero (in-place)
-                if causal { Self::apply_causal_mask_inplace(scores); }
-                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+                // Preload q_i view
+                let q_i = q.row(i);
 
-                with_tls_yh(n, self.head_dim, |yh| {
-                    yh.fill(0.0);
-                    general_mat_mul(1.0, &*scores, &v, 0.0, yh);
+                for (j_rel, j) in (j_start..=i).enumerate() {
+                    // score = q_i · k_j
+                    let mut s_ij = q_i.dot(&k.row(j)) * dk_scale;
+                    // add CoPE position logit: dot(q_i, pe[pos])
+                    if self.use_cope {
+                        let pos = if j == 0 { i } else { i - j };
+                        if pos <= self.cope_max_pos {
+                            if let Some(pe) = &self.cope_pos_embeddings {
+                                s_ij += q_i.dot(&pe.row(pos));
+                            }
+                        }
+                    }
+                    // polynomial activation
+                    let a = self.a[[0,0]];
+                    let b = self.b[[0,0]];
+                    let scale = self.scale[[0,0]];
+                    let p_i32 = self.p as i32;
+                    let sp = s_ij.powi(p_i32);
+                    let phi = scale * (a * sp + b);
 
-                    // Apply gating: row-wise scaling by g_col
-                    *yh *= &g_col;
+                    // accumulate: y_row += phi * v_j
+                    // y_row (1,d_h) += phi * v_j (1,d_h)
+                    for d in 0..self.head_dim { y_row[[0, d]] += phi * v[[j, d]]; }
+                }
 
-                    // Accumulate directly into output via the corresponding rows of W_out
-                    let start = h_idx * self.head_dim;
-                    let end = start + self.head_dim;
-                    let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
-                    general_mat_mul(1.0, &*yh, &w_block, 1.0, &mut out);
-                });
-            });
+                // Apply gating for row i
+                let g_i = g_col[[i, 0]];
+                for d in 0..self.head_dim { y_row[[0, d]] *= g_i; }
+
+                // Accumulate into output row i via W_out block
+                // out[i, :] += y_row (1,d_h) · W_block (d_h, D)
+                // Use BLAS for the row matmul
+                let mut out_i = out.slice_mut(s![i..i+1, ..]);
+                general_mat_mul(1.0, &y_row, &w_block, 1.0, &mut out_i);
+            }
         }
 
         out
@@ -520,7 +537,7 @@ impl PolyAttention {
                         // Backprop through linear projections: Q = X W_q; so dW_q = X^T dQ, dX += dQ W_q^T
                         let d_w_q = input.t().dot(&grad_q);
                         let d_w_k = input.t().dot(&grad_k);
-                        let d_w_v = input.t().dot(&grad_v);
+                        let d_w_v = input.t().dot(&g_yh_pre);
 
                         all_param_grads.push(d_w_q);
                         all_param_grads.push(d_w_k);
@@ -529,27 +546,34 @@ impl PolyAttention {
                         // Accumulate grad_input from projections
                         general_mat_mul(1.0, &grad_q, &head.w_q.t(), 1.0, &mut grad_input_total);
                         general_mat_mul(1.0, &grad_k, &head.w_k.t(), 1.0, &mut grad_input_total);
-                        general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_total);
+                        general_mat_mul(1.0, &g_yh_pre, &head.w_v.t(), 1.0, &mut grad_input_total);
+
                     });
                 });
             });
         }
 
-        // Append output projection grads and scalar grads and gating grads
+        // Append W_out gradient
         all_param_grads.push(grad_w_out);
-        let grad_a = Array2::<f32>::from_shape_vec((1,1), vec![grad_a_scalar]).unwrap();
-        let grad_b = Array2::<f32>::from_shape_vec((1,1), vec![grad_b_scalar]).unwrap();
-        let grad_scale = Array2::<f32>::from_shape_vec((1,1), vec![grad_scale_scalar]).unwrap();
-        all_param_grads.push(grad_a);
-        all_param_grads.push(grad_b);
-        all_param_grads.push(grad_scale);
+
+        // Append scalar grads as 1x1 arrays for optimizer compatibility
+        all_param_grads.push(Array2::from_shape_vec((1, 1), vec![grad_a_scalar]).unwrap());
+        all_param_grads.push(Array2::from_shape_vec((1, 1), vec![grad_b_scalar]).unwrap());
+        all_param_grads.push(Array2::from_shape_vec((1, 1), vec![grad_scale_scalar]).unwrap());
+
+        // Append gating param grads
         all_param_grads.push(grad_w_g);
         all_param_grads.push(grad_alpha_g);
         all_param_grads.push(grad_beta_g);
-        // [LEARN] gate polynomial coefficient grads
-        let grad_gate_poly = Array2::<f32>::from_shape_vec((1, n_gate_w), grad_gate_poly_vec.into_iter().map(|v| v as f32).collect()).unwrap();
-        all_param_grads.push(grad_gate_poly);
 
+        // Append gate polynomial coefficient grads as a 1xN array (N = weights.len())
+        let grad_gate_poly_arr = Array2::<f32>::from_shape_vec(
+            (1, n_gate_w),
+            grad_gate_poly_vec.iter().map(|&v| v as f32).collect()
+        ).unwrap();
+        all_param_grads.push(grad_gate_poly_arr);
+
+        // Append CoPE grads if enabled
         if let Some(grad_pe) = grad_cope_pos { all_param_grads.push(grad_pe); }
 
         (grad_input_total, all_param_grads)
