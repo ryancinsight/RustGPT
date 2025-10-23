@@ -9,6 +9,7 @@ use std::thread_local;
 
 use crate::{adam::Adam, MAX_SEQ_LEN};
 use crate::llm::Layer;
+use crate::sigmoid_poly::SigmoidPoly; // [MOD] import learnable polynomial gate
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyHead {
@@ -54,22 +55,25 @@ pub struct PolyAttention {
     opt_w_out: Adam,
 
     // polynomial parameters (scalars, stored as 1x1 arrays for optimizer compatibility)
-    pub p: usize, // fixed odd integer (e.g., 3)
-    pub a: Array2<f32>, // init 1.0
-    pub b: Array2<f32>, // init 0.0
-    pub scale: Array2<f32>, // init 1/sqrt(N) with N = MAX_SEQ_LEN by default
+    pub p: usize,
+    pub a: Array2<f32>,
+    pub b: Array2<f32>,
+    pub scale: Array2<f32>,
     opt_a: Adam,
     opt_b: Adam,
     opt_scale: Adam,
 
     // ===== Adaptive Mixture-of-Heads gating (learned, fully adaptive) =====
-    // Per-head gating projection and learned parametric sigmoid: g = sigmoid(alpha * (X·W_g) + beta)
+    // Per-head gating projection and learned polynomial gate: g = phi(alpha * (X·W_g) + beta)
     pub w_g: Array2<f32>,       // (embed_dim, num_heads)
     pub alpha_g: Array2<f32>,   // (1, num_heads)
     pub beta_g: Array2<f32>,    // (1, num_heads)
     opt_w_g: Adam,
     opt_alpha_g: Adam,
     opt_beta_g: Adam,
+
+    // [MOD] Learnable polynomial for gating
+    pub gate_poly: SigmoidPoly,
 
     // CoPE integration and sliding window
     use_cope: bool,
@@ -188,6 +192,8 @@ impl PolyAttention {
             opt_w_g,
             opt_alpha_g,
             opt_beta_g,
+            // [MOD]
+            gate_poly: SigmoidPoly::new_cubic_default(),
             use_cope,
             cope_max_pos,
             cope_pos_embeddings,
@@ -254,14 +260,21 @@ impl PolyAttention {
             let k = input.dot(&head.w_k); // (N, d_h)
             let v = input.dot(&head.w_v); // (N, d_h)
 
-            // Compute per-token gating for this head: g = sigmoid(alpha * (X·w_g_col) + beta)
+            // Compute per-token gating for this head: g = phi(alpha * (X·w_g_col) + beta)
             let w_g_col = self.w_g.slice(s![.., h_idx..h_idx+1]); // (D,1)
             let mut g_col = input.dot(&w_g_col); // (N,1)
             let a_h = self.alpha_g[[0, h_idx]];
             let b_h = self.beta_g[[0, h_idx]];
-            g_col.mapv_inplace(|z| {
-                let z = (a_h * z + b_h).max(-20.0).min(20.0);
-                1.0 / (1.0 + (-z).exp())
+            // [MOD] polynomial gate with dynamic scaling based on z range
+            let max_abs_z = g_col.iter().fold(0.0_f64, |m, &v| {
+                let z = a_h as f64 * v as f64 + b_h as f64;
+                m.max(z.abs())
+            });
+            let mut gate_poly = self.gate_poly.clone();
+            gate_poly.update_scaling_from_max_abs(max_abs_z);
+            g_col.mapv_inplace(|xw| {
+                let z = a_h * xw + b_h;
+                gate_poly.forward_scalar(z as f64) as f32
             });
 
             with_tls_scores(n, |scores| {
@@ -340,6 +353,9 @@ impl PolyAttention {
         let mut grad_w_g = Array2::<f32>::zeros((self.embed_dim, self.num_heads));
         let mut grad_alpha_g = Array2::<f32>::zeros((1, self.num_heads));
         let mut grad_beta_g = Array2::<f32>::zeros((1, self.num_heads));
+        // [LEARN] Gate polynomial coefficient gradient accumulator (shared across heads)
+        let n_gate_w = self.gate_poly.weights.len();
+        let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
         // CoPE grads accumulator (shared across heads)
         let grad_cope_pos = if self.use_cope {
@@ -364,14 +380,14 @@ impl PolyAttention {
             let xw_col = input.dot(&w_g_col); // (N,1)
             let a_h = self.alpha_g[[0, h_idx]];
             let b_h = self.beta_g[[0, h_idx]];
-            // z = a_h * xw + b_h; g = sigmoid(z)
+            // z = a_h * xw + b_h; g = phi(z)
             let mut z_col = xw_col.clone();
             z_col.mapv_inplace(|v| a_h * v + b_h);
+            let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
+            let mut gate_poly = self.gate_poly.clone();
+            gate_poly.update_scaling_from_max_abs(max_abs_z);
             let mut g_col = z_col.clone();
-            g_col.mapv_inplace(|z| {
-                let z = z.max(-20.0).min(20.0);
-                1.0 / (1.0 + (-z).exp())
-            });
+            g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
 
             with_tls_scores(n, |scores| {
                 scores.fill(0.0);
@@ -419,13 +435,26 @@ impl PolyAttention {
 
                         // grad_g_col (N,1) = sum_j g_yh_gated[i,j] * y_pre[i,j]
                         let prod = &y_pre * &*yh; // (N, d_h)
-                        let mut grad_g_col = prod.sum_axis(Axis(1)).insert_axis(Axis(1)); // (N,1)
+                        let grad_g_dg = prod.sum_axis(Axis(1)).insert_axis(Axis(1)); // (N,1), dL/dg
 
-                        // dz = grad_g * sigmoid'(z) where sigmoid'(z) = g * (1 - g)
-                        let mut dz_col = g_col.clone(); // (N,1)
-                        azip!((dz in &mut dz_col) { *dz = *dz * (1.0 - *dz); }); // g*(1-g)
-                        grad_g_col *= &dz_col; // dz = grad_g * g*(1-g)
+                        // dz = grad_g * phi'(z)
+                        let mut dphi_col = z_col.clone();
+                        dphi_col.mapv_inplace(|z| gate_poly.backward_scalar(z as f64) as f32);
+                        let mut grad_g_col = grad_g_dg.clone();
+                        grad_g_col *= &dphi_col; // chain rule
 
+                        // [LEARN] Accumulate gate polynomial coefficient gradients: dL/dw_i = sum grad(dL/dg) * (c*z)^i
+                        let c_gate = gate_poly.scaling as f64;
+                        for i in 0..n {
+                            let z = z_col[[i, 0]] as f64;
+                            let mut power = 1.0_f64; // (c*z)^0
+                            let cz = c_gate * z;
+                            for wi in 0..n_gate_w {
+                                grad_gate_poly_vec[wi] += (grad_g_dg[[i, 0]] as f64) * power;
+                                power *= cz;
+                            }
+                        }
+                        
                         // Accumulate gating param grads
                         // dW_g_col = alpha * X^T dot dz
                         let d_wg_col = input.t().dot(&grad_g_col) * a_h;
@@ -517,6 +546,9 @@ impl PolyAttention {
         all_param_grads.push(grad_w_g);
         all_param_grads.push(grad_alpha_g);
         all_param_grads.push(grad_beta_g);
+        // [LEARN] gate polynomial coefficient grads
+        let grad_gate_poly = Array2::<f32>::from_shape_vec((1, n_gate_w), grad_gate_poly_vec.into_iter().map(|v| v as f32).collect()).unwrap();
+        all_param_grads.push(grad_gate_poly);
 
         if let Some(grad_pe) = grad_cope_pos { all_param_grads.push(grad_pe); }
 
@@ -525,7 +557,7 @@ impl PolyAttention {
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
         // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g
-        let mut expected = self.num_heads * 3 + 1 + 3 + 3;
+        let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
         if self.use_cope { expected += 1; }
         if param_grads.len() != expected {
             return Err(crate::errors::ModelError::GradientError{
@@ -549,6 +581,14 @@ impl PolyAttention {
         self.opt_alpha_g.step(&mut self.alpha_g, &param_grads[idx+1], lr);
         self.opt_beta_g.step(&mut self.beta_g, &param_grads[idx+2], lr);
         idx += 3;
+        // [LEARN] update gate polynomial weights via SGD
+        {
+            let grad_gate_poly = &param_grads[idx];
+            for i in 0..self.gate_poly.weights.len() {
+                self.gate_poly.weights[i] -= (lr as f64) * (grad_gate_poly[[0, i]] as f64);
+            }
+        }
+        idx += 1;
         if self.use_cope {
             if let (Some(pe), Some(opt)) = (self.cope_pos_embeddings.as_mut(), self.opt_cope_pos.as_mut()) {
                 opt.step(pe, &param_grads[idx], lr);
@@ -566,7 +606,7 @@ impl PolyAttention {
 
     fn parameters(&self) -> usize {
         let head_params = self.heads.iter().map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len()).sum::<usize>();
-        let mut total = self.w_out.len() + 3 + head_params + self.w_g.len() + self.alpha_g.len() + self.beta_g.len();
+        let mut total = self.w_out.len() + 3 + head_params + self.w_g.len() + self.alpha_g.len() + self.beta_g.len() + self.gate_poly.weights.len();
         if self.use_cope { total += (self.cope_max_pos + 1) * self.head_dim; }
         total
     }

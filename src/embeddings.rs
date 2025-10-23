@@ -64,6 +64,7 @@ impl Embeddings {
         Array2::from_shape_fn((max_seq_len, embedding_dim), |_| normal.sample(&mut rng))
     }
 
+    #[inline]
     fn get_token_embeddings(embeddings: &Array2<f32>, token_ids: &[usize]) -> Array2<f32> {
         let mut token_embeds = Array2::<f32>::zeros((token_ids.len(), embeddings.ncols()));
         for (i, &token_id) in token_ids.iter().enumerate() {
@@ -86,6 +87,7 @@ impl Embeddings {
         token_embeds
     }
 
+    #[inline]
     fn get_positional_embeddings(
         positional_encodings: &Array2<f32>,
         seq_len: usize,
@@ -106,6 +108,7 @@ impl Embeddings {
             .to_owned()
     }
 
+    #[inline]
     pub fn embed_tokens(&self, token_ids: &[usize]) -> Array2<f32> {
         let token_embeds = Self::get_token_embeddings(&self.token_embeddings, token_ids);
         if self.use_positional {
@@ -123,6 +126,7 @@ impl Layer for Embeddings {
         "Embeddings"
     }
 
+    #[inline]
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // input shape is [1, sequence_length]
         self.cached_input = Some(input.clone());
@@ -130,6 +134,7 @@ impl Layer for Embeddings {
         self.embed_tokens(&token_ids) // shape is [sequence_length, embedding_dim]
     }
 
+    #[inline]
     fn compute_gradients(
         &self,
         _input: &Array2<f32>,

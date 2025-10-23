@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::fs;
 
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array2, Axis};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
@@ -193,8 +193,13 @@ impl LLM {
         self.network
             .iter()
             .map(|layer| layer.layer_type())
-            .collect::<Vec<&str>>()
-            .join(", ")
+            .fold(String::new(), |mut acc, layer_type| {
+                if !acc.is_empty() {
+                    acc.push_str(", ");
+                }
+                acc.push_str(layer_type);
+                acc
+            })
     }
 
     pub fn total_parameters(&self) -> usize {
@@ -205,6 +210,7 @@ impl LLM {
             .sum::<usize>()
     }
 
+    #[inline]
     pub fn predict(&mut self, text: &str) -> String {
         let output_tokens = self.forward(text);
 
@@ -214,14 +220,19 @@ impl LLM {
         }
 
         // Convert token_ids to strings
-        let token_strs = output_tokens
+        output_tokens
             .iter()
             .map(|&t| self.vocab.decode(t).unwrap())
-            .collect::<Vec<&str>>();
-
-        token_strs.join(" ")
+            .fold(String::new(), |mut acc, token_str| {
+                if !acc.is_empty() {
+                    acc.push(' ');
+                }
+                acc.push_str(token_str);
+                acc
+            })
     }
 
+    #[inline]
     fn forward(&mut self, text: &str) -> Vec<usize> {
         // Tokenize the input text
         let mut tokenized = self.tokenize(text);
@@ -247,11 +258,10 @@ impl LLM {
                 break;
             }
 
-            let token_input = Array2::from_shape_vec(
-                (1, tokenized.len()),
-                tokenized.iter().map(|&x| x as f32).collect(),
-            )
-            .unwrap();
+            let mut token_input = Array2::zeros((1, tokenized.len()));
+            for (i, &token_id) in tokenized.iter().enumerate() {
+                token_input[[0, i]] = token_id as f32;
+            }
             let mut input = token_input;
 
             for layer in &mut self.network {
@@ -430,9 +440,9 @@ impl LLM {
 
             // Forward pass with signal propagation variance tracking
             let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-            input
-                .row_mut(0)
-                .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
+            for (i, &token_id) in input_ids.iter().enumerate() {
+                input[[0, i]] = token_id as f32;
+            }
 
             // Track forward pass variance for signal propagation analysis
             // Reference: "Deep Information Propagation" (Schoenholz et al., 2017)
@@ -442,11 +452,11 @@ impl LLM {
             for layer in &mut self.network {
                 input = layer.forward(&input);
 
-                // Compute variance of layer output
-                let mean: f32 = input.iter().sum::<f32>() / input.len() as f32;
-                let variance: f32 = input.iter()
-                    .map(|&x| (x - mean).powi(2))
-                    .sum::<f32>() / input.len() as f32;
+                // Compute variance of layer output in single pass
+                let (sum, sum_sq) = input.iter().fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
+                let n = input.len() as f32;
+                let mean = sum / n;
+                let variance = (sum_sq / n) - mean * mean;
                 layer_variances.push(variance);
             }
 
@@ -672,6 +682,7 @@ impl LLM {
         Ok(())
     }
 
+    #[inline]
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         // Input validation
         let safe_text = if text.len() > crate::MAX_INPUT_LENGTH {
@@ -729,26 +740,27 @@ impl LLM {
         tokens
     }
 
+    #[inline]
     fn softmax(logits: &Array2<f32>) -> Array2<f32> {
         // logits is seq_len x vocab_size
         let mut result = logits.clone();
 
         // Apply softmax row-wise
         for mut row in result.rows_mut() {
-            // Calculate exp for each element
+            // Calculate max value for numerical stability
             let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let exp_values: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
-            let sum_exp: f32 = exp_values.iter().copied().sum();
 
-            // Normalize by sum without aliasing borrows
-            for (r, &exp_val) in row.iter_mut().zip(exp_values.iter()) {
-                *r = exp_val / sum_exp;
-            }
+            // Compute sum of exp values in one pass
+            let sum_exp: f32 = row.iter().map(|&x| (x - max_val).exp()).sum();
+
+            // Normalize in-place
+            row.mapv_inplace(|x| (x - max_val).exp() / sum_exp);
         }
 
         result
     }
 
+    #[inline]
     fn greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
         probs
             .map_axis(Axis(1), |row| {
@@ -761,6 +773,7 @@ impl LLM {
             .to_vec()
     }
 
+    #[inline]
     fn cross_entropy_loss_step(probs: &Array2<f32>, target: &[usize]) -> f32 {
         let mut loss = 0.0;
         for row_idx in 0..probs.shape()[0] {
@@ -771,6 +784,7 @@ impl LLM {
         loss / target.len() as f32
     }
 
+    #[inline]
     fn compute_gradients_step(probs: &Array2<f32>, target: &[usize]) -> Array2<f32> {
         let mut grads = probs.clone(); // Start with softmax probabilities
 

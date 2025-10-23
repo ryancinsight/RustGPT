@@ -83,6 +83,7 @@ impl Adam {
         self.use_decoupled_wd = decoupled;
     }
 
+    #[inline]
     pub fn step(&mut self, params: &mut Array2<f32>, grads: &Array2<f32>, lr: f32) {
         self.timestep += 1;
 
@@ -98,7 +99,10 @@ impl Adam {
             grads.clone()
         };
 
+        // Update m first
         self.m = &self.m * self.beta1 + &(effective_grads.clone() * (1.0 - self.beta1));
+
+        // Then update v using the same effective_grads
         self.v = &self.v * self.beta2 + &(effective_grads.mapv(|x| x * x) * (1.0 - self.beta2));
 
         let m_hat = &self.m / (1.0 - self.beta1.powi(self.timestep as i32));
