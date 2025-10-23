@@ -3,6 +3,8 @@ use std::{cell::RefCell, thread_local};
 use ndarray::{Array2, Axis, azip, linalg::general_mat_mul, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
+use rayon::prelude::*;
+use rayon::slice::ParallelSliceMut;
 
 use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, sigmoid_poly::SigmoidPoly}; // [MOD] import learnable polynomial gate
 
@@ -97,6 +99,8 @@ thread_local! {
     static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
+    static TLS_ROWBUF1: RefCell<Vec<f32>> = RefCell::new(Vec::new()); // (d_h)
+    static TLS_ROWBUF2: RefCell<Vec<f32>> = RefCell::new(Vec::new()); // (d_h)
 }
 
 #[inline]
@@ -144,6 +148,24 @@ fn with_tls_yh<R>(n: usize, d: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> 
         }
         let mat = opt.as_mut().unwrap();
         f(mat)
+    })
+}
+
+#[inline]
+fn with_tls_rowbuf1<R>(d: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    TLS_ROWBUF1.with(|cell| {
+        let mut v = cell.borrow_mut();
+        if v.len() != d { v.resize(d, 0.0); } else { v.fill(0.0); }
+        f(v.as_mut_slice())
+    })
+}
+
+#[inline]
+fn with_tls_rowbuf2<R>(d: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    TLS_ROWBUF2.with(|cell| {
+        let mut v = cell.borrow_mut();
+        if v.len() != d { v.resize(d, 0.0); } else { v.fill(0.0); }
+        f(v.as_mut_slice())
     })
 }
 
@@ -308,7 +330,7 @@ impl PolyAttention {
             let mut g_col = input.dot(&w_g_col); // (N,1)
             let a_h = self.alpha_g[[0, h_idx]];
             let b_h = self.beta_g[[0, h_idx]];
-            // [MOD] polynomial gate with dynamic scaling based on z range
+            // polynomial gate with dynamic scaling based on z range
             let max_abs_z = g_col.iter().fold(0.0_f64, |m, &v| {
                 let z = a_h as f64 * v as f64 + b_h as f64;
                 m.max(z.abs())
@@ -320,57 +342,120 @@ impl PolyAttention {
                 gate_poly.forward_scalar(z as f64) as f32
             });
 
-            with_tls_scores(n, |scores| {
-                scores.fill(0.0);
-                general_mat_mul(1.0, &q, &k.t(), 0.0, scores);
-                *scores *= dk_scale;
+            // Common polynomial params
+            let a = self.a[[0, 0]];
+            let b = self.b[[0, 0]];
+            let scale = self.scale[[0, 0]];
+            let p_i32 = self.p as i32;
 
-                // Optional causal masking (in-place)
-                if causal {
-                    Self::apply_causal_mask_inplace(scores);
-                }
-                // Optional sliding window mask (lower triangle band)
-                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+            // If no sliding window, keep the original dense path for full attention
+            if self.window_size.is_none() {
+                // Dense path (kept as-is)
+                with_tls_scores(n, |scores| {
+                    scores.fill(0.0);
+                    general_mat_mul(1.0, &q, &k.t(), 0.0, scores);
+                    *scores *= dk_scale;
 
-                // Add CoPE position logits if enabled
-                if self.use_cope {
-                    let pos_logits = self.cope_pos_logits(&q, &k, self.window_size);
-                    *scores += &pos_logits;
                     if causal {
                         Self::apply_causal_mask_inplace(scores);
                     }
                     Self::apply_sliding_window_mask_inplace(scores, self.window_size);
-                }
 
-                // Polynomial activation in-place on scores: phi(S) = scale * (a * S^p + b)
-                let a = self.a[[0, 0]];
-                let b = self.b[[0, 0]];
-                let scale = self.scale[[0, 0]];
-                let p_i32 = self.p as i32;
-                scores.mapv_inplace(|x| {
-                    let sp = x.powi(p_i32);
-                    scale * (a * sp + b)
+                    if self.use_cope {
+                        let pos_logits = self.cope_pos_logits(&q, &k, self.window_size);
+                        *scores += &pos_logits;
+                        if causal {
+                            Self::apply_causal_mask_inplace(scores);
+                        }
+                        Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+                    }
+
+                    scores.mapv_inplace(|x| {
+                        let sp = x.powi(p_i32);
+                        scale * (a * sp + b)
+                    });
+
+                    if causal {
+                        Self::apply_causal_mask_inplace(scores);
+                    }
+                    Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+
+                    with_tls_yh(n, self.head_dim, |yh| {
+                        yh.fill(0.0);
+                        general_mat_mul(1.0, &*scores, &v, 0.0, yh);
+                        *yh *= &g_col;
+
+                        let start = h_idx * self.head_dim;
+                        let end = start + self.head_dim;
+                        let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
+                        general_mat_mul(1.0, &*yh, &w_block, 1.0, &mut out);
+                    });
+                });
+                continue;
+            }
+
+            // Windowed path: true banded compute, no NxN scratch
+            let w = self.window_size.unwrap();
+            let use_cope = self.use_cope;
+            let cope_max_pos = self.cope_max_pos;
+            let cope_pe_opt = self.cope_pos_embeddings.as_ref();
+
+            with_tls_yh(n, self.head_dim, |yh| {
+                yh.fill(0.0);
+                // Parallel row compute with zero-copy slices
+                let dh = self.head_dim;
+                let q_s = q.as_slice_memory_order().expect("Q contiguous");
+                let k_s = k.as_slice_memory_order().expect("K contiguous");
+                let v_s = v.as_slice_memory_order().expect("V contiguous");
+                let g_s = g_col.as_slice_memory_order().expect("g contiguous"); // (N,1)
+                let pe_s_opt = cope_pe_opt.and_then(|pe| pe.as_slice_memory_order());
+                let yh_s = yh
+                    .as_slice_memory_order_mut()
+                    .expect("Yh contiguous");
+                // Each row has length dh
+                yh_s.par_chunks_mut(dh).enumerate().for_each(|(i, row)| {
+                    let j_end: usize = i; // lower-tri band in windowed path
+                    let j_start = if w > 0 { i.saturating_sub(w - 1) } else { 0 };
+                    let qi = &q_s[i * dh..(i + 1) * dh];
+                    for j in j_start..=j_end {
+                        let kj = &k_s[j * dh..(j + 1) * dh];
+                        // dot(q_i, k_j)
+                        let mut s = 0.0f32;
+                        for u in 0..dh {
+                            s += qi[u] * kj[u];
+                        }
+                        s *= dk_scale;
+                        if use_cope {
+                            let pos = i - j;
+                            if pos <= cope_max_pos {
+                                if let Some(pe_s) = pe_s_opt {
+                                    let pe_row = &pe_s[pos * dh..(pos + 1) * dh];
+                                    let mut add = 0.0f32;
+                                    for u in 0..dh {
+                                        add += qi[u] * pe_row[u];
+                                    }
+                                    s += add;
+                                }
+                            }
+                        }
+                        let sp = s.powi(p_i32);
+                        let s_act = scale * (a * sp + b);
+                        let vj = &v_s[j * dh..(j + 1) * dh];
+                        for u in 0..dh {
+                            row[u] += s_act * vj[u];
+                        }
+                    }
+                    let g_i = g_s[i];
+                    for u in 0..dh {
+                        row[u] *= g_i;
+                    }
                 });
 
-                // keep masked positions zero (in-place)
-                if causal {
-                    Self::apply_causal_mask_inplace(scores);
-                }
-                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
-
-                with_tls_yh(n, self.head_dim, |yh| {
-                    yh.fill(0.0);
-                    general_mat_mul(1.0, &*scores, &v, 0.0, yh);
-
-                    // Apply gating: row-wise scaling by g_col
-                    *yh *= &g_col;
-
-                    // Accumulate directly into output via the corresponding rows of W_out
-                    let start = h_idx * self.head_dim;
-                    let end = start + self.head_dim;
-                    let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
-                    general_mat_mul(1.0, &*yh, &w_block, 1.0, &mut out);
-                });
+                // Accumulate into output via W_out head block
+                let start = h_idx * self.head_dim;
+                let end = start + self.head_dim;
+                let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
+                general_mat_mul(1.0, &*yh, &w_block, 1.0, &mut out);
             });
         }
 
@@ -406,7 +491,7 @@ impl PolyAttention {
         let n_gate_w = self.gate_poly.weights.len();
         let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
-        // CoPE grads accumulator (shared across heads)
+        // CoPE grads accumulator (shared across heads) — keeping shape for optimizer compatibility
         let grad_cope_pos = if self.use_cope {
             Some(Array2::<f32>::zeros((self.cope_max_pos + 1, self.head_dim)))
         } else {
@@ -425,6 +510,212 @@ impl PolyAttention {
         let scale = self.scale[[0, 0]];
         let p_i32 = self.p as i32;
         let p_f = self.p as f32;
+
+        // Banded backward path when windowed attention is enabled
+        if let Some(w) = self.window_size {
+            for (h_idx, head) in self.heads.iter().enumerate() {
+                // Recompute per-head Q, K, V and intermediates
+                let q = input.dot(&head.w_q); // (N, d_h)
+                let k = input.dot(&head.w_k); // (N, d_h)
+                let v = input.dot(&head.w_v); // (N, d_h)
+
+                // Gating forward values for this head (and caches for backward)
+                let w_g_col = self.w_g.slice(s![.., h_idx..h_idx + 1]); // (D,1)
+                let xw_col = input.dot(&w_g_col); // (N,1)
+                let a_h = self.alpha_g[[0, h_idx]];
+                let b_h = self.beta_g[[0, h_idx]];
+                // z = a_h * xw + b_h; g = phi(z)
+                let mut z_col = xw_col.clone();
+                z_col.mapv_inplace(|v| a_h * v + b_h);
+                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
+                let mut gate_poly = self.gate_poly.clone();
+                gate_poly.update_scaling_from_max_abs(max_abs_z);
+                let mut g_col = z_col.clone();
+                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+
+                // grad wrt W_out needs H_h (gated). We avoid storing H by accumulating the block.
+                let start = h_idx * self.head_dim;
+                let end = start + self.head_dim;
+                let w_block = self.w_out.slice(s![start..end, ..]);
+                let w_block_t = w_block.t();
+
+                // g_yh_gated = dL/dY · W_out_block^T
+                let mut g_yh_gated = Array2::<f32>::zeros((n, self.head_dim));
+                general_mat_mul(1.0, output_grads, &w_block_t, 0.0, &mut g_yh_gated);
+
+                // Per-projection grads
+                let mut grad_q = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_k = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_v = Array2::<f32>::zeros((n, self.head_dim));
+
+                // Gating param grads accumulators (per-head)
+                let mut d_wg_col_acc = Array2::<f32>::zeros((self.embed_dim, 1)); // (D,1)
+                let mut dalpha = 0.0_f32;
+                let mut dbeta = 0.0_f32;
+
+                // Gate polynomial coefficient grads (shared accumulator)
+                let c_gate = gate_poly.scaling as f64;
+
+                // Row-wise banded backward
+                // Use contiguous zero-copy slices and reusable row buffers
+                let dh = self.head_dim;
+                let q_s = q.as_slice_memory_order().expect("Q contiguous");
+                let k_s = k.as_slice_memory_order().expect("K contiguous");
+                let v_s = v.as_slice_memory_order().expect("V contiguous");
+                let gyg_s = g_yh_gated.as_slice_memory_order().expect("g_yh_gated contiguous");
+                let og_s = output_grads.as_slice_memory_order().expect("output grads contiguous");
+
+                for i in 0..n {
+                    let g_i = g_col[[i, 0]];
+                    let qi = &q_s[i * dh..(i + 1) * dh];
+
+                    // y_pre[i,*] via banded sum; reuse TLS row buffer
+                    with_tls_rowbuf1(dh, |y_pre_row| {
+                        let j_start = i.saturating_sub(w - 1);
+                        for j in j_start..=i {
+                            let kj = &k_s[j * dh..(j + 1) * dh];
+                            let mut s_ij = 0.0f32;
+                            for u in 0..dh { s_ij += qi[u] * kj[u]; }
+                            s_ij *= dk_scale;
+                            let sp = s_ij.powi(p_i32);
+                            let phi_s = scale * (a * sp + b);
+                            let vj = &v_s[j * dh..(j + 1) * dh];
+                            for u in 0..dh { y_pre_row[u] += phi_s * vj[u]; }
+                        }
+
+                        // Accumulate grad_w_out block using H_h[i,*] = g_i * y_pre_row
+                        let og_i = &og_s[i * self.embed_dim..(i + 1) * self.embed_dim];
+                        for u in 0..dh {
+                            let yhu = y_pre_row[u] * g_i;
+                            if yhu != 0.0 {
+                                let row_idx = start + u;
+                                for d in 0..self.embed_dim {
+                                    grad_w_out[[row_idx, d]] += yhu * og_i[d];
+                                }
+                            }
+                        }
+
+                        // grad_g_dg[i] = dot(g_yh_gated[i,*], y_pre[i,*])
+                        let gyg_i = &gyg_s[i * dh..(i + 1) * dh];
+                        let mut grad_g_dg_i = 0.0f32;
+                        for u in 0..dh { grad_g_dg_i += gyg_i[u] * y_pre_row[u]; }
+                        // dz = grad_g * phi_gate'(z)
+                        let dphi_gate = gate_poly.backward_scalar(z_col[[i, 0]] as f64) as f32;
+                        let grad_g_col_i = grad_g_dg_i * dphi_gate;
+
+                        // Accumulate gating weight grads: dW_g_col += alpha * X[i]^T * grad_g_col_i
+                        for d in 0..self.embed_dim {
+                            d_wg_col_acc[[d, 0]] += a_h * grad_g_col_i * input[[i, d]];
+                        }
+                        // d alpha and d beta
+                        dalpha += grad_g_col_i * xw_col[[i, 0]];
+                        dbeta += grad_g_col_i;
+
+                        // dX from gating path: grad_input += grad_g_col_i · (alpha * w_g_col^T)
+                        for d in 0..self.embed_dim {
+                            grad_input_total[[i, d]] += grad_g_col_i * a_h * w_g_col[[d, 0]];
+                        }
+
+                        // [LEARN] gate polynomial coefficient gradient: dL/dw_i += grad_g_dg * (c*z)^i
+                        let zf = z_col[[i, 0]] as f64;
+                        let mut power = 1.0_f64; // (c*z)^0
+                        let cz = c_gate * zf;
+                        for wi in 0..n_gate_w {
+                            grad_gate_poly_vec[wi] += (grad_g_dg_i as f64) * power;
+                            power *= cz;
+                        }
+
+                        // Now compute grads wrt V, S, then Q and K over the same band
+                        with_tls_rowbuf2(dh, |g_yh_pre_row| {
+                            for u in 0..dh { g_yh_pre_row[u] = g_i * gyg_i[u]; }
+                            let j_start2 = i.saturating_sub(w - 1);
+                            for j in j_start2..=i {
+                                // Forward recompute s_ij (no CoPE path in backward for parity)
+                                let kj2 = &k_s[j * dh..(j + 1) * dh];
+                                let mut s_ij = 0.0f32;
+                                for u in 0..dh { s_ij += qi[u] * kj2[u]; }
+                                s_ij *= dk_scale;
+                                let sp = s_ij.powi(p_i32);
+                                // phi'(s) factor for dS
+                                let dphi_ds = scale * a * p_f * if p_i32 == 1 { 1.0 } else { s_ij.powi(p_i32 - 1) };
+
+                                // dphi_ij = dot(g_yh_pre[i,*], v_j)
+                                let vj2 = &v_s[j * dh..(j + 1) * dh];
+                                let mut dphi_ij = 0.0f32;
+                                for u in 0..dh { dphi_ij += g_yh_pre_row[u] * vj2[u]; }
+
+                                // Scalars grads wrt (a, b, scale)
+                                grad_scale_scalar += dphi_ij * (a * sp + b);
+                                grad_a_scalar += dphi_ij * scale * sp;
+                                grad_b_scalar += dphi_ij * scale;
+
+                                // dS_ij
+                                let dS_ij = dphi_ij * dphi_ds;
+
+                                // dV_j += phi(s_ij) * g_yh_pre[i,*]
+                                let phi_s = scale * (a * sp + b);
+                                for u in 0..dh {
+                                    grad_v[[j, u]] += phi_s * g_yh_pre_row[u];
+                                }
+
+                                // dQ_i += dS_ij * dk_scale * k_j;  dK_j += dS_ij * dk_scale * q_i
+                                for u in 0..dh {
+                                    grad_q[[i, u]] += dS_ij * dk_scale * kj2[u];
+                                    grad_k[[j, u]] += dS_ij * dk_scale * qi[u];
+                                }
+                            }
+                        });
+                    });
+                }
+
+                // Backprop through linear projections: Q = X W_q; W grads and input grads
+                let d_w_q = input.t().dot(&grad_q);
+                let d_w_k = input.t().dot(&grad_k);
+                let d_w_v = input.t().dot(&grad_v);
+
+                all_param_grads.push(d_w_q);
+                all_param_grads.push(d_w_k);
+                all_param_grads.push(d_w_v);
+
+                // Accumulate grad_input from projections
+                general_mat_mul(1.0, &grad_q, &head.w_q.t(), 1.0, &mut grad_input_total);
+                general_mat_mul(1.0, &grad_k, &head.w_k.t(), 1.0, &mut grad_input_total);
+                general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_total);
+
+                // Write gating grads into shared accumulators
+                let mut grad_wg_slice = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
+                grad_wg_slice += &d_wg_col_acc;
+                grad_alpha_g[[0, h_idx]] += dalpha;
+                grad_beta_g[[0, h_idx]] += dbeta;
+            }
+
+            // Append output projection grads and scalar grads and gating grads
+            all_param_grads.push(grad_w_out);
+            let grad_a = Array2::<f32>::from_shape_vec((1, 1), vec![grad_a_scalar]).unwrap();
+            let grad_b = Array2::<f32>::from_shape_vec((1, 1), vec![grad_b_scalar]).unwrap();
+            let grad_scale = Array2::<f32>::from_shape_vec((1, 1), vec![grad_scale_scalar]).unwrap();
+            all_param_grads.push(grad_a);
+            all_param_grads.push(grad_b);
+            all_param_grads.push(grad_scale);
+            all_param_grads.push(grad_w_g);
+            all_param_grads.push(grad_alpha_g);
+            all_param_grads.push(grad_beta_g);
+            // [LEARN] gate polynomial coefficient grads
+            let grad_gate_poly = Array2::<f32>::from_shape_vec(
+                (1, n_gate_w),
+                grad_gate_poly_vec.into_iter().map(|v| v as f32).collect(),
+            )
+            .unwrap();
+            all_param_grads.push(grad_gate_poly);
+
+            if let Some(grad_pe) = grad_cope_pos {
+                all_param_grads.push(grad_pe);
+            }
+
+            return (grad_input_total, all_param_grads);
+        }
+
+        // ===== Dense backward path (original) when window_size is None =====
         for (h_idx, head) in self.heads.iter().enumerate() {
             // Recompute per-head Q, K, V and intermediates
             let q = input.dot(&head.w_q); // (N, d_h)
