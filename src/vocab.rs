@@ -53,6 +53,7 @@ impl Vocab {
     }
 
     /// Convert a word to its token index
+    #[inline]
     pub fn encode(&self, word: &str) -> Option<usize> {
         self.encode.get(word).copied()
     }
@@ -70,6 +71,7 @@ impl Vocab {
     }
 
     /// Convert a token index back to a word
+    #[inline]
     pub fn decode(&self, token_id: usize) -> Option<&str> {
         self.word_ranges.get(token_id).map(|&(start, len)| {
             &self.words_buffer[start..start + len]
@@ -136,17 +138,14 @@ impl Vocab {
             .iter()
             .flat_map(|text| text.split_whitespace())
             .flat_map(|word| {
-                let parts = word
-                    .split(|c: char| c.is_ascii_punctuation())
+                word.split(|c: char| c.is_ascii_punctuation())
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
-                    .collect::<Vec<_>>();
-                let puncts = word
-                    .chars()
-                    .filter(|c| c.is_ascii_punctuation())
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>();
-                parts.into_iter().chain(puncts)
+                    .chain(
+                        word.chars()
+                            .filter(|c| c.is_ascii_punctuation())
+                            .map(|c| c.to_string())
+                    )
             })
             .for_each(|token| {
                 vocab_set.insert(token);

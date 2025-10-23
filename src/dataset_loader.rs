@@ -36,8 +36,8 @@ impl Dataset {
         }
 
         Ok(Dataset {
-            pretraining_data: pretraining_data.clone(),
-            chat_training_data: chat_training_data.clone(),
+            pretraining_data,
+            chat_training_data,
         })
     }
 }

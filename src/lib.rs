@@ -15,6 +15,7 @@ pub mod model_config;
 pub mod model_persistence;
 pub mod output_projection;
 pub mod dynamic_tanh_norm;
+pub mod sigmoid_poly;
 // removed: pub mod routing;
 // removed: pub mod self_attention;
 pub mod swiglu;

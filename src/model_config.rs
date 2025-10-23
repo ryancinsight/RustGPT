@@ -229,69 +229,7 @@ pub enum AttentionType {
     PolyAttention { degree_p: usize },
 }
 
-/// Configuration for adaptive recursive depth
-///
-/// Enables models to dynamically learn the optimal number of recursive steps
-/// for each input based on complexity, using Adaptive Computation Time (ACT).
-///
-/// # Mechanism
-/// - At each recursive step, compute halting probability: p_halt = sigmoid(W·h + b)
-/// - Accumulate probabilities: cumulative_p = sum(p_halt[0:t])
-/// - Stop when cumulative_p >= halt_threshold (e.g., 0.95)
-/// - Ponder loss: Penalize excessive depth to encourage efficiency
-///
-/// # Benefits
-/// - Simple inputs use fewer steps (e.g., 2-3 instead of 5)
-/// - Complex inputs can use more steps (e.g., 7-10 instead of 5)
-/// - Fully differentiable (maintains excellent gradient flow)
-/// - Compatible with existing MoH mechanism
-///
-/// # Example
-/// ```rust
-/// use llm::model_config::AdaptiveDepthConfig;
-/// let config = AdaptiveDepthConfig {
-///     max_depth: 10,           // Allow up to 10 recursive steps
-///     halt_threshold: 0.95,    // Stop when 95% cumulative probability
-///     ponder_weight: 0.01,     // Small penalty for using more steps
-/// };
-/// ```
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct AdaptiveDepthConfig {
-    /// Maximum recursive depth allowed
-    ///
-    /// The model can use anywhere from 1 to max_depth steps.
-    /// Recommended: 7-10 (allows more refinement than fixed depth=5)
-    pub max_depth: usize,
 
-    /// Cumulative halting probability threshold
-    ///
-    /// Stop recursion when sum of halting probabilities exceeds this threshold.
-    /// Higher values = more steps (more conservative halting)
-    /// Lower values = fewer steps (more aggressive halting)
-    ///
-    /// Recommended: 0.95 (standard in ACT literature)
-    /// Range: 0.90 to 0.99
-    pub halt_threshold: f32,
-
-    /// Weight for ponder loss (penalizes excessive depth)
-    ///
-    /// Ponder loss = (avg_depth / max_depth) * ponder_weight
-    /// Encourages the model to use fewer steps when possible.
-    ///
-    /// Recommended: 0.01 (similar to other auxiliary losses)
-    /// Range: 0.001 to 0.05
-    pub ponder_weight: f32,
-}
-
-impl Default for AdaptiveDepthConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: 10,  // Allow up to 10 recursive steps
-            halt_threshold: 0.95,
-            ponder_weight: 0.05,  // Increased from 0.01 to 0.05 for much stronger efficiency pressure
-        }
-    }
-}
 
 /// Configuration for model architecture and hyperparameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
