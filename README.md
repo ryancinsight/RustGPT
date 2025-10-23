@@ -32,13 +32,13 @@ Start with these two core files to understand the implementation:
 
 ## 🏗️ Architecture
 
-The model uses a **Tiny Recursive Model (TRM)** architecture with the following components:
+The model uses a **Transformer** architecture with the following components:
 
 ```
-Input Text → Tokenization → Embeddings → TRM Blocks → Output Projection → Predictions
+Input Text → Tokenization → Embeddings → Transformer Blocks → Output Projection → Predictions
 ```
 
-TRM applies a single transformer block recursively multiple times with adaptive residual scaling and optional adaptive depth control.
+The Transformer uses multi-head self-attention with feed-forward networks.
 
 ### Project Structure
 
@@ -47,7 +47,7 @@ src/
 ├── main.rs              # 🎯 Training pipeline and interactive mode
 ├── llm.rs               # 🧠 Core LLM implementation and training logic
 ├── lib.rs               # 📚 Library exports and constants
-├── trm.rs               # 🔄 Tiny Recursive Model (TRM) block with recursive attention and feed-forward
+
 ├── self_attention.rs    # 👀 Multi-head self-attention mechanism with CoPE positional encoding
 ├── swiglu.rs            # ⚡ SwiGLU activation for feed-forward networks
 ├── embeddings.rs        # 📊 Token embedding layer with learned positional embeddings
@@ -61,7 +61,7 @@ tests/
 ├── llm_test.rs         # Tests for core LLM functionality (19 tests)
 ├── persistence_test.rs # Tests for model save/load (7 tests)
 
-├── trm_test.rs         # Tests for TRM blocks
+
 ├── self_attention_test.rs # Tests for attention mechanisms
 ├── swiglu_test.rs      # Tests for SwiGLU layers
 ├── embeddings_test.rs  # Tests for embedding layers
@@ -170,7 +170,7 @@ let llm_from_json = LLM::load_json("model.json")?;
 - **Embedding Dimension**: 128 (defined by `EMBEDDING_DIM` in `src/lib.rs`)
 - **Hidden Dimension**: 256 (defined by `HIDDEN_DIM` in `src/lib.rs`)
 - **Max Sequence Length**: 80 tokens (defined by `MAX_SEQ_LEN` in `src/lib.rs`)
-- **Architecture**: TRM with recursive depth 3 + embeddings + output projection
+- **Architecture**: Transformer with 3 layers + embeddings + output projection
 - **Normalization**: Dynamic Tanh Normalization (DyT)
 - **Positional Encoding**: CoPE (Context-aware Positional Encoding)
 - **Activation**: SwiGLU
@@ -260,7 +260,7 @@ Total test count: **53 tests** across all components
 ## 🧠 Learning Resources
 
 This implementation demonstrates key ML concepts:
-- **Recursive transformer architecture** (TRM with attention, feed-forward, dynamic tanh norm)
+- **Transformer architecture** (with attention, feed-forward, dynamic tanh norm)
 - **Backpropagation** through neural networks
 - **Language model training** (pre-training + fine-tuning)
 - **Tokenization** and vocabulary management

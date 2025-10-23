@@ -71,6 +71,13 @@ pub struct PolyAttention {
     opt_alpha_g: Adam,
     opt_beta_g: Adam,
 
+    // CoPE integration and sliding window
+    use_cope: bool,
+    cope_max_pos: usize,
+    cope_pos_embeddings: Option<Array2<f32>>, // (max_pos+1, head_dim)
+    opt_cope_pos: Option<Adam>,
+    window_size: Option<usize>,
+
     // training cache
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>, // (N, embed_dim)
@@ -117,7 +124,7 @@ fn with_tls_yh<R>(n: usize, d: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> 
 }
 
 impl PolyAttention {
-    pub fn new(embed_dim: usize, num_heads: usize, p: usize) -> Self {
+    pub fn new(embed_dim: usize, num_heads: usize, p: usize, max_pos: usize, window_size: Option<usize>) -> Self {
         assert!(num_heads > 0 && embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads");
         assert!(p % 2 == 1, "p must be an odd integer for stability");
         let head_dim = embed_dim / num_heads;
@@ -152,6 +159,15 @@ impl PolyAttention {
         let opt_alpha_g = Adam::new((1, num_heads));
         let opt_beta_g = Adam::new((1, num_heads));
 
+        // CoPE integration (shared pos embeddings across heads)
+        let use_cope = true;
+        let cope_max_pos = max_pos;
+        let normal_pe = Normal::new(0.0, 0.02).unwrap();
+        let pe = Array2::<f32>::from_shape_fn((max_pos + 1, head_dim), |_| normal_pe.sample(&mut rng));
+        let opt = Adam::new((max_pos + 1, head_dim));
+        let cope_pos_embeddings = Some(pe);
+        let opt_cope_pos = Some(opt);
+
         Self {
             embed_dim,
             num_heads,
@@ -172,6 +188,11 @@ impl PolyAttention {
             opt_w_g,
             opt_alpha_g,
             opt_beta_g,
+            use_cope,
+            cope_max_pos,
+            cope_pos_embeddings,
+            opt_cope_pos,
+            window_size,
             cached_input: None,
         }
     }
@@ -184,6 +205,35 @@ impl PolyAttention {
                 mat[[i, j]] = 0.0;
             }
         }
+    }
+
+    #[inline]
+    fn apply_sliding_window_mask_inplace(mat: &mut Array2<f32>, window: Option<usize>) {
+        if let Some(w) = window {
+            let n = mat.nrows();
+            for i in 0..n {
+                // allow j in [max(0, i+1-w), i]
+                let j_min = i.saturating_sub(w - 1);
+                for j in 0..j_min { mat[[i, j]] = 0.0; }
+            }
+        }
+    }
+
+    fn cope_pos_logits(&self, q: &Array2<f32>, _k: &Array2<f32>, window_size: Option<usize>) -> Array2<f32> {
+        let n = q.nrows();
+        let mut pos_logits = Array2::<f32>::zeros((n, n));
+        if let Some(pe) = &self.cope_pos_embeddings {
+            for i in 0..n {
+                let j_start = match window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
+                for j in j_start..=i {
+                    let pos = if j == 0 { i } else { i - j };
+                    if pos <= self.cope_max_pos {
+                        pos_logits[[i, j]] = q.row(i).dot(&pe.row(pos));
+                    }
+                }
+            }
+        }
+        pos_logits
     }
 
     pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
@@ -221,6 +271,16 @@ impl PolyAttention {
 
                 // Optional causal masking (in-place)
                 if causal { Self::apply_causal_mask_inplace(scores); }
+                // Optional sliding window mask (lower triangle band)
+                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+
+                // Add CoPE position logits if enabled
+                if self.use_cope {
+                    let pos_logits = self.cope_pos_logits(&q, &k, self.window_size);
+                    *scores += &pos_logits;
+                    if causal { Self::apply_causal_mask_inplace(scores); }
+                    Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+                }
 
                 // Polynomial activation in-place on scores: phi(S) = scale * (a * S^p + b)
                 let a = self.a[[0,0]];
@@ -234,6 +294,7 @@ impl PolyAttention {
 
                 // keep masked positions zero (in-place)
                 if causal { Self::apply_causal_mask_inplace(scores); }
+                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
 
                 with_tls_yh(n, self.head_dim, |yh| {
                     yh.fill(0.0);
@@ -252,15 +313,6 @@ impl PolyAttention {
         }
 
         out
-    }
-}
-
-impl Layer for PolyAttention {
-    fn layer_type(&self) -> &str { "PolyAttention" }
-
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // default causal
-        self.forward_impl(input, true)
     }
 
     fn compute_gradients(
@@ -289,8 +341,13 @@ impl Layer for PolyAttention {
         let mut grad_alpha_g = Array2::<f32>::zeros((1, self.num_heads));
         let mut grad_beta_g = Array2::<f32>::zeros((1, self.num_heads));
 
+        // CoPE grads accumulator (shared across heads)
+        let grad_cope_pos = if self.use_cope {
+            Some(Array2::<f32>::zeros((self.cope_max_pos + 1, self.head_dim)))
+        } else { None };
+
         // Per-head param grads (Wq, Wk, Wv) + W_out + scalars + gating params
-        let mut all_param_grads: Vec<Array2<f32>> = Vec::with_capacity(self.num_heads * 3 + 1 + 3 + 3);
+        let mut all_param_grads: Vec<Array2<f32>> = Vec::with_capacity(self.num_heads * 3 + 1 + 3 + 3 + if self.use_cope {1} else {0});
 
         // Build grad for W_out block-wise to avoid materializing H
         let mut grad_w_out = Array2::<f32>::zeros((self.embed_dim, self.embed_dim)); // (D, D)
@@ -304,7 +361,7 @@ impl Layer for PolyAttention {
 
             // Gating forward values for this head (and caches for backward)
             let w_g_col = self.w_g.slice(s![.., h_idx..h_idx+1]); // (D,1)
-            let mut xw_col = input.dot(&w_g_col); // (N,1)
+            let xw_col = input.dot(&w_g_col); // (N,1)
             let a_h = self.alpha_g[[0, h_idx]];
             let b_h = self.beta_g[[0, h_idx]];
             // z = a_h * xw + b_h; g = sigmoid(z)
@@ -322,6 +379,7 @@ impl Layer for PolyAttention {
                 *scores *= dk_scale;
                 // causal mask
                 Self::apply_causal_mask_inplace(scores);
+                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
 
                 with_tls_work(n, |work| {
                     // work <- phi(scores)
@@ -329,6 +387,7 @@ impl Layer for PolyAttention {
                     work.mapv_inplace(|x| { let sp = x.powi(p_i32); scale * (a * sp + b) });
                     // apply mask again to keep upper triangle zero
                     Self::apply_causal_mask_inplace(work);
+                    Self::apply_sliding_window_mask_inplace(work, self.window_size);
 
                     with_tls_yh(n, self.head_dim, |yh| {
                         // Y_h (pre-gating)
@@ -362,14 +421,9 @@ impl Layer for PolyAttention {
                         let prod = &y_pre * &*yh; // (N, d_h)
                         let mut grad_g_col = prod.sum_axis(Axis(1)).insert_axis(Axis(1)); // (N,1)
 
-                        // dz = dL/dz = grad_g * sigmoid'(z) where sigmoid'(z)=g*(1-g)
+                        // dz = grad_g * sigmoid'(z) where sigmoid'(z) = g * (1 - g)
                         let mut dz_col = g_col.clone(); // (N,1)
-                        azip!((dz in &mut dz_col, &g in &g_col) {
-                            *dz = *dz * (1.0 - g) * *dz; // will overwrite correctly below? No; fixed below
-                        });
-                        // The above azip is incorrect; recompute dz properly
-                        dz_col.assign(&g_col);
-                        azip!((dz in &mut dz_col) { *dz = *dz * (1.0 - *dz); });
+                        azip!((dz in &mut dz_col) { *dz = *dz * (1.0 - *dz); }); // g*(1-g)
                         grad_g_col *= &dz_col; // dz = grad_g * g*(1-g)
 
                         // Accumulate gating param grads
@@ -423,6 +477,7 @@ impl Layer for PolyAttention {
                         });
                         // masked positions have zero influence
                         Self::apply_causal_mask_inplace(work);
+                        Self::apply_sliding_window_mask_inplace(work, self.window_size);
 
                         // S = (Q K^T) * dk_scale
                         // Therefore dQ = dS dot K * dk_scale, dK = dS^T dot Q * dk_scale
@@ -463,12 +518,15 @@ impl Layer for PolyAttention {
         all_param_grads.push(grad_alpha_g);
         all_param_grads.push(grad_beta_g);
 
+        if let Some(grad_pe) = grad_cope_pos { all_param_grads.push(grad_pe); }
+
         (grad_input_total, all_param_grads)
     }
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
         // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g
-        let expected = self.num_heads * 3 + 1 + 3 + 3;
+        let mut expected = self.num_heads * 3 + 1 + 3 + 3;
+        if self.use_cope { expected += 1; }
         if param_grads.len() != expected {
             return Err(crate::errors::ModelError::GradientError{
                 message: format!("PolyAttention expected {} grad arrays, got {}", expected, param_grads.len()),
@@ -490,6 +548,12 @@ impl Layer for PolyAttention {
         self.opt_w_g.step(&mut self.w_g, &param_grads[idx], lr);
         self.opt_alpha_g.step(&mut self.alpha_g, &param_grads[idx+1], lr);
         self.opt_beta_g.step(&mut self.beta_g, &param_grads[idx+2], lr);
+        idx += 3;
+        if self.use_cope {
+            if let (Some(pe), Some(opt)) = (self.cope_pos_embeddings.as_mut(), self.opt_cope_pos.as_mut()) {
+                opt.step(pe, &param_grads[idx], lr);
+            }
+        }
         Ok(())
     }
 
@@ -502,6 +566,37 @@ impl Layer for PolyAttention {
 
     fn parameters(&self) -> usize {
         let head_params = self.heads.iter().map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len()).sum::<usize>();
-        self.w_out.len() + 3 + head_params + self.w_g.len() + self.alpha_g.len() + self.beta_g.len()
+        let mut total = self.w_out.len() + 3 + head_params + self.w_g.len() + self.alpha_g.len() + self.beta_g.len();
+        if self.use_cope { total += (self.cope_max_pos + 1) * self.head_dim; }
+        total
+    }
+}
+
+impl Layer for PolyAttention {
+    fn layer_type(&self) -> &str { "PolyAttention" }
+
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        // default causal
+        self.forward_impl(input, true)
+    }
+
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        <PolyAttention>::compute_gradients(self, _input, output_grads)
+    }
+
+    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
+        <PolyAttention>::apply_gradients(self, param_grads, lr)
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        <PolyAttention>::backward(self, grads, lr)
+    }
+
+    fn parameters(&self) -> usize {
+        <PolyAttention>::parameters(self)
     }
 }

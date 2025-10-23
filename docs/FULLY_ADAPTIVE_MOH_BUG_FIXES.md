@@ -218,7 +218,7 @@ cargo run --release 2>&1 | Tee-Object -FilePath "training_log.txt"
 ## 🔗 Related Documents
 
 - `docs/FULLY_ADAPTIVE_MOH_DESIGN.md` - Original design specification
-- `docs/TRM_ARCHITECTURE_AUDIT.md` - TRM architecture analysis
+
 - `docs/MOH_OPTIMIZATION_PLAN.md` - Standard MoH optimization strategies
 
 ---

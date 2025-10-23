@@ -13,7 +13,7 @@ use crate::{
 
 /// Build a network based on the provided configuration
 ///
-/// This function constructs Transformer or TRM architecture
+/// This function constructs Transformer architecture
 /// based on the configuration, allowing for easy A/B comparison between
 /// different approaches.
 ///
@@ -27,16 +27,13 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
     let mut layers = Vec::new();
 
     // Add embedding layer (common to all architectures)
-    layers.push(LayerEnum::Embeddings(Embeddings::new(vocab.clone())));
+    // CoPE handles positions inside attention, so disable additive positional embeddings
+    let use_positional = false;
+    layers.push(LayerEnum::Embeddings(Embeddings::new_with_positional(vocab.clone(), use_positional)));
 
     // Build architecture-specific layers
     match config.architecture {
         ArchitectureType::Transformer => {
-            build_transformer_layers(&mut layers, config);
-        }
-
-        ArchitectureType::TRM => {
-            // TRM path removed; reuse transformer path with PolyAttention-only
             build_transformer_layers(&mut layers, config);
         }
     }
@@ -63,10 +60,13 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 
     for _layer_idx in 0..config.num_layers {
         // Always build PolyAttention layers
+    let max_pos = match config.positional_encoding { crate::model_config::PositionalEncodingType::CoPE { max_pos } => max_pos };
         let poly = PolyAttention::new(
             config.embedding_dim,
             num_heads,
             config.get_poly_degree_p(),
+            max_pos,
+            config.window_size,
         );
         layers.push(LayerEnum::PolyAttention(Box::new(poly)));
 
@@ -129,9 +129,6 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     // Positional Encoding
     use crate::model_config::PositionalEncodingType;
     match &config.positional_encoding {
-        PositionalEncodingType::Learned => {
-            println!("  • Learned Positional Embeddings (standard)");
-        }
         PositionalEncodingType::CoPE { max_pos } => {
             println!(
                 "  ✓ CoPE (context-aware, max_pos={}, best performance)",
@@ -184,6 +181,11 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     // Head Selection Strategy (Mixture-of-Heads)
     use crate::model_config::HeadSelectionStrategy;
     match &config.head_selection {
+
+        HeadSelectionStrategy::AllHeads => {
+            println!("  • All Heads Active (Standard Multi-Head Attention)");
+            println!("    - No efficiency gains");
+        }
 
         HeadSelectionStrategy::MixtureOfHeads {
             num_shared_heads,
@@ -296,28 +298,9 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 /// Legacy note: HRM architecture removed
 ///
 /// This section previously described HRM-specific layer construction, which
-/// has been removed. Supported architectures: Transformer and TRM.
+/// has been removed. Supported architectures: Transformer.
 
-/// Build TRM (Tiny Recursive Model) architecture layers
-///
-/// Creates a parameter-efficient architecture with weight sharing across depth.
-/// A single transformer block is applied recursively multiple times.
-///
-/// # Architecture
-/// - Single transformer block (attention + FFN + norms)
-/// - Applied recursively D times (recursive depth)
-/// - Adaptive residual scaling per step (learned)
-/// - Per-step gradient tracking
-///
-/// # TRM Configuration
-/// - `num_layers` stores recursive depth (D)
-/// - `use_dynamic_tanh_norm` determines normalization type
-///
-/// # Gradient Stability
-/// - Adaptive residual scaling prevents vanishing/exploding gradients
-/// - Per-step gradient tracking for analysis
-
-// TRM builder removed; TRM architecture is routed to transformer build path using PolyAttention-only.
+// TRM architecture removed; only Transformer is supported now.
 
 #[cfg(test)]
 mod tests {
@@ -347,7 +330,6 @@ mod tests {
 pub fn build_network(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
     match config.architecture {
         ArchitectureType::Transformer => build_transformer_layers(config, vocab_size),
-        ArchitectureType::TRM => build_trm_layers(config, vocab_size),
     }
 }
 
@@ -384,15 +366,13 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
                 )));
             }
             AttentionType::PolyAttention { degree_p } => {
+        let max_pos = match config.positional_encoding { crate::model_config::PositionalEncodingType::CoPE { max_pos } => max_pos };
                 layers.push(LayerEnum::PolyAttention(PolyAttention::new(
-                    config.get_num_heads(),
                     config.embedding_dim,
+                    config.get_num_heads(),
                     degree_p,
+                    max_pos,
                     config.window_size,
-                    config.use_adaptive_window,
-                    config.min_window_size,
-                    config.max_window_size,
-                    config.window_adaptation_strategy,
                 )));
             }
         }
@@ -410,29 +390,4 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
     layers
 }
 
-#[cfg(any())]
-fn build_trm_layers(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
-    let mut layers: Vec<LayerEnum> = Vec::new();
 
-    // Embedding layer
-    layers.push(LayerEnum::Embeddings(Embeddings::new(vocab_size, config.embedding_dim)));
-
-    // TRM block which encapsulates recursive attention/ffn internally
-    layers.push(LayerEnum::TRMBlock(TinyRecursiveModel::new(
-        config.embedding_dim,
-        config.hidden_dim,
-        config.get_recursive_depth(),
-        config.get_num_heads(),
-        config.num_kv_heads,
-        config.window_size,
-        config.use_adaptive_window,
-        config.min_window_size,
-        config.max_window_size,
-        config.window_adaptation_strategy,
-    )));
-
-    // Output projection
-    layers.push(LayerEnum::OutputProjection(OutputProjection::new(config.embedding_dim, vocab_size)));
-
-    layers
-}

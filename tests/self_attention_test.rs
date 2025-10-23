@@ -1,10 +1,10 @@
-use llm::{EMBEDDING_DIM, Layer, self_attention::SelfAttention};
+use llm::{EMBEDDING_DIM, Layer, poly_attention::PolyAttention};
 use ndarray::Array2;
 
 #[test]
 fn test_self_attention_forward() {
     // Create self-attention module
-    let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
+    let mut self_attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None);
 
     // Create input tensor (batch_size=1, seq_len=3, embedding_dim=EMBEDDING_DIM)
     let input = Array2::ones((3, EMBEDDING_DIM));
@@ -19,7 +19,7 @@ fn test_self_attention_forward() {
 #[test]
 fn test_self_attention_with_different_sequence_lengths() {
     // Create self-attention module
-    let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
+    let mut self_attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None);
 
     // Test with different sequence lengths
     for seq_len in 1..5 {

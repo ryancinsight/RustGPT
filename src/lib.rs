@@ -1,7 +1,7 @@
 pub mod adam;
 
 
-pub mod cop;
+// pub mod cop; // removed: integrated CoPE into PolyAttention
 pub mod dataset_loader;
 pub mod embeddings;
 pub mod errors;

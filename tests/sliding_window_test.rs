@@ -1,4 +1,4 @@
-use llm::{EMBEDDING_DIM, Layer, PositionalEncodingType, self_attention::SelfAttention};
+use llm::{EMBEDDING_DIM, Layer, PositionalEncodingType, poly_attention::PolyAttention};
 use ndarray::Array2;
 
 const TEST_SEQ_LEN: usize = 10;
@@ -7,12 +7,11 @@ const TEST_WINDOW_SIZE: usize = 4;
 #[test]
 fn test_sliding_window_mask_correctness() {
     // Test that tokens only attend within the sliding window
-    let mut attention = SelfAttention::new_with_positional_encoding(
+    let mut attention = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         Some(TEST_WINDOW_SIZE),
     );
 
@@ -27,14 +26,7 @@ fn test_sliding_window_mask_correctness() {
 #[test]
 fn test_full_attention_backward_compatibility() {
     // Test that window_size = None gives full attention
-    let mut full_attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
-        None,
-    );
+    let mut full_attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None);
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = full_attention.forward(&input);
@@ -46,14 +38,7 @@ fn test_full_attention_backward_compatibility() {
 
 #[test]
 fn test_window_size_1024() {
-    let mut attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        8,
-        &PositionalEncodingType::Learned,
-        2048,
-        Some(1024),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((20, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -64,14 +49,7 @@ fn test_window_size_1024() {
 
 #[test]
 fn test_window_size_2048() {
-    let mut attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        8,
-        &PositionalEncodingType::Learned,
-        4096,
-        Some(2048),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(2048));
 
     let input = Array2::from_elem((30, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -83,14 +61,7 @@ fn test_window_size_2048() {
 #[test]
 fn test_window_size_4096_mistral_style() {
     // Mistral 7B uses window_size=4096
-    let mut attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        4, // GQA with 4 KV heads like Mistral
-        &PositionalEncodingType::Learned,
-        8192,
-        Some(4096),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(4096));
 
     let input = Array2::from_elem((50, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -102,14 +73,7 @@ fn test_window_size_4096_mistral_style() {
 #[test]
 fn test_sliding_window_with_gqa() {
     // Test integration of sliding window with GQA
-    let mut attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        4, // GQA: 8 query heads, 4 KV heads
-        &PositionalEncodingType::Learned,
-        512,
-        Some(TEST_WINDOW_SIZE),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -121,12 +85,11 @@ fn test_sliding_window_with_gqa() {
 #[test]
 fn test_sliding_window_with_rope() {
     // Test integration of sliding window with RoPE
-    let mut attention = SelfAttention::new_with_positional_encoding(
+    let mut attention = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::CoPE { max_pos: 64 },
-        512,
+        3,
+        64,
         Some(TEST_WINDOW_SIZE),
     );
 
@@ -140,14 +103,7 @@ fn test_sliding_window_with_rope() {
 #[test]
 fn test_sliding_window_with_gqa_and_rope() {
     // Test full Mistral 7B configuration: GQA + RoPE + Sliding Window
-    let mut attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        4, // GQA
-        &PositionalEncodingType::CoPE { max_pos: 64 },
-        512,
-        Some(TEST_WINDOW_SIZE), // Sliding Window
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -159,12 +115,11 @@ fn test_sliding_window_with_gqa_and_rope() {
 #[test]
 fn test_causal_masking_preserved() {
     // Verify that causal masking (no future attention) is still enforced
-    let mut attention = SelfAttention::new_with_positional_encoding(
+    let mut attention = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         Some(TEST_WINDOW_SIZE),
     );
 
@@ -181,12 +136,11 @@ fn test_long_sequence_handling() {
     let seq_len = 100;
     let window_size = 10;
 
-    let mut attention = SelfAttention::new_with_positional_encoding(
+    let mut attention = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         Some(window_size),
     );
 
@@ -203,21 +157,19 @@ fn test_window_size_equals_sequence_length() {
     let seq_len = 10;
     let window_size = 10;
 
-    let mut windowed = SelfAttention::new_with_positional_encoding(
+    let mut windowed = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         Some(window_size),
     );
 
-    let mut full = SelfAttention::new_with_positional_encoding(
+    let mut full = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         None,
     );
 
@@ -235,12 +187,11 @@ fn test_window_size_equals_sequence_length() {
 #[test]
 fn test_window_size_one() {
     // Extreme case: window_size = 1 (only attend to self)
-    let mut attention = SelfAttention::new_with_positional_encoding(
+    let mut attention = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         Some(1),
     );
 
@@ -253,12 +204,11 @@ fn test_window_size_one() {
 
 #[test]
 fn test_sliding_window_backward_pass() {
-    let mut attention = SelfAttention::new_with_positional_encoding(
+    let mut attention = PolyAttention::new(
         EMBEDDING_DIM,
         8,
-        8,
-        &PositionalEncodingType::Learned,
-        512,
+        3,
+        64,
         Some(TEST_WINDOW_SIZE),
     );
 
@@ -275,14 +225,7 @@ fn test_sliding_window_backward_pass() {
 
 #[test]
 fn test_sliding_window_training_stability() {
-    let mut attention = SelfAttention::new_with_positional_encoding(
-        EMBEDDING_DIM,
-        8,
-        4,
-        &PositionalEncodingType::Learned,
-        512,
-        Some(TEST_WINDOW_SIZE),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
 
@@ -304,14 +247,7 @@ fn test_different_window_sizes_comparison() {
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
 
     for window_size in [2, 4, 8, TEST_SEQ_LEN] {
-        let mut attention = SelfAttention::new_with_positional_encoding(
-            EMBEDDING_DIM,
-            8,
-            8,
-            &PositionalEncodingType::Learned,
-            512,
-            Some(window_size),
-        );
+        let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(window_size));
 
         let output = attention.forward(&input);
         assert_eq!(output.shape(), [TEST_SEQ_LEN, EMBEDDING_DIM]);

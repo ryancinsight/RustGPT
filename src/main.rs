@@ -45,7 +45,7 @@ fn main() -> llm::Result<()> {
     //   - Better than static MLPMixer due to input-dependent mixing
     // ============================================================================
 
-    // Choose architecture: Transformer or TRM
+    // Choose architecture: Transformer
 
     //let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
     
@@ -76,34 +76,16 @@ fn main() -> llm::Result<()> {
     // ============================================================================
     // POSITIONAL ENCODING CONFIGURATION
     // ============================================================================
-    // Choose between three positional encoding strategies:
-    //
-    // 1. Learned Embeddings: Standard absolute positional embeddings
-    //    - Parameters: max_seq_len × embedding_dim learned weights
-    //    - Used in original Transformer, GPT-2, GPT-3
-    //    - Simple and effective for fixed-length contexts
-    //
-    // 2. RoPE (Rotary Positional Encoding): Geometric position encoding
-    //    - Parameters: Zero (no learned weights)
-    //    - Encodes relative position through rotation matrices
-    //    - Better length extrapolation (handles longer sequences)
-    //    - Used in LLaMA, PaLM, GPT-NeoX, Mistral
-    //
-    // 3. CoPE (Contextual Position Encoding): Context-aware position encoding
-    //    - Parameters: max_pos × head_dim learned position embeddings
-    //    - Positions conditioned on context via gating mechanism
-    //    - Can count abstract units (words, sentences, specific tokens)
-    //    - Better OOD generalization and perplexity than RoPE
-    //    - Used in research (Meta FAIR 2024)
-    //    - Recommended for best performance
+    // CoPE (Contextual Position Encoding): Context-aware position encoding
+    // - Parameters: max_pos × head_dim learned position embeddings
+    // - Positions conditioned on context via gating mechanism
+    // - Can count abstract units (words, sentences, specific tokens)
+    // - Better OOD generalization and perplexity than RoPE
+    // - Used in research (Meta FAIR 2024)
     // ============================================================================
 
-    // Select positional encoding type (CoPE recommended)
+    // Select positional encoding type
     let positional_encoding = PositionalEncodingType::CoPE { max_pos: 64 };
-
-    // Alternative options:
-    // let positional_encoding = PositionalEncodingType::Learned;
-    // let positional_encoding = PositionalEncodingType::RoPE;
 
     // ============================================================================
     // GROUP-QUERY ATTENTION (GQA) CONFIGURATION
@@ -316,13 +298,6 @@ fn main() -> llm::Result<()> {
     let mut config = match architecture {
         ArchitectureType::Transformer => {
             ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None, Some(8))
-        }
-
-
-        ArchitectureType::TRM => {
-            // TRM with recursive_depth=5 (single block applied 5 times)
-            // Parameter efficient: O(1) params regardless of depth
-            ModelConfig::trm(EMBEDDING_DIM, HIDDEN_DIM, 5, MAX_SEQ_LEN, Some(8))
         }
     };
 

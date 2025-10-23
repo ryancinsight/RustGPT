@@ -541,7 +541,7 @@ impl LLM {
         }
 
         // Compute global gradient norm (L2 norm across all parameters)
-        let mut grad_norm = total_grad_norm_sq.sqrt();
+        let grad_norm = total_grad_norm_sq.sqrt();
 
 
 
