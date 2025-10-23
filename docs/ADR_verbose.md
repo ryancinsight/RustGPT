@@ -280,24 +280,6 @@ let encoded = bincode::serde::encode_to_vec(self, config)?;
 
 ---
 
-## ADR-007: Adaptive Gradient Clipping
-
-**Status**: ✅ Accepted (Sprint 2.5)
-
-**Decision**: Implement trait-based gradient clipping with Adaptive Gradient Clipping (AGC) as default strategy.
-
-**Rationale**:
-- AGC provides parameter-norm based scaling for better gradient stability
-- Gradient centralization improves convergence
-- Trait-based design allows extensible clipping strategies
-- Maintains backward compatibility with L2 clipping
-
-**Implementation**: `src/gradient_clipping.rs` with `GradientClipping` trait, `AdaptiveGradientClipping`, and `L2GradientClipping` structs.
-
-**Testing**: 4 comprehensive tests covering AGC, L2, centralization, and configuration.
-
----
-
 ## References
 
 - [Rust Serde Documentation](https://serde.rs/)
@@ -305,5 +287,3 @@ let encoded = bincode::serde::encode_to_vec(self, config)?;
 - [Bincode 2.0 Migration Guide](https://github.com/bincode-org/bincode/blob/trunk/docs/migration_guide.md)
 - [Rust Enum Memory Layout](https://doc.rust-lang.org/reference/type-layout.html#reprc-enums)
 - [Clippy Lint: large_enum_variant](https://rust-lang.github.io/rust-clippy/master/index.html#large_enum_variant)
-- [Adaptive Gradient Clipping (AGC)](https://arxiv.org/abs/2102.06171) - Brock et al., 2021
-- [Gradient Centralization](https://arxiv.org/abs/2004.01461) - Yong et al., 2020

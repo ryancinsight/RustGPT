@@ -7,92 +7,59 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::{
-    Embeddings, MAX_SEQ_LEN, Vocab,
     errors::{ModelError, Result},
-    gradient_clipping::{AdaptiveClippingConfig, AdaptiveGradientClipping, GradientClipping},
+    embeddings::Embeddings,
     output_projection::OutputProjection,
+    MAX_SEQ_LEN,
+    Vocab,
 };
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LayerEnum {
     Embeddings(Embeddings),
-    SelfAttention(Box<crate::self_attention::SelfAttention>),
+    // Removed SelfAttention variant
     // Removed FeedForward variant; SwiGLU is the only FFN
     SwiGLU(Box<crate::swiglu::SwiGLU>),
 
-    LayerNorm(crate::layer_norm::LayerNorm),
-    RMSNorm(crate::rms_norm::RMSNorm),
     DynamicTanhNorm(crate::dynamic_tanh_norm::DynamicTanhNorm),
     OutputProjection(OutputProjection),
 
-    TRMBlock(Box<crate::trm::TinyRecursiveModel>),
+    // Removed TRMBlock variant
+    PolyAttention(Box<crate::poly_attention::PolyAttention>),
 }
 
 impl LayerEnum {
-    /// Downcast to SelfAttention layer if this is a SelfAttention variant
-    pub fn as_self_attention(&self) -> Option<&crate::self_attention::SelfAttention> {
-        match self {
-            LayerEnum::SelfAttention(layer) => Some(layer.as_ref()),
-            _ => None,
-        }
-    }
-
-    /// Downcast to mutable SelfAttention layer if this is a SelfAttention variant
-    pub fn as_self_attention_mut(&mut self) -> Option<&mut crate::self_attention::SelfAttention> {
-        match self {
-            LayerEnum::SelfAttention(layer) => Some(layer.as_mut()),
-            _ => None,
-        }
-    }
-
-
-    /// Downcast to TRMBlock layer if this is a TRMBlock variant
-    pub fn as_trm_block(&self) -> Option<&crate::trm::TinyRecursiveModel> {
-        match self {
-            LayerEnum::TRMBlock(layer) => Some(layer.as_ref()),
-            _ => None,
-        }
-    }
-
-    /// Downcast to mutable TRMBlock layer if this is a TRMBlock variant
-    pub fn as_trm_block_mut(&mut self) -> Option<&mut crate::trm::TinyRecursiveModel> {
-        match self {
-            LayerEnum::TRMBlock(layer) => Some(layer.as_mut()),
-            _ => None,
-        }
-    }
+    // Removed downcast helpers for SelfAttention/TRM to simplify to PolyAttention-only
 }
 
 impl Layer for LayerEnum {
     fn layer_type(&self) -> &str {
         match self {
             LayerEnum::Embeddings(layer) => layer.layer_type(),
-            LayerEnum::SelfAttention(layer) => layer.layer_type(),
+            // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.layer_type(),
 
-            LayerEnum::LayerNorm(layer) => layer.layer_type(),
-            LayerEnum::RMSNorm(layer) => layer.layer_type(),
             LayerEnum::DynamicTanhNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
 
-            LayerEnum::TRMBlock(layer) => layer.layer_type(),
+            // Removed TRMBlock arm
+            LayerEnum::PolyAttention(layer) => layer.layer_type(),
         }
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         match self {
             LayerEnum::Embeddings(layer) => layer.forward(input),
-            LayerEnum::SelfAttention(layer) => layer.forward(input),
+            // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.forward(input),
 
-            LayerEnum::LayerNorm(layer) => layer.forward(input),
-            LayerEnum::RMSNorm(layer) => layer.forward(input),
             LayerEnum::DynamicTanhNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
 
-            LayerEnum::TRMBlock(layer) => layer.forward(input),
+            // Removed TRMBlock arm
+            LayerEnum::PolyAttention(layer) => layer.forward(input),
         }
     }
 
@@ -103,63 +70,59 @@ impl Layer for LayerEnum {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match self {
             LayerEnum::Embeddings(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::SelfAttention(layer) => layer.compute_gradients(input, output_grads),
+            // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.compute_gradients(input, output_grads),
 
-            LayerEnum::LayerNorm(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::RMSNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::DynamicTanhNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
 
-            LayerEnum::TRMBlock(layer) => layer.compute_gradients(input, output_grads),
+            // Removed TRMBlock arm
+            LayerEnum::PolyAttention(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
         match self {
             LayerEnum::Embeddings(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::SelfAttention(layer) => layer.apply_gradients(param_grads, lr),
+            // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.apply_gradients(param_grads, lr),
 
-            LayerEnum::LayerNorm(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::RMSNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::DynamicTanhNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
 
-            LayerEnum::TRMBlock(layer) => layer.apply_gradients(param_grads, lr),
+            // Removed TRMBlock arm
+            LayerEnum::PolyAttention(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         match self {
             LayerEnum::Embeddings(layer) => layer.backward(grads, lr),
-            LayerEnum::SelfAttention(layer) => layer.backward(grads, lr),
+            // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.backward(grads, lr),
 
-            LayerEnum::LayerNorm(layer) => layer.backward(grads, lr),
-            LayerEnum::RMSNorm(layer) => layer.backward(grads, lr),
             LayerEnum::DynamicTanhNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
 
-            LayerEnum::TRMBlock(layer) => layer.backward(grads, lr),
+            // Removed TRMBlock arm
+            LayerEnum::PolyAttention(layer) => layer.backward(grads, lr),
         }
     }
 
     fn parameters(&self) -> usize {
         match self {
             LayerEnum::Embeddings(layer) => layer.parameters(),
-            LayerEnum::SelfAttention(layer) => layer.parameters(),
+            // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::SwiGLU(layer) => layer.parameters(),
 
-            LayerEnum::LayerNorm(layer) => layer.parameters(),
-            LayerEnum::RMSNorm(layer) => layer.parameters(),
             LayerEnum::DynamicTanhNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
-            LayerEnum::TRMBlock(layer) => layer.parameters(),
+            // Removed TRMBlock arm
+            LayerEnum::PolyAttention(layer) => layer.parameters(),
         }
     }
 }
@@ -189,8 +152,6 @@ pub trait Layer {
 pub struct LLM {
     pub vocab: Vocab,
     pub network: Vec<LayerEnum>,
-    #[serde(skip)]
-    pub gradient_clipper: Option<Box<dyn GradientClipping>>,
 }
 
 impl std::fmt::Debug for LLM {
@@ -198,7 +159,6 @@ impl std::fmt::Debug for LLM {
         f.debug_struct("LLM")
             .field("vocab", &self.vocab)
             .field("network", &self.network)
-            .field("gradient_clipper", &"Box<dyn GradientClipping>")
             .finish()
     }
 }
@@ -215,9 +175,6 @@ impl Default for LLM {
         Self {
             vocab,
             network,
-            gradient_clipper: Some(Box::new(AdaptiveGradientClipping::new(
-                AdaptiveClippingConfig::default(),
-            ))),
         }
     }
 }
@@ -227,9 +184,6 @@ impl LLM {
         Self {
             vocab,
             network,
-            gradient_clipper: Some(Box::new(AdaptiveGradientClipping::new(
-                AdaptiveClippingConfig::default(),
-            ))),
         }
     }
 }
@@ -262,7 +216,7 @@ impl LLM {
         // Convert token_ids to strings
         let token_strs = output_tokens
             .iter()
-            .map(|&t| self.vocab.decode.get(&t).unwrap().as_str())
+            .map(|&t| self.vocab.decode(t).unwrap())
             .collect::<Vec<&str>>();
 
         token_strs.join(" ")
@@ -393,24 +347,16 @@ impl LLM {
             };
 
             // Compute training progress for adaptive MoH
-            let training_progress = if epoch < warmup_epochs {
+            let _training_progress = if epoch < warmup_epochs {
                 0.0
             } else {
                 (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
             };
 
-            // Set epoch info for all MoH layers (for warm-up and annealing)
-            for layer in self.network.iter_mut() {
-                if let Some(attn_layer) = layer.as_self_attention_mut() {
-                    attn_layer.set_epoch_info(epoch, epochs);
-                } else if let Some(trm_block) = layer.as_trm_block_mut() {
-                    trm_block.set_epoch_info(epoch, epochs);
-                }
-            }
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, grad_norm) = self.train_batch(batch, effective_lr, training_progress)?;
+                let (batch_loss, grad_norm) = self.train_batch(batch, effective_lr)?;
                 total_loss += batch_loss;
                 total_grad_norm += grad_norm;
                 batch_count += 1;
@@ -438,234 +384,20 @@ impl LLM {
                 });
             }
 
-            // NFR-7.3: Training metrics with gradient norms
+            // NFR-7.3: Training metrics
             let warmup_status = if epoch < warmup_epochs {
                 format!(" (warmup {}/{})", epoch + 1, warmup_epochs)
             } else {
                 String::new()
             };
 
-            // Log MoH statistics if enabled (with adaptive metrics)
-            let training_progress = if epoch < warmup_epochs {
-                0.0
-            } else {
-                (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
-            };
-
-            // Collect stats from all MoH layers
-            let mut moh_layers_stats = Vec::new();
-            let mut has_learned_predictor = false;
-            let mut threshold_range_min = f32::INFINITY;
-            let mut threshold_range_max = f32::NEG_INFINITY;
-            let mut total_conf_avg = 0.0;
-            let mut total_conf_min = f32::INFINITY;
-            let mut total_fallback_pct = 0.0;
-            let mut total_pred_norm = 0.0;
-            let mut total_complexity_avg = 0.0;
-            let mut total_complexity_min = f32::INFINITY;
-            let mut total_complexity_max = f32::NEG_INFINITY;
-            let mut total_temp_avg = 0.0;
-            let mut total_temp_min = f32::INFINITY;
-            let mut total_temp_max = f32::NEG_INFINITY;
-            let mut has_temperature_stats = false;
-            let mut moh_layer_count = 0;
-
-            for (layer_idx, layer) in self.network.iter().enumerate() {
-                if let Some(attn_layer) = layer.as_self_attention() {
-                    let avg_routed = attn_layer.get_avg_active_routed_heads();
-                    if avg_routed > 0.0 {
-                        let (min_thresh, max_thresh, mean_thresh, _std_thresh) = attn_layer.get_threshold_stats();
-                        let dyn_weight = attn_layer.get_dynamic_loss_weight(training_progress);
-                        moh_layers_stats.push((layer_idx, avg_routed, mean_thresh, dyn_weight));
-
-                        // Track threshold range across all layers
-                        threshold_range_min = threshold_range_min.min(min_thresh);
-                        threshold_range_max = threshold_range_max.max(max_thresh);
-
-                        // Track confidence statistics
-                        let (conf_avg, conf_min, fallback_pct) = attn_layer.get_confidence_stats();
-                        total_conf_avg += conf_avg;
-                        total_conf_min = total_conf_min.min(conf_min);
-                        total_fallback_pct += fallback_pct;
-
-                        // Track complexity statistics
-                        let (complexity_avg, complexity_min, complexity_max) = attn_layer.get_complexity_stats();
-                        total_complexity_avg += complexity_avg;
-                        total_complexity_min = total_complexity_min.min(complexity_min);
-                        total_complexity_max = total_complexity_max.max(complexity_max);
-
-                        // Track predictor weight norm
-                        let pred_norm = attn_layer.get_predictor_weight_norm();
-                        total_pred_norm += pred_norm;
-
-                        // Track temperature statistics (for fully adaptive MoH)
-                        if let Some((temp_avg, temp_min, temp_max)) = attn_layer.get_temperature_stats() {
-                            total_temp_avg += temp_avg;
-                            total_temp_min = total_temp_min.min(temp_min);
-                            total_temp_max = total_temp_max.max(temp_max);
-                            has_temperature_stats = true;
-                        }
-
-                        // Check if any layer has learned predictor
-                        if attn_layer.has_learned_predictor() {
-                            has_learned_predictor = true;
-                        }
-
-                        moh_layer_count += 1;
-                    }
-                } else if let Some(trm_block) = layer.as_trm_block() {
-                    // For TRM, get MoH stats from internal attention layer
-                    let (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct,
-                         complexity_avg, complexity_min, complexity_max, pred_norm) = trm_block.get_moh_stats();
-                    if avg_routed > 0.0 {
-                        let dyn_weight = 0.0; // TRM doesn't have dynamic loss weight yet
-                        moh_layers_stats.push((layer_idx, avg_routed, mean_thresh, dyn_weight));
-
-                        // Track threshold range (approximate from mean)
-                        threshold_range_min = threshold_range_min.min(mean_thresh - 0.1);
-                        threshold_range_max = threshold_range_max.max(mean_thresh + 0.1);
-
-                        // Track confidence statistics
-                        total_conf_avg += conf_avg;
-                        total_conf_min = total_conf_min.min(conf_min);
-                        total_fallback_pct += fallback_pct;
-
-                        // Track complexity statistics (now with proper min/max)
-                        total_complexity_avg += complexity_avg;
-                        total_complexity_min = total_complexity_min.min(complexity_min);
-                        total_complexity_max = total_complexity_max.max(complexity_max);
-
-                        // Track predictor weight norm
-                        total_pred_norm += pred_norm;
-
-                        // Track temperature statistics (for fully adaptive MoH)
-                        if let Some((temp_avg, temp_min, temp_max)) = trm_block.get_temperature_stats() {
-                            total_temp_avg += temp_avg;
-                            total_temp_min = total_temp_min.min(temp_min);
-                            total_temp_max = total_temp_max.max(temp_max);
-                            has_temperature_stats = true;
-                        }
-
-                        has_learned_predictor = true;
-                        moh_layer_count += 1;
-                    }
-            }
-            }
-
-            // Compute averages
-            let avg_conf = if moh_layer_count > 0 { total_conf_avg / moh_layer_count as f32 } else { 0.0 };
-            let avg_fallback_pct = if moh_layer_count > 0 { total_fallback_pct / moh_layer_count as f32 } else { 0.0 };
-            let avg_pred_norm = if moh_layer_count > 0 { total_pred_norm / moh_layer_count as f32 } else { 0.0 };
-            let avg_complexity = if moh_layer_count > 0 { total_complexity_avg / moh_layer_count as f32 } else { 0.0 };
-
-            // Format MoH stats: show first, middle, and last layers + confidence + predictor stats
-            let mut moh_stats = String::new();
-            if !moh_layers_stats.is_empty() {
-                let first = &moh_layers_stats[0];
-                let last = moh_layers_stats.last().unwrap();
-
-                // Add threshold range if learned predictor is enabled
-                let threshold_range_str = if has_learned_predictor && threshold_range_min.is_finite() {
-                    format!(" | ThreshRange: [{:.2}-{:.2}]", threshold_range_min, threshold_range_max)
-                } else {
-                    String::new()
-                };
-
-                // Add confidence statistics
-                let confidence_str = if avg_conf > 0.0 {
-                    format!(" | ConfAvg: {:.2}, ConfMin: {:.2}, Fallback: {:.1}%",
-                            avg_conf, total_conf_min, avg_fallback_pct)
-                } else {
-                    String::new()
-                };
-
-                // Add predictor weight norm if learned predictor is enabled
-                let predictor_str = if has_learned_predictor && avg_pred_norm > 0.0 {
-                    format!(" | PredNorm: {:.4}", avg_pred_norm)
-                } else {
-                    String::new()
-                };
-
-                // Add complexity statistics
-                let complexity_str = if avg_complexity > 0.0 && total_complexity_min.is_finite() {
-                    format!(" | Complexity: {:.3} [{:.3}-{:.3}]",
-                            avg_complexity, total_complexity_min, total_complexity_max)
-                } else {
-                    String::new()
-                };
-
-                // Add temperature statistics (for fully adaptive MoH)
-                let avg_temp = if moh_layer_count > 0 { total_temp_avg / moh_layer_count as f32 } else { 0.0 };
-                let temperature_str = if has_temperature_stats && total_temp_min.is_finite() {
-                    format!(" | Temp: {:.2} [{:.2}-{:.2}]",
-                            avg_temp, total_temp_min, total_temp_max)
-                } else {
-                    String::new()
-                };
-
-                // Only show DynW if it's non-zero (Standard MoH only)
-                let dyn_weight_str = if first.3 > 1e-10 {
-                    format!(" | DynW: {:.2e}", first.3)
-                } else {
-                    String::new()
-                };
-
-                if moh_layers_stats.len() > 2 {
-                    let mid = &moh_layers_stats[moh_layers_stats.len() / 2];
-                    moh_stats = format!(
-                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p{}{}{}{}{}{}",
-                        first.0, first.1, first.2,
-                        mid.0, mid.1, mid.2,
-                        last.0, last.1, last.2,
-                        dyn_weight_str,
-                        threshold_range_str,
-                        confidence_str,
-                        predictor_str,
-                        complexity_str,
-                        temperature_str
-                    );
-                } else {
-                    moh_stats = format!(
-                        " | MoH L{}: {:.2}h@{:.2}p | L{}: {:.2}h@{:.2}p{}{}{}{}{}{}",
-                        first.0, first.1, first.2,
-                        last.0, last.1, last.2,
-                        dyn_weight_str,
-                        threshold_range_str,
-                        confidence_str,
-                        predictor_str,
-                        complexity_str,
-                        temperature_str
-                    );
-                }
-            }
-
-            // Log TRM statistics if present
-            let mut trm_stats = String::new();
-            for layer in self.network.iter() {
-                if let LayerEnum::TRMBlock(trm) = layer {
-                    let scales = trm.get_step_scales();
-
-                    // Add depth statistics if adaptive depth is enabled
-                    let depth_info = if let Some((avg, min, max)) = trm.get_depth_stats() {
-                        format!(" Depth: avg={:.1} [{}-{}]", avg, min, max)
-                    } else {
-                        String::new()
-                    };
-
-                    trm_stats = format!(" | TRM: {}{}", scales, depth_info);
-                    break;
-                }
-            }
-
             info!(
                 epoch = epoch,
                 loss = avg_loss,
                 grad_norm = avg_grad_norm,
                 learning_rate = effective_lr,
-                "Training epoch completed{}{}{}",
-                warmup_status,
-                moh_stats,
-                trm_stats
+                "Training epoch completed{}",
+                warmup_status
             );
 
         }
@@ -675,7 +407,7 @@ impl LLM {
 
     /// Train on a single batch of sequences
     /// Returns (batch_loss, gradient_norm)
-    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32, training_progress: f32) -> Result<(f32, f32)> {
+    fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<(f32, f32)> {
         let mut batch_loss = 0.0;
         let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
         let mut layer_grad_norms: Vec<f32> = Vec::new(); // Track per-layer gradient norms
@@ -727,10 +459,6 @@ impl LLM {
             // Compute gradients w.r.t. logits
             let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
 
-            // Apply gradient clipping
-            if let Some(ref mut clipper) = self.gradient_clipper {
-                clipper.clip_gradients(&mut grads_output);
-            }
 
             // Backward pass: compute parameter gradients for each layer
             // Note: AttentionMoE layers use backward() directly and are handled separately
@@ -778,32 +506,7 @@ impl LLM {
             );
         }
 
-        // Add auxiliary losses from MoH routing (load balance + dynamic loss)
-        // These are computed once per batch, not per sequence
-        for layer in &self.network {
-            if let Some(attn_layer) = layer.as_self_attention() {
-                // Load balance loss (weighted by load_balance_weight)
-                let lb_loss = attn_layer.get_load_balance_loss();
-                batch_loss += lb_loss; // Weight is already applied in the loss computation
-
-                // Dynamic loss (weighted by adaptive dynamic_loss_weight)
-                let dyn_loss = attn_layer.get_dynamic_loss();
-                let dyn_weight = attn_layer.get_dynamic_loss_weight(training_progress);
-                batch_loss += dyn_loss * dyn_weight;
-            } else if let Some(trm_block) = layer.as_trm_block() {
-                // For TRM, get auxiliary losses from internal attention layer
-                let lb_loss = trm_block.get_load_balance_loss();
-                batch_loss += lb_loss;
-
-                let dyn_loss = trm_block.get_dynamic_loss();
-                let dyn_weight = trm_block.get_dynamic_loss_weight(training_progress);
-                batch_loss += dyn_loss * dyn_weight;
-
-                // Add ponder loss (adaptive recursive depth)
-                let ponder_loss = trm_block.get_ponder_loss();
-                batch_loss += ponder_loss;
-            }
-        }
+        // PolyAttention-only: no auxiliary routing losses
         
         // Prepare averaged gradients and detect anomalies
         let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
@@ -840,24 +543,7 @@ impl LLM {
         // Compute global gradient norm (L2 norm across all parameters)
         let mut grad_norm = total_grad_norm_sq.sqrt();
 
-        // Apply global gradient clipping on parameter gradients
-        const GRAD_CLIP_THRESHOLD: f32 = 100.0;
-        if grad_norm > GRAD_CLIP_THRESHOLD {
-            let scale = GRAD_CLIP_THRESHOLD / grad_norm;
-            for grads in &mut averaged_grads_per_layer {
-                for grad in grads {
-                    grad.mapv_inplace(|x| x * scale);
-                }
-            }
-            // Recompute grad_norm after clipping
-            let mut clipped_total_grad_norm_sq = 0.0f32;
-            for grads in &averaged_grads_per_layer {
-                for grad in grads {
-                    clipped_total_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
-                }
-            }
-            grad_norm = clipped_total_grad_norm_sq.sqrt();
-        }
+
 
         // Apply accumulated and averaged gradients with layer-wise adaptive learning rates
         // Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
@@ -887,19 +573,7 @@ impl LLM {
             }
         }
 
-        // Update threshold predictors in MoH layers (if enabled)
-        // This happens after parameter updates to use the latest routing statistics
-        for layer in &mut self.network {
-            if let Some(attn_layer) = layer.as_self_attention_mut() {
-                if attn_layer.has_learned_predictor() {
-                    // Use a separate learning rate for predictor (slightly higher than base LR)
-                    // Predictor needs faster adaptation to track routing efficiency, but not too aggressive
-                    // 2x base LR provides faster learning while maintaining stability
-                    let predictor_lr = lr * 2.0;
-                    attn_layer.update_threshold_predictor(predictor_lr);
-                }
-            }
-        }
+        // PolyAttention-only: no learned threshold predictors to update
 
         Ok((batch_loss, grad_norm))
     }
@@ -965,15 +639,7 @@ impl LLM {
         adaptive_lr
     }
 
-    /// Configure gradient clipping strategy
-    pub fn set_gradient_clipping(&mut self, clipper: Box<dyn GradientClipping>) {
-        self.gradient_clipper = Some(clipper);
-    }
 
-    /// Disable gradient clipping
-    pub fn disable_gradient_clipping(&mut self) {
-        self.gradient_clipper = None;
-    }
 
     /// Detect gradient anomalies that may indicate training instability or poisoning
     fn detect_gradient_anomalies(&self, grads: &[Array2<f32>]) -> Result<()> {
@@ -1072,11 +738,11 @@ impl LLM {
             // Calculate exp for each element
             let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exp_values: Vec<f32> = row.iter().map(|&x| (x - max_val).exp()).collect();
-            let sum_exp: f32 = exp_values.iter().sum();
+            let sum_exp: f32 = exp_values.iter().copied().sum();
 
-            // Normalize by sum
-            for (i, &exp_val) in exp_values.iter().enumerate() {
-                row[i] = exp_val / sum_exp;
+            // Normalize by sum without aliasing borrows
+            for (r, &exp_val) in row.iter_mut().zip(exp_values.iter()) {
+                *r = exp_val / sum_exp;
             }
         }
 

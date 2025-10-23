@@ -38,25 +38,6 @@ Sprint 5.1 successfully eliminated all "For now", "simplified", and "placeholder
 
 ---
 
-### 2. Fixed Model Builder Gradient Clipping Comment (src/model_builder.rs:96)
-**Issue**: "Commented out for now" indicated temporary state  
-**Fix**: Replaced with clear justification for design decision
-
-**Before**:
-```rust
-// attention.enable_gradient_clipping(50.0); // Commented out for now
-```
-
-**After**:
-```rust
-// Gradient clipping is handled globally in the training loop via AdaptiveGradientClipper
-// Per-layer gradient clipping is disabled to avoid double-clipping and maintain
-// consistent gradient flow across all layers
-```
-
-**Impact**: Documents architectural decision to use global gradient clipping
-
----
 
 ### 3. Fixed Model Persistence Parameter Counting (src/model_persistence.rs:310-311)
 **Issue**: "This is a simplified count" and "For now, return an estimate"  
@@ -189,7 +170,7 @@ let mixing_weight = 1.0 / seq_len as f32;
 
 ### Files Modified
 1. `src/rms_norm.rs` - Documentation improvement
-2. `src/model_builder.rs` - Gradient clipping justification
+2. `src/model_builder.rs` - Comment cleanup and documentation consistency
 3. `src/model_persistence.rs` - Proper parameter counting
 4. `src/self_attention.rs` - Perplexity adaptation documentation
 5. `src/token_mixing.rs` - Token mixing gradient clarification

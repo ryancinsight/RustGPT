@@ -1,6 +1,6 @@
 use llm::{
     EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, LayerEnum, MAX_SEQ_LEN, Vocab,
-    layer_norm::LayerNorm, output_projection::OutputProjection, self_attention::SelfAttention,
+    dynamic_tanh_norm::DynamicTanhNorm, output_projection::OutputProjection, self_attention::SelfAttention,
     swiglu::SwiGLU,
 };
 use ndarray::{Array2, Axis};
@@ -23,7 +23,7 @@ fn create_custom_vocab(words: Vec<&str>) -> Vocab {
 #[test]
 fn test_llm_tokenize() {
     let vocab = create_test_vocab();
-    let vocab_size = vocab.words.len();
+    let vocab_size = vocab.size();
     let llm = LLM::new(
         vocab,
         vec![LayerEnum::OutputProjection(OutputProjection::new(
@@ -91,7 +91,7 @@ fn test_llm_tokenize_empty_input() {
 #[test]
 fn test_llm_tokenize_unknown_words() {
     let vocab = create_custom_vocab(vec!["hello", "world", "</s>"]);
-    let vocab_size = vocab.words.len();
+    let vocab_size = vocab.size();
     let llm = LLM::new(
         vocab,
         vec![LayerEnum::OutputProjection(OutputProjection::new(
@@ -110,7 +110,7 @@ fn test_llm_tokenize_unknown_words() {
 #[test]
 fn test_llm_tokenize_punctuation() {
     let vocab = create_custom_vocab(vec!["hello", "world", ".", "!", "</s>"]);
-    let vocab_size = vocab.words.len();
+    let vocab_size = vocab.size();
     let llm = LLM::new(
         vocab,
         vec![LayerEnum::OutputProjection(OutputProjection::new(
@@ -166,9 +166,9 @@ fn test_parameter_count_consistency() {
         vec![
             LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
             LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(EMBEDDING_DIM)),
             LayerEnum::SwiGLU(Box::new(SwiGLU::new(EMBEDDING_DIM, HIDDEN_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(EMBEDDING_DIM)),
             LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size)),
         ],
     );
@@ -178,9 +178,9 @@ fn test_parameter_count_consistency() {
         vec![
             LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
             LayerEnum::SelfAttention(Box::new(SelfAttention::new(EMBEDDING_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(EMBEDDING_DIM)),
             LayerEnum::SwiGLU(Box::new(SwiGLU::new(EMBEDDING_DIM, HIDDEN_DIM))),
-            LayerEnum::LayerNorm(LayerNorm::new(EMBEDDING_DIM)),
+            LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(EMBEDDING_DIM)),
             LayerEnum::OutputProjection(OutputProjection::new(EMBEDDING_DIM, vocab_size)),
         ],
     );
@@ -350,7 +350,7 @@ proptest! {
     #[test]
     fn prop_tokenize_produces_valid_indices(s in "[a-z ]{1,50}") {
         let llm = LLM::default();
-        let vocab_size = llm.vocab.words.len();
+        let vocab_size = llm.vocab.size();
 
         let tokens = llm.tokenize(&s);
 

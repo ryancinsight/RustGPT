@@ -39,7 +39,7 @@ Provide a clear, well-documented reference implementation for understanding tran
 - **FR-2.1**: Support pre-training on factual text completion tasks
 - **FR-2.2**: Support instruction tuning for conversational AI
 - **FR-2.3**: Implement Adam optimizer with configurable hyperparameters
-- **FR-2.4**: Implement adaptive gradient clipping for training stability using AGC (Adaptive Gradient Clipping) and Gradient Centralization techniques
+
 - **FR-2.5**: Support cross-entropy loss computation
 - **FR-2.6**: Display epoch-wise loss metrics during training
 
@@ -103,7 +103,7 @@ Provide a clear, well-documented reference implementation for understanding tran
 | `HIDDEN_DIM` | 256 | 128-4096 | Hidden layer size in feed-forward networks |
 | `NUM_LAYERS` | 3 | 1-12 | Number of transformer blocks |
 | `LEARNING_RATE` | 0.0005 (pre-train)<br>0.0001 (fine-tune) | 1e-5 to 1e-2 | Adam optimizer learning rate |
-| `GRADIENT_CLIP` | AGC (λ=0.01) + Centralization | AGC/L2 | Adaptive gradient clipping strategy |
+
 
 ### 3.2 Architecture Details
 
@@ -253,7 +253,7 @@ $$
 ### 7.2 Risk Analysis
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
-| Training divergence | Medium | High | AGC + gradient centralization implemented |
+| Training divergence | Medium | High | Monitor loss trends; adjust learning rate and batch size |
 | OOM during training | Low | High | Memory profiling needed, arena allocators |
 | Serialization bugs | Low | Medium | Comprehensive round-trip tests (7 tests) |
 | Performance bottlenecks | Medium | Medium | Rayon integration, profiling with flamegraph |

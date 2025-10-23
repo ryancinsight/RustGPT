@@ -11,9 +11,31 @@ fn test_vocab_encode_decode() {
     assert_eq!(vocab.encode("unknown"), None);
 
     // Test decoding
-    assert_eq!(vocab.decode(0).map(|s| s.as_str()), Some("hello"));
-    assert_eq!(vocab.decode(1).map(|s| s.as_str()), Some("world"));
+    assert_eq!(vocab.decode(0), Some("hello"));
+    assert_eq!(vocab.decode(1), Some("world"));
     assert_eq!(vocab.decode(999), None);
+
+    // Test size
+    assert_eq!(vocab.size(), 6);
+
+    // Test contains
+    assert!(vocab.contains("hello"));
+    assert!(!vocab.contains("unknown"));
+
+    // Test batch operations
+    let batch_encode = vocab.encode_batch(&["hello", "world", "unknown"]);
+    assert_eq!(batch_encode, vec![Some(0), Some(1), None]);
+
+    let batch_decode = vocab.decode_batch(vec![0, 1, 999]);
+    assert_eq!(batch_decode, vec![Some("hello"), Some("world"), None]);
+
+    // Test iterator
+    let words: Vec<&str> = vocab.iter_words().collect();
+    assert_eq!(words, vec!["hello", "world", "this", "is", "rust", "</s>"]);
+
+    // Test unknown token
+    assert_eq!(vocab.encode_or_unknown("unknown"), None);
+    assert_eq!(vocab.unknown_token(), None);
 }
 
 #[test]

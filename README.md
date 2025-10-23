@@ -13,7 +13,7 @@ This project demonstrates how to build a transformer-based language model from s
 - **Pre-training** on factual text completion
 - **Instruction tuning** for conversational AI
 - **Interactive chat mode** for testing
-- **Full backpropagation** with gradient clipping
+- **Full backpropagation**
 - **Model persistence** for saving/loading trained models
 - **Modular architecture** with clean separation of concerns
 
@@ -32,11 +32,13 @@ Start with these two core files to understand the implementation:
 
 ## 🏗️ Architecture
 
-The model uses a **transformer-based architecture** with the following components:
+The model uses a **Tiny Recursive Model (TRM)** architecture with the following components:
 
 ```
-Input Text → Tokenization → Embeddings → Transformer Blocks → Output Projection → Predictions
+Input Text → Tokenization → Embeddings → TRM Blocks → Output Projection → Predictions
 ```
+
+TRM applies a single transformer block recursively multiple times with adaptive residual scaling and optional adaptive depth control.
 
 ### Project Structure
 
@@ -45,29 +47,29 @@ src/
 ├── main.rs              # 🎯 Training pipeline and interactive mode
 ├── llm.rs               # 🧠 Core LLM implementation and training logic
 ├── lib.rs               # 📚 Library exports and constants
-├── transformer.rs       # 🔄 Transformer block (attention + feed-forward)
-├── self_attention.rs    # 👀 Multi-head self-attention mechanism
-├── feed_forward.rs      # ⚡ Position-wise feed-forward networks
-├── embeddings.rs        # 📊 Token embedding layer
+├── trm.rs               # 🔄 Tiny Recursive Model (TRM) block with recursive attention and feed-forward
+├── self_attention.rs    # 👀 Multi-head self-attention mechanism with CoPE positional encoding
+├── swiglu.rs            # ⚡ SwiGLU activation for feed-forward networks
+├── embeddings.rs        # 📊 Token embedding layer with learned positional embeddings
 ├── output_projection.rs # 🎰 Final linear layer for vocabulary predictions
 ├── vocab.rs            # 📝 Vocabulary management and tokenization
-├── layer_norm.rs       # 🧮 Layer normalization
+├── dynamic_tanh_norm.rs # 🧮 Dynamic Tanh Normalization (DyT) for layer normalization
 ├── adam.rs             # 🏃 Adam optimizer implementation
-└── gradient_clipping.rs # ✂️ Adaptive gradient clipping strategies
+
 
 tests/
 ├── llm_test.rs         # Tests for core LLM functionality (19 tests)
 ├── persistence_test.rs # Tests for model save/load (7 tests)
-├── gradient_clipping_test.rs # Tests for gradient clipping (4 tests)
-├── transformer_test.rs # Tests for transformer blocks
+
+├── trm_test.rs         # Tests for TRM blocks
 ├── self_attention_test.rs # Tests for attention mechanisms
-├── feed_forward_test.rs # Tests for feed-forward layers
+├── swiglu_test.rs      # Tests for SwiGLU layers
 ├── embeddings_test.rs  # Tests for embedding layers
 ├── vocab_test.rs       # Tests for vocabulary handling
 ├── adam_test.rs        # Tests for optimizer
 └── output_projection_test.rs # Tests for output layer
 
-Total: 68 tests, all passing ✅
+All tests passing ✅
 ```
 
 ## 🧪 What The Model Learns
@@ -160,36 +162,6 @@ let llm_from_json = LLM::load_json("model.json")?;
 - **Versioned**: SHA256 integrity, version compatibility, metadata tracking (recommended for production)
 - **Basic**: Simple serialization without validation (faster, smaller files)
 
-## ✂️ Gradient Clipping
-
-Advanced gradient clipping with multiple strategies:
-
-```rust
-use llm::{LLM, AdaptiveGradientClipping, AdaptiveClippingConfig, L2GradientClipping};
-
-// Default: Adaptive Gradient Clipping (AGC) with gradient centralization
-let mut llm = LLM::default();
-
-// Configure AGC parameters
-let config = AdaptiveClippingConfig {
-    agc_threshold: 0.01,           // AGC threshold (λ)
-    use_centralization: true,      // Enable gradient centralization
-    use_agc: true,                 // Use AGC (vs L2 fallback)
-    l2_threshold: 5.0,             // L2 fallback threshold
-};
-llm.set_gradient_clipping(Box::new(AdaptiveGradientClipping::new(config)));
-
-// Or use simple L2 norm clipping
-llm.set_gradient_clipping(Box::new(L2GradientClipping::new(5.0)));
-
-// Disable gradient clipping
-llm.disable_gradient_clipping();
-```
-
-**Gradient Clipping Strategies**:
-- **Adaptive Gradient Clipping (AGC)**: Parameter-norm based scaling for better stability
-- **Gradient Centralization**: Zero-mean gradients for improved convergence
-- **L2 Norm Clipping**: Traditional threshold-based clipping (legacy support)
 
 ## 🧮 Technical Implementation
 
@@ -198,25 +170,28 @@ llm.disable_gradient_clipping();
 - **Embedding Dimension**: 128 (defined by `EMBEDDING_DIM` in `src/lib.rs`)
 - **Hidden Dimension**: 256 (defined by `HIDDEN_DIM` in `src/lib.rs`)
 - **Max Sequence Length**: 80 tokens (defined by `MAX_SEQ_LEN` in `src/lib.rs`)
-- **Architecture**: 3 Transformer blocks + embeddings + output projection
+- **Architecture**: TRM with recursive depth 3 + embeddings + output projection
+- **Normalization**: Dynamic Tanh Normalization (DyT)
+- **Positional Encoding**: CoPE (Context-aware Positional Encoding)
+- **Activation**: SwiGLU
 
 ### Training Details
-- **Optimizer**: Adam with adaptive gradient clipping
+- **Optimizer**: Adam
 - **Pre-training LR**: 0.0005 (100 epochs)
 - **Instruction Tuning LR**: 0.0001 (100 epochs)
 - **Loss Function**: Cross-entropy loss
-- **Gradient Clipping**: Adaptive Gradient Clipping (AGC) with gradient centralization (default)
-  - AGC threshold (λ): 0.01
-  - L2 fallback threshold: 5.0
-  - Gradient centralization enabled
 
 ### Key Features
 - **Custom tokenization** with punctuation handling
 - **Greedy decoding** for text generation
-- **Adaptive gradient clipping** with AGC and gradient centralization for training stability
+
 - **Model persistence** with dual-format serialization (binary + JSON)
 - **Modular layer system** with clean interfaces
-- **Comprehensive test coverage** for all components (55 tests)
+- **Recursive architecture** with adaptive residual scaling
+- **Dynamic Tanh Normalization** for efficient normalization
+- **CoPE positional encoding** for context-aware position handling
+- **SwiGLU activation** for improved feed-forward performance
+- **Comprehensive test coverage** for all components (68 tests)
 
 ## 🔧 Development
 
@@ -285,11 +260,12 @@ Total test count: **53 tests** across all components
 ## 🧠 Learning Resources
 
 This implementation demonstrates key ML concepts:
-- **Transformer architecture** (attention, feed-forward, layer norm)
+- **Recursive transformer architecture** (TRM with attention, feed-forward, dynamic tanh norm)
 - **Backpropagation** through neural networks
 - **Language model training** (pre-training + fine-tuning)
 - **Tokenization** and vocabulary management
 - **Gradient-based optimization** with Adam
+- **Adaptive depth control** and residual scaling
 
 Perfect for understanding how modern LLMs work under the hood!
 

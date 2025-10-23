@@ -125,7 +125,7 @@ fn test_sliding_window_with_rope() {
         EMBEDDING_DIM,
         8,
         8,
-        &PositionalEncodingType::RoPE,
+        &PositionalEncodingType::CoPE { max_pos: 64 },
         512,
         Some(TEST_WINDOW_SIZE),
     );
@@ -144,7 +144,7 @@ fn test_sliding_window_with_gqa_and_rope() {
         EMBEDDING_DIM,
         8,
         4, // GQA
-        &PositionalEncodingType::RoPE,
+        &PositionalEncodingType::CoPE { max_pos: 64 },
         512,
         Some(TEST_WINDOW_SIZE), // Sliding Window
     );

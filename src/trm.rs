@@ -1,15 +1,14 @@
-use ndarray::{s, Array1, Array2, Axis};
+use ndarray::{s, Array1, Array2};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
 
 use crate::{
     adam::Adam,
     errors::Result,
     // feed_forward::FeedForward, // Removed
     llm::Layer,
-    model_config::{AdaptiveDepthConfig, HeadSelectionStrategy},
-    rms_norm::RMSNorm,
-    self_attention::SelfAttention,
+    model_config::AdaptiveDepthConfig,
+    dynamic_tanh_norm::DynamicTanhNorm,
+    poly_attention::PolyAttention,
     swiglu::SwiGLU,
 };
 
@@ -24,7 +23,7 @@ use crate::{
 /// - **Memory Efficient**: O(1) parameters regardless of depth
 /// - **Adaptive Residual Scaling**: Learned per-step scales prevent gradient issues
 /// - **Per-Step Gradient Tracking**: Monitor gradient flow through recursive depth
-/// - **No Gradient Clipping**: Stability achieved through adaptive mechanisms
+
 ///
 /// # Architecture
 ///
@@ -65,11 +64,11 @@ use crate::{
 /// - Deep Equilibrium Models (Bai et al., 2019)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TinyRecursiveModel {
-    /// Self-attention layer (reused recursively)
-    attention: SelfAttention,
+    /// Polynomial attention layer (reused recursively)
+    attention: PolyAttention,
 
     /// Normalization after attention
-    norm1: RMSNorm,
+    norm1: DynamicTanhNorm,
 
     /// Feedforward layer (reused recursively)
     #[serde(skip)]
@@ -77,7 +76,7 @@ pub struct TinyRecursiveModel {
     // #[serde(skip)] feed_forward_standard removed
 
     /// Normalization after feedforward
-    norm2: RMSNorm,
+    norm2: DynamicTanhNorm,
 
     /// Recursive depth (number of times to apply the block)
     recursive_depth: usize,
@@ -154,41 +153,27 @@ impl TinyRecursiveModel {
     /// * `embedding_dim` - Embedding dimension
     /// * `hidden_dim` - Hidden dimension for feedforward layer
     /// * `num_heads` - Number of attention heads
-    /// * `num_kv_heads` - Number of key-value heads (for GQA)
+    /// * `degree_p` - Polynomial degree `p` for PolyAttention (odd integer)
     /// * `recursive_depth` - Number of times to apply the block recursively
-    /// * `use_swiglu` - Whether to use SwiGLU (true) or standard FeedForward (false)
-    /// * `max_seq_len` - Maximum sequence length
-    /// * `head_selection` - Head selection strategy (AllHeads, MoH, or FullyAdaptiveMoH)
     /// * `adaptive_depth_config` - Optional adaptive depth configuration (enables ACT mechanism)
     pub fn new(
         embedding_dim: usize,
         hidden_dim: usize,
         num_heads: usize,
-        num_kv_heads: Option<usize>,
         recursive_depth: usize,
-        // use_swiglu: bool, // Removed
-        max_seq_len: usize,
-        head_selection: HeadSelectionStrategy,
+        degree_p: usize,
         adaptive_depth_config: Option<AdaptiveDepthConfig>,
     ) -> Self {
-        // Create attention layer with GQA support
-        let kv_heads = num_kv_heads.unwrap_or(num_heads);
-        let mut attention = SelfAttention::new_with_gqa(
+        // Create polynomial attention layer (PolyAttention)
+        let mut attention = PolyAttention::new(
             embedding_dim,
             num_heads,
-            kv_heads,
-            false, // use_rope = false (positional encoding handled by embeddings)
-            max_seq_len,
-            None, // window_size = None (full attention)
+            degree_p,
         );
 
-        // Set head selection strategy (MoH, AllHeads, or FullyAdaptiveMoH)
-        // Use layer_idx=0 since TRM is a single block
-        attention.set_head_selection(head_selection, 0);
-
         // Create normalization layers
-        let norm1 = RMSNorm::new(embedding_dim);
-        let norm2 = RMSNorm::new(embedding_dim);
+        let norm1 = DynamicTanhNorm::new(embedding_dim);
+        let norm2 = DynamicTanhNorm::new(embedding_dim);
 
         // Create feedforward layer (SwiGLU only)
         let feed_forward_swiglu = Some(SwiGLU::new(embedding_dim, hidden_dim));
@@ -283,10 +268,10 @@ impl TinyRecursiveModel {
     fn gumbel_softmax(logits: &Array1<f32>, temperature: f32, training: bool) -> Array1<f32> {
         if training {
             // Sample Gumbel noise: g ~ -log(-log(U)) where U ~ Uniform(0, 1)
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             use rand::Rng;
             let gumbel_noise: Array1<f32> = Array1::from_shape_fn(logits.len(), |_| {
-                let u: f32 = rng.gen_range(1e-10..1.0); // Avoid log(0)
+                let u: f32 = rng.random_range(1e-10..1.0); // Avoid log(0)
                 -(-u.ln()).ln()
             });
 
@@ -342,34 +327,31 @@ impl TinyRecursiveModel {
     /// Returns (avg_routed_heads, mean_threshold, conf_avg, conf_min, fallback_pct, complexity_avg, complexity_min, complexity_max, pred_norm)
     /// Returns (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) if MoH is not enabled.
     pub fn get_moh_stats(&self) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32) {
-        let (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct, complexity_avg, pred_norm) =
-            self.attention.get_moh_stats();
-        let (_, complexity_min, complexity_max) = self.attention.get_complexity_stats();
-
-        (avg_routed, mean_thresh, conf_avg, conf_min, fallback_pct,
-         complexity_avg, complexity_min, complexity_max, pred_norm)
+        // PolyAttention does not expose MoH stats; return neutral defaults
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     }
 
     /// Get temperature statistics from internal attention layer
     ///
     /// Returns (avg, min, max) or None if temperature predictor is not enabled.
     pub fn get_temperature_stats(&self) -> Option<(f32, f32, f32)> {
-        self.attention.get_temperature_stats()
+        // PolyAttention does not expose a temperature predictor; no stats available
+        None
     }
 
     /// Get load balance loss from internal attention layer
     pub fn get_load_balance_loss(&self) -> f32 {
-        self.attention.get_load_balance_loss()
+        0.0
     }
 
     /// Get dynamic loss from internal attention layer
     pub fn get_dynamic_loss(&self) -> f32 {
-        self.attention.get_dynamic_loss()
+        0.0
     }
 
     /// Get dynamic loss weight from internal attention layer
-    pub fn get_dynamic_loss_weight(&self, training_progress: f32) -> f32 {
-        self.attention.get_dynamic_loss_weight(training_progress)
+    pub fn get_dynamic_loss_weight(&self, _training_progress: f32) -> f32 {
+        0.0
     }
 
     /// Get ponder loss (penalizes excessive depth in adaptive mode)
@@ -392,10 +374,15 @@ impl TinyRecursiveModel {
     ///
     /// # Example
     /// ```rust
-    /// use llm::model_config::{AdaptiveDepthConfig, HeadSelectionStrategy};
+    /// use llm::model_config::AdaptiveDepthConfig;
     /// use llm::trm::TinyRecursiveModel;
     /// let trm = TinyRecursiveModel::new(
-    ///     64, 128, 4, None, 3, true, 80, HeadSelectionStrategy::AllHeads, Some(AdaptiveDepthConfig::default()),
+    ///     64,   // embedding_dim
+    ///     128,  // hidden_dim
+    ///     4,    // num_heads
+    ///     3,    // recursive_depth
+    ///     3,    // degree_p for PolyAttention (odd)
+    ///     Some(AdaptiveDepthConfig::default()),
     /// );
     /// if let Some((avg, min, max)) = trm.get_depth_stats() {
     ///     println!("Depth: avg={:.1} [{}-{}]", avg, min, max);
@@ -487,7 +474,7 @@ impl Layer for TinyRecursiveModel {
                 // Step 1: Compute attention logits over sequence positions
                 // attn_logits = x · W_attn  →  (seq_len, 1)
                 let attn_logits_2d = x.dot(&self.w_attn);
-                let attn_logits = attn_logits_2d.into_shape(batch_size).unwrap(); // (seq_len,)
+                let attn_logits = attn_logits_2d.into_shape_with_order(batch_size).unwrap(); // (seq_len,)
 
                 // Step 2: Apply Gumbel-Softmax to get differentiable attention weights
                 // Training: adds Gumbel noise for exploration
@@ -722,10 +709,10 @@ impl Layer for TinyRecursiveModel {
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
         // Calculate number of parameters for each component
-        // For SelfAttention: 3 gradients per head (W_q, W_k, W_v)
-        let attention_params = self.attention.num_heads * 3;
+        // For PolyAttention: per-head (q,k,v), plus W_out, scalars (a,b,scale), gating (w_g, alpha_g, beta_g)
+        let attention_params = self.attention.num_heads * 3 + 1 + 3 + 3;
 
-        let norm_params = 1; // RMSNorm has 1 parameter (gamma)
+        let norm_params = 3; // DynamicTanhNorm has 3 parameters (alpha, gamma, beta)
 
         // For SwiGLU: W_gate, W_up, W_down (3 matrices)
         let ffn_params = 3; // SwiGLU-only: W_gate, W_up, W_down

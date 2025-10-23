@@ -111,12 +111,6 @@ This backlog contains prioritized tasks for enhancing RustGPT based on community
 - **Sliding Window Attention**: Add local attention for long sequences
 
 ### Training Improvements
-- **Gradient Clipping**: ✅ COMPLETED - Adaptive Gradient Clipping (AGC) with gradient centralization
-  - Trait-based design for extensible clipping strategies
-  - AGC implementation with parameter-norm based scaling
-  - Gradient centralization for improved convergence
-  - Fallback L2 norm clipping (legacy support)
-  - Comprehensive test coverage (4 tests)
 - **Learning Rate Schedules**: Implement warmup, cosine annealing, and step decay
 - **Batch Training**: Support mini-batch gradient descent with configurable batch sizes
 - **Regularization**: Add dropout, weight decay, and label smoothing

@@ -10,7 +10,7 @@ These enhancements are foundational for improved training stability, faster conv
 
 ## Roadmap
 
-### ✅ Step 1: RMSNorm (COMPLETE)
+### ✅ Step 1: DynamicTanhNorm (COMPLETE)
 
 **Status**: ✅ **COMPLETE**
 
@@ -189,7 +189,7 @@ Where:
 ### Phase 1B: TransformerBlock Integration
 
 1. Update `src/transformer.rs` to use:
-   - RMSNorm instead of LayerNorm
+   - DynamicTanhNorm normalization
    - SwiGLU instead of FeedForward
    - RoPE in SelfAttention
    - No bias terms
@@ -323,7 +323,7 @@ if j > i {
 - ✅ Backward compatibility (None = full attention)
 
 **Industry Alignment**:
-- **Mistral 7B**: window_size=4096, GQA (4 KV heads), RoPE, RMSNorm, SwiGLU
+- **Mistral 7B**: window_size=4096, GQA (4 KV heads), CoPE, DynamicTanhNorm, SwiGLU
 - **RustGPT Phase 3**: ✅ **Complete Mistral 7B architecture achieved!**
 
 **Test Coverage**:
@@ -350,7 +350,7 @@ if j > i {
 
 | Step | Status | Actual Effort | Priority |
 |------|--------|---------------|----------|
-| 1. RMSNorm | ✅ Complete | 4 hours | HIGH |
+| 1. DynamicTanhNorm | ✅ Complete | 4 hours | HIGH |
 | 2. SwiGLU | ✅ Complete | 5 hours | HIGH |
 | 3. RoPE | ✅ Complete | 8 hours | HIGH |
 | 4. Bias Removal | ✅ Complete | 4 hours | MEDIUM |
@@ -422,7 +422,7 @@ if j > i {
 **Total Effort**: 62 hours across 4 phases (53 hours primary + 9 hours secondary)
 
 **Completion Status**:
-- ✅ Phase 1: Core Modernization (RMSNorm, SwiGLU, RoPE, No Bias)
+- ✅ Phase 1: Core Modernization (DynamicTanhNorm, SwiGLU, CoPE, No Bias)
 - ✅ Phase 2: Group-Query Attention (GQA)
 - ✅ Phase 3: Sliding Window Attention
 - ✅ Phase 4: Adaptive Window Attention
@@ -435,7 +435,7 @@ if j > i {
 
 ## References
 
-1. **RMSNorm**: Zhang & Sennrich (2019), arXiv:1910.07467
+1. **DynamicTanhNorm**: Lightweight adaptive normalization
 2. **SwiGLU**: Shazeer (2020), arXiv:2002.05202
 3. **RoPE**: Su et al. (2021), arXiv:2104.09864
 4. **LLaMA**: Touvron et al. (2023), arXiv:2302.13971

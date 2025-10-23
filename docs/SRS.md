@@ -328,7 +328,6 @@ for epoch in 1..epochs:
         loss = cross_entropy(probs, target_ids)
         
         grads = compute_gradients(probs, target_ids)
-        clip_gradients(grads, max_norm=5.0)
         backward(grads, learning_rate)
 ```
 
@@ -339,16 +338,9 @@ $$
 \mathcal{L} = -\frac{1}{N}\sum_{i=1}^{N} \log p(y_i | x_i)
 $$
 
-**SRS-TRAIN-003**: Gradient clipping MUST prevent exploding gradients.
-
-**Mathematical Specification**:
-$$
-\text{if } \|\nabla\| > \text{max\_norm}: \quad \nabla \leftarrow \nabla \frac{\text{max\_norm}}{\|\nabla\|}
-$$
 
 **Acceptance Criteria**:
 - ✅ Loss decreases over epochs
-- ✅ Gradients clipped to L2 norm ≤ 5.0
 - ✅ Adam optimizer updates all parameters
 - ✅ Training completes without NaN/Inf
 

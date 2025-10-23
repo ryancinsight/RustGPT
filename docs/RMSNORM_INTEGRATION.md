@@ -1,12 +1,12 @@
-# RMSNorm Integration into TransformerBlock
+# DynamicTanhNorm Integration into TransformerBlock
 
 ## Overview
 
-RMSNorm has been successfully integrated into the TransformerBlock architecture, allowing for direct comparison between LayerNorm and RMSNorm during training. This integration is controlled via a configuration flag, maintaining backward compatibility while enabling modern LLM enhancements.
+DynamicTanhNorm has been successfully integrated into the TransformerBlock architecture. This provides a lightweight normalization alternative without computing batch statistics.
 
 ## Implementation Status
 
-✅ **COMPLETE** - RMSNorm fully integrated into TransformerBlock with configuration support
+✅ **COMPLETE** - DynamicTanhNorm fully integrated into TransformerBlock
 
 ### Files Modified
 
@@ -172,7 +172,7 @@ When running training with LayerNorm vs RMSNorm, track:
 5. **Gradient Statistics**
    - Gradient magnitudes
    - Gradient variance
-   - Gradient clipping frequency
+   - Gradient norm distribution
 
 ## Usage Example
 

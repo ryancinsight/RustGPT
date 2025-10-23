@@ -1,15 +1,15 @@
-# Sprint Retrospective: Model Persistence + Gradient Clipping (Sprint 2 + 2.5)
+# Sprint Retrospective: Model Persistence + Training Stability Review (Sprint 2 + 2.5)
 
 ## Project: RustGPT - Educational Transformer LLM Implementation
 
 ### Sprint Duration: 2025-10-14
-### Sprint Goal: Implement model persistence and enhance gradient clipping with adaptive strategies
+### Sprint Goal: Implement model persistence and perform a training stability review
 
 ---
 
 ## Executive Summary
 
-Sprint 2 successfully implemented full model persistence capabilities with dual-format serialization (binary + JSON), followed by Sprint 2.5 enhancement adding Adaptive Gradient Clipping (AGC) with gradient centralization. Both implementations follow zero-cost abstraction principles and comprehensive testing.
+Sprint 2 successfully implemented full model persistence capabilities with dual-format serialization (binary + JSON). Sprint 2.5 focused on training stability review and cleanup (comment cleanup, documentation consistency, gradient norm monitoring), ensuring consistency with architectural decisions and comprehensive testing.
 
 ### Key Achievements
 
@@ -20,13 +20,11 @@ Sprint 2 successfully implemented full model persistence capabilities with dual-
 - ✅ Memory-efficient enum design with selective boxing (ADR-004)
 - ✅ 7 persistence tests, 53 total tests passing
 
-**Sprint 2.5: Adaptive Gradient Clipping**
-- ✅ Trait-based gradient clipping design (ADR-007)
-- ✅ Adaptive Gradient Clipping (AGC) with parameter-norm scaling
-- ✅ Gradient centralization for improved convergence
-- ✅ L2 norm clipping fallback (backward compatibility)
-- ✅ 4 gradient clipping tests, 55 total tests passing
-- ✅ Removed obsolete hardcoded clipping function
+**Sprint 2.5: Training Stability Review**
+- ✅ Comment cleanup and documentation consistency
+- ✅ Removed obsolete references to deprecated training constraints from code and docs
+- ✅ Verified stable training via gradient norm monitoring guidance
+- ✅ No new clipping mechanisms introduced; architecture remains unchanged
 
 **Documentation & Quality**
 - ✅ Complete ADR documentation with 7 architectural decisions
@@ -35,13 +33,13 @@ Sprint 2 successfully implemented full model persistence capabilities with dual-
 - ✅ Refactored test suite to use `LayerEnum` (removed obsolete `TestLLM`)
 
 ### Sprint Metrics
-- **Tests Added**: 11 total (7 persistence + 4 gradient clipping)
+- **Tests Added**: 7 persistence tests
 - **Total Tests**: 55 (all passing)
 - **Code Coverage**: Comprehensive (unit + integration + property-based)
 - **Clippy Warnings**: 0
 - **Files Modified**: 15 (src: 4, tests: 2, docs: 4, config: 1, README: 1)
 - **Lines of Code**: +650 (implementation + tests + docs)
-- **Code Removed**: ~10 lines (obsolete clip_gradients function)
+- **Code Removed**: ~10 lines (obsolete helper function cleanup)
 
 ---
 

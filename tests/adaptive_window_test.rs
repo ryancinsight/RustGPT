@@ -1,4 +1,4 @@
-use llm::{
+﻿use llm::{
     EMBEDDING_DIM, Layer, PositionalEncodingType, WindowAdaptationStrategy,
     self_attention::SelfAttention,
 };
@@ -13,8 +13,6 @@ fn test_adaptive_window_sequence_length_based() {
         EMBEDDING_DIM,
         8,
         8,
-        false,
-        512,
         None,
     )
     .min_window_size(10)
@@ -36,10 +34,7 @@ fn test_adaptive_window_min_max_bounds() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(5)
     .max_window_size(15)
@@ -66,8 +61,6 @@ fn test_adaptive_window_with_gqa() {
         EMBEDDING_DIM,
         8,
         4, // GQA: 4 KV heads
-        false,
-        512,
         None,
     )
     .min_window_size(10)
@@ -89,8 +82,6 @@ fn test_adaptive_window_with_rope() {
         EMBEDDING_DIM,
         8,
         8,
-        true,
-        512,
         None,
     )
     .min_window_size(10)
@@ -112,8 +103,6 @@ fn test_adaptive_window_with_gqa_and_rope() {
         EMBEDDING_DIM,
         8,
         4, // GQA
-        true,
-        512,
         None,
     )
     .min_window_size(10)
@@ -133,10 +122,7 @@ fn test_adaptive_window_backward_pass() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(10)
     .max_window_size(50)
@@ -159,10 +145,7 @@ fn test_adaptive_window_training_stability() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        4,
-        false,
-        512,
-        None,
+        4, None,
     )
     .min_window_size(10)
     .max_window_size(50)
@@ -188,10 +171,7 @@ fn test_adaptive_window_different_sequence_lengths() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(5)
     .max_window_size(50)
@@ -214,10 +194,7 @@ fn test_adaptive_window_attention_entropy_strategy() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(10)
     .max_window_size(50)
@@ -237,10 +214,7 @@ fn test_attention_entropy_high_expands_window() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(10)
     .max_window_size(50)
@@ -260,10 +234,7 @@ fn test_attention_entropy_low_shrinks_window() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(10)
     .max_window_size(50)
@@ -283,17 +254,14 @@ fn test_attention_entropy_mid_maps_to_mid_window() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(10)
     .max_window_size(50)
     .strategy(WindowAdaptationStrategy::AttentionEntropy)
     .build();
 
-    // Half of theoretical max entropy → mid window
+    // Half of theoretical max entropy â†’ mid window
     let half_max_entropy = (seq_len as f32).ln() * 0.5;
     attention.set_last_attention_entropy_for_test(half_max_entropy);
     let ws = attention.recompute_window_for_test(seq_len);
@@ -307,10 +275,7 @@ fn test_adaptive_window_perplexity_based_strategy() {
     let mut attention = SelfAttention::new_with_adaptive_window(
         EMBEDDING_DIM,
         8,
-        8,
-        false,
-        512,
-        None,
+        8, None,
     )
     .min_window_size(10)
     .max_window_size(50)
@@ -331,8 +296,6 @@ fn test_adaptive_window_fixed_strategy() {
         EMBEDDING_DIM,
         8,
         8,
-        false,
-        512,
         Some(30), // Fixed window size
     )
     .min_window_size(10)
@@ -354,8 +317,6 @@ fn test_adaptive_window_vs_fixed_window() {
         EMBEDDING_DIM,
         8,
         8,
-        false,
-        512,
         None,
     )
     .min_window_size(10)
@@ -382,3 +343,4 @@ fn test_adaptive_window_vs_fixed_window() {
     assert!(output_adaptive.iter().all(|&x| x.is_finite()));
     assert!(output_fixed.iter().all(|&x| x.is_finite()));
 }
+

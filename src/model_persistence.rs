@@ -268,19 +268,13 @@ impl LLM {
 
     /// Get the architecture name for metadata
     fn get_architecture_name(&self) -> String {
-        // Detect architecture from network layers
-        let has_self_attention = self
+        // In PolyAttention-only refactor, any presence of PolyAttention implies Transformer
+        let has_poly_attention = self
             .network
             .iter()
-            .any(|l| matches!(l, crate::llm::LayerEnum::SelfAttention(_)));
-        let has_trm = self
-            .network
-            .iter()
-            .any(|l| matches!(l, crate::llm::LayerEnum::TRMBlock(_)));
+            .any(|l| matches!(l, crate::llm::LayerEnum::PolyAttention(_)));
 
-        if has_trm {
-            "TRM".to_string()
-        } else if has_self_attention {
+        if has_poly_attention {
             "Transformer".to_string()
         } else {
             "Unknown".to_string()

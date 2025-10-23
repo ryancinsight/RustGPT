@@ -161,7 +161,7 @@ fn test_round_trip_preserves_data() {
 
     // Verify vocab matches
     assert_eq!(llm.vocab.encode.len(), loaded_llm.vocab.encode.len());
-    assert_eq!(llm.vocab.words.len(), loaded_llm.vocab.words.len());
+    assert_eq!(llm.vocab.size(), loaded_llm.vocab.size());
 
     // Verify network structure matches
     assert_eq!(llm.network.len(), loaded_llm.network.len());

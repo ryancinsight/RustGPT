@@ -22,12 +22,6 @@ This checklist tracks the implementation status of requirements from the PRD and
 - [x] **FR-2.1**: Support pre-training on factual text completion tasks
 - [x] **FR-2.2**: Support instruction tuning for conversational AI
 - [x] **FR-2.3**: Implement Adam optimizer with configurable hyperparameters
-- [x] **FR-2.4**: Implement gradient clipping for training stability
-  - [x] Adaptive Gradient Clipping (AGC) with parameter-norm scaling
-  - [x] Gradient centralization for improved convergence
-  - [x] Trait-based extensible design (GradientClipping trait)
-  - [x] L2 norm clipping fallback (threshold: 5.0)
-  - [x] Configurable via AdaptiveClippingConfig
 - [x] **FR-2.5**: Support cross-entropy loss computation
 - [x] **FR-2.6**: Display epoch-wise loss metrics during training
 - [x] **FR-2.7**: Batch training with gradient accumulation - **ADDED Sprint 3.1**
@@ -138,7 +132,6 @@ This checklist tracks the implementation status of requirements from the PRD and
 - [x] **NFR-9.1**: Layer trait for composable neural network components
 - [x] **NFR-9.2**: Pluggable optimizer interface (currently Adam)
 - [x] **NFR-9.3**: Extensible dataset loader supporting multiple formats
-- [x] **NFR-9.4**: Gradient clipping trait (AGC, L2, custom strategies)
 
 ## Acceptance Gates
 
