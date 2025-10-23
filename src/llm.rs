@@ -1,5 +1,4 @@
-use std::cmp::Ordering;
-use std::fs;
+use std::{cmp::Ordering, fs};
 
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
@@ -7,11 +6,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::{
-    errors::{ModelError, Result},
+    MAX_SEQ_LEN, Vocab,
     embeddings::Embeddings,
+    errors::{ModelError, Result},
     output_projection::OutputProjection,
-    MAX_SEQ_LEN,
-    Vocab,
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -165,41 +163,34 @@ impl std::fmt::Debug for LLM {
 
 impl Default for LLM {
     fn default() -> Self {
-        use crate::model_builder::build_network;
-        use crate::model_config::ModelConfig;
+        use crate::{model_builder::build_network, model_config::ModelConfig};
 
         let config = ModelConfig::default();
         let vocab = Vocab::default();
         let network = build_network(&config, &vocab);
 
-        Self {
-            vocab,
-            network,
-        }
+        Self { vocab, network }
     }
 }
 
 impl LLM {
     pub fn new(vocab: Vocab, network: Vec<LayerEnum>) -> Self {
-        Self {
-            vocab,
-            network,
-        }
+        Self { vocab, network }
     }
 }
 
 impl LLM {
     pub fn network_description(&self) -> String {
-        self.network
-            .iter()
-            .map(|layer| layer.layer_type())
-            .fold(String::new(), |mut acc, layer_type| {
+        self.network.iter().map(|layer| layer.layer_type()).fold(
+            String::new(),
+            |mut acc, layer_type| {
                 if !acc.is_empty() {
                     acc.push_str(", ");
                 }
                 acc.push_str(layer_type);
                 acc
-            })
+            },
+        )
     }
 
     pub fn total_parameters(&self) -> usize {
@@ -341,7 +332,8 @@ impl LLM {
             let mut batch_count = 0;
 
             // Learning rate warmup + cosine annealing
-            // Reference: "SGDR: Stochastic Gradient Descent with Warm Restarts" (Loshchilov & Hutter, 2016)
+            // Reference: "SGDR: Stochastic Gradient Descent with Warm Restarts" (Loshchilov &
+            // Hutter, 2016)
             let effective_lr = if epoch < warmup_epochs {
                 // Linear warmup: gradually increase LR from 0 to target
                 target_lr * ((epoch + 1) as f32 / warmup_epochs as f32)
@@ -362,7 +354,6 @@ impl LLM {
             } else {
                 (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
             };
-
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
@@ -409,7 +400,6 @@ impl LLM {
                 "Training epoch completed{}",
                 warmup_status
             );
-
         }
 
         Ok(())
@@ -453,7 +443,9 @@ impl LLM {
                 input = layer.forward(&input);
 
                 // Compute variance of layer output in single pass
-                let (sum, sum_sq) = input.iter().fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
+                let (sum, sum_sq) = input
+                    .iter()
+                    .fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
                 let n = input.len() as f32;
                 let mean = sum / n;
                 let variance = (sum_sq / n) - mean * mean;
@@ -469,12 +461,10 @@ impl LLM {
             // Compute gradients w.r.t. logits
             let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
 
-
             // Backward pass: compute parameter gradients for each layer
             // Note: AttentionMoE layers use backward() directly and are handled separately
             for (rev_idx, layer) in self.network.iter().rev().enumerate() {
                 let layer_idx = self.network.len() - 1 - rev_idx;
-
 
                 let (input_grads, param_grads) =
                     layer.compute_gradients(&Array2::zeros((0, 0)), &grads_output);
@@ -509,7 +499,8 @@ impl LLM {
         if max_layer_grad > 10.0 {
             tracing::warn!(
                 "Layer-wise gradient norms: {:?}",
-                layer_grad_norms.iter()
+                layer_grad_norms
+                    .iter()
                     .enumerate()
                     .map(|(i, &norm)| format!("L{}: {:.2}", i, norm))
                     .collect::<Vec<_>>()
@@ -517,7 +508,7 @@ impl LLM {
         }
 
         // PolyAttention-only: no auxiliary routing losses
-        
+
         // Prepare averaged gradients and detect anomalies
         let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
         let mut total_grad_norm_sq = 0.0f32;
@@ -553,15 +544,15 @@ impl LLM {
         // Compute global gradient norm (L2 norm across all parameters)
         let grad_norm = total_grad_norm_sq.sqrt();
 
-
-
         // Apply accumulated and averaged gradients with layer-wise adaptive learning rates
         // Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
         // Formula: lr_layer = lr_base * trust_coef * ||W|| / (||∇W|| + weight_decay * ||W|| + ε)
         // This balances gradient flow across layers of different depths
 
         // Compute adaptive learning rates for all layers first (to avoid borrow checker issues)
-        let adaptive_lrs: Vec<f32> = self.network.iter()
+        let adaptive_lrs: Vec<f32> = self
+            .network
+            .iter()
             .zip(&averaged_grads_per_layer)
             .enumerate()
             .map(|(layer_idx, (layer, grads))| {
@@ -574,7 +565,9 @@ impl LLM {
             .collect();
 
         // Apply gradients with computed adaptive learning rates
-        for ((layer, averaged_grads), adaptive_lr) in self.network.iter_mut()
+        for ((layer, averaged_grads), adaptive_lr) in self
+            .network
+            .iter_mut()
             .zip(averaged_grads_per_layer)
             .zip(adaptive_lrs)
         {
@@ -587,6 +580,7 @@ impl LLM {
 
         Ok((batch_loss, grad_norm))
     }
+
     /// Compute layer-wise adaptive learning rate using bidirectional LARS
     /// Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
     ///
@@ -609,7 +603,8 @@ impl LLM {
         }
 
         // Compute gradient norm ||∇W||
-        let grad_norm: f32 = grads.iter()
+        let grad_norm: f32 = grads
+            .iter()
             .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
             .sum::<f32>()
             .sqrt();
@@ -648,8 +643,6 @@ impl LLM {
 
         adaptive_lr
     }
-
-
 
     /// Detect gradient anomalies that may indicate training instability or poisoning
     fn detect_gradient_anomalies(&self, grads: &[Array2<f32>]) -> Result<()> {
@@ -810,7 +803,6 @@ impl LLM {
 
         grads
     }
-
 
     /// Save model to JSON format (human-readable, larger file size)
     pub fn save_json(&self, path: &str) -> Result<()> {

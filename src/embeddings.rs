@@ -2,9 +2,7 @@ use ndarray::{Array2, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::adam::Adam;
-use crate::llm::Layer;
-use crate::{EMBEDDING_DIM, MAX_SEQ_LEN, Vocab};
+use crate::{EMBEDDING_DIM, MAX_SEQ_LEN, Vocab, adam::Adam, llm::Layer};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Embeddings {

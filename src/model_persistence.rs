@@ -1,9 +1,12 @@
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
 
-use crate::errors::{ModelError, Result};
-use crate::llm::LLM;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    errors::{ModelError, Result},
+    llm::LLM,
+};
 
 /// Current model format version
 /// Increment this when making breaking changes to the serialization format

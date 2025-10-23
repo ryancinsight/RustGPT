@@ -1,11 +1,8 @@
 use ndarray::Array2;
+use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use rand_distr::{Distribution, Normal};
-use crate::adam::Adam;
-use crate::errors::Result;
-use crate::llm::Layer;
-use crate::sigmoid_poly::SigmoidPoly; // [MOD] Import learnable polynomial activation
+use crate::{adam::Adam, errors::Result, llm::Layer, sigmoid_poly::SigmoidPoly}; // [MOD] Import learnable polynomial activation
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SwiGLU {
@@ -45,7 +42,9 @@ impl SwiGLU {
         Self {
             w1: Array2::from_shape_fn((embedding_dim, hidden_dim), |_| normal_w1.sample(&mut rng)),
             w2: Array2::from_shape_fn((embedding_dim, hidden_dim), |_| normal_w2.sample(&mut rng)),
-            w_out: Array2::from_shape_fn((hidden_dim, embedding_dim), |_| normal_w3.sample(&mut rng)),
+            w_out: Array2::from_shape_fn((hidden_dim, embedding_dim), |_| {
+                normal_w3.sample(&mut rng)
+            }),
             optimizer_w1: Adam::new((embedding_dim, hidden_dim)),
             optimizer_w2: Adam::new((embedding_dim, hidden_dim)),
             optimizer_w_out: Adam::new((hidden_dim, embedding_dim)),
@@ -105,7 +104,9 @@ impl SwiGLU {
 }
 
 impl Layer for SwiGLU {
-    fn layer_type(&self) -> &str { "SwiGLU" }
+    fn layer_type(&self) -> &str {
+        "SwiGLU"
+    }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         let x1 = input.dot(&self.w1);
@@ -144,7 +145,10 @@ impl Layer for SwiGLU {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let input = self.cached_input.as_ref().expect("forward must be called before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before backward");
         let (grad_input, param_grads) = self.compute_gradients(input, grads);
         self.apply_gradients(&param_grads, lr).unwrap();
         grad_input
@@ -152,14 +156,38 @@ impl Layer for SwiGLU {
 
     fn parameters(&self) -> usize {
         let base = self.w1.len() + self.w2.len() + self.w_out.len();
-        base + self.alpha_swish.len() + self.alpha_gate.len() + self.beta_gate.len() + self.swish_poly.weights.len() + self.gate_poly.weights.len()
+        base + self.alpha_swish.len()
+            + self.alpha_gate.len()
+            + self.beta_gate.len()
+            + self.swish_poly.weights.len()
+            + self.gate_poly.weights.len()
     }
 
-    fn compute_gradients(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let x1 = self.cached_x1.as_ref().cloned().unwrap_or_else(|| input.dot(&self.w1));
-        let x2 = self.cached_x2.as_ref().cloned().unwrap_or_else(|| input.dot(&self.w2));
-        let swish = self.cached_swish.as_ref().cloned().unwrap_or_else(|| self.swish_learned(&x1));
-        let gated = self.cached_gated.as_ref().cloned().unwrap_or_else(|| &swish * &x2);
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        let x1 = self
+            .cached_x1
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| input.dot(&self.w1));
+        let x2 = self
+            .cached_x2
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| input.dot(&self.w2));
+        let swish = self
+            .cached_swish
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.swish_learned(&x1));
+        let gated = self
+            .cached_gated
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| &swish * &x2);
 
         // Gradients wrt parameters
         let grad_w_out = gated.t().dot(output_grads);
@@ -196,11 +224,16 @@ impl Layer for SwiGLU {
         let mut grad_x2 = grad_z.clone();
         ndarray::Zip::from(&mut grad_x2)
             .and_broadcast(&self.alpha_gate)
-            .for_each(|elem, &a| { *elem *= a; });
+            .for_each(|elem, &a| {
+                *elem *= a;
+            });
         let grad_x1 = self.swish_derivative_learned(&x1) * &grad_swish;
 
         // Use input directly for weight gradients
-        let cached_input = self.cached_input.as_ref().expect("forward must cache input before compute_gradients");
+        let cached_input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must cache input before compute_gradients");
         let grad_w1 = cached_input.t().dot(&grad_x1);
         let grad_w2 = cached_input.t().dot(&grad_x2);
 
@@ -228,7 +261,8 @@ impl Layer for SwiGLU {
         }
         param_grads.push(grad_alpha_swish);
 
-        // [LEARN] swish polynomial coefficient gradients: dL/dw_k = Σ_i,j grad_swish[i,j] * x1[i,j] * (c * (a_j * x1[i,j]))^k
+        // [LEARN] swish polynomial coefficient gradients: dL/dw_k = Σ_i,j grad_swish[i,j] * x1[i,j]
+        // * (c * (a_j * x1[i,j]))^k
         let n_swish_w = poly.weights.len();
         let mut grad_swish_poly_vec = vec![0.0_f64; n_swish_w];
         for j in 0..x1.ncols() {
@@ -244,7 +278,11 @@ impl Layer for SwiGLU {
                 }
             }
         }
-        let grad_swish_poly = Array2::<f32>::from_shape_vec((1, n_swish_w), grad_swish_poly_vec.into_iter().map(|v| v as f32).collect()).unwrap();
+        let grad_swish_poly = Array2::<f32>::from_shape_vec(
+            (1, n_swish_w),
+            grad_swish_poly_vec.into_iter().map(|v| v as f32).collect(),
+        )
+        .unwrap();
         param_grads.push(grad_swish_poly);
 
         // Efficient gate parameter gradients accumulation
@@ -259,7 +297,8 @@ impl Layer for SwiGLU {
         param_grads.push(grad_alpha_gate);
         param_grads.push(grad_beta_gate);
 
-        // [LEARN] gate polynomial coefficient gradients: dL/dw_k = Σ_i,j grad_gate_sigma[i,j] * (c * (a_j * x2[i,j] + b_j))^k
+        // [LEARN] gate polynomial coefficient gradients: dL/dw_k = Σ_i,j grad_gate_sigma[i,j] * (c
+        // * (a_j * x2[i,j] + b_j))^k
         let max_abs_gate = x2.iter().fold(0.0_f64, |m, &v| m.max((v as f64).abs()));
         let mut gate_poly = self.gate_poly.clone();
         gate_poly.update_scaling_from_max_abs(max_abs_gate);
@@ -280,31 +319,45 @@ impl Layer for SwiGLU {
                 }
             }
         }
-        let grad_gate_poly = Array2::<f32>::from_shape_vec((1, n_gate_w), grad_gate_poly_vec.into_iter().map(|v| v as f32).collect()).unwrap();
+        let grad_gate_poly = Array2::<f32>::from_shape_vec(
+            (1, n_gate_w),
+            grad_gate_poly_vec.into_iter().map(|v| v as f32).collect(),
+        )
+        .unwrap();
         param_grads.push(grad_gate_poly);
 
         (grad_input, param_grads)
     }
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        // Expect gradients in order: W1, W2, W_out, alpha_swish, swish_poly_w, alpha_gate, beta_gate, gate_poly_w
+        // Expect gradients in order: W1, W2, W_out, alpha_swish, swish_poly_w, alpha_gate,
+        // beta_gate, gate_poly_w
         if param_grads.len() != 8 {
-            return Err(crate::errors::ModelError::GradientError{ message: format!("SwiGLU expects 8 gradient blocks, got {}", param_grads.len()) });
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "SwiGLU expects 8 gradient blocks, got {}",
+                    param_grads.len()
+                ),
+            });
         }
         // update w1, w2, w_out
         self.optimizer_w1.step(&mut self.w1, &param_grads[0], lr);
         self.optimizer_w2.step(&mut self.w2, &param_grads[1], lr);
-        self.optimizer_w_out.step(&mut self.w_out, &param_grads[2], lr);
+        self.optimizer_w_out
+            .step(&mut self.w_out, &param_grads[2], lr);
         // update alpha_swish
-        self.optimizer_alpha_swish.step(&mut self.alpha_swish, &param_grads[3], lr);
+        self.optimizer_alpha_swish
+            .step(&mut self.alpha_swish, &param_grads[3], lr);
         // swish polynomial weights via SGD
         let grad_swish_poly = &param_grads[4];
         for i in 0..self.swish_poly.weights.len() {
             self.swish_poly.weights[i] -= (lr as f64) * (grad_swish_poly[[0, i]] as f64);
         }
         // update gate alphas and betas
-        self.optimizer_alpha_gate.step(&mut self.alpha_gate, &param_grads[5], lr);
-        self.optimizer_beta_gate.step(&mut self.beta_gate, &param_grads[6], lr);
+        self.optimizer_alpha_gate
+            .step(&mut self.alpha_gate, &param_grads[5], lr);
+        self.optimizer_beta_gate
+            .step(&mut self.beta_gate, &param_grads[6], lr);
         // gate polynomial weights via SGD
         let grad_gate_poly = &param_grads[7];
         for i in 0..self.gate_poly.weights.len() {

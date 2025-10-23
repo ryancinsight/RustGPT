@@ -7,13 +7,7 @@ const TEST_WINDOW_SIZE: usize = 4;
 #[test]
 fn test_sliding_window_mask_correctness() {
     // Test that tokens only attend within the sliding window
-    let mut attention = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(TEST_WINDOW_SIZE),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -85,13 +79,7 @@ fn test_sliding_window_with_gqa() {
 #[test]
 fn test_sliding_window_with_rope() {
     // Test integration of sliding window with RoPE
-    let mut attention = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(TEST_WINDOW_SIZE),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -115,13 +103,7 @@ fn test_sliding_window_with_gqa_and_rope() {
 #[test]
 fn test_causal_masking_preserved() {
     // Verify that causal masking (no future attention) is still enforced
-    let mut attention = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(TEST_WINDOW_SIZE),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -136,13 +118,7 @@ fn test_long_sequence_handling() {
     let seq_len = 100;
     let window_size = 10;
 
-    let mut attention = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(window_size),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(window_size));
 
     let input = Array2::from_elem((seq_len, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -157,21 +133,9 @@ fn test_window_size_equals_sequence_length() {
     let seq_len = 10;
     let window_size = 10;
 
-    let mut windowed = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(window_size),
-    );
+    let mut windowed = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(window_size));
 
-    let mut full = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        None,
-    );
+    let mut full = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None);
 
     let input = Array2::from_elem((seq_len, EMBEDDING_DIM), 0.1);
 
@@ -187,13 +151,7 @@ fn test_window_size_equals_sequence_length() {
 #[test]
 fn test_window_size_one() {
     // Extreme case: window_size = 1 (only attend to self)
-    let mut attention = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(1),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(1));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let output = attention.forward(&input);
@@ -204,13 +162,7 @@ fn test_window_size_one() {
 
 #[test]
 fn test_sliding_window_backward_pass() {
-    let mut attention = PolyAttention::new(
-        EMBEDDING_DIM,
-        8,
-        3,
-        64,
-        Some(TEST_WINDOW_SIZE),
-    );
+    let mut attention = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, Some(TEST_WINDOW_SIZE));
 
     let input = Array2::from_elem((TEST_SEQ_LEN, EMBEDDING_DIM), 0.1);
     let _output = attention.forward(&input);

@@ -1,5 +1,6 @@
-use llm::LLM;
 use std::fs;
+
+use llm::LLM;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -118,7 +119,8 @@ fn test_save_load_preserves_vocab() {
     let loaded = LLM::load_binary(path).expect("Failed to load");
 
     assert_eq!(
-        original_words, loaded.vocab.words(),
+        original_words,
+        loaded.vocab.words(),
         "Vocabulary words should be preserved"
     );
 

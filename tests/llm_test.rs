@@ -1,7 +1,7 @@
 use llm::{
     EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, LayerEnum, Vocab,
-    dynamic_tanh_norm::DynamicTanhNorm, output_projection::OutputProjection, poly_attention::PolyAttention,
-    swiglu::SwiGLU,
+    dynamic_tanh_norm::DynamicTanhNorm, output_projection::OutputProjection,
+    poly_attention::PolyAttention, swiglu::SwiGLU,
 };
 use ndarray::{Array2, Axis};
 use proptest::prelude::*;
@@ -217,9 +217,7 @@ fn manual_greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
         .map_axis(Axis(1), |row| {
             row.iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a
-                    .partial_cmp(b)
-                    .unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(index, _)| index)
                 .unwrap()
         })
@@ -233,17 +231,18 @@ fn manual_greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
 #[test]
 fn test_softmax_properties() {
     // Test that softmax produces valid probability distributions
-    let logits = Array2::from_shape_vec(
-        (2, 4),
-        vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0],
-    )
-    .unwrap();
+    let logits =
+        Array2::from_shape_vec((2, 4), vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0]).unwrap();
 
     let softmax_result = manual_softmax(&logits);
 
     // Property 1: All values should be in [0, 1]
     for &val in softmax_result.iter() {
-        assert!((0.0..=1.0).contains(&val), "Softmax value {} not in [0,1]", val);
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "Softmax value {} not in [0,1]",
+            val
+        );
     }
 
     // Property 2: Each row should sum to 1.0
@@ -283,8 +282,15 @@ fn test_softmax_numerical_stability() {
     let result = manual_softmax(&large_logits);
 
     for &val in result.iter() {
-        assert!(val.is_finite(), "Softmax should handle large values without overflow");
-        assert!((0.0..=1.0).contains(&val), "Softmax value {} not in [0,1]", val);
+        assert!(
+            val.is_finite(),
+            "Softmax should handle large values without overflow"
+        );
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "Softmax value {} not in [0,1]",
+            val
+        );
     }
 
     // Test with very small values (should not underflow to zero)
@@ -292,7 +298,11 @@ fn test_softmax_numerical_stability() {
     let result = manual_softmax(&small_logits);
 
     let sum: f32 = result.iter().sum();
-    assert!((sum - 1.0).abs() < 1e-5, "Softmax should handle small values, sum={}", sum);
+    assert!(
+        (sum - 1.0).abs() < 1e-5,
+        "Softmax should handle small values, sum={}",
+        sum
+    );
 }
 
 #[test]
@@ -311,7 +321,10 @@ fn test_greedy_decode_properties() {
 
     assert_eq!(decoded.len(), 2, "Should decode one token per row");
     assert_eq!(decoded[0], 2, "Should select index with max probability");
-    assert!(decoded[1] == 0 || decoded[1] == 3, "Should select one of the max indices");
+    assert!(
+        decoded[1] == 0 || decoded[1] == 3,
+        "Should select one of the max indices"
+    );
 }
 
 // =========================================================================
@@ -321,6 +334,7 @@ fn test_greedy_decode_properties() {
 #[test]
 fn test_llm_save_load() {
     use std::fs;
+
     use tempfile::NamedTempFile;
 
     let original_llm = LLM::default();
@@ -334,9 +348,15 @@ fn test_llm_save_load() {
     let loaded_llm = LLM::load(path).expect("Failed to load LLM");
 
     // Verify that the loaded LLM has the same structure
-    assert_eq!(original_llm.vocab.encode.len(), loaded_llm.vocab.encode.len());
+    assert_eq!(
+        original_llm.vocab.encode.len(),
+        loaded_llm.vocab.encode.len()
+    );
     assert_eq!(original_llm.network.len(), loaded_llm.network.len());
-    assert_eq!(original_llm.total_parameters(), loaded_llm.total_parameters());
+    assert_eq!(
+        original_llm.total_parameters(),
+        loaded_llm.total_parameters()
+    );
 
     // Clean up
     fs::remove_file(path).unwrap();

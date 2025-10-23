@@ -1,12 +1,13 @@
 use crate::{
+    dynamic_tanh_norm::DynamicTanhNorm,
     embeddings::Embeddings,
+    // feed_forward::FeedForward, // Removed: using SwiGLU exclusively
     llm::{Layer, LayerEnum},
-    model_config::{ArchitectureType, AttentionType, ModelConfig, PositionalEncodingType},
+    model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     poly_attention::PolyAttention,
     swiglu::SwiGLU,
     vocab::Vocab,
-    dynamic_tanh_norm::DynamicTanhNorm,
 };
 
 /// Build a network based on the provided configuration
@@ -45,37 +46,57 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
     layers
 }
 
-/// Build Transformer layers (Pre-LN): Norm -> Attn -> Norm -> SwiGLU, with final Norm
-pub fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    // Build attention + FFN blocks for num_layers
-    for _ in 0..config.num_layers {
-        // Pre-LN before attention
+/// Build Transformer architecture layers
+///
+/// Creates a Pre-LN-style transformer architecture with:
+/// - DynamicTanhNorm before each sublayer
+/// - PolyAttention self-attention (with optional CoPE) and SwiGLU feedforward
+/// - Residual connections handled inside layers (SwiGLU, PolyAttention)
+/// - Final normalization before the output projection
+fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
+    let num_heads = config.get_num_heads();
+
+    for _layer_idx in 0..config.num_layers {
+        // Pre-Attention normalization (Pre-LN)
         layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
 
-        match config.attention {
-            AttentionType::SelfAttention => {
-                panic!("SelfAttention not supported in this build; use PolyAttention");
-            }
-            AttentionType::PolyAttention { degree_p } => {
-                // Use CoPE positional encoding integrated in PolyAttention; max_pos is ignored at runtime
-                let max_pos = match config.positional_encoding { PositionalEncodingType::CoPE { max_pos } => max_pos };
-                layers.push(LayerEnum::PolyAttention(Box::new(PolyAttention::new(
-                    config.embedding_dim,
-                    config.get_num_heads(),
-                    degree_p,
-                    max_pos,
-                    config.window_size,
-                ))));
-            }
-        }
+        // PolyAttention block with CoPE enabled; derive max_pos from window settings
+        let effective_window = if config.use_adaptive_window {
+            config.max_window_size
+        } else if let Some(w) = config.window_size {
+            w
+        } else {
+            config.max_seq_len
+        };
+        let cope_max_pos = effective_window.saturating_sub(1);
+        let poly = PolyAttention::new(
+            config.embedding_dim,
+            num_heads,
+            config.get_poly_degree_p(),
+            cope_max_pos,
+            config.window_size,
+        );
+        layers.push(LayerEnum::PolyAttention(Box::new(poly)));
 
-        // Pre-LN before feed-forward
+        // Pre-FFN normalization (Pre-LN)
         layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
-        layers.push(LayerEnum::SwiGLU(Box::new(SwiGLU::new(config.embedding_dim, config.hidden_dim))));
+
+        // Feedforward layer (SwiGLU only)
+        let swiglu = SwiGLU::new(
+            config.embedding_dim,
+            config.hidden_dim,
+        );
+        layers.push(LayerEnum::SwiGLU(Box::new(swiglu)));
     }
 
-    // Final normalization before output projection (Pre-LN stability)
-    layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+    // Final normalization layer prior to logits projection (typical Pre-LN pattern)
+    let last_is_norm = matches!(
+        layers.last(),
+        Some(LayerEnum::DynamicTanhNorm(_))
+    );
+    if !last_is_norm {
+        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+    }
 }
 
 /// Print architecture summary
@@ -104,20 +125,20 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     // Activation
     println!("  ✓ SwiGLU (gated activation, no bias)");
 
-    // Positional Encoding
-    match &config.positional_encoding {
-        PositionalEncodingType::CoPE { .. } => {
-            println!("  ✓ CoPE (Contextual Position Encoding)");
-            let derived_span = config.window_size.unwrap_or(128);
-            println!(
-                "    - CoPE size: derived from {} (span = {})",
-                if config.window_size.is_some() { "sliding window" } else { "tile" },
-                derived_span
-            );
-        }
-    }
+    // Positional Encoding (CoPE always on; max_pos derived from window)
+    let effective_window = if config.use_adaptive_window {
+        config.max_window_size
+    } else if let Some(w) = config.window_size {
+        w
+    } else {
+        config.max_seq_len
+    };
+    let cope_max_pos = effective_window.saturating_sub(1);
+    println!("  ✓ CoPE (Contextual Position Encoding)");
+    println!("    - Max Position (derived): {}", cope_max_pos);
 
     println!("\n🧠 Attention:");
+    use crate::model_config::AttentionType;
     match &config.attention {
         AttentionType::PolyAttention { degree_p } => {
             println!("  ✓ Polynomial Attention (p = {})", degree_p);
@@ -153,8 +174,7 @@ mod tests {
     #[test]
     fn test_build_transformer_network() {
         let vocab = Vocab::new(vec!["a", "b", "c"]);
-        let mut config = ModelConfig::transformer(128, 256, 2, 80, None, Some(8));
-        config.attention = AttentionType::PolyAttention { degree_p: 3 };
+        let config = ModelConfig::transformer(128, 256, 2, 80, None, Some(8));
 
         let layers = build_network(&config, &vocab);
 
@@ -168,7 +188,6 @@ mod tests {
     }
 }
 
-
 #[cfg(any())]
 pub fn build_network(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
     match config.architecture {
@@ -179,7 +198,10 @@ pub fn build_network(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> 
 #[cfg(any())]
 fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
     let mut layers: Vec<LayerEnum> = Vec::new();
-    layers.push(LayerEnum::Embeddings(Embeddings::new(vocab_size, config.embedding_dim)));
+    layers.push(LayerEnum::Embeddings(Embeddings::new(
+        vocab_size,
+        config.embedding_dim,
+    )));
 
     // Positional encoding could be inserted here based on config.positional_encoding
     match config.positional_encoding {
@@ -209,7 +231,9 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
                 )));
             }
             AttentionType::PolyAttention { degree_p } => {
-        let max_pos = match config.positional_encoding { crate::model_config::PositionalEncodingType::CoPE { max_pos } => max_pos };
+                let max_pos = match config.positional_encoding {
+                    crate::model_config::PositionalEncodingType::CoPE { max_pos } => max_pos,
+                };
                 layers.push(LayerEnum::PolyAttention(PolyAttention::new(
                     config.embedding_dim,
                     config.get_num_heads(),
@@ -221,14 +245,22 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
         }
 
         if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(
+                config.embedding_dim,
+            )));
         }
 
-        layers.push(LayerEnum::SwiGLU(SwiGLU::new(config.embedding_dim, config.hidden_dim)));
+        layers.push(LayerEnum::SwiGLU(SwiGLU::new(
+            config.embedding_dim,
+            config.hidden_dim,
+        )));
     }
 
     // Output projection to vocab size
-    layers.push(LayerEnum::OutputProjection(OutputProjection::new(config.embedding_dim, vocab_size)));
+    layers.push(LayerEnum::OutputProjection(OutputProjection::new(
+        config.embedding_dim,
+        vocab_size,
+    )));
 
     layers
 }

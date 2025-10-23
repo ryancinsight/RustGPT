@@ -61,7 +61,9 @@ impl Vocab {
     /// Convert a word to its token index, using unknown token if not found
     pub fn encode_or_unknown(&self, word: &str) -> Option<usize> {
         self.encode.get(word).copied().or_else(|| {
-            self.unknown_token.as_ref().and_then(|unk| self.encode.get(unk).copied())
+            self.unknown_token
+                .as_ref()
+                .and_then(|unk| self.encode.get(unk).copied())
         })
     }
 
@@ -73,9 +75,9 @@ impl Vocab {
     /// Convert a token index back to a word
     #[inline]
     pub fn decode(&self, token_id: usize) -> Option<&str> {
-        self.word_ranges.get(token_id).map(|&(start, len)| {
-            &self.words_buffer[start..start + len]
-        })
+        self.word_ranges
+            .get(token_id)
+            .map(|&(start, len)| &self.words_buffer[start..start + len])
     }
 
     /// Get the size of the vocabulary
@@ -95,9 +97,10 @@ impl Vocab {
 
     /// Get a reference to the words vector (for compatibility)
     pub fn words(&self) -> Vec<&str> {
-        self.word_ranges.iter().map(|&(start, len)| {
-            &self.words_buffer[start..start + len]
-        }).collect()
+        self.word_ranges
+            .iter()
+            .map(|&(start, len)| &self.words_buffer[start..start + len])
+            .collect()
     }
 
     /// Encode multiple words at once
@@ -106,7 +109,10 @@ impl Vocab {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        words.into_iter().map(|word| self.encode(word.as_ref())).collect()
+        words
+            .into_iter()
+            .map(|word| self.encode(word.as_ref()))
+            .collect()
     }
 
     /// Decode multiple token IDs at once
@@ -119,9 +125,9 @@ impl Vocab {
 
     /// Iterate over all words in the vocabulary
     pub fn iter_words(&self) -> impl Iterator<Item = &str> {
-        self.word_ranges.iter().map(|&(start, len)| {
-            &self.words_buffer[start..start + len]
-        })
+        self.word_ranges
+            .iter()
+            .map(|&(start, len)| &self.words_buffer[start..start + len])
     }
 
     pub fn default_words() -> Vec<&'static str> {
@@ -144,7 +150,7 @@ impl Vocab {
                     .chain(
                         word.chars()
                             .filter(|c| c.is_ascii_punctuation())
-                            .map(|c| c.to_string())
+                            .map(|c| c.to_string()),
                     )
             })
             .for_each(|token| {

@@ -22,10 +22,6 @@ fn test_mqa_extreme_case() {
     assert_eq!(attention.num_heads, 8);
 }
 
-
-
-
-
 #[test]
 fn test_gqa_parameter_reduction() {
     let head_dim = EMBEDDING_DIM / 8;
@@ -157,8 +153,8 @@ fn test_gqa_parameter_count_consistency() {
     for num_kv_heads in [1, 2, 4, 8] {
         let gqa = PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None);
         // Parameter counts changed
-        // let expected_params = 8 * head_dim * head_dim + num_kv_heads * 2 * head_dim * head_dim + cope_params;
-        // assert_eq!(
+        // let expected_params = 8 * head_dim * head_dim + num_kv_heads * 2 * head_dim * head_dim +
+        // cope_params; assert_eq!(
         //     gqa.parameters(),
         //     expected_params,
         //     "Parameter count mismatch for num_kv_heads={}",
