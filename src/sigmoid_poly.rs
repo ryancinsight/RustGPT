@@ -25,7 +25,11 @@ impl SigmoidPoly {
 
     /// Update scaling to c = 1/sqrt(max|x|) with safe fallback
     pub fn update_scaling_from_max_abs(&mut self, max_abs_x: f64) {
-        self.scaling = if max_abs_x > 0.0 { 1.0 / max_abs_x.sqrt() } else { 1.0 };
+        self.scaling = if max_abs_x > 0.0 {
+            1.0 / max_abs_x.sqrt()
+        } else {
+            1.0
+        };
     }
 
     /// Forward for a single scalar (f64)
@@ -105,5 +109,7 @@ impl SigmoidPoly {
 
     /// Mutable access for optimizers
     #[inline]
-    pub fn weights_mut(&mut self) -> &mut [f64] { &mut self.weights }
+    pub fn weights_mut(&mut self) -> &mut [f64] {
+        &mut self.weights
+    }
 }

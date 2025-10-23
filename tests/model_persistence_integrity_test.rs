@@ -1,5 +1,4 @@
-use llm::model_persistence::VersionedModel;
-use llm::LLM;
+use llm::{LLM, model_persistence::VersionedModel};
 use tempfile::NamedTempFile;
 
 #[test]
@@ -207,7 +206,12 @@ fn test_checksum_hex_format() {
 
     // Verify checksum is valid hex (64 characters for SHA256)
     assert_eq!(versioned.checksum.len(), 64);
-    assert!(versioned.checksum.chars().all(|c: char| c.is_ascii_hexdigit()));
+    assert!(
+        versioned
+            .checksum
+            .chars()
+            .all(|c: char| c.is_ascii_hexdigit())
+    );
 }
 
 #[test]

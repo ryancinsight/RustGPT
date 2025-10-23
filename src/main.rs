@@ -3,9 +3,8 @@ use std::io::Write;
 use clap::Parser;
 use llm::{
     ArchitectureType, AttentionType, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
-    HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, PositionalEncodingType, Vocab,
-    WindowAdaptationStrategy, build_network,
-    print_architecture_summary,
+    HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, Vocab,
+    WindowAdaptationStrategy, build_network, print_architecture_summary,
 };
 
 #[derive(Parser)]
@@ -47,10 +46,10 @@ fn main() -> llm::Result<()> {
 
     // Choose architecture: Transformer
 
-    //let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY ADAPTIVE MOH
-    
-    let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing)
+    // let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY
+    // ADAPTIVE MOH
 
+    let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing)
 
     let use_dynamic_tanh_norm = true;
 
@@ -71,8 +70,6 @@ fn main() -> llm::Result<()> {
     //   - Used in LLaMA, PaLM, Mistral
     // ============================================================================
 
-
-
     // ============================================================================
     // POSITIONAL ENCODING CONFIGURATION
     // ============================================================================
@@ -85,7 +82,7 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // Select positional encoding type
-    let positional_encoding = PositionalEncodingType::CoPE { max_pos: 64 };
+    // Positional encoding is always CoPE; max_pos derives from sliding window size.
 
     // ============================================================================
     // GROUP-QUERY ATTENTION (GQA) CONFIGURATION
@@ -240,11 +237,11 @@ fn main() -> llm::Result<()> {
         // ============================================================================
         // SOFT ROUTING: Differentiable routing with continuous weights
         HeadSelectionStrategy::FullyAdaptiveMoH {
-            min_heads: 1,                       // Minimum heads for simple inputs (safety constraint)
-            max_heads: 8,                       // Maximum heads for complex inputs (efficiency constraint)
-            load_balance_weight: 0.1,           // INCREASED 10x: was 0.01 (too weak)
-            complexity_loss_weight: 0.1,        // INCREASED 10x: was 0.01 (too weak)
-            sparsity_weight: 0.01,              // INCREASED 10x: was 0.001 (too weak)
+            min_heads: 1,                // Minimum heads for simple inputs (safety constraint)
+            max_heads: 8,                // Maximum heads for complex inputs (efficiency constraint)
+            load_balance_weight: 0.1,    // INCREASED 10x: was 0.01 (too weak)
+            complexity_loss_weight: 0.1, // INCREASED 10x: was 0.01 (too weak)
+            sparsity_weight: 0.01,       // INCREASED 10x: was 0.001 (too weak)
         }
 
         // Alternative: Standard MoH (for comparison)
@@ -293,7 +290,6 @@ fn main() -> llm::Result<()> {
     //   - Configurable trade-off between quality and speed
     // ============================================================================
 
-
     // Create model configuration
     let mut config = match architecture {
         ArchitectureType::Transformer => {
@@ -304,7 +300,6 @@ fn main() -> llm::Result<()> {
     // Apply modern LLM enhancements configuration
     config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
 
-    config.positional_encoding = positional_encoding;
     config.num_kv_heads = num_kv_heads;
     config.window_size = window_size;
     config.use_adaptive_window = use_adaptive_window;
@@ -346,8 +341,6 @@ fn main() -> llm::Result<()> {
     //   - use_moe = true, num_experts = 8, num_active_experts = 2: Higher capacity
     // ============================================================================
 
-
-
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
 
@@ -376,7 +369,6 @@ fn main() -> llm::Result<()> {
 
     // Create LLM with the configured network
     let mut llm = LLM::new(vocab, network);
-
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
@@ -419,7 +411,12 @@ fn main() -> llm::Result<()> {
         instruction_lr
     );
 
-    llm.train_with_batch_size(chat_training_examples, instruction_epochs, instruction_lr, 64)?;
+    llm.train_with_batch_size(
+        chat_training_examples,
+        instruction_epochs,
+        instruction_lr,
+        64,
+    )?;
 
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", string);

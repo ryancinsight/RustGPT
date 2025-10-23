@@ -1,8 +1,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::adam::Adam;
-use crate::llm::Layer;
+use crate::{adam::Adam, llm::Layer};
 
 /// Dynamic Tanh Normalization (DyT)
 ///
@@ -27,7 +26,7 @@ pub struct DynamicTanhNorm {
     beta: Array2<f32>,
 
     /// Cached input for backward
-    cached_input: Option<Array2<f32>>, 
+    cached_input: Option<Array2<f32>>,
 
     /// Optimizers for parameters
     optimizer_alpha: Adam,
@@ -70,9 +69,13 @@ impl DynamicTanhNorm {
 }
 
 impl Layer for DynamicTanhNorm {
-    fn layer_type(&self) -> &str { "DynamicTanhNorm" }
+    fn layer_type(&self) -> &str {
+        "DynamicTanhNorm"
+    }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> { self.normalize(input) }
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.normalize(input)
+    }
 
     fn compute_gradients(
         &self,
@@ -101,7 +104,7 @@ impl Layer for DynamicTanhNorm {
                 let s2 = 1.0 - t * t; // sech^2(alpha * x)
                 *o = (g * dy) * s2 * a; // grad w.r.t. input
                 grad_gamma[[0, j]] += t * dy; // grad w.r.t. gamma
-                grad_beta[[0, j]] += dy;      // grad w.r.t. beta
+                grad_beta[[0, j]] += dy; // grad w.r.t. beta
                 grad_alpha_scalar += (g * dy) * s2 * x; // grad w.r.t. alpha (scalar)
             });
 
@@ -109,18 +112,25 @@ impl Layer for DynamicTanhNorm {
         (grad_input, vec![grad_alpha, grad_gamma, grad_beta])
     }
 
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
         if param_grads.len() != 3 {
-            return Err(crate::errors::ModelError::GradientError { 
+            return Err(crate::errors::ModelError::GradientError {
                 message: format!(
                     "DynamicTanhNorm expected 3 parameter gradients (alpha, gamma, beta), got {}",
                     param_grads.len()
                 ),
             });
         }
-        self.optimizer_alpha.step(&mut self.alpha, &param_grads[0], lr);
-        self.optimizer_gamma.step(&mut self.gamma, &param_grads[1], lr);
-        self.optimizer_beta.step(&mut self.beta, &param_grads[2], lr);
+        self.optimizer_alpha
+            .step(&mut self.alpha, &param_grads[0], lr);
+        self.optimizer_gamma
+            .step(&mut self.gamma, &param_grads[1], lr);
+        self.optimizer_beta
+            .step(&mut self.beta, &param_grads[2], lr);
         Ok(())
     }
 

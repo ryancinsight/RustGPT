@@ -59,7 +59,6 @@ pub enum HeadSelectionStrategy {
     /// - Zero overhead
     /// - Backward compatible
     /// - Use for baseline comparisons
-
     AllHeads,
 
     /// Mixture-of-Heads: fully adaptive dynamic head selection per token
@@ -94,8 +93,8 @@ pub enum HeadSelectionStrategy {
         /// Note: Actual threshold varies by layer (early: +0.1, late: -0.1)
         threshold_p_base: f32,
 
-        /// Base weight for dynamic loss (adjusted adaptively based on sparsity and training progress)
-        /// Typical: 1e-4
+        /// Base weight for dynamic loss (adjusted adaptively based on sparsity and training
+        /// progress) Typical: 1e-4
         /// Actual weight = base * sparsity_multiplier * annealing_multiplier
         /// Prevents model from activating all heads by encouraging confident routing
         dynamic_loss_weight_base: f32,
@@ -127,8 +126,9 @@ pub enum HeadSelectionStrategy {
 
     /// Fully Adaptive Mixture-of-Heads: complexity-aware dynamic head selection
     ///
-    /// **Key Innovation**: No hardcoded shared/routed head split - ALL heads are routing candidates.
-    /// Head count is determined by learned complexity predictor based on input difficulty.
+    /// **Key Innovation**: No hardcoded shared/routed head split - ALL heads are routing
+    /// candidates. Head count is determined by learned complexity predictor based on input
+    /// difficulty.
     ///
     /// # Architecture
     ///
@@ -229,8 +229,6 @@ pub enum AttentionType {
     PolyAttention { degree_p: usize },
 }
 
-
-
 /// Configuration for model architecture and hyperparameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -253,15 +251,13 @@ pub struct ModelConfig {
     /// Maximum sequence length
     pub max_seq_len: usize,
 
-    /// Number of attention heads for multi-head attention (used in both Transformer and HyperMixer)
-    /// If None, defaults to 8 (same as standard transformers)
+    /// Number of attention heads for multi-head attention (used in both Transformer and
+    /// HyperMixer) If None, defaults to 8 (same as standard transformers)
     pub num_heads: Option<usize>,
 
     /// Use DynamicTanhNorm for normalization
     /// Default: false (disabled by default)
     pub use_dynamic_tanh_norm: bool,
-
-
 
     /// Positional encoding type to use
     /// Default: CoPE (modern default for best performance)
@@ -336,7 +332,6 @@ pub struct ModelConfig {
 
     /// Attention mechanism selection (SelfAttention vs PolyAttention)
     pub attention: AttentionType,
-
 }
 
 impl ModelConfig {
@@ -377,11 +372,9 @@ impl ModelConfig {
                 confidence_threshold: 0.6,
                 use_confidence_fallback: true,
             },
-            attention: AttentionType::PolyAttention { degree_p: 3 },
+            attention: AttentionType::SelfAttention,
         }
     }
-
-
 }
 
 impl Default for ModelConfig {
@@ -391,7 +384,9 @@ impl Default for ModelConfig {
 }
 
 // Provide serde default value for entropy_ema_alpha
-fn entropy_ema_alpha_default_model() -> f32 { 0.2 }
+fn entropy_ema_alpha_default_model() -> f32 {
+    0.2
+}
 
 impl ModelConfig {
     pub fn get_num_heads(&self) -> usize {
@@ -404,9 +399,9 @@ impl ModelConfig {
 
     pub fn get_hypernetwork_hidden_dim(&self) -> usize {
         // Provide a reasonable default if not specified.
-        self.hypernetwork_hidden_dim.unwrap_or(self.embedding_dim / 4)
+        self.hypernetwork_hidden_dim
+            .unwrap_or(self.embedding_dim / 4)
     }
-
 
     pub fn get_recursive_depth(&self) -> usize {
         // In recursive models, num_layers stores the recursive depth

@@ -2,8 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::adam::Adam;
-use crate::llm::Layer;
+use crate::{adam::Adam, llm::Layer};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OutputProjection {
