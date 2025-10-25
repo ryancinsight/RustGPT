@@ -4,6 +4,7 @@ pub mod adam;
 pub mod dataset_loader;
 pub mod embeddings;
 pub mod errors;
+pub mod richards;
 
 // removed: pub mod head_router;
 pub mod llm;
@@ -13,7 +14,7 @@ pub mod model_builder;
 pub mod model_config;
 pub mod model_persistence;
 pub mod output_projection;
-pub mod sigmoid_poly;
+// removed: pub mod sigmoid_poly;
 // removed: pub mod routing;
 // removed: pub mod self_attention;
 pub mod poly_attention;
@@ -34,15 +35,14 @@ pub const GRADIENT_ANOMALY_THRESHOLD: f32 = 2000.0;
 // Re-export key structs for easier access
 pub use adam::Adam;
 pub use dataset_loader::{Dataset, DatasetType};
-pub use embeddings::Embeddings;
+pub use embeddings::TokenEmbeddings as Embeddings;
 pub use errors::{ModelError, Result};
 // removed head_router re-exports
 // pub use head_router::{RouterType, FullyAdaptiveHeadRouter};
 pub use llm::{LLM, Layer, LayerEnum};
 pub use model_builder::{build_network, print_architecture_summary};
 pub use model_config::{
-    ArchitectureType, AttentionType, HeadSelectionStrategy, ModelConfig, PositionalEncodingType,
-    WindowAdaptationStrategy,
+    ArchitectureType, AttentionType, HeadSelectionStrategy, ModelConfig, WindowAdaptationStrategy,
 };
 // Also re-export Vocab for convenience
 pub use vocab::Vocab;

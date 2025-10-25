@@ -1,4 +1,5 @@
-use llm::{EMBEDDING_DIM, Embeddings, Layer, MAX_SEQ_LEN, Vocab};
+use llm::{EMBEDDING_DIM, Layer, Embeddings, Vocab, MAX_SEQ_LEN};
+use ndarray::Array2;
 
 #[test]
 fn test_embeddings_creation() {
@@ -12,7 +13,7 @@ fn test_embed_tokens() {
     // Create vocab and embeddings
     let words = vec!["hello", "world", "test", "</s>"];
     let vocab = Vocab::new(words);
-    let embeddings = Embeddings::new(vocab.clone());
+    let embeddings = TokenEmbeddings::new(vocab.clone());
 
     // Test embedding a single token
     let token_ids = vec![0]; // "hello"
@@ -44,14 +45,14 @@ fn test_positional_embeddings() {
         // Check dimensions
         assert_eq!(embedded.shape(), [seq_len, EMBEDDING_DIM]);
 
-        // Verify that embeddings for the same token at different positions are different
-        // (due to positional embeddings being added)
+        // Verify that embeddings for the same token at different positions are the same
+        // (positional embeddings are handled in attention)
         if seq_len > 1 {
             let first_pos = embedded.row(0).to_owned();
             let second_pos = embedded.row(1).to_owned();
 
-            // They should be different due to positional encoding
-            assert_ne!(first_pos, second_pos);
+            // They should be the same since no positional addition here
+            assert_eq!(first_pos, second_pos);
         }
     }
 }
@@ -77,7 +78,6 @@ fn test_embedding_backwards() {
     let mut embeddings = Embeddings::new(vocab);
 
     let pre_train_token_embeddings = embeddings.token_embeddings.clone();
-    let pre_train_position_embeddings = embeddings.positional_embeddings.clone();
 
     // Simulate forward and backward pass
     use ndarray::Array2;
@@ -89,11 +89,6 @@ fn test_embedding_backwards() {
     let _grad_input = embeddings.backward(&grads, 0.01);
 
     let post_train_token_embeddings = embeddings.token_embeddings.clone();
-    let post_train_position_embeddings = embeddings.positional_embeddings.clone();
 
     assert_ne!(pre_train_token_embeddings, post_train_token_embeddings);
-    assert_ne!(
-        pre_train_position_embeddings,
-        post_train_position_embeddings
-    );
 }

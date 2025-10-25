@@ -1,5 +1,5 @@
 use llm::{
-    EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, LayerEnum, Vocab,
+    EMBEDDING_DIM, HIDDEN_DIM, LLM, LayerEnum, Embeddings, Vocab,
     dynamic_tanh_norm::DynamicTanhNorm, output_projection::OutputProjection,
     poly_attention::PolyAttention, swiglu::SwiGLU,
 };
@@ -164,7 +164,7 @@ fn test_parameter_count_consistency() {
     let llm1 = LLM::new(
         vocab.clone(),
         vec![
-            LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
+            LayerEnum::TokenEmbeddings(TokenEmbeddings::new(vocab.clone())),
             LayerEnum::PolyAttention(Box::new(PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None))),
             LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(EMBEDDING_DIM)),
             LayerEnum::SwiGLU(Box::new(SwiGLU::new(EMBEDDING_DIM, HIDDEN_DIM))),
@@ -176,7 +176,7 @@ fn test_parameter_count_consistency() {
     let llm2 = LLM::new(
         vocab.clone(),
         vec![
-            LayerEnum::Embeddings(Embeddings::new(vocab.clone())),
+            LayerEnum::TokenEmbeddings(TokenEmbeddings::new(vocab.clone())),
             LayerEnum::PolyAttention(Box::new(PolyAttention::new(EMBEDDING_DIM, 8, 3, 64, None))),
             LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(EMBEDDING_DIM)),
             LayerEnum::SwiGLU(Box::new(SwiGLU::new(EMBEDDING_DIM, HIDDEN_DIM))),

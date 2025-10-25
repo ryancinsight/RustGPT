@@ -1,4 +1,4 @@
-use llm::{EMBEDDING_DIM, Layer, PositionalEncodingType, poly_attention::PolyAttention};
+use llm::{EMBEDDING_DIM, Layer, poly_attention::PolyAttention};
 use ndarray::Array2;
 
 #[test]

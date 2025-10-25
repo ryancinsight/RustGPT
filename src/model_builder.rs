@@ -1,6 +1,6 @@
 use crate::{
     dynamic_tanh_norm::DynamicTanhNorm,
-    embeddings::Embeddings,
+    embeddings::TokenEmbeddings,
     // feed_forward::FeedForward, // Removed: using SwiGLU exclusively
     llm::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
@@ -26,9 +26,8 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
     let mut layers = Vec::new();
 
     // Add embedding layer (common to all architectures)
-    // CoPE handles positions inside attention, so disable additive positional embeddings
-    let use_positional = false;
-    layers.push(LayerEnum::Embeddings(Embeddings::new_with_positional(vocab.clone(), use_positional)));
+    // Position embeddings are handled inside attention (CoPE), so only token embeddings
+    layers.push(LayerEnum::TokenEmbeddings(TokenEmbeddings::new(vocab.clone())));
 
     // Build architecture-specific layers
     match config.architecture {
@@ -69,13 +68,14 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
             config.max_seq_len
         };
         let cope_max_pos = effective_window.saturating_sub(1);
-        let poly = PolyAttention::new(
+        let mut poly = PolyAttention::new(
             config.embedding_dim,
             num_heads,
             config.get_poly_degree_p(),
             cope_max_pos,
             config.window_size,
         );
+        poly.set_head_selection_config(&config.head_selection);
         layers.push(LayerEnum::PolyAttention(Box::new(poly)));
 
         // Pre-FFN normalization (Pre-LN)
@@ -203,15 +203,7 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
         config.embedding_dim,
     )));
 
-    // Positional encoding could be inserted here based on config.positional_encoding
-    match config.positional_encoding {
-        PositionalEncodingType::Learned => {
-            // TODO: implement learned positional embeddings if needed
-        }
-        PositionalEncodingType::CoPE { .. } => {
-            // CoPE is integrated within attention modules as needed
-        }
-    }
+    // CoPE is integrated within attention modules as needed
 
     // Build attention + FFN blocks
     for _ in 0..config.num_layers {
@@ -231,14 +223,11 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
                 )));
             }
             AttentionType::PolyAttention { degree_p } => {
-                let max_pos = match config.positional_encoding {
-                    crate::model_config::PositionalEncodingType::CoPE { max_pos } => max_pos,
-                };
                 layers.push(LayerEnum::PolyAttention(PolyAttention::new(
                     config.embedding_dim,
                     config.get_num_heads(),
                     degree_p,
-                    max_pos,
+                    config.cope_max_pos,
                     config.window_size,
                 )));
             }

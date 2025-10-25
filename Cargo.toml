@@ -22,11 +22,48 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 proptest = "1.5"
 tempfile = "3.0"
+approx = "0.5"
 
 [lib]
 name = "llm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "llm"
+name = "main"
 path = "src/main.rs"
+
+[[bin]]
+name = "test_fix_validation_simple"
+path = "test_fix_validation_simple.rs"
+
+[[bin]]
+name = "test_sigmoid_gompertz_validation"
+path = "test_sigmoid_gompertz_validation.rs"
+
+[[bin]]
+name = "test_richards_attention"
+path = "test_richards_attention.rs"
+
+[[bin]]
+name = "test_swiglu_richards"
+path = "test_swiglu_richards.rs"
+
+[[bin]]
+name = "test_none_variant"
+path = "test_none_variant.rs"
+
+[[bin]]
+name = "test_parameter_learning_validation"
+path = "test_parameter_learning_validation.rs"
+
+[[bin]]
+name = "test_dramatic_learning"
+path = "test_dramatic_learning.rs"
+
+[[bin]]
+name = "test_poly_attention_none_variant"
+path = "test_poly_attention_none_variant.rs"
+
+[[bin]]
+name = "test_learning_bug_demo"
+path = "test_learning_bug_demo.rs"

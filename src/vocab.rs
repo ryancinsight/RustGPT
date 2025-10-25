@@ -25,8 +25,6 @@ impl Vocab {
         let mut encode = HashMap::new();
         let mut words_buffer = String::new();
         let mut word_ranges = Vec::new();
-        let mut total_len = 0;
-
         for (i, word_str) in words.into_iter().take(crate::MAX_VOCAB_SIZE).enumerate() {
             let word = word_str.as_ref();
             tracing::debug!(word = word, index = i, "Adding word to encoding");
@@ -35,13 +33,9 @@ impl Vocab {
             let len = word.len();
             word_ranges.push((start, len));
             encode.insert(word.to_string(), i);
-            total_len += len;
         }
 
         let vocab_size = word_ranges.len();
-
-        // Pre-allocate capacity for words_buffer (though already built)
-        words_buffer.reserve(total_len.saturating_sub(words_buffer.len()));
 
         tracing::info!(vocab_size = vocab_size, "Vocabulary initialized");
         Vocab {
@@ -103,24 +97,25 @@ impl Vocab {
             .collect()
     }
 
-    /// Encode multiple words at once
-    pub fn encode_batch<I, S>(&self, words: I) -> Vec<Option<usize>>
+    /// Encode multiple words at once (returns iterator for zero-copy)
+    pub fn encode_batch<'a, I, S>(&'a self, words: I) -> impl Iterator<Item = Option<usize>> + 'a
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
+        <I as IntoIterator>::IntoIter: 'a,
     {
         words
             .into_iter()
-            .map(|word| self.encode(word.as_ref()))
-            .collect()
+            .map(move |word| self.encode(word.as_ref()))
     }
 
-    /// Decode multiple token IDs at once
-    pub fn decode_batch<I>(&self, token_ids: I) -> Vec<Option<&str>>
+    /// Decode multiple token IDs at once (returns iterator for zero-copy)
+    pub fn decode_batch<'a, I>(&'a self, token_ids: I) -> impl Iterator<Item = Option<&'a str>> + 'a
     where
         I: IntoIterator<Item = usize>,
+        <I as IntoIterator>::IntoIter: 'a,
     {
-        token_ids.into_iter().map(|id| self.decode(id)).collect()
+        token_ids.into_iter().map(move |id| self.decode(id))
     }
 
     /// Iterate over all words in the vocabulary

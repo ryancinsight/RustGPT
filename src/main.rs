@@ -81,8 +81,7 @@ fn main() -> llm::Result<()> {
     // - Used in research (Meta FAIR 2024)
     // ============================================================================
 
-    // Select positional encoding type
-    // Positional encoding is always CoPE; max_pos derives from sliding window size.
+    // CoPE max_pos derives from sliding window size.
 
     // ============================================================================
     // GROUP-QUERY ATTENTION (GQA) CONFIGURATION

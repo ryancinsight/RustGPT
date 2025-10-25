@@ -56,12 +56,35 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
     }
 
     // convert json file to Vec<String>
-    let data_json = fs::read_to_string(path).map_err(ModelError::from)?;
-    let data: Vec<String> =
-        serde_json::from_str(&data_json).map_err(|e| ModelError::Serialization {
-            source: Box::new(e),
-        })?;
-    Ok(data)
+    let data_json_raw = fs::read_to_string(path).map_err(ModelError::from)?;
+
+    // First attempt: strict JSON parsing
+    match serde_json::from_str::<Vec<String>>(&data_json_raw) {
+        Ok(strict) => return Ok(strict),
+        Err(_) => {
+            // Fallback: relaxed line-based parsing to handle comma-only lines or split commas
+            let mut items = Vec::new();
+            for line in data_json_raw.lines() {
+                let t = line.trim();
+                if t.is_empty() || t == "," || t == "[" || t == "]" { continue; }
+                // Accept lines like "...", or "...",
+                if t.starts_with('"') {
+                    let mut s = t.trim_end_matches(',').to_string();
+                    // Remove surrounding quotes
+                    if s.starts_with('"') && s.ends_with('"') {
+                        s = s[1..s.len()-1].to_string();
+                    }
+                    items.push(s);
+                }
+            }
+            if items.is_empty() {
+                // If still empty, return original error for visibility
+                return serde_json::from_str::<Vec<String>>(&data_json_raw).map_err(|e| ModelError::Serialization { source: Box::new(e) });
+            }
+            tracing::warn!(path = path, count = items.len(), "Loaded JSON via relaxed parser (found formatting artifacts)");
+            Ok(items)
+        }
+    }
 }
 
 fn get_data_from_csv(path: &str) -> Result<Vec<String>> {
