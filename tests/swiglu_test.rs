@@ -9,7 +9,7 @@ fn test_swiglu_basic_properties() {
     // Parameters: W₁ (128×512) + W₂ (128×512) + W₃ (512×128) + α_swish (512) + α_gate (512) +
     // β_gate (512) + swish_poly (coeffs) + gate_poly (coeffs)
     let expected_params =
-        128 * 512 * 3 + 512 * 3 + swiglu.swish_poly.weights.len() + swiglu.gate_poly.weights.len();
+        128 * 512 * 3 + 512 * 3 + swiglu.swish_poly.weights().len() + swiglu.gate_poly.weights().len();
     assert_eq!(swiglu.parameters(), expected_params);
 
     // Test layer type
@@ -74,11 +74,11 @@ fn test_swiglu_gradient_flow() {
     assert_eq!(param_grads[3].shape(), &[1, 128]); // grad_alpha_swish
     assert_eq!(
         param_grads[4].shape(),
-        &[1, swiglu.swish_poly.weights.len()]
+        &[1, swiglu.swish_poly.weights().len()]
     ); // grad_swish_poly coeffs
     assert_eq!(param_grads[5].shape(), &[1, 128]); // grad_alpha_gate
     assert_eq!(param_grads[6].shape(), &[1, 128]); // grad_beta_gate
-    assert_eq!(param_grads[7].shape(), &[1, swiglu.gate_poly.weights.len()]); // grad_gate_poly coeffs
+    assert_eq!(param_grads[7].shape(), &[1, swiglu.gate_poly.weights().len()]); // grad_gate_poly coeffs
 
     // Gradients should not be all zeros
     assert!(
@@ -195,8 +195,8 @@ fn test_swiglu_parameter_efficiency() {
     // hidden_dim
     let expected_params = 3 * embedding_dim * hidden_dim
         + hidden_dim * 3
-        + swiglu.swish_poly.weights.len()
-        + swiglu.gate_poly.weights.len();
+        + swiglu.swish_poly.weights().len()
+        + swiglu.gate_poly.weights().len();
     assert_eq!(swiglu.parameters(), expected_params);
 
     // Compare with FeedForward (ReLU-based) which has biases
@@ -306,7 +306,7 @@ fn test_swiglu_backward_updates_parameters() {
     // but we can verify that backward pass completes without errors
     assert_eq!(
         swiglu.parameters(),
-        8 * 32 * 3 + 32 * 3 + swiglu.swish_poly.weights.len() + swiglu.gate_poly.weights.len()
+        8 * 32 * 3 + 32 * 3 + swiglu.swish_poly.weights().len() + swiglu.gate_poly.weights().len()
     );
 }
 

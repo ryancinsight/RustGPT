@@ -3,10 +3,8 @@ use std::{cell::RefCell, thread_local};
 use ndarray::{Array2, Axis, azip, linalg::general_mat_mul, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
-use rayon::prelude::*;
-use rayon::slice::ParallelSliceMut;
 
-use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, sigmoid_poly::SigmoidPoly}; // [MOD] import learnable polynomial gate
+use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, richards::{RichardsCurve, Variant}, model_config::HeadSelectionStrategy};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyHead {
@@ -71,7 +69,7 @@ pub struct PolyAttention {
     opt_scale: Adam,
 
     // ===== Adaptive Mixture-of-Heads gating (learned, fully adaptive) =====
-    // Per-head gating projection and learned polynomial gate: g = phi(alpha * (X·W_g) + beta)
+    // Per-head gating projection and learned Richards curve gate: g = Richards(alpha * (X·W_g) + beta)
     pub w_g: Array2<f32>,     // (embed_dim, num_heads)
     pub alpha_g: Array2<f32>, // (1, num_heads)
     pub beta_g: Array2<f32>,  // (1, num_heads)
@@ -79,8 +77,32 @@ pub struct PolyAttention {
     opt_alpha_g: Adam,
     opt_beta_g: Adam,
 
-    // [MOD] Learnable polynomial for gating
-    pub gate_poly: SigmoidPoly,
+    // Learnable Richards curve for gating
+    pub gate_poly: RichardsCurve,
+
+    // ===== Learned threshold predictor (optional) =====
+    pub use_learned_threshold: bool,
+    pub w_tau: Option<Array2<f32>>,     // (embed_dim, 1)
+    pub alpha_tau: Option<Array2<f32>>, // (1, 1)
+    pub beta_tau: Option<Array2<f32>>,  // (1, 1)
+    opt_w_tau: Option<Adam>,
+    opt_alpha_tau: Option<Adam>,
+    opt_beta_tau: Option<Adam>,
+
+    // Head selection metrics and config
+    pub load_balance_weight: f32,
+    pub sparsity_weight: f32,
+    pub min_heads: usize,
+    pub max_heads: usize,
+    pub complexity_loss_weight: f32,
+    pub metrics_active_sum_per_head: Vec<f32>,
+    pub metrics_token_count_per_head: Vec<usize>,
+    pub metrics_tau_min: f32,
+    pub metrics_tau_max: f32,
+    pub metrics_tau_sum: f32,
+    pub metrics_tau_count: usize,
+    pub metrics_g_sq_sum: f32,
+    pub metrics_g_count: usize,
 
     // CoPE integration and sliding window
     use_cope: bool,
@@ -99,8 +121,6 @@ thread_local! {
     static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
-    static TLS_ROWBUF1: RefCell<Vec<f32>> = RefCell::new(Vec::new()); // (d_h)
-    static TLS_ROWBUF2: RefCell<Vec<f32>> = RefCell::new(Vec::new()); // (d_h)
 }
 
 #[inline]
@@ -148,24 +168,6 @@ fn with_tls_yh<R>(n: usize, d: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> 
         }
         let mat = opt.as_mut().unwrap();
         f(mat)
-    })
-}
-
-#[inline]
-fn with_tls_rowbuf1<R>(d: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
-    TLS_ROWBUF1.with(|cell| {
-        let mut v = cell.borrow_mut();
-        if v.len() != d { v.resize(d, 0.0); } else { v.fill(0.0); }
-        f(v.as_mut_slice())
-    })
-}
-
-#[inline]
-fn with_tls_rowbuf2<R>(d: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
-    TLS_ROWBUF2.with(|cell| {
-        let mut v = cell.borrow_mut();
-        if v.len() != d { v.resize(d, 0.0); } else { v.fill(0.0); }
-        f(v.as_mut_slice())
     })
 }
 
@@ -227,6 +229,12 @@ impl PolyAttention {
         let cope_pos_embeddings = Some(pe);
         let opt_cope_pos = Some(opt);
 
+        // Richards curve gate (default sigmoid variant, learnable)
+        let gate_poly = RichardsCurve::new_learnable(Variant::Sigmoid);
+
+        // Threshold predictor defaults
+        let use_learned_threshold = false;
+
         Self {
             embed_dim,
             num_heads,
@@ -247,8 +255,27 @@ impl PolyAttention {
             opt_w_g,
             opt_alpha_g,
             opt_beta_g,
-            // [MOD]
-            gate_poly: SigmoidPoly::new_cubic_default(),
+            gate_poly,
+            use_learned_threshold,
+            w_tau: None,
+            alpha_tau: None,
+            beta_tau: None,
+            opt_w_tau: None,
+            opt_alpha_tau: None,
+            opt_beta_tau: None,
+            load_balance_weight: 0.0,
+             sparsity_weight: 0.0,
+             min_heads: 1,
+             max_heads: num_heads,
+             complexity_loss_weight: 0.0,
+             metrics_active_sum_per_head: vec![0.0; num_heads],
+             metrics_token_count_per_head: vec![0; num_heads],
+            metrics_tau_min: f32::INFINITY,
+            metrics_tau_max: f32::NEG_INFINITY,
+            metrics_tau_sum: 0.0,
+            metrics_tau_count: 0,
+            metrics_g_sq_sum: 0.0,
+            metrics_g_count: 0,
             use_cope,
             cope_max_pos,
             cope_pos_embeddings,
@@ -273,7 +300,6 @@ impl PolyAttention {
         if let Some(w) = window {
             let n = mat.nrows();
             for i in 0..n {
-                // allow j in [max(0, i+1-w), i]
                 let j_min = i.saturating_sub(w - 1);
                 for j in 0..j_min {
                     mat[[i, j]] = 0.0;
@@ -297,7 +323,7 @@ impl PolyAttention {
                     None => 0,
                 };
                 for j in j_start..=i {
-                    let pos = if j == 0 { i } else { i - j };
+                    let pos = i - j;
                     if pos <= self.cope_max_pos {
                         pos_logits[[i, j]] = q.row(i).dot(&pe.row(pos));
                     }
@@ -319,145 +345,136 @@ impl PolyAttention {
         // Streamed accumulation: avoid building a large concat buffer
         let mut out = input.to_owned();
 
+        if self.use_learned_threshold {
+            self.ensure_threshold_predictor();
+        }
+        // Temporary accumulators for head activity and predictor metrics
+        let mut active_sums_tmp = vec![0.0f32; self.num_heads];
+        let mut token_counts_tmp = vec![0usize; self.num_heads];
+        let mut tau_min_local = f32::INFINITY;
+        let mut tau_max_local = f32::NEG_INFINITY;
+        let mut tau_count_local = 0usize;
+        let mut g_sq_sum_local = 0.0f32;
+        let mut g_count_local = 0usize;
+
         for (h_idx, head) in self.heads.iter().enumerate() {
             // Project to Q, K, V
             let q = input.dot(&head.w_q); // (N, d_h)
             let k = input.dot(&head.w_k); // (N, d_h)
             let v = input.dot(&head.w_v); // (N, d_h)
 
-            // Compute per-token gating for this head: g = phi(alpha * (X·w_g_col) + beta)
+            // Compute per-token gating for this head: g = Richards(alpha * (X·w_g_col) + beta)
             let w_g_col = self.w_g.slice(s![.., h_idx..h_idx + 1]); // (D,1)
-            let mut g_col = input.dot(&w_g_col); // (N,1)
+            let mut xw_col = input.dot(&w_g_col); // (N,1)
             let a_h = self.alpha_g[[0, h_idx]];
             let b_h = self.beta_g[[0, h_idx]];
-            // polynomial gate with dynamic scaling based on z range
-            let max_abs_z = g_col.iter().fold(0.0_f64, |m, &v| {
+            let max_abs_z = xw_col.iter().fold(0.0_f64, |m, &v| {
                 let z = a_h as f64 * v as f64 + b_h as f64;
                 m.max(z.abs())
             });
             let mut gate_poly = self.gate_poly.clone();
             gate_poly.update_scaling_from_max_abs(max_abs_z);
-            g_col.mapv_inplace(|xw| {
-                let z = a_h * xw + b_h;
-                gate_poly.forward_scalar(z as f64) as f32
-            });
+            let mut g_col = xw_col.clone();
+            g_col.mapv_inplace(|xw| gate_poly.forward_scalar((a_h * xw + b_h) as f64) as f32);
+            // Predictor norm RMS tracking (x·W_g)
+            g_sq_sum_local += xw_col.iter().map(|&v| v * v).sum::<f32>();
+            g_count_local += n;
 
-            // Common polynomial params
-            let a = self.a[[0, 0]];
-            let b = self.b[[0, 0]];
-            let scale = self.scale[[0, 0]];
-            let p_i32 = self.p as i32;
-
-            // If no sliding window, keep the original dense path for full attention
-            if self.window_size.is_none() {
-                // Dense path (kept as-is)
-                with_tls_scores(n, |scores| {
-                    scores.fill(0.0);
-                    general_mat_mul(1.0, &q, &k.t(), 0.0, scores);
-                    *scores *= dk_scale;
-
-                    if causal {
-                        Self::apply_causal_mask_inplace(scores);
-                    }
-                    Self::apply_sliding_window_mask_inplace(scores, self.window_size);
-
-                    if self.use_cope {
-                        let pos_logits = self.cope_pos_logits(&q, &k, self.window_size);
-                        *scores += &pos_logits;
-                        if causal {
-                            Self::apply_causal_mask_inplace(scores);
-                        }
-                        Self::apply_sliding_window_mask_inplace(scores, self.window_size);
-                    }
-
-                    scores.mapv_inplace(|x| {
-                        let sp = x.powi(p_i32);
-                        scale * (a * sp + b)
-                    });
-
-                    if causal {
-                        Self::apply_causal_mask_inplace(scores);
-                    }
-                    Self::apply_sliding_window_mask_inplace(scores, self.window_size);
-
-                    with_tls_yh(n, self.head_dim, |yh| {
-                        yh.fill(0.0);
-                        general_mat_mul(1.0, &*scores, &v, 0.0, yh);
-                        *yh *= &g_col;
-
-                        let start = h_idx * self.head_dim;
-                        let end = start + self.head_dim;
-                        let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
-                        general_mat_mul(1.0, &*yh, &w_block, 1.0, &mut out);
-                    });
-                });
-                continue;
+            // Learned threshold predictor m = sigmoid(alpha_tau * (X·W_tau) + beta_tau)
+            let mut m_col = Array2::<f32>::ones((n, 1));
+            if self.use_learned_threshold {
+                let w_tau = self.w_tau.as_ref().unwrap();
+                let alpha_tau = self.alpha_tau.as_ref().unwrap();
+                let beta_tau = self.beta_tau.as_ref().unwrap();
+                let mut xw_tau = input.dot(w_tau); // (N,1)
+                let a_t = alpha_tau[[0, 0]];
+                let b_t = beta_tau[[0, 0]];
+                // z_tau pre-activation for metrics
+                let mut z_tau = xw_tau.clone();
+                z_tau.mapv_inplace(|v| a_t * v + b_t);
+                let local_min = z_tau.iter().fold(f32::INFINITY, |m, &z| m.min(z));
+                let local_max = z_tau.iter().fold(f32::NEG_INFINITY, |m, &z| m.max(z));
+                tau_min_local = tau_min_local.min(local_min);
+                tau_max_local = tau_max_local.max(local_max);
+                tau_count_local += n;
+                // m = sigmoid(z_tau)
+                m_col.assign(&z_tau);
+                m_col.mapv_inplace(|z| 1.0 / (1.0 + (-z).exp()));
             }
 
-            // Windowed path: true banded compute, no NxN scratch
-            let w = self.window_size.unwrap();
-            let use_cope = self.use_cope;
-            let cope_max_pos = self.cope_max_pos;
-            let cope_pe_opt = self.cope_pos_embeddings.as_ref();
+            // Effective gate per token: eff = g * m
+            let eff_col = &g_col * &m_col;
+            // Accumulate active-head metrics (soft routing: sum of eff over tokens)
+            active_sums_tmp[h_idx] += eff_col.sum();
+            token_counts_tmp[h_idx] += n;
 
-            with_tls_yh(n, self.head_dim, |yh| {
-                yh.fill(0.0);
-                // Parallel row compute with zero-copy slices
-                let dh = self.head_dim;
-                let q_s = q.as_slice_memory_order().expect("Q contiguous");
-                let k_s = k.as_slice_memory_order().expect("K contiguous");
-                let v_s = v.as_slice_memory_order().expect("V contiguous");
-                let g_s = g_col.as_slice_memory_order().expect("g contiguous"); // (N,1)
-                let pe_s_opt = cope_pe_opt.and_then(|pe| pe.as_slice_memory_order());
-                let yh_s = yh
-                    .as_slice_memory_order_mut()
-                    .expect("Yh contiguous");
-                // Each row has length dh
-                yh_s.par_chunks_mut(dh).enumerate().for_each(|(i, row)| {
-                    let j_end: usize = i; // lower-tri band in windowed path
-                    let j_start = if w > 0 { i.saturating_sub(w - 1) } else { 0 };
-                    let qi = &q_s[i * dh..(i + 1) * dh];
-                    for j in j_start..=j_end {
-                        let kj = &k_s[j * dh..(j + 1) * dh];
-                        // dot(q_i, k_j)
-                        let mut s = 0.0f32;
-                        for u in 0..dh {
-                            s += qi[u] * kj[u];
-                        }
-                        s *= dk_scale;
-                        if use_cope {
-                            let pos = i - j;
-                            if pos <= cope_max_pos {
-                                if let Some(pe_s) = pe_s_opt {
-                                    let pe_row = &pe_s[pos * dh..(pos + 1) * dh];
-                                    let mut add = 0.0f32;
-                                    for u in 0..dh {
-                                        add += qi[u] * pe_row[u];
-                                    }
-                                    s += add;
-                                }
-                            }
-                        }
-                        let sp = s.powi(p_i32);
-                        let s_act = scale * (a * sp + b);
-                        let vj = &v_s[j * dh..(j + 1) * dh];
-                        for u in 0..dh {
-                            row[u] += s_act * vj[u];
-                        }
-                    }
-                    let g_i = g_s[i];
-                    for u in 0..dh {
-                        row[u] *= g_i;
-                    }
-                });
-
-                // Accumulate into output via W_out head block
+            {
+                // True banded computation per row (avoids building N×N scores)
+                let a = self.a[[0, 0]];
+                let b = self.b[[0, 0]];
+                let scale = self.scale[[0, 0]];
+                let p_i32 = self.p as i32;
                 let start = h_idx * self.head_dim;
                 let end = start + self.head_dim;
                 let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
-                general_mat_mul(1.0, &*yh, &w_block, 1.0, &mut out);
-            });
+
+                for i in 0..n {
+                    let mut yh_row = Array2::<f32>::zeros((1, self.head_dim));
+                    let j_start = match self.window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
+                    let j_end = if causal { i } else { n - 1 };
+
+                    // CoPE q·p_pos caching for row i
+                    let q_pe: Option<Vec<f32>> = if self.use_cope {
+                        if let Some(pe) = &self.cope_pos_embeddings {
+                            let max_pos = usize::min(self.cope_max_pos, i.saturating_sub(j_start));
+                            let mut buf = vec![0.0f32; max_pos + 1];
+                            for pos in 0..=max_pos {
+                                buf[pos] = q.row(i).dot(&pe.row(pos));
+                            }
+                            Some(buf)
+                        } else { None }
+                    } else { None };
+
+                    for j in j_start..=j_end {
+                        let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                        let mut s = base;
+                        if let Some(ref qpe) = q_pe {
+                            let pos = i.saturating_sub(j);
+                            if pos < qpe.len() { s += qpe[pos]; }
+                        }
+                        let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+                        let phi = scale * (a * sp + b);
+                        // yh_row += phi * v[j,:]
+                        for h in 0..self.head_dim {
+                            yh_row[[0, h]] += phi * v[[j, h]];
+                        }
+                    }
+
+                    // Apply gating: eff = g * m for token i
+                    let eff_i = g_col[[i, 0]] * m_col[[i, 0]];
+                    for h in 0..self.head_dim {
+                        yh_row[[0, h]] *= eff_i;
+                    }
+
+                    // Accumulate into output row i via W_out block
+                    let mut out_row = out.slice_mut(s![i..i + 1, ..]);
+                    general_mat_mul(1.0, &yh_row, &w_block, 1.0, &mut out_row);
+                }
+            }
         }
+
+        // Flush temporary metrics into persistent accumulators
+        for h in 0..self.num_heads {
+            self.metrics_active_sum_per_head[h] += active_sums_tmp[h];
+            self.metrics_token_count_per_head[h] += token_counts_tmp[h];
+        }
+        if self.use_learned_threshold && tau_count_local > 0 {
+            self.metrics_tau_min = self.metrics_tau_min.min(tau_min_local);
+            self.metrics_tau_max = self.metrics_tau_max.max(tau_max_local);
+            self.metrics_tau_count += tau_count_local;
+        }
+        self.metrics_g_sq_sum += g_sq_sum_local;
+        self.metrics_g_count += g_count_local;
 
         out
     }
@@ -487,20 +504,30 @@ impl PolyAttention {
         let mut grad_w_g = Array2::<f32>::zeros((self.embed_dim, self.num_heads));
         let mut grad_alpha_g = Array2::<f32>::zeros((1, self.num_heads));
         let mut grad_beta_g = Array2::<f32>::zeros((1, self.num_heads));
-        // [LEARN] Gate polynomial coefficient gradient accumulator (shared across heads)
-        let n_gate_w = self.gate_poly.weights.len();
+        // Gate polynomial coefficient gradient accumulator (shared across heads)
+        let n_gate_w = self.gate_poly.weights().len();
         let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
-        // CoPE grads accumulator (shared across heads) — keeping shape for optimizer compatibility
-        let grad_cope_pos = if self.use_cope {
+        // Threshold predictor grads
+        let mut grad_w_tau = if self.use_learned_threshold {
+            Some(Array2::<f32>::zeros((self.embed_dim, 1)))
+        } else { None };
+        let mut grad_alpha_tau = if self.use_learned_threshold {
+            Some(Array2::<f32>::zeros((1, 1)))
+        } else { None };
+        let mut grad_beta_tau = if self.use_learned_threshold {
+            Some(Array2::<f32>::zeros((1, 1)))
+        } else { None };
+
+        // CoPE grads accumulator (shared across heads)
+        let mut grad_cope_pos = if self.use_cope {
             Some(Array2::<f32>::zeros((self.cope_max_pos + 1, self.head_dim)))
         } else {
             None
         };
 
         // Per-head param grads (Wq, Wk, Wv) + W_out + scalars + gating params
-        let mut all_param_grads: Vec<Array2<f32>> =
-            Vec::with_capacity(self.num_heads * 3 + 1 + 3 + 3 + if self.use_cope { 1 } else { 0 });
+        let mut all_param_grads: Vec<Array2<f32>> = Vec::new();
 
         // Build grad for W_out block-wise to avoid materializing H
         let mut grad_w_out = Array2::<f32>::zeros((self.embed_dim, self.embed_dim)); // (D, D)
@@ -510,212 +537,6 @@ impl PolyAttention {
         let scale = self.scale[[0, 0]];
         let p_i32 = self.p as i32;
         let p_f = self.p as f32;
-
-        // Banded backward path when windowed attention is enabled
-        if let Some(w) = self.window_size {
-            for (h_idx, head) in self.heads.iter().enumerate() {
-                // Recompute per-head Q, K, V and intermediates
-                let q = input.dot(&head.w_q); // (N, d_h)
-                let k = input.dot(&head.w_k); // (N, d_h)
-                let v = input.dot(&head.w_v); // (N, d_h)
-
-                // Gating forward values for this head (and caches for backward)
-                let w_g_col = self.w_g.slice(s![.., h_idx..h_idx + 1]); // (D,1)
-                let xw_col = input.dot(&w_g_col); // (N,1)
-                let a_h = self.alpha_g[[0, h_idx]];
-                let b_h = self.beta_g[[0, h_idx]];
-                // z = a_h * xw + b_h; g = phi(z)
-                let mut z_col = xw_col.clone();
-                z_col.mapv_inplace(|v| a_h * v + b_h);
-                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-                let mut gate_poly = self.gate_poly.clone();
-                gate_poly.update_scaling_from_max_abs(max_abs_z);
-                let mut g_col = z_col.clone();
-                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
-
-                // grad wrt W_out needs H_h (gated). We avoid storing H by accumulating the block.
-                let start = h_idx * self.head_dim;
-                let end = start + self.head_dim;
-                let w_block = self.w_out.slice(s![start..end, ..]);
-                let w_block_t = w_block.t();
-
-                // g_yh_gated = dL/dY · W_out_block^T
-                let mut g_yh_gated = Array2::<f32>::zeros((n, self.head_dim));
-                general_mat_mul(1.0, output_grads, &w_block_t, 0.0, &mut g_yh_gated);
-
-                // Per-projection grads
-                let mut grad_q = Array2::<f32>::zeros((n, self.head_dim));
-                let mut grad_k = Array2::<f32>::zeros((n, self.head_dim));
-                let mut grad_v = Array2::<f32>::zeros((n, self.head_dim));
-
-                // Gating param grads accumulators (per-head)
-                let mut d_wg_col_acc = Array2::<f32>::zeros((self.embed_dim, 1)); // (D,1)
-                let mut dalpha = 0.0_f32;
-                let mut dbeta = 0.0_f32;
-
-                // Gate polynomial coefficient grads (shared accumulator)
-                let c_gate = gate_poly.scaling as f64;
-
-                // Row-wise banded backward
-                // Use contiguous zero-copy slices and reusable row buffers
-                let dh = self.head_dim;
-                let q_s = q.as_slice_memory_order().expect("Q contiguous");
-                let k_s = k.as_slice_memory_order().expect("K contiguous");
-                let v_s = v.as_slice_memory_order().expect("V contiguous");
-                let gyg_s = g_yh_gated.as_slice_memory_order().expect("g_yh_gated contiguous");
-                let og_s = output_grads.as_slice_memory_order().expect("output grads contiguous");
-
-                for i in 0..n {
-                    let g_i = g_col[[i, 0]];
-                    let qi = &q_s[i * dh..(i + 1) * dh];
-
-                    // y_pre[i,*] via banded sum; reuse TLS row buffer
-                    with_tls_rowbuf1(dh, |y_pre_row| {
-                        let j_start = i.saturating_sub(w - 1);
-                        for j in j_start..=i {
-                            let kj = &k_s[j * dh..(j + 1) * dh];
-                            let mut s_ij = 0.0f32;
-                            for u in 0..dh { s_ij += qi[u] * kj[u]; }
-                            s_ij *= dk_scale;
-                            let sp = s_ij.powi(p_i32);
-                            let phi_s = scale * (a * sp + b);
-                            let vj = &v_s[j * dh..(j + 1) * dh];
-                            for u in 0..dh { y_pre_row[u] += phi_s * vj[u]; }
-                        }
-
-                        // Accumulate grad_w_out block using H_h[i,*] = g_i * y_pre_row
-                        let og_i = &og_s[i * self.embed_dim..(i + 1) * self.embed_dim];
-                        for u in 0..dh {
-                            let yhu = y_pre_row[u] * g_i;
-                            if yhu != 0.0 {
-                                let row_idx = start + u;
-                                for d in 0..self.embed_dim {
-                                    grad_w_out[[row_idx, d]] += yhu * og_i[d];
-                                }
-                            }
-                        }
-
-                        // grad_g_dg[i] = dot(g_yh_gated[i,*], y_pre[i,*])
-                        let gyg_i = &gyg_s[i * dh..(i + 1) * dh];
-                        let mut grad_g_dg_i = 0.0f32;
-                        for u in 0..dh { grad_g_dg_i += gyg_i[u] * y_pre_row[u]; }
-                        // dz = grad_g * phi_gate'(z)
-                        let dphi_gate = gate_poly.backward_scalar(z_col[[i, 0]] as f64) as f32;
-                        let grad_g_col_i = grad_g_dg_i * dphi_gate;
-
-                        // Accumulate gating weight grads: dW_g_col += alpha * X[i]^T * grad_g_col_i
-                        for d in 0..self.embed_dim {
-                            d_wg_col_acc[[d, 0]] += a_h * grad_g_col_i * input[[i, d]];
-                        }
-                        // d alpha and d beta
-                        dalpha += grad_g_col_i * xw_col[[i, 0]];
-                        dbeta += grad_g_col_i;
-
-                        // dX from gating path: grad_input += grad_g_col_i · (alpha * w_g_col^T)
-                        for d in 0..self.embed_dim {
-                            grad_input_total[[i, d]] += grad_g_col_i * a_h * w_g_col[[d, 0]];
-                        }
-
-                        // [LEARN] gate polynomial coefficient gradient: dL/dw_i += grad_g_dg * (c*z)^i
-                        let zf = z_col[[i, 0]] as f64;
-                        let mut power = 1.0_f64; // (c*z)^0
-                        let cz = c_gate * zf;
-                        for wi in 0..n_gate_w {
-                            grad_gate_poly_vec[wi] += (grad_g_dg_i as f64) * power;
-                            power *= cz;
-                        }
-
-                        // Now compute grads wrt V, S, then Q and K over the same band
-                        with_tls_rowbuf2(dh, |g_yh_pre_row| {
-                            for u in 0..dh { g_yh_pre_row[u] = g_i * gyg_i[u]; }
-                            let j_start2 = i.saturating_sub(w - 1);
-                            for j in j_start2..=i {
-                                // Forward recompute s_ij (no CoPE path in backward for parity)
-                                let kj2 = &k_s[j * dh..(j + 1) * dh];
-                                let mut s_ij = 0.0f32;
-                                for u in 0..dh { s_ij += qi[u] * kj2[u]; }
-                                s_ij *= dk_scale;
-                                let sp = s_ij.powi(p_i32);
-                                // phi'(s) factor for dS
-                                let dphi_ds = scale * a * p_f * if p_i32 == 1 { 1.0 } else { s_ij.powi(p_i32 - 1) };
-
-                                // dphi_ij = dot(g_yh_pre[i,*], v_j)
-                                let vj2 = &v_s[j * dh..(j + 1) * dh];
-                                let mut dphi_ij = 0.0f32;
-                                for u in 0..dh { dphi_ij += g_yh_pre_row[u] * vj2[u]; }
-
-                                // Scalars grads wrt (a, b, scale)
-                                grad_scale_scalar += dphi_ij * (a * sp + b);
-                                grad_a_scalar += dphi_ij * scale * sp;
-                                grad_b_scalar += dphi_ij * scale;
-
-                                // dS_ij
-                                let dS_ij = dphi_ij * dphi_ds;
-
-                                // dV_j += phi(s_ij) * g_yh_pre[i,*]
-                                let phi_s = scale * (a * sp + b);
-                                for u in 0..dh {
-                                    grad_v[[j, u]] += phi_s * g_yh_pre_row[u];
-                                }
-
-                                // dQ_i += dS_ij * dk_scale * k_j;  dK_j += dS_ij * dk_scale * q_i
-                                for u in 0..dh {
-                                    grad_q[[i, u]] += dS_ij * dk_scale * kj2[u];
-                                    grad_k[[j, u]] += dS_ij * dk_scale * qi[u];
-                                }
-                            }
-                        });
-                    });
-                }
-
-                // Backprop through linear projections: Q = X W_q; W grads and input grads
-                let d_w_q = input.t().dot(&grad_q);
-                let d_w_k = input.t().dot(&grad_k);
-                let d_w_v = input.t().dot(&grad_v);
-
-                all_param_grads.push(d_w_q);
-                all_param_grads.push(d_w_k);
-                all_param_grads.push(d_w_v);
-
-                // Accumulate grad_input from projections
-                general_mat_mul(1.0, &grad_q, &head.w_q.t(), 1.0, &mut grad_input_total);
-                general_mat_mul(1.0, &grad_k, &head.w_k.t(), 1.0, &mut grad_input_total);
-                general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_total);
-
-                // Write gating grads into shared accumulators
-                let mut grad_wg_slice = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
-                grad_wg_slice += &d_wg_col_acc;
-                grad_alpha_g[[0, h_idx]] += dalpha;
-                grad_beta_g[[0, h_idx]] += dbeta;
-            }
-
-            // Append output projection grads and scalar grads and gating grads
-            all_param_grads.push(grad_w_out);
-            let grad_a = Array2::<f32>::from_shape_vec((1, 1), vec![grad_a_scalar]).unwrap();
-            let grad_b = Array2::<f32>::from_shape_vec((1, 1), vec![grad_b_scalar]).unwrap();
-            let grad_scale = Array2::<f32>::from_shape_vec((1, 1), vec![grad_scale_scalar]).unwrap();
-            all_param_grads.push(grad_a);
-            all_param_grads.push(grad_b);
-            all_param_grads.push(grad_scale);
-            all_param_grads.push(grad_w_g);
-            all_param_grads.push(grad_alpha_g);
-            all_param_grads.push(grad_beta_g);
-            // [LEARN] gate polynomial coefficient grads
-            let grad_gate_poly = Array2::<f32>::from_shape_vec(
-                (1, n_gate_w),
-                grad_gate_poly_vec.into_iter().map(|v| v as f32).collect(),
-            )
-            .unwrap();
-            all_param_grads.push(grad_gate_poly);
-
-            if let Some(grad_pe) = grad_cope_pos {
-                all_param_grads.push(grad_pe);
-            }
-
-            return (grad_input_total, all_param_grads);
-        }
-
-        // ===== Dense backward path (original) when window_size is None =====
         for (h_idx, head) in self.heads.iter().enumerate() {
             // Recompute per-head Q, K, V and intermediates
             let q = input.dot(&head.w_q); // (N, d_h)
@@ -727,7 +548,7 @@ impl PolyAttention {
             let xw_col = input.dot(&w_g_col); // (N,1)
             let a_h = self.alpha_g[[0, h_idx]];
             let b_h = self.beta_g[[0, h_idx]];
-            // z = a_h * xw + b_h; g = phi(z)
+            // z = a_h * xw + b_h; g = Richards(z)
             let mut z_col = xw_col.clone();
             z_col.mapv_inplace(|v| a_h * v + b_h);
             let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
@@ -736,162 +557,311 @@ impl PolyAttention {
             let mut g_col = z_col.clone();
             g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
 
-            with_tls_scores(n, |scores| {
-                scores.fill(0.0);
-                general_mat_mul(1.0, &q, &k.t(), 0.0, scores);
-                *scores *= dk_scale;
-                // causal mask
-                Self::apply_causal_mask_inplace(scores);
-                Self::apply_sliding_window_mask_inplace(scores, self.window_size);
+            // Threshold path forward
+            let mut m_col = Array2::<f32>::ones((n, 1));
+            let (xw_tau, a_t, b_t) = if self.use_learned_threshold {
+                let w_tau = self.w_tau.as_ref().unwrap();
+                let alpha_tau = self.alpha_tau.as_ref().unwrap();
+                let beta_tau = self.beta_tau.as_ref().unwrap();
+                let xw_tau = input.dot(w_tau);
+                let a_t = alpha_tau[[0, 0]];
+                let b_t = beta_tau[[0, 0]];
+                m_col.assign(&xw_tau);
+                m_col.mapv_inplace(|v| {
+                    let z = a_t * v + b_t;
+                    1.0 / (1.0 + (-z).exp())
+                });
+                (Some(xw_tau), Some(a_t), Some(b_t))
+            } else { (None, None, None) };
 
-                with_tls_work(n, |work| {
-                    // work <- phi(scores)
-                    work.assign(scores);
-                    work.mapv_inplace(|x| {
-                        let sp = x.powi(p_i32);
-                        scale * (a * sp + b)
-                    });
-                    // apply mask again to keep upper triangle zero
-                    Self::apply_causal_mask_inplace(work);
-                    Self::apply_sliding_window_mask_inplace(work, self.window_size);
+            {
+                // True banded backward: per-row computations within the window
+                let start = h_idx * self.head_dim;
+                let end = start + self.head_dim;
+                let w_block = self.w_out.slice(s![start..end, ..]);
+                let w_block_t = w_block.t();
 
-                    with_tls_yh(n, self.head_dim, |yh| {
-                        // Y_h (pre-gating)
-                        yh.fill(0.0);
-                        general_mat_mul(1.0, &*work, &v, 0.0, yh); // yh = phi dot V
+                // Allocate per-head grads
+                let mut grad_q: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_k: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_v: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_p_local: Option<Array2<f32>> = if self.use_cope {
+                    Some(Array2::<f32>::zeros((self.cope_max_pos + 1, self.head_dim)))
+                } else { None };
 
-                        // Apply gating for W_out gradients
-                        *yh *= &g_col; // yh now is H_h (gated)
+                for i in 0..n {
+                    // g_yh_gated_row from output_grads and W_out block
+                    let out_row = output_grads.slice(s![i..i + 1, ..]);
+                    let mut g_yh_gated_row = Array2::<f32>::zeros((1, self.head_dim));
+                    general_mat_mul(1.0, &out_row, &w_block_t, 0.0, &mut g_yh_gated_row);
 
-                        // Block rows in W_out corresponding to this head
-                        let start = h_idx * self.head_dim;
-                        let end = start + self.head_dim;
+                    // Recompute y_pre_row (pre-gating) via banded phi(S) * V
+                    let mut y_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                    let j_start = match self.window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
+                    let j_end = i; // causal always true here
 
-                        // dL/dW_out block = H_h^T dL/dY
-                        {
-                            let mut gw_block = grad_w_out.slice_mut(s![start..end, ..]);
-                            let yh_t = yh.t();
-                            general_mat_mul(1.0, &yh_t, output_grads, 0.0, &mut gw_block);
+                    // CoPE q·p_pos caching for row i
+                    let q_pe: Option<Vec<f32>> = if self.use_cope {
+                        if let Some(pe) = &self.cope_pos_embeddings {
+                            let max_pos = usize::min(self.cope_max_pos, i.saturating_sub(j_start));
+                            let mut buf = vec![0.0f32; max_pos + 1];
+                            for pos in 0..=max_pos {
+                                buf[pos] = q.row(i).dot(&pe.row(pos));
+                            }
+                            Some(buf)
+                        } else { None }
+                    } else { None };
+
+                    for j in j_start..=j_end {
+                        let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                        let mut s = base;
+                        if let Some(ref qpe) = q_pe {
+                            let pos = i.saturating_sub(j);
+                            if pos < qpe.len() { s += qpe[pos]; }
                         }
+                        let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+                        let phi = scale * (a * sp + b);
+                        for h in 0..self.head_dim { y_pre_row[[0, h]] += phi * v[[j, h]]; }
+                    }
 
-                        // Gradient wrt head output slice (gated): g_yh_gated = dL/dY dot
-                        // W_out_block^T
-                        let w_block = self.w_out.slice(s![start..end, ..]);
-                        let w_block_t = w_block.t();
-                        yh.fill(0.0);
-                        general_mat_mul(1.0, output_grads, &w_block_t, 0.0, yh); // reuse yh as g_yh_gated
+                    // W_out grads: yh_gated_row = y_pre_row * eff_i
+                    let eff_i = g_col[[i, 0]] * m_col[[i, 0]];
+                    let mut yh_gated_row = y_pre_row.clone();
+                    for h in 0..self.head_dim { yh_gated_row[[0, h]] *= eff_i; }
+                    {
+                        let mut gw_block = grad_w_out.slice_mut(s![start..end, ..]);
+                        general_mat_mul(1.0, &yh_gated_row.t(), &out_row, 1.0, &mut gw_block);
+                    }
 
-                        // Recompute Y_h (pre-gating) to compute grad wrt gating efficiently
-                        let y_pre = work.dot(&v); // (N, d_h)
+                    // Gradient wrt eff = g*m
+                    let mut grad_eff_i = 0.0f32;
+                    for h in 0..self.head_dim {
+                        grad_eff_i += g_yh_gated_row[[0, h]] * y_pre_row[[0, h]];
+                    }
+                    let d_g_i = grad_eff_i * m_col[[i, 0]];
+                    let d_m_i = grad_eff_i * g_col[[i, 0]];
 
-                        // grad_g_col (N,1) = sum_j g_yh_gated[i,j] * y_pre[i,j]
-                        let prod = &y_pre * &*yh; // (N, d_h)
-                        let grad_g_dg = prod.sum_axis(Axis(1)).insert_axis(Axis(1)); // (N,1), dL/dg
+                    // Gate Richards path
+                    let z_i = a_h * xw_col[[i, 0]] + b_h;
+                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let grad_g_i = d_g_i * dphi_dz_i;
+                    // Parameter grads for Richards curve
+                    let gws = gate_poly.grad_weights_scalar(z_i as f64, d_g_i as f64);
+                    for (wi, gw) in gws.iter().enumerate() { grad_gate_poly_vec[wi] += *gw; }
+                    // dW_g_col increment (outer product)
+                    {
+                        let mut grad_wg_slice = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
+                        for d in 0..self.embed_dim { grad_wg_slice[[d, 0]] += a_h * input[[i, d]] * grad_g_i; }
+                    }
+                    grad_alpha_g[[0, h_idx]] += grad_g_i * xw_col[[i, 0]];
+                    grad_beta_g[[0, h_idx]] += grad_g_i;
+                    // dX from gating path
+                    {
+                        let wg_col_owned = self.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
+                        let wg_scaled_t = wg_col_owned.t();
+                        for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i; }
+                    }
 
-                        // dz = grad_g * phi'(z)
-                        let mut dphi_col = z_col.clone();
-                        dphi_col.mapv_inplace(|z| gate_poly.backward_scalar(z as f64) as f32);
-                        let mut grad_g_col = grad_g_dg.clone();
-                        grad_g_col *= &dphi_col; // chain rule
+                    // Threshold sigmoid path
+                    if self.use_learned_threshold {
+                        let xw_tau = xw_tau.as_ref().unwrap();
+                        let a_t = a_t.unwrap();
+                        let m_i = m_col[[i, 0]];
+                        let dm_dz_i = m_i * (1.0 - m_i);
+                        let grad_tau_i = d_m_i * dm_dz_i;
+                        // dW_tau increment
+                        {
+                            let grad_wtau = grad_w_tau.as_mut().unwrap();
+                            for d in 0..self.embed_dim { grad_wtau[[d, 0]] += a_t * input[[i, d]] * grad_tau_i; }
+                        }
+                        grad_alpha_tau.as_mut().unwrap()[[0, 0]] += grad_tau_i * xw_tau[[i, 0]];
+                        grad_beta_tau.as_mut().unwrap()[[0, 0]] += grad_tau_i;
+                        // dX from threshold path
+                        {
+                            let wt_scaled_t = self.w_tau.as_ref().unwrap().t();
+                            for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_t * wt_scaled_t[[0, d]] * grad_tau_i; }
+                        }
+                    }
 
-                        // [LEARN] Accumulate gate polynomial coefficient gradients: dL/dw_i = sum
-                        // grad(dL/dg) * (c*z)^i
-                        let c_gate = gate_poly.scaling as f64;
-                        for i in 0..n {
-                            let z = z_col[[i, 0]] as f64;
-                            let mut power = 1.0_f64; // (c*z)^0
-                            let cz = c_gate * z;
-                            for wi in 0..n_gate_w {
-                                grad_gate_poly_vec[wi] += (grad_g_dg[[i, 0]] as f64) * power;
-                                power *= cz;
+                    // Attention path: g_yh_pre_row = g_yh_gated_row * g_i * m_i
+                    let mut g_yh_pre_row = g_yh_gated_row.clone();
+                    for h in 0..self.head_dim { g_yh_pre_row[[0, h]] *= g_col[[i, 0]] * m_col[[i, 0]]; }
+
+                    for j in j_start..=j_end {
+                        let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                        let mut s = base;
+                        if let Some(ref qpe) = q_pe {
+                            let pos = i.saturating_sub(j);
+                            if pos < qpe.len() { s += qpe[pos]; }
+                        }
+                        let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+                        let phi = scale * (a * sp + b);
+                        // dV
+                        for h in 0..self.head_dim { grad_v[[j, h]] += phi * g_yh_pre_row[[0, h]]; }
+                        // dphi
+                        let dphi_ij = g_yh_pre_row.row(0).dot(&v.row(j));
+                        // accumulate scalar grads
+                        grad_scale_scalar += dphi_ij * (a * sp + b);
+                        grad_a_scalar += dphi_ij * scale * sp;
+                        grad_b_scalar += dphi_ij * scale;
+                        // dS
+                        let spm1 = match p_i32 { 1 => 1.0, 2 => s, 3 => s * s, _ => s.powi(p_i32 - 1) };
+                        let dS_ij = dphi_ij * scale * a * (self.p as f32) * spm1;
+                        // base Q,K grads
+                        for h in 0..self.head_dim {
+                            grad_q[[i, h]] += dS_ij * k[[j, h]] * dk_scale;
+                            grad_k[[j, h]] += dS_ij * q[[i, h]] * dk_scale;
+                        }
+                        // CoPE grads
+                        if let Some(ref qpe) = q_pe {
+                            let pos = i.saturating_sub(j);
+                            if pos < qpe.len() {
+                                if let Some(pe) = &self.cope_pos_embeddings {
+                                    for h in 0..self.head_dim {
+                                        grad_q[[i, h]] += dS_ij * pe[[pos, h]];
+                                        if let Some(gpl) = grad_p_local.as_mut() {
+                                            gpl[[pos, h]] += dS_ij * q[[i, h]];
+                                        }
+                                    }
+                                }
                             }
                         }
+                    }
+                }
 
-                        // Accumulate gating param grads
-                        // dW_g_col = alpha * X^T dot dz
-                        let d_wg_col = input.t().dot(&grad_g_col) * a_h;
-                        let mut grad_wg_slice = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
-                        grad_wg_slice += &d_wg_col;
+                // Backprop through linear projections for this head
+                let d_w_q = input.t().dot(&grad_q);
+                let d_w_k = input.t().dot(&grad_k);
+                let d_w_v = input.t().dot(&grad_v);
+                all_param_grads.push(d_w_q);
+                all_param_grads.push(d_w_k);
+                all_param_grads.push(d_w_v);
+                general_mat_mul(1.0, &grad_q, &head.w_q.t(), 1.0, &mut grad_input_total);
+                general_mat_mul(1.0, &grad_k, &head.w_k.t(), 1.0, &mut grad_input_total);
+                general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_total);
 
-                        // d alpha = sum_i dz_i * xw_i
-                        let dalpha = (&grad_g_col * &xw_col).sum();
-                        grad_alpha_g[[0, h_idx]] += dalpha;
-
-                        // d beta = sum_i dz_i
-                        let dbeta = grad_g_col.sum();
-                        grad_beta_g[[0, h_idx]] += dbeta;
-
-                        // dX from gating path: grad_input += dz · (alpha * w_g_col^T)
-                        let mut wg_scaled_t = w_g_col.t().to_owned(); // (1,D)
-                        wg_scaled_t *= a_h;
-                        let gx = grad_g_col.dot(&wg_scaled_t); // (N,D)
-                        grad_input_total += &gx;
-
-                        // Now continue grads through attention path using g_yh_pre = g_yh_gated .*
-                        // g
-                        let mut g_yh_pre = yh.to_owned(); // g_yh_gated clone
-                        g_yh_pre *= &g_col; // (N, d_h)
-
-                        // dL/dV = phi^T dot g_yh_pre
-                        let grad_v = work.t().dot(&g_yh_pre);
-
-                        // dL/dphi = g_yh_pre dot V^T
-                        work.fill(0.0);
-                        general_mat_mul(1.0, &g_yh_pre, &v.t(), 0.0, work); // work = grad_phi (N,N)
-
-                        // grads wrt scalars (vectorized)
-                        let mut acc_scale = 0.0f32;
-                        let mut acc_a = 0.0f32;
-                        let mut acc_b = 0.0f32;
-                        azip!(( &dphi in &*work, &sij in &scores.view()) {
-                            let sp = sij.powi(p_i32);
-                            acc_scale += dphi * (a * sp + b);
-                            acc_a += dphi * scale * sp;
-                            acc_b += dphi * scale;
-                        });
-                        grad_scale_scalar += acc_scale;
-                        grad_a_scalar += acc_a;
-                        grad_b_scalar += acc_b;
-
-                        // dL/dS = dL/dphi * scale * a * p * S^(p-1) (vectorized)
-                        azip!(( w in &mut *work, &sij in &scores.view()) {
-                            let dphi = *w;
-                            let spm1 = if p_i32 == 1 { 1.0 } else { sij.powi(p_i32 - 1) };
-                            *w = dphi * scale * a * p_f * spm1;
-                        });
-                        // masked positions have zero influence
-                        Self::apply_causal_mask_inplace(work);
-                        Self::apply_sliding_window_mask_inplace(work, self.window_size);
-
-                        // S = (Q K^T) * dk_scale
-                        // Therefore dQ = dS dot K * dk_scale, dK = dS^T dot Q * dk_scale
-                        let mut grad_q: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
-                        general_mat_mul(1.0, &*work, &k, 0.0, &mut grad_q);
-                        grad_q *= dk_scale;
-                        let mut grad_k: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
-                        general_mat_mul(1.0, &work.t(), &q, 0.0, &mut grad_k);
-                        grad_k *= dk_scale;
-
-                        // Backprop through linear projections: Q = X W_q; so dW_q = X^T dQ, dX +=
-                        // dQ W_q^T
-                        let d_w_q = input.t().dot(&grad_q);
-                        let d_w_k = input.t().dot(&grad_k);
-                        let d_w_v = input.t().dot(&grad_v);
-
-                        all_param_grads.push(d_w_q);
-                        all_param_grads.push(d_w_k);
-                        all_param_grads.push(d_w_v);
-
-                        // Accumulate grad_input from projections
-                        general_mat_mul(1.0, &grad_q, &head.w_q.t(), 1.0, &mut grad_input_total);
-                        general_mat_mul(1.0, &grad_k, &head.w_k.t(), 1.0, &mut grad_input_total);
-                        general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_total);
-                    });
-                });
-            });
+                // Aggregate CoPE position grads
+                if self.use_cope {
+                    if let Some(gpl) = grad_p_local {
+                        if let Some(grad_pe_global) = grad_cope_pos.as_mut() {
+                            *grad_pe_global += &gpl;
+                        }
+                    }
+                }
+            }
         }
 
-        // Append output projection grads and scalar grads and gating grads
+        // ===== Head-selection regularizers (auxiliary losses) =====
+        if self.use_learned_threshold && (self.complexity_loss_weight > 0.0 || self.load_balance_weight > 0.0 || self.sparsity_weight > 0.0) {
+            // m(x) via threshold predictor
+            let w_tau = self.w_tau.as_ref().unwrap();
+            let alpha_tau = self.alpha_tau.as_ref().unwrap();
+            let beta_tau = self.beta_tau.as_ref().unwrap();
+            let xw_tau2 = input.dot(w_tau);
+            let a_t = alpha_tau[[0, 0]];
+            let b_t = beta_tau[[0, 0]];
+            let mut m_vec = xw_tau2.clone();
+            m_vec.mapv_inplace(|v| {
+                let z = a_t * v + b_t;
+                1.0 / (1.0 + (-z).exp())
+            });
+
+            // Precompute g(z) and eff per head
+            let mut g_mat = Array2::<f32>::zeros((n, self.num_heads));
+            let mut eff_mat = Array2::<f32>::zeros((n, self.num_heads));
+            let mut z_mat = Array2::<f32>::zeros((n, self.num_heads));
+            let mut max_abs_vec: Vec<f64> = vec![0.0; self.num_heads];
+
+            for h in 0..self.num_heads {
+                let w_g_col = self.w_g.slice(s![.., h..h + 1]);
+                let xw_col = input.dot(&w_g_col);
+                let a_h = self.alpha_g[[0, h]];
+                let b_h = self.beta_g[[0, h]];
+                let mut z_col = xw_col.clone();
+                z_col.mapv_inplace(|v| a_h * v + b_h);
+                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
+                max_abs_vec[h] = max_abs_z;
+                let mut gate_poly = self.gate_poly.clone();
+                gate_poly.update_scaling_from_max_abs(max_abs_z);
+                let mut g_col = z_col.clone();
+                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+                for i in 0..n {
+                    z_mat[[i, h]] = z_col[[i, 0]];
+                    g_mat[[i, h]] = g_col[[i, 0]];
+                    eff_mat[[i, h]] = g_col[[i, 0]] * m_vec[[i, 0]];
+                }
+            }
+
+            let inv_n = 1.0f32 / (n as f32);
+            let inv_h = 1.0f32 / (self.num_heads as f32);
+            let target_heads = ((self.min_heads + self.max_heads) as f32) * 0.5;
+ 
+            for i in 0..n {
+                let m_i = m_vec[[i, 0]];
+                // sum over heads
+                let mut s = 0.0f32;
+                for h in 0..self.num_heads { s += eff_mat[[i, h]]; }
+                let mean = s * inv_h;
+ 
+                // base derivative for complexity and sparsity (normalized)
+                let mut base_d = 0.0f32;
+                if self.complexity_loss_weight > 0.0 {
+                    base_d += self.complexity_loss_weight * (s - target_heads) * inv_n;
+                }
+                // sparsity derivative normalized by tokens and heads
+                base_d += self.sparsity_weight * inv_n * inv_h;
+ 
+                // accumulate threshold gradient across heads
+                let mut d_m_total = 0.0f32;
+ 
+                for h in 0..self.num_heads {
+                    let eff_h = eff_mat[[i, h]];
+                    let mut d_eff_h = base_d;
+                    if self.load_balance_weight > 0.0 {
+                        d_eff_h += 2.0 * self.load_balance_weight * inv_n * inv_h * (eff_h - mean);
+                    }
+                    // gating path
+                    let d_g_i = d_eff_h * m_i;
+                    let a_h = self.alpha_g[[0, h]];
+                    let z_i = z_mat[[i, h]];
+                    let mut gate_poly = self.gate_poly.clone();
+                    gate_poly.update_scaling_from_max_abs(max_abs_vec[h]);
+                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let grad_g_i = d_g_i * dphi_dz_i;
+
+                    // update gating parameter grads
+                    for d in 0..self.embed_dim { grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i; }
+                    // alpha uses xw; derive xw from z: xw = (z - beta)/alpha when alpha != 0
+                    let xw_val = if a_h.abs() > 1e-8 { (z_i - self.beta_g[[0, h]]) / a_h } else { 0.0 };
+                    grad_alpha_g[[0, h]] += grad_g_i * xw_val;
+                    grad_beta_g[[0, h]] += grad_g_i;
+                    for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_h * self.w_g[[d, h]] * grad_g_i; }
+
+                    // threshold accumulation uses g
+                    d_m_total += d_eff_h * g_mat[[i, h]];
+                }
+
+                // threshold predictor grads (aggregated across heads)
+                let dm_dz_i = m_i * (1.0 - m_i);
+                let grad_tau_i = d_m_total * dm_dz_i;
+                let a_t = alpha_tau[[0, 0]];
+                // dW_tau
+                if let Some(gwt) = grad_w_tau.as_mut() {
+                    for d in 0..self.embed_dim { gwt[[d, 0]] += a_t * input[[i, d]] * grad_tau_i; }
+                }
+                if let Some(ga) = grad_alpha_tau.as_mut() {
+                    ga[[0, 0]] += grad_tau_i * xw_tau2[[i, 0]];
+                }
+                if let Some(gb) = grad_beta_tau.as_mut() {
+                    gb[[0, 0]] += grad_tau_i;
+                }
+                // dX from threshold path
+                let wt_scaled_t = self.w_tau.as_ref().unwrap().t();
+                for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_t * wt_scaled_t[[0, d]] * grad_tau_i; }
+            }
+        }
+ 
+         // Append output projection grads and scalar grads and gating grads
         all_param_grads.push(grad_w_out);
         let grad_a = Array2::<f32>::from_shape_vec((1, 1), vec![grad_a_scalar]).unwrap();
         let grad_b = Array2::<f32>::from_shape_vec((1, 1), vec![grad_b_scalar]).unwrap();
@@ -902,13 +872,19 @@ impl PolyAttention {
         all_param_grads.push(grad_w_g);
         all_param_grads.push(grad_alpha_g);
         all_param_grads.push(grad_beta_g);
-        // [LEARN] gate polynomial coefficient grads
+        // gate Richards parameter grads
         let grad_gate_poly = Array2::<f32>::from_shape_vec(
             (1, n_gate_w),
             grad_gate_poly_vec.into_iter().map(|v| v as f32).collect(),
-        )
-        .unwrap();
+        ).unwrap();
         all_param_grads.push(grad_gate_poly);
+
+        // Threshold predictor grads
+        if self.use_learned_threshold {
+            all_param_grads.push(grad_w_tau.unwrap());
+            all_param_grads.push(grad_alpha_tau.unwrap());
+            all_param_grads.push(grad_beta_tau.unwrap());
+        }
 
         if let Some(grad_pe) = grad_cope_pos {
             all_param_grads.push(grad_pe);
@@ -922,11 +898,10 @@ impl PolyAttention {
         param_grads: &[Array2<f32>],
         lr: f32,
     ) -> crate::errors::Result<()> {
-        // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g
+        // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w
         let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
-        if self.use_cope {
-            expected += 1;
-        }
+        if self.use_learned_threshold { expected += 3; }
+        if self.use_cope { expected += 1; }
         if param_grads.len() != expected {
             return Err(crate::errors::ModelError::GradientError {
                 message: format!(
@@ -947,23 +922,32 @@ impl PolyAttention {
         idx += 1;
         self.opt_a.step(&mut self.a, &param_grads[idx], lr);
         self.opt_b.step(&mut self.b, &param_grads[idx + 1], lr);
-        self.opt_scale
-            .step(&mut self.scale, &param_grads[idx + 2], lr);
+        self.opt_scale.step(&mut self.scale, &param_grads[idx + 2], lr);
         idx += 3;
         self.opt_w_g.step(&mut self.w_g, &param_grads[idx], lr);
-        self.opt_alpha_g
-            .step(&mut self.alpha_g, &param_grads[idx + 1], lr);
-        self.opt_beta_g
-            .step(&mut self.beta_g, &param_grads[idx + 2], lr);
+        self.opt_alpha_g.step(&mut self.alpha_g, &param_grads[idx + 1], lr);
+        self.opt_beta_g.step(&mut self.beta_g, &param_grads[idx + 2], lr);
         idx += 3;
-        // [LEARN] update gate polynomial weights via SGD
+        // update Richards curve parameters via Adam
         {
             let grad_gate_poly = &param_grads[idx];
-            for i in 0..self.gate_poly.weights.len() {
-                self.gate_poly.weights[i] -= (lr as f64) * (grad_gate_poly[[0, i]] as f64);
-            }
+            let grad_gate_vec: Vec<f64> = grad_gate_poly.iter().map(|&x| x as f64).collect();
+            self.gate_poly.step(&grad_gate_vec, lr as f64);
         }
         idx += 1;
+
+        if self.use_learned_threshold {
+            if let (Some(wt), Some(opt)) = (&mut self.w_tau, &mut self.opt_w_tau) {
+                opt.step(wt, &param_grads[idx], lr);
+            }
+            if let (Some(at), Some(opt)) = (&mut self.alpha_tau, &mut self.opt_alpha_tau) {
+                opt.step(at, &param_grads[idx + 1], lr);
+            }
+            if let (Some(bt), Some(opt)) = (&mut self.beta_tau, &mut self.opt_beta_tau) {
+                opt.step(bt, &param_grads[idx + 2], lr);
+            }
+            idx += 3;
+        }
         if self.use_cope {
             if let (Some(pe), Some(opt)) = (
                 self.cope_pos_embeddings.as_mut(),
@@ -997,11 +981,90 @@ impl PolyAttention {
             + self.w_g.len()
             + self.alpha_g.len()
             + self.beta_g.len()
-            + self.gate_poly.weights.len();
+            + self.gate_poly.weights().len();
         if self.use_cope {
             total += (self.cope_max_pos + 1) * self.head_dim;
         }
+        if self.use_learned_threshold {
+            total += self.embed_dim + 1 + 1; // w_tau + alpha_tau + beta_tau
+        }
         total
+    }
+
+    // Initialize or ensure learned threshold predictor parameters
+    fn ensure_threshold_predictor(&mut self) {
+        if self.w_tau.is_none() {
+            let std_tau = (2.0f32 / self.embed_dim as f32).sqrt();
+            let normal_tau = Normal::new(0.0, std_tau).unwrap();
+            let mut rng = rand::rng();
+            let wtau = Array2::<f32>::from_shape_fn((self.embed_dim, 1), |_| normal_tau.sample(&mut rng));
+            self.w_tau = Some(wtau);
+            self.opt_w_tau = Some(Adam::new((self.embed_dim, 1)));
+        }
+        if self.alpha_tau.is_none() {
+            self.alpha_tau = Some(Array2::<f32>::from_shape_vec((1, 1), vec![1.0]).unwrap());
+            self.opt_alpha_tau = Some(Adam::new((1, 1)));
+        }
+        if self.beta_tau.is_none() {
+            self.beta_tau = Some(Array2::<f32>::from_shape_vec((1, 1), vec![0.0]).unwrap());
+            self.opt_beta_tau = Some(Adam::new((1, 1)));
+        }
+    }
+
+    pub fn set_head_selection_config(&mut self, strategy: &HeadSelectionStrategy) {
+        match strategy {
+            HeadSelectionStrategy::FullyAdaptiveMoH { min_heads, max_heads, complexity_loss_weight, load_balance_weight, sparsity_weight } => {
+                self.use_learned_threshold = true;
+                self.min_heads = *min_heads as usize;
+                self.max_heads = *max_heads as usize;
+                self.complexity_loss_weight = *complexity_loss_weight;
+                self.load_balance_weight = *load_balance_weight;
+                self.sparsity_weight = *sparsity_weight;
+                self.ensure_threshold_predictor();
+            }
+        }
+        // reset metrics whenever strategy changes
+        for h in 0..self.num_heads {
+            self.metrics_active_sum_per_head[h] = 0.0;
+            self.metrics_token_count_per_head[h] = 0;
+        }
+    }
+
+    pub fn get_head_metrics_and_reset(&mut self) -> Vec<(f32, usize)> {
+        let mut res = Vec::with_capacity(self.num_heads);
+        for h in 0..self.num_heads {
+            let tokens = self.metrics_token_count_per_head[h];
+            let avg = if tokens > 0 {
+                self.metrics_active_sum_per_head[h] / tokens as f32
+            } else { 0.0 };
+            res.push((avg, tokens));
+            self.metrics_active_sum_per_head[h] = 0.0;
+            self.metrics_token_count_per_head[h] = 0;
+        }
+        res
+    }
+
+    pub fn take_tau_metrics(&mut self) -> Option<(f32, f32)> {
+        if self.metrics_tau_count > 0 {
+            let min = self.metrics_tau_min;
+            let max = self.metrics_tau_max;
+            self.metrics_tau_min = f32::INFINITY;
+            self.metrics_tau_max = f32::NEG_INFINITY;
+            self.metrics_tau_sum = 0.0;
+            self.metrics_tau_count = 0;
+            Some((min, max))
+        } else {
+            None
+        }
+    }
+
+    pub fn take_pred_norm(&mut self) -> Option<f32> {
+        if self.metrics_g_count > 0 {
+            let rms = (self.metrics_g_sq_sum / self.metrics_g_count as f32).sqrt();
+            self.metrics_g_sq_sum = 0.0;
+            self.metrics_g_count = 0;
+            Some(rms)
+        } else { None }
     }
 }
 
@@ -1020,7 +1083,7 @@ impl Layer for PolyAttention {
         _input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        <PolyAttention>::compute_gradients(self, _input, output_grads)
+        PolyAttention::compute_gradients(self, _input, output_grads)
     }
 
     fn apply_gradients(
@@ -1028,14 +1091,14 @@ impl Layer for PolyAttention {
         param_grads: &[Array2<f32>],
         lr: f32,
     ) -> crate::errors::Result<()> {
-        <PolyAttention>::apply_gradients(self, param_grads, lr)
+        PolyAttention::apply_gradients(self, param_grads, lr)
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        <PolyAttention>::backward(self, grads, lr)
+        PolyAttention::backward(self, grads, lr)
     }
 
     fn parameters(&self) -> usize {
-        <PolyAttention>::parameters(self)
+        PolyAttention::parameters(self)
     }
 }

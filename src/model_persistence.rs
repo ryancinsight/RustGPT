@@ -288,7 +288,7 @@ impl LLM {
     fn get_embedding_dim(&self) -> usize {
         // Extract from first embeddings layer
         for layer in &self.network {
-            if let crate::llm::LayerEnum::Embeddings(emb) = layer {
+            if let crate::llm::LayerEnum::TokenEmbeddings(emb) = layer {
                 // Get embedding dimension from token_embeddings shape
                 return emb.token_embeddings.shape()[1];
             }

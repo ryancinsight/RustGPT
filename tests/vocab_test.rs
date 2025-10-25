@@ -23,10 +23,10 @@ fn test_vocab_encode_decode() {
     assert!(!vocab.contains("unknown"));
 
     // Test batch operations
-    let batch_encode = vocab.encode_batch(&["hello", "world", "unknown"]);
+    let batch_encode: Vec<_> = vocab.encode_batch(&["hello", "world", "unknown"]).collect();
     assert_eq!(batch_encode, vec![Some(0), Some(1), None]);
 
-    let batch_decode = vocab.decode_batch(vec![0, 1, 999]);
+    let batch_decode: Vec<_> = vocab.decode_batch(vec![0, 1, 999]).collect();
     assert_eq!(batch_decode, vec![Some("hello"), Some("world"), None]);
 
     // Test iterator

@@ -83,6 +83,16 @@ impl Adam {
         self.use_decoupled_wd = decoupled;
     }
 
+    /// Reset optimizer state (useful for restarting training)
+    pub fn reset(&mut self) {
+        self.timestep = 0;
+        self.m.fill(0.0);
+        self.v.fill(0.0);
+        if let Some(ref mut v_hat_max) = self.v_hat_max {
+            v_hat_max.fill(0.0);
+        }
+    }
+
     #[inline]
     pub fn step(&mut self, params: &mut Array2<f32>, grads: &Array2<f32>, lr: f32) {
         self.timestep += 1;

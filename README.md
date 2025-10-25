@@ -319,14 +319,14 @@ Contributions are welcome! This project is perfect for learning and experimentat
 
 ### Areas for Improvement
 
-- **Advanced architectures** (multi-head attention, positional encoding, RoPE)
+- **Advanced architectures** (multi-head attention, positional encoding, CoPE)
 - **Training improvements** (different optimizers, learning rate schedules, regularization)
 - **Data handling** (larger datasets, tokenizer improvements, streaming)
 - **Model analysis** (attention visualization, gradient analysis, interpretability)
 
 ### Areas for Improvement
 
-- **Advanced architectures** (multi-head attention, positional encoding, RoPE)
+- **Advanced architectures** (multi-head attention, positional encoding, CoPE)
 - **Training improvements** (different optimizers, learning rate schedules, regularization)
 - **Data handling** (larger datasets, tokenizer improvements, streaming)
 - **Model analysis** (attention visualization, gradient analysis, interpretability)
