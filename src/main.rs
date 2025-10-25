@@ -417,6 +417,12 @@ fn main() -> llm::Result<()> {
         64,
     )?;
 
+    // Save trained model to disk for inference
+    std::fs::create_dir_all("models").ok();
+    let save_path = "models/rustgpt.bin";
+    llm.save_versioned(save_path, Some("RustGPT trained model".to_string()))?;
+    println!("Saved model to {}", save_path);
+
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", string);
     let result = llm.predict(&string);
