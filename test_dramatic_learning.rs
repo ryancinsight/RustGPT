@@ -16,8 +16,8 @@ fn main() {
             curve.k.unwrap_or(1.0),
             curve.m.unwrap_or(0.0),
             curve.beta.unwrap_or(1.0),
-            curve.a.unwrap_or(1.0),
-            curve.b.unwrap_or(0.0),
+            curve.output_gain.unwrap_or(1.0),
+            curve.output_bias.unwrap_or(0.0),
             curve.scale.unwrap_or(1.0),
             curve.shift.unwrap_or(0.0),
         ]
@@ -122,11 +122,11 @@ fn main() {
     // Verify a,b coefficient behavior
     println!("5. Richards Coefficients (a,b) Analysis:");
     println!("  Sigmoid a,b: {:.6}, {:.6} (should remain 1.0, 0.0)", 
-             sigmoid_curve.a.unwrap_or(1.0), sigmoid_curve.b.unwrap_or(0.0));
+             sigmoid_curve.output_gain.unwrap_or(1.0), sigmoid_curve.output_bias.unwrap_or(0.0));
     println!("  None a,b: {:.6}, {:.6} (should change dramatically)", 
-             none_curve.a.unwrap_or(1.0), none_curve.b.unwrap_or(0.0));
+             none_curve.output_gain.unwrap_or(1.0), none_curve.output_bias.unwrap_or(0.0));
     println!("  Fully learnable a,b: {:.6}, {:.6} (should change dramatically)", 
-             fully_learnable_curve.a.unwrap_or(1.0), fully_learnable_curve.b.unwrap_or(0.0));
+             fully_learnable_curve.output_gain.unwrap_or(1.0), fully_learnable_curve.output_bias.unwrap_or(0.0));
 
     // Verify equivalence between None and fully_learnable
     let none_vs_fully_diff: f64 = none_final.iter()

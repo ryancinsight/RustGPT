@@ -1,18 +1,32 @@
-/// Decoding strategies for language model inference
-///
-/// This module provides various decoding algorithms for generating text from language models:
-/// - Speculative decoding: Fast parallel decoding using single-model speculation
-/// - Speculative beam search: Combines beam search quality with speculative speed (zero overhead)
-/// - Greedy decoding: Simple argmax token selection
-/// - Beam search: Multi-hypothesis search for higher quality generation
+//! # Decoding Module
+//!
+//! This module provides text decoding functionality for the RustGPT language model,
+//! organized with clear separation of concerns and hierarchical structure.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! decoding/
+//! ├── mod.rs              # Main module exports and coordination
+//! ├── greedy.rs           # Greedy decoding implementation
+//! └── autodeco.rs         # AutoDeco advanced decoding system
+//! ```
+//!
+//! ## Key Components
+//!
+//! - **GreedyDecoder**: Simple greedy token selection
+//! - **AutoDeco**: Advanced end-to-end decoding with learned parameters
+//!
+//! ## Design Principles
+//!
+//! - **Separation of Concerns**: Each submodule handles one decoding strategy
+//! - **Hierarchical Organization**: Clear dependency structure
+//! - **Performance-Oriented**: Zero-cost abstractions where possible
+//! - **Extensible Design**: Easy to add new decoding methods
 
-pub mod speculative;
-pub mod speculative_beam;
 pub mod greedy;
-pub mod beam_search;
+pub mod autodeco;
 
-// Re-export main types
-pub use speculative::SpeculativeDecoder;
-pub use speculative_beam::SpeculativeBeamDecoder;
+// Re-export main types for convenience
 pub use greedy::GreedyDecoder;
-pub use beam_search::BeamSearchDecoder;
+pub use autodeco::{AutoDeco, AutoDecoConfig, TemperatureHead, TopPHead};

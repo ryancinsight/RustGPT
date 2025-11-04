@@ -1,5 +1,5 @@
 use crate::{
-    dynamic_tanh_norm::DynamicTanhNorm,
+    richards::RichardsNorm,
     embeddings::TokenEmbeddings,
     // feed_forward::FeedForward, // Removed: using SwiGLU exclusively
     llm::{Layer, LayerEnum},
@@ -7,8 +7,8 @@ use crate::{
     output_projection::OutputProjection,
     poly_attention::PolyAttention,
     swiglu::SwiGLU,
-    vocab::Vocab,
 };
+use crate::encoding::Vocab;
 
 /// Build a network based on the provided configuration
 ///
@@ -57,7 +57,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 
     for _layer_idx in 0..config.num_layers {
         // Pre-Attention normalization (Pre-LN)
-        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
 
         // PolyAttention block with CoPE enabled; derive max_pos from window settings
         let effective_window = if config.use_adaptive_window {
@@ -79,7 +79,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         layers.push(LayerEnum::PolyAttention(Box::new(poly)));
 
         // Pre-FFN normalization (Pre-LN)
-        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
 
         // Feedforward layer (SwiGLU only)
         let swiglu = SwiGLU::new(
@@ -95,7 +95,7 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         Some(LayerEnum::DynamicTanhNorm(_))
     );
     if !last_is_norm {
-        layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(config.embedding_dim)));
+        layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
     }
 }
 
@@ -143,7 +143,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
         AttentionType::PolyAttention { degree_p } => {
             println!("  ✓ Polynomial Attention (p = {})", degree_p);
             println!("    - Grouped-query heads: {}", config.get_num_heads());
-            println!("    - Sliding window: {}", config.window_size.map(|w| w.to_string()).unwrap_or_else(|| "disabled".to_string()));
+            println!("    - Sliding window: {}", config.window_size.map(|w: usize| w.to_string()).unwrap_or_else(|| "disabled".to_string()));
         }
         AttentionType::SelfAttention => {
             println!("  ✓ Scaled Dot-Product Self-Attention");

@@ -105,15 +105,15 @@ fn main() {
     // Analyze Richards coefficients specifically
     println!("6. Richards Coefficients Analysis:");
     println!("  Sigmoid a,b: {:.6}, {:.6} (fixed)", 
-             poly_sigmoid.gate_poly.a.unwrap_or(1.0), 
-             poly_sigmoid.gate_poly.b.unwrap_or(0.0));
+             poly_sigmoid.gate_poly.output_gain.unwrap_or(1.0),
+             poly_sigmoid.gate_poly.output_bias.unwrap_or(0.0));
     println!("  None a,b: {:.6}, {:.6} (learnable)", 
-             poly_none.gate_poly.a.unwrap_or(1.0), 
-             poly_none.gate_poly.b.unwrap_or(0.0));
+             poly_none.gate_poly.output_gain.unwrap_or(1.0),
+             poly_none.gate_poly.output_bias.unwrap_or(0.0));
     
     // Check if a,b changed for None variant
-    let none_a_changed = (poly_none.gate_poly.a.unwrap_or(1.0) - 1.0).abs() > 1e-6;
-    let none_b_changed = (poly_none.gate_poly.b.unwrap_or(0.0) - 0.0).abs() > 1e-6;
+    let none_a_changed = (poly_none.gate_poly.output_gain.unwrap_or(1.0) - 1.0).abs() > 1e-6;
+    let none_b_changed = (poly_none.gate_poly.output_bias.unwrap_or(0.0) - 0.0).abs() > 1e-6;
     
     println!("  None variant a changed: {}", none_a_changed);
     println!("  None variant b changed: {}", none_b_changed);

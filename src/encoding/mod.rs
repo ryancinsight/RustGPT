@@ -9,15 +9,13 @@
 //! encoding/
 //! ├── mod.rs              # Main module exports and coordination
 //! ├── tokenizer.rs        # Core tokenization algorithms (SimpleTokenizer)
-//! ├── vocabulary.rs       # Vocabulary management and token-ID mapping
-//! └── word_level.rs       # Word-level tokenization utilities
+//! └── vocabulary.rs       # Vocabulary management and token-ID mapping
 //! ```
 //!
 //! ## Key Components
 //!
 //! - **Tokenizer**: Converts raw text into token sequences
 //! - **Vocabulary**: Manages bidirectional mapping between tokens and IDs
-//! - **Word-Level Utils**: Helper functions for word-level processing
 //!
 //! ## Design Principles
 //!
@@ -28,11 +26,8 @@
 
 pub mod tokenizer;
 pub mod vocabulary;
-pub mod word_level;
 
 // Re-export main types for convenience
 pub use tokenizer::SimpleTokenizer;
 pub use vocabulary::Vocab;
 
-// Re-export utility functions that might be commonly used
-pub use word_level::{tokenize_word_level, extract_vocab_from_texts};

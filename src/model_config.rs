@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::mixtures::moh::HeadSelectionStrategy;
 
 /// Architecture type for model configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,29 +30,6 @@ pub enum WindowAdaptationStrategy {
     PerplexityBased,
 }
 
-/// Strategy for selecting which attention heads to activate
-///
-/// Implements Mixture-of-Heads (MoH) for dynamic head selection per token.
-/// Based on "MoH: Multi-Head Attention as Mixture-of-Head Attention" (Skywork AI, 2024).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HeadSelectionStrategy {
-    /// Fully Adaptive Mixture-of-Heads: complexity-aware dynamic head selection
-    ///
-    /// This is the only supported strategy. All heads are candidates and the number
-    /// of active heads per token is determined by learned predictors.
-    FullyAdaptiveMoH {
-        /// Minimum number of heads to activate (safety constraint)
-        min_heads: usize,
-        /// Maximum number of heads to activate (efficiency constraint)
-        max_heads: usize,
-        /// Weight for load balance loss (prevents routing collapse)
-        load_balance_weight: f32,
-        /// Weight for complexity alignment loss (aligns head usage with predicted complexity)
-        complexity_loss_weight: f32,
-        /// Weight for sparsity loss (encourages minimal head usage)
-        sparsity_weight: f32,
-    },
-}
 
 /// Attention mechanism selection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,3 +223,4 @@ impl ModelConfig {
         }
     }
 }
+

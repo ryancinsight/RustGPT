@@ -134,20 +134,57 @@ impl Vocab {
         vec!["hello", "world", "this", "is", "rust", "</s>"]
     }
 
-    /// Convenience: build a Vocab from a text stream
-    pub fn build_from_stream<I, S>(texts: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let vocab_words = super::tokenizer::SimpleTokenizer::extract_vocab_from_texts(texts);
-        Vocab::new(vocab_words)
-    }
 
     /// Tokenize text using simple word-level tokenization
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         let tokenizer = super::tokenizer::SimpleTokenizer::new();
         tokenizer.tokenize(text, self)
+    }
+
+
+    /// Build vocabulary from a stream of texts
+    /// This is the primary method for creating vocabularies from training data
+    pub fn build_from_texts<I, S>(texts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut vocab_set = std::collections::HashSet::new();
+
+        // Always include special tokens
+        vocab_set.insert("</s>".to_string());
+        vocab_set.insert("<unk>".to_string());
+
+        // Process each text to extract tokens
+        for text in texts {
+            Self::process_text_tokens(text.as_ref(), &mut vocab_set);
+        }
+
+        // Convert to sorted vector for deterministic ordering
+        let mut vocab_words: Vec<String> = vocab_set.into_iter().collect();
+        vocab_words.sort();
+
+        Self::new(vocab_words.iter().map(|s| s.as_str()))
+    }
+
+    /// Process a single text to extract tokens and add them to the vocabulary set
+    fn process_text_tokens(text: &str, vocab_set: &mut std::collections::HashSet<String>) {
+        for word in text.split_whitespace() {
+            // Split on punctuation and collect all parts
+            let tokens = word
+                .split(|c: char| c.is_ascii_punctuation())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .chain(
+                    word.chars()
+                        .filter(|c| c.is_ascii_punctuation())
+                        .map(|c| c.to_string())
+                );
+
+            for token in tokens {
+                vocab_set.insert(token);
+            }
+        }
     }
 }
 
