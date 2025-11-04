@@ -1,1 +1,10 @@
 /target
+
+# Model files
+models/*.bin
+models/*.ckpt
+models/*.pth
+models/*.h5
+models/*.pb
+models/*.onnx
+*.bin
