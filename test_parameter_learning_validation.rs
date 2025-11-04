@@ -26,16 +26,16 @@ fn main() {
     
     // 2. Coefficient Values Verification
     println!("2. Coefficient Values Verification:");
-    println!("  Sigmoid learnable - a: {:?}, b: {:?}", sigmoid_learnable.a, sigmoid_learnable.b);
-    println!("  None variant - a: {:?}, b: {:?}", none_variant.a, none_variant.b);
-    println!("  Tanh learnable - a: {:?}, b: {:?}", tanh_learnable.a, tanh_learnable.b);
+    println!("  Sigmoid learnable - output_gain: {:?}, output_bias: {:?}", sigmoid_learnable.output_gain, sigmoid_learnable.output_bias);
+    println!("  None variant - output_gain: {:?}, output_bias: {:?}", none_variant.output_gain, none_variant.output_bias);
+    println!("  Tanh learnable - output_gain: {:?}, output_bias: {:?}", tanh_learnable.output_gain, tanh_learnable.output_bias);
     
-    assert_eq!(sigmoid_learnable.a, Some(1.0), "Sigmoid should have a=1.0 fixed");
-    assert_eq!(sigmoid_learnable.b, Some(0.0), "Sigmoid should have b=0.0 fixed");
-    assert_eq!(none_variant.a, None, "None variant should have a=None (learnable)");
-    assert_eq!(none_variant.b, None, "None variant should have b=None (learnable)");
-    assert_eq!(tanh_learnable.a, Some(1.0), "Tanh should have a=1.0 fixed");
-    assert_eq!(tanh_learnable.b, Some(0.0), "Tanh should have b=0.0 fixed");
+    assert_eq!(sigmoid_learnable.output_gain, Some(1.0), "Sigmoid should have output_gain=1.0 fixed");
+    assert_eq!(sigmoid_learnable.output_bias, Some(0.0), "Sigmoid should have output_bias=0.0 fixed");
+    assert_eq!(none_variant.output_gain, None, "None variant should have output_gain=None (learnable)");
+    assert_eq!(none_variant.output_bias, None, "None variant should have output_bias=None (learnable)");
+    assert_eq!(tanh_learnable.output_gain, Some(1.0), "Tanh should have output_gain=1.0 fixed");
+    assert_eq!(tanh_learnable.output_bias, Some(0.0), "Tanh should have output_bias=0.0 fixed");
     println!("  ✅ Coefficient constraints verified!\n");
     
     // 3. Learning Simulation - Track actual parameter values
@@ -49,8 +49,8 @@ fn main() {
             curve.k.unwrap_or(1.0), 
             curve.m.unwrap_or(0.0),
             curve.beta.unwrap_or(1.0),
-            curve.a.unwrap_or(1.0),
-            curve.b.unwrap_or(0.0),
+            curve.output_gain.unwrap_or(1.0),
+            curve.output_bias.unwrap_or(0.0),
             curve.scale.unwrap_or(1.0),
             curve.shift.unwrap_or(0.0),
         ]

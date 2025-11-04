@@ -210,20 +210,34 @@ impl Layer for SwiGLU {
         // Parameter gradients vector
         let mut param_grads = vec![grad_w1, grad_w2, grad_w_out];
 
-        // Compute RichardsActivation/RichardsCurve gradients (scalar version for now)
+        // Compute RichardsActivation/RichardsCurve gradients
+        // For Richards layers, we need to accumulate gradients across all input elements
         let mut swish_grads_sum = Array2::<f32>::zeros((1, self.swish_activation.weights().len()));
         let mut gate_grads_sum = Array2::<f32>::zeros((1, self.gate_curve.weights().len()));
-        
-        for (i, (x1_row, x2_row)) in x1.outer_iter().zip(x2.outer_iter()).enumerate() {
-            for (j, (&x1_val, &x2_val)) in x1_row.iter().zip(x2_row.iter()).enumerate() {
-                let swish_grads = self.swish_activation.grad_weights_scalar(x1_val as f64, grad_swish[[i, j]] as f64);
-                let gate_grads = self.gate_curve.grad_weights_scalar(x2_val as f64, grad_gate_sigma[[i, j]] as f64);
-                
-                for (k, &grad) in swish_grads.iter().enumerate() {
-                    swish_grads_sum[[0, k]] += grad as f32;
+
+
+        // Accumulate gradients for swish_activation (x * Richards(x))
+        for (i, x1_row) in x1.outer_iter().enumerate() {
+            for (j, &x1_val) in x1_row.iter().enumerate() {
+                let grad_output = grad_swish[[i, j]] as f64;
+                if grad_output != 0.0 {
+                    let swish_grads = self.swish_activation.richards_curve.grad_weights_scalar(x1_val as f64, grad_output);
+                    for (k, &grad) in swish_grads.iter().enumerate() {
+                        swish_grads_sum[[0, k]] += grad as f32;
+                    }
                 }
-                for (k, &grad) in gate_grads.iter().enumerate() {
-                    gate_grads_sum[[0, k]] += grad as f32;
+            }
+        }
+
+        // Accumulate gradients for gate_curve (sigmoid)
+        for (i, x2_row) in x2.outer_iter().enumerate() {
+            for (j, &x2_val) in x2_row.iter().enumerate() {
+                let grad_output = grad_gate_sigma[[i, j]] as f64;
+                if grad_output != 0.0 {
+                    let gate_grads = self.gate_curve.grad_weights_scalar(x2_val as f64, grad_output);
+                    for (k, &grad) in gate_grads.iter().enumerate() {
+                        gate_grads_sum[[0, k]] += grad as f32;
+                    }
                 }
             }
         }
@@ -253,7 +267,7 @@ impl Layer for SwiGLU {
         // Update RichardsActivation weights
         let grad_swish_vec: Vec<f64> = param_grads[3].iter().map(|&x| x as f64).collect();
         self.swish_activation.step(&grad_swish_vec, lr as f64);
-        
+
         // Update RichardsCurve weights
         let grad_gate_vec: Vec<f64> = param_grads[4].iter().map(|&x| x as f64).collect();
         self.gate_curve.step(&grad_gate_vec, lr as f64);

@@ -29,10 +29,10 @@ fn main() {
     println!("Sigmoid variant output: {}", sigmoid_output);
     
     // Test 5: Verify parameter structure - None should have a,b as None (learnable)
-    println!("None variant a parameter: {:?}", none_variant.a);
-    println!("None variant b parameter: {:?}", none_variant.b);
-    assert!(none_variant.a.is_none(), "None variant should have learnable a parameter");
-    assert!(none_variant.b.is_none(), "None variant should have learnable b parameter");
+    println!("None variant output_gain parameter: {:?}", none_variant.output_gain);
+    println!("None variant output_bias parameter: {:?}", none_variant.output_bias);
+    assert!(none_variant.output_gain.is_none(), "None variant should have learnable output_gain parameter");
+    assert!(none_variant.output_bias.is_none(), "None variant should have learnable output_bias parameter");
     
     // Test 6: Compare with constrained variants
     let sigmoid_constrained = RichardsCurve::new_learnable(Variant::Sigmoid);
@@ -40,10 +40,10 @@ fn main() {
     println!("Sigmoid variant parameter count: {}", sigmoid_weights.len());
     assert_eq!(sigmoid_weights.len(), 6, "Sigmoid variant should have 6 learnable parameters");
     
-    println!("Sigmoid variant a parameter: {:?}", sigmoid_constrained.a);
-    println!("Sigmoid variant b parameter: {:?}", sigmoid_constrained.b);
-    assert!(sigmoid_constrained.a.is_some(), "Sigmoid variant should have fixed a parameter");
-    assert!(sigmoid_constrained.b.is_some(), "Sigmoid variant should have fixed b parameter");
+    println!("Sigmoid variant output_gain parameter: {:?}", sigmoid_constrained.output_gain);
+    println!("Sigmoid variant output_bias parameter: {:?}", sigmoid_constrained.output_bias);
+    assert!(sigmoid_constrained.output_gain.is_some(), "Sigmoid variant should have fixed output_gain parameter");
+    assert!(sigmoid_constrained.output_bias.is_some(), "Sigmoid variant should have fixed output_bias parameter");
     
     println!("✅ All None variant tests passed!");
 }

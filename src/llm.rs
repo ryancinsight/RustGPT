@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, fs};
+use std::fs;
 
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
@@ -7,6 +7,7 @@ use tracing::{info, instrument};
 
 use crate::{
     MAX_SEQ_LEN, Vocab,
+    decoding::GreedyDecoder,
     embeddings::TokenEmbeddings,
     errors::{ModelError, Result},
     output_projection::OutputProjection,
@@ -19,7 +20,7 @@ pub enum LayerEnum {
     // Removed FeedForward variant; SwiGLU is the only FFN
     SwiGLU(Box<crate::swiglu::SwiGLU>),
 
-    DynamicTanhNorm(crate::dynamic_tanh_norm::DynamicTanhNorm),
+    DynamicTanhNorm(crate::richards::RichardsNorm),
     OutputProjection(OutputProjection),
 
     // Removed TRMBlock variant
@@ -150,6 +151,7 @@ pub trait Layer {
 pub struct LLM {
     pub vocab: Vocab,
     pub network: Vec<LayerEnum>,
+    decoder: GreedyDecoder,
 }
 
 impl std::fmt::Debug for LLM {
@@ -169,13 +171,13 @@ impl Default for LLM {
         let vocab = Vocab::default();
         let network = build_network(&config, &vocab);
 
-        Self { vocab, network }
+        Self { vocab, network, decoder: GreedyDecoder::new() }
     }
 }
 
 impl LLM {
     pub fn new(vocab: Vocab, network: Vec<LayerEnum>) -> Self {
-        Self { vocab, network }
+        Self { vocab, network, decoder: GreedyDecoder::new() }
     }
 }
 
@@ -276,7 +278,7 @@ impl LLM {
             let probs = Self::softmax(&last_logit); // 1 x vocab_size
 
             // Greedy Decode - Choose the highest probability token for each position
-            let tokens = Self::greedy_decode(&probs);
+            let tokens = self.decoder.decode(&probs);
 
             let next_token = tokens[tokens.len() - 1];
 
@@ -590,8 +592,31 @@ impl LLM {
                     .map(|grad| grad / batch.len() as f32)
                     .collect();
 
+                // Apply global gradient clipping to prevent numerical instability
+                const MAX_TOTAL_GRAD_NORM: f32 = 100.0; // Maximum total gradient norm across all parameters
+                let mut total_layer_grad_norm_sq = 0.0;
+
+                // First pass: compute total gradient norm for this layer
+                for grad in &averaged_grads {
+                    total_layer_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
+                }
+                let total_layer_grad_norm = total_layer_grad_norm_sq.sqrt();
+
+                // Second pass: clip if needed
+                let scale = if total_layer_grad_norm > MAX_TOTAL_GRAD_NORM {
+                    MAX_TOTAL_GRAD_NORM / total_layer_grad_norm
+                } else {
+                    1.0
+                };
+
+                let clipped_grads: Vec<Array2<f32>> = if scale < 1.0 {
+                    averaged_grads.into_iter().map(|grad| grad.mapv(|x| x * scale)).collect()
+                } else {
+                    averaged_grads
+                };
+
                 // Detect gradient anomalies (poisoning/training instability)
-                if let Err(e) = self.detect_gradient_anomalies(&averaged_grads) {
+                if let Err(e) = self.detect_gradient_anomalies(&clipped_grads) {
                     tracing::error!(
                         layer_idx = layer_idx,
                         layer_type = self.network[layer_idx].layer_type(),
@@ -600,12 +625,12 @@ impl LLM {
                     return Err(e);
                 }
 
-                // Compute L2 norm of gradients for this layer
-                for grad in &averaged_grads {
+                // Compute L2 norm of gradients for this layer (after clipping)
+                for grad in &clipped_grads {
                     total_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
                 }
 
-                averaged_grads_per_layer.push(averaged_grads);
+                averaged_grads_per_layer.push(clipped_grads);
             } else {
                 averaged_grads_per_layer.push(Vec::new());
             }
@@ -635,14 +660,14 @@ impl LLM {
             .collect();
 
         // Apply gradients with computed adaptive learning rates
-        for ((layer, averaged_grads), adaptive_lr) in self
+        for ((layer, grads), adaptive_lr) in self
             .network
             .iter_mut()
             .zip(averaged_grads_per_layer)
             .zip(adaptive_lrs)
         {
-            if !averaged_grads.is_empty() {
-                layer.apply_gradients(&averaged_grads, adaptive_lr)?;
+            if !grads.is_empty() {
+                layer.apply_gradients(&grads, adaptive_lr)?;
             }
         }
 
@@ -735,8 +760,13 @@ impl LLM {
             }
 
             // Check for NaN/Inf values
-            if grad.iter().any(|&x| !x.is_finite()) {
-                tracing::error!("Non-finite gradients detected in layer {}", i);
+            let nan_count = grad.iter().filter(|&x| x.is_nan()).count();
+            let inf_count = grad.iter().filter(|&x| x.is_infinite()).count();
+            if nan_count > 0 || inf_count > 0 {
+                tracing::error!("Non-finite gradients detected in layer {}: {} NaN, {} Inf values", i, nan_count, inf_count);
+                // Log some sample values for debugging
+                let first_10: Vec<f32> = grad.iter().take(10).cloned().collect();
+                tracing::error!("First 10 gradient values: {:?}", first_10);
                 return Err(ModelError::GradientError {
                     message: format!("Non-finite gradients detected in layer {}", i),
                 });
@@ -747,60 +777,7 @@ impl LLM {
 
     #[inline]
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
-        // Input validation
-        let safe_text = if text.len() > crate::MAX_INPUT_LENGTH {
-            tracing::warn!(
-                "Input text length {} exceeds maximum allowed length {}, truncating",
-                text.len(),
-                crate::MAX_INPUT_LENGTH
-            );
-            &text[..crate::MAX_INPUT_LENGTH.min(text.len())]
-        } else {
-            text
-        };
-
-        // Split by whitespace first
-        let mut tokens = Vec::new();
-
-        for word in safe_text.split_whitespace() {
-            // Special case for end token
-            if word == "</s>" {
-                if let Some(token_id) = self.vocab.encode(word) {
-                    tokens.push(token_id);
-                }
-                continue;
-            }
-
-            let mut current_word = String::new();
-
-            for c in word.chars() {
-                if c.is_ascii_punctuation() {
-                    // If we have a word before the punctuation, add it
-                    if !current_word.is_empty() {
-                        if let Some(token_id) = self.vocab.encode(&current_word) {
-                            tokens.push(token_id);
-                        }
-                        current_word.clear();
-                    }
-
-                    // Add the punctuation as its own token
-                    if let Some(token_id) = self.vocab.encode(&c.to_string()) {
-                        tokens.push(token_id);
-                    }
-                } else {
-                    current_word.push(c);
-                }
-            }
-
-            // Add any remaining word
-            if !current_word.is_empty()
-                && let Some(token_id) = self.vocab.encode(&current_word)
-            {
-                tokens.push(token_id);
-            }
-        }
-
-        tokens
+        self.vocab.tokenize(text)
     }
 
     #[inline]
@@ -823,18 +800,6 @@ impl LLM {
         result
     }
 
-    #[inline]
-    fn greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
-        probs
-            .map_axis(Axis(1), |row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                    .map(|(index, _)| index)
-                    .unwrap()
-            })
-            .to_vec()
-    }
 
     #[inline]
     fn cross_entropy_loss_step(probs: &Array2<f32>, target: &[usize]) -> f32 {

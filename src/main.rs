@@ -349,16 +349,12 @@ fn main() -> llm::Result<()> {
         DatasetType::JSON,
     )?;
 
-    // Extract all unique words from training data to create vocabulary
-    let mut vocab_set = std::collections::HashSet::new();
+    // Build vocabulary from training data
+    let all_texts = dataset.pretraining_data.iter()
+        .chain(dataset.chat_training_data.iter())
+        .cloned();
 
-    // Process all training examples for vocabulary
-    Vocab::process_text_for_vocab(&dataset.pretraining_data, &mut vocab_set);
-    Vocab::process_text_for_vocab(&dataset.chat_training_data, &mut vocab_set);
-
-    let mut vocab_words: Vec<String> = vocab_set.into_iter().collect();
-    vocab_words.sort(); // Sort for deterministic ordering
-    let vocab = Vocab::new(vocab_words);
+    let vocab = Vocab::build_from_texts(all_texts);
 
     // Build network based on configuration
     let network = build_network(&config, &vocab);
