@@ -41,11 +41,11 @@ pub struct AutoDecoConfig {
 impl Default for AutoDecoConfig {
     fn default() -> Self {
         Self {
-            head_hidden_dim: 128,
-            temp_range: (0.1, 2.0),
-            top_p_range: (0.1, 1.0),
-            soft_top_p_alpha: 30.0,
-            enable_instruction_control: false,
+            head_hidden_dim: 256,  // Increased capacity for better learning
+            temp_range: (0.1, 3.0), // Wider temperature range for more diversity
+            top_p_range: (0.05, 0.95), // More aggressive top-p range
+            soft_top_p_alpha: 50.0, // Sharper top-p transitions
+            enable_instruction_control: false, // Not yet implemented
             instruction_control_weight: 0.1,
         }
     }
@@ -359,8 +359,8 @@ impl AutoDeco {
         }
     }
 
-    /// Get all parameters for gradient computation
-    pub fn parameters(&self) -> Vec<&Array2<f32>> {
+    /// Get all parameter tensors for gradient computation
+    pub fn parameter_tensors(&self) -> Vec<&Array2<f32>> {
         let mut params = self.temp_head.parameters();
         params.extend(self.top_p_head.parameters());
         params
@@ -385,6 +385,48 @@ impl AutoDeco {
         let mut biases = self.temp_head.biases_mut();
         biases.extend(self.top_p_head.biases_mut());
         biases
+    }
+}
+
+impl Layer for AutoDeco {
+    fn layer_type(&self) -> &str {
+        "AutoDeco"
+    }
+
+    fn forward(&mut self, _input: &Array2<f32>) -> Array2<f32> {
+        // AutoDeco doesn't transform the main network flow
+        // It operates on hidden states during decoding
+        panic!("AutoDeco should not be used in the main network forward pass")
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
+        // Pass gradients through unchanged
+        grads.clone()
+    }
+
+    fn parameters(&self) -> usize {
+        let mut count = 0;
+        for param in &self.parameter_tensors() {
+            count += param.len();
+        }
+        for bias in &self.biases() {
+            count += bias.len();
+        }
+        count
+    }
+
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        // AutoDeco gradients are computed during decoding, not in the main network
+        (Array2::zeros(_output_grads.raw_dim()), Vec::new())
+    }
+
+    fn apply_gradients(&mut self, _param_grads: &[Array2<f32>], _lr: f32) -> Result<(), crate::errors::ModelError> {
+        // AutoDeco gradients are applied during decoding
+        Ok(())
     }
 }
 

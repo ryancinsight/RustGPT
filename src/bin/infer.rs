@@ -27,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.model,
         MAX_SEQ_LEN
     );
+    println!("Network: {}", llm.network_description());
+    println!("Total parameters: {}", llm.total_parameters());
 
     // Single-shot generation if --prompt provided
     if let Some(p) = args.prompt {

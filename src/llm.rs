@@ -7,7 +7,7 @@ use tracing::{info, instrument};
 
 use crate::{
     MAX_SEQ_LEN, Vocab,
-    decoding::GreedyDecoder,
+    decoding::{AutoDeco, AutoDecoConfig, GreedyDecoder},
     embeddings::TokenEmbeddings,
     errors::{ModelError, Result},
     output_projection::OutputProjection,
@@ -146,12 +146,34 @@ pub trait Layer {
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()>;
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DecoderType {
+    Greedy(GreedyDecoder),
+    AutoDeco(AutoDeco),
+}
+
+impl DecoderType {
+    pub fn layer_type(&self) -> &str {
+        match self {
+            DecoderType::Greedy(_) => "GreedyDecoder",
+            DecoderType::AutoDeco(_) => "AutoDeco",
+        }
+    }
+
+    pub fn parameters(&self) -> usize {
+        match self {
+            DecoderType::Greedy(_) => 0, // Greedy has no parameters
+            DecoderType::AutoDeco(decoder) => decoder.parameters(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[allow(clippy::upper_case_acronyms)]
 pub struct LLM {
     pub vocab: Vocab,
     pub network: Vec<LayerEnum>,
-    decoder: GreedyDecoder,
+    decoder: DecoderType,
 }
 
 impl std::fmt::Debug for LLM {
@@ -171,19 +193,64 @@ impl Default for LLM {
         let vocab = Vocab::default();
         let network = build_network(&config, &vocab);
 
-        Self { vocab, network, decoder: GreedyDecoder::new() }
+        // Get embed_dim from the first layer (token embeddings)
+        let embed_dim = if let Some(LayerEnum::TokenEmbeddings(embed)) = network.first() {
+            embed.token_embeddings.shape()[1]
+        } else {
+            768 // fallback
+        };
+
+        let autodeco_config = AutoDecoConfig::default();
+        let decoder = DecoderType::AutoDeco(AutoDeco::new(embed_dim, autodeco_config));
+
+        Self { vocab, network, decoder }
     }
 }
 
 impl LLM {
     pub fn new(vocab: Vocab, network: Vec<LayerEnum>) -> Self {
-        Self { vocab, network, decoder: GreedyDecoder::new() }
+        // Get embed_dim from the first layer (token embeddings)
+        let embed_dim = if let Some(LayerEnum::TokenEmbeddings(embed)) = network.first() {
+            embed.token_embeddings.shape()[1]
+        } else {
+            768 // fallback
+        };
+
+        let autodeco_config = AutoDecoConfig::default();
+        let decoder = DecoderType::AutoDeco(AutoDeco::new(embed_dim, autodeco_config));
+
+        Self { vocab, network, decoder }
+    }
+
+    /// Create LLM with GreedyDecoder
+    pub fn with_greedy_decoder(vocab: Vocab, network: Vec<LayerEnum>) -> Self {
+        let decoder = DecoderType::Greedy(GreedyDecoder::new());
+        Self { vocab, network, decoder }
+    }
+
+    /// Switch to AutoDeco decoder
+    pub fn enable_autodeco(&mut self) {
+        let embed_dim = if let Some(LayerEnum::TokenEmbeddings(embed)) = self.network.first() {
+            embed.token_embeddings.shape()[1]
+        } else {
+            768 // fallback
+        };
+
+        let autodeco_config = AutoDecoConfig::default();
+        let decoder = DecoderType::AutoDeco(AutoDeco::new(embed_dim, autodeco_config));
+        self.decoder = decoder;
+    }
+
+    /// Switch to GreedyDecoder
+    pub fn enable_greedy(&mut self) {
+        let decoder = DecoderType::Greedy(GreedyDecoder::new());
+        self.decoder = decoder;
     }
 }
 
 impl LLM {
     pub fn network_description(&self) -> String {
-        self.network.iter().map(|layer| layer.layer_type()).fold(
+        let network_layers = self.network.iter().map(|layer| layer.layer_type()).fold(
             String::new(),
             |mut acc, layer_type| {
                 if !acc.is_empty() {
@@ -192,15 +259,21 @@ impl LLM {
                 acc.push_str(layer_type);
                 acc
             },
-        )
+        );
+
+        // Include decoder type in the description
+        format!("{}, {}", network_layers, self.decoder.layer_type())
     }
 
     pub fn total_parameters(&self) -> usize {
         // Sum the parameters across all layers in the network
-        self.network
+        let network_params = self.network
             .iter()
             .map(|layer| layer.parameters())
-            .sum::<usize>()
+            .sum::<usize>();
+
+        // Add decoder parameters
+        network_params + self.decoder.parameters()
     }
 
     #[inline]
@@ -257,11 +330,24 @@ impl LLM {
             }
             let mut input = token_input;
 
-            for layer in &mut self.network {
-                input = layer.forward(&input);
-            }
+            // Forward pass through all layers except output projection to get hidden states
+            let network_len = self.network.len();
+            let mut hidden_states = input.clone();
+            let mut logits = Array2::zeros((1, self.vocab.size()));
 
-            let logits = input;
+            for (i, layer) in self.network.iter_mut().enumerate() {
+                input = layer.forward(&input);
+
+                // Capture hidden states before output projection (second-to-last layer)
+                if i == network_len - 2 {
+                    hidden_states = input.clone();
+                }
+
+                // Get logits from output projection (last layer)
+                if i == network_len - 1 {
+                    logits = input.clone();
+                }
+            }
 
             // Safety check: ensure we have at least one token
             if logits.shape()[0] == 0 {
@@ -273,14 +359,50 @@ impl LLM {
                 .to_owned()
                 .insert_axis(Axis(0));
 
-            // Softmax - convert activations of each token to a probability distribution over the
-            // vocabulary
-            let probs = Self::softmax(&last_logit); // 1 x vocab_size
+            // Get hidden states for the last position
+            let last_hidden = hidden_states
+                .row(hidden_states.shape()[0] - 1)
+                .to_owned();
 
-            // Greedy Decode - Choose the highest probability token for each position
-            let tokens = self.decoder.decode(&probs);
+            let next_token = match &mut self.decoder {
+                DecoderType::Greedy(decoder) => {
+                    // Simple greedy decoding
+                    let probs = Self::softmax(&last_logit);
+                    let tokens = decoder.decode(&probs);
+                    tokens[0]
+                }
+                DecoderType::AutoDeco(decoder) => {
+                    // Use AutoDeco to predict temperature and top-p from hidden states
+                    let (temperature, top_p) = decoder.predict_step(&last_hidden.view());
 
-            let next_token = tokens[tokens.len() - 1];
+                    // Apply temperature scaling to logits
+                    let scaled_logits = &last_logit / temperature;
+
+                    // Softmax - convert activations to probabilities
+                    let probs = Self::softmax(&scaled_logits);
+
+                    // Apply top-p sampling using AutoDeco's soft top-p method
+                    let sampled_probs = if top_p < 1.0 {
+                        // Convert 1 x vocab_size Array2 to Array1 for AutoDeco
+                        let probs_1d = probs.row(0).to_owned();
+                        let sampled_1d = decoder.soft_top_p_sample(&probs_1d, top_p);
+                        // Convert back to 1 x vocab_size Array2
+                        sampled_1d.insert_axis(Axis(0))
+                    } else {
+                        probs
+                    };
+
+                    // Sample from the distribution (simple argmax for now, could be improved)
+                    sampled_probs.row(0).iter().enumerate()
+                        .fold((0, 0.0), |(max_idx, max_val), (idx, &val)| {
+                            if val > max_val {
+                                (idx, val)
+                            } else {
+                                (max_idx, max_val)
+                            }
+                        }).0
+                }
+            };
 
             output_tokens.push(next_token);
             tokenized.push(next_token);
@@ -897,5 +1019,64 @@ impl LLM {
         } else {
             Self::load_binary(path)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_network_description_includes_decoder() {
+        let llm = LLM::default();
+        let description = llm.network_description();
+
+        // Should include network layers and decoder type
+        assert!(description.contains("OutputProjection"));
+        assert!(description.contains("AutoDeco"));
+        println!("Network description: {}", description);
+    }
+
+    #[test]
+    fn test_greedy_decoder_creation() {
+        let vocab = Vocab::default();
+        let network = Vec::new(); // Empty network for testing
+        let llm = LLM::with_greedy_decoder(vocab, network);
+
+        match llm.decoder {
+            DecoderType::Greedy(_) => {},
+            _ => panic!("Expected GreedyDecoder"),
+        }
+
+        assert_eq!(llm.decoder.layer_type(), "GreedyDecoder");
+    }
+
+    #[test]
+    fn test_autodeco_enabled_by_default() {
+        let llm = LLM::default();
+
+        match &llm.decoder {
+            DecoderType::AutoDeco(_) => {},
+            _ => panic!("Expected AutoDeco by default"),
+        }
+
+        assert_eq!(llm.decoder.layer_type(), "AutoDeco");
+        assert!(llm.decoder.parameters() > 0, "AutoDeco should have parameters");
+    }
+
+    #[test]
+    fn test_decoder_switching() {
+        let mut llm = LLM::default();
+
+        // Should start with AutoDeco
+        assert_eq!(llm.decoder.layer_type(), "AutoDeco");
+
+        // Switch to Greedy
+        llm.enable_greedy();
+        assert_eq!(llm.decoder.layer_type(), "GreedyDecoder");
+
+        // Switch back to AutoDeco
+        llm.enable_autodeco();
+        assert_eq!(llm.decoder.layer_type(), "AutoDeco");
     }
 }

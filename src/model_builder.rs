@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(layers.len(), 11);
 
         // Check first and last layers
-        assert_eq!(layers[0].layer_type(), "Embeddings");
+        assert_eq!(layers[0].layer_type(), "TokenEmbeddings");
         assert_eq!(layers[layers.len() - 1].layer_type(), "OutputProjection");
     }
 }
