@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 pub mod richards_act;
 pub mod richards_curve;
 pub mod richards_norm;
@@ -7,6 +5,13 @@ pub mod richards_norm;
 pub use self::richards_act::*;
 pub use self::richards_curve::{RichardsCurve, WeightsIter};
 pub use self::richards_norm::*;
+
+use ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
+use crate::adam::Adam;
+use rayon::prelude::*;
+
+
 
 /// Variant types for Richards curve initialization and constraints
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
