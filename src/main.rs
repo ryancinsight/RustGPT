@@ -406,11 +406,14 @@ fn main() -> llm::Result<()> {
         instruction_lr
     );
 
-    llm.train_with_batch_size(
+    // Use warmup + cosine annealing for instruction tuning stability
+    let warmup_epochs = 15;
+    llm.train_with_warmup(
         chat_training_examples,
         instruction_epochs,
         instruction_lr,
         64,
+        warmup_epochs,
     )?;
 
     // Save trained model to disk for inference

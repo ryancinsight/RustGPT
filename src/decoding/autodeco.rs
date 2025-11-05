@@ -428,6 +428,24 @@ impl Layer for AutoDeco {
         // AutoDeco gradients are applied during decoding
         Ok(())
     }
+
+    fn weight_norm(&self) -> f32 {
+        let mut sumsq: f32 = 0.0;
+
+        // Aggregate norms of all linear parameters
+        for p in self.parameter_tensors() {
+            sumsq += p.iter().map(|&w| w * w).sum::<f32>();
+        }
+        for b in self.biases() {
+            sumsq += b.iter().map(|&w| w * w).sum::<f32>();
+        }
+
+        // Include RichardsNorm parameters from both heads
+        sumsq += self.temp_head.norm.weight_norm().powi(2);
+        sumsq += self.top_p_head.norm.weight_norm().powi(2);
+
+        sumsq.sqrt()
+    }
 }
 
 #[cfg(test)]

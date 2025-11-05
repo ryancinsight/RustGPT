@@ -79,4 +79,9 @@ impl Layer for OutputProjection {
     fn parameters(&self) -> usize {
         self.w_out.len()
     }
+
+    fn weight_norm(&self) -> f32 {
+        let sumsq = self.w_out.iter().map(|&w| w * w).sum::<f32>();
+        sumsq.sqrt()
+    }
 }

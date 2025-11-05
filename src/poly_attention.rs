@@ -1062,4 +1062,53 @@ impl Layer for PolyAttention {
     fn parameters(&self) -> usize {
         PolyAttention::parameters(self)
     }
+
+    fn weight_norm(&self) -> f32 {
+        let mut sumsq: f32 = 0.0;
+
+        // Heads: w_q, w_k, w_v
+        for head in &self.heads {
+            sumsq += head.w_q.iter().map(|&w| w * w).sum::<f32>();
+            sumsq += head.w_k.iter().map(|&w| w * w).sum::<f32>();
+            sumsq += head.w_v.iter().map(|&w| w * w).sum::<f32>();
+        }
+
+        // Output projection
+        sumsq += self.w_out.iter().map(|&w| w * w).sum::<f32>();
+
+        // Polynomial scalars
+        sumsq += self.a.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self.b.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self.scale.iter().map(|&w| w * w).sum::<f32>();
+
+        // Gating parameters
+        sumsq += self.w_g.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self.alpha_g.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self.beta_g.iter().map(|&w| w * w).sum::<f32>();
+
+        // Learnable Richards gate parameters
+        sumsq += self
+            .gate_poly
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>();
+
+        // CoPE positional embeddings if present
+        if let Some(pe) = &self.cope_pos_embeddings {
+            sumsq += pe.iter().map(|&w| w * w).sum::<f32>();
+        }
+
+        // Threshold predictor weights if present
+        if let Some(pred) = &self.threshold_predictor {
+            sumsq += pred.weights1.iter().map(|&w| w * w).sum::<f32>();
+            sumsq += pred.weights2.iter().map(|&w| w * w).sum::<f32>();
+            sumsq += pred.bias1.iter().map(|&w| w * w).sum::<f32>();
+            sumsq += pred.bias2.iter().map(|&w| w * w).sum::<f32>();
+            // Include RichardsNorm internal weights via its trait method
+            sumsq += pred.norm.weight_norm().powi(2);
+        }
+
+        sumsq.sqrt()
+    }
 }

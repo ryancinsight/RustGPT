@@ -124,6 +124,16 @@ impl Layer for LayerEnum {
             LayerEnum::PolyAttention(layer) => layer.parameters(),
         }
     }
+
+    fn weight_norm(&self) -> f32 {
+        match self {
+            LayerEnum::TokenEmbeddings(layer) => layer.weight_norm(),
+            LayerEnum::SwiGLU(layer) => layer.weight_norm(),
+            LayerEnum::DynamicTanhNorm(layer) => layer.weight_norm(),
+            LayerEnum::OutputProjection(layer) => layer.weight_norm(),
+            LayerEnum::PolyAttention(layer) => layer.weight_norm(),
+        }
+    }
 }
 
 pub trait Layer {
@@ -134,6 +144,10 @@ pub trait Layer {
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
 
     fn parameters(&self) -> usize;
+
+    /// Frobenius norm of all learnable weights in the layer
+    /// Used by LARS trust-ratio to balance update magnitude
+    fn weight_norm(&self) -> f32;
 
     fn compute_gradients(
         &self,
@@ -174,6 +188,8 @@ pub struct LLM {
     pub vocab: Vocab,
     pub network: Vec<LayerEnum>,
     decoder: DecoderType,
+    // EMA of median per-layer gradient norm to stabilize adaptive LR balance
+    median_grad_ema: Option<f32>,
 }
 
 impl std::fmt::Debug for LLM {
@@ -203,7 +219,7 @@ impl Default for LLM {
         let autodeco_config = AutoDecoConfig::default();
         let decoder = DecoderType::AutoDeco(AutoDeco::new(embed_dim, autodeco_config));
 
-        Self { vocab, network, decoder }
+        Self { vocab, network, decoder, median_grad_ema: None }
     }
 }
 
@@ -219,13 +235,13 @@ impl LLM {
         let autodeco_config = AutoDecoConfig::default();
         let decoder = DecoderType::AutoDeco(AutoDeco::new(embed_dim, autodeco_config));
 
-        Self { vocab, network, decoder }
+        Self { vocab, network, decoder, median_grad_ema: None }
     }
 
     /// Create LLM with GreedyDecoder
     pub fn with_greedy_decoder(vocab: Vocab, network: Vec<LayerEnum>) -> Self {
         let decoder = DecoderType::Greedy(GreedyDecoder::new());
-        Self { vocab, network, decoder }
+        Self { vocab, network, decoder, median_grad_ema: None }
     }
 
     /// Switch to AutoDeco decoder
@@ -761,6 +777,53 @@ impl LLM {
         // Compute global gradient norm (L2 norm across all parameters)
         let grad_norm = total_grad_norm_sq.sqrt();
 
+        // Compute per-layer gradient norms (post-clipping)
+        let mut per_layer_grad_norms: Vec<f32> = self
+            .network
+            .iter()
+            .zip(&averaged_grads_per_layer)
+            .map(|(_layer, grads)| {
+                if grads.is_empty() {
+                    0.0
+                } else {
+                    let mut s = 0.0f32;
+                    for g in grads {
+                        s += g.iter().map(|&x| x * x).sum::<f32>();
+                    }
+                    s.sqrt()
+                }
+            })
+            .collect();
+
+        // Median of non-zero per-layer gradient norms as bidirectional target
+        let mut nonzero: Vec<f32> = per_layer_grad_norms
+            .iter()
+            .cloned()
+            .filter(|&v| v > 0.0)
+            .collect();
+        let median_grad_norm = if nonzero.is_empty() {
+            grad_norm.max(1e-6)
+        } else {
+            nonzero.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mid = nonzero.len() / 2;
+            if nonzero.len() % 2 == 0 {
+                (nonzero[mid - 1] + nonzero[mid]) * 0.5
+            } else {
+                nonzero[mid]
+            }
+        };
+
+        // EMA-smooth the median to reduce step-to-step volatility
+        const EMA_BETA: f32 = 0.9; // 90% memory, gentle smoothing
+        let median_smoothed = if let Some(prev) = self.median_grad_ema {
+            let sm = EMA_BETA * prev + (1.0 - EMA_BETA) * median_grad_norm;
+            self.median_grad_ema = Some(sm);
+            sm
+        } else {
+            self.median_grad_ema = Some(median_grad_norm);
+            median_grad_norm
+        };
+
         // Apply accumulated and averaged gradients with layer-wise adaptive learning rates
         // Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
         // Formula: lr_layer = lr_base * trust_coef * ||W|| / (||∇W|| + weight_decay * ||W|| + ε)
@@ -776,7 +839,7 @@ impl LLM {
                 if grads.is_empty() {
                     lr
                 } else {
-                    Self::compute_layer_adaptive_lr_static(layer, grads, lr, layer_idx)
+                    Self::compute_layer_adaptive_lr_static(layer, grads, lr, layer_idx, median_smoothed)
                 }
             })
             .collect();
@@ -806,13 +869,16 @@ impl LLM {
     /// - Low-gradient layers (L6-L14): Increase LR to prevent under-updating
     /// - Target: All layers converge at similar rates
     ///
-    /// Formula: lr_layer = lr_base * (target_norm / (grad_norm + ε))^power
-    /// where power controls aggressiveness (0.5 = gentle, 1.0 = aggressive)
+    /// Formula (trust-ratio + bidirectional balance):
+    /// lr_layer = lr_base * clamp( (||W|| / (||∇W|| + ε)) * (median_grad_norm / (||∇W|| + ε))^power, [min,max] )
+    /// - Trust-ratio term encourages proportionate updates relative to parameter scale
+    /// - Bidirectional balance aligns layer grad norms towards the batch median
     fn compute_layer_adaptive_lr_static(
         layer: &LayerEnum,
         grads: &[Array2<f32>],
         base_lr: f32,
         layer_idx: usize,
+        median_grad_norm: f32,
     ) -> f32 {
         // Skip for layers without gradients
         if grads.is_empty() {
@@ -832,18 +898,23 @@ impl LLM {
             return base_lr;
         }
 
-        // Bidirectional LARS: Target gradient norm for balanced learning
-        // Target chosen based on observed mid-layer gradients (L3-L5: ~2-4)
-        const TARGET_GRAD_NORM: f32 = 3.0;
-        const POWER: f32 = 0.5; // Gentle adaptation (sqrt scaling)
+        // Trust-ratio term: ||W|| / ||∇W||
+        let w_norm = layer.weight_norm();
+        if w_norm < EPSILON {
+            return base_lr;
+        }
+        let trust_ratio = w_norm / (grad_norm + EPSILON);
 
-        // Compute scaling factor
-        let scale = (TARGET_GRAD_NORM / (grad_norm + EPSILON)).powf(POWER);
+        // Bidirectional balance relative to batch median
+        const POWER_BALANCE: f32 = 0.5; // Gentle correction
+        let balance_scale = (median_grad_norm / (grad_norm + EPSILON)).powf(POWER_BALANCE);
 
-        // Clamp to reasonable range to prevent extreme adjustments
-        // 0.3x-3.0x range allows significant adaptation while maintaining stability
-        let scale_clamped = scale.clamp(0.3, 3.0);
-        let adaptive_lr = base_lr * scale_clamped;
+        // Combined scale with conservative clamping
+        // Tighter bounds reduce jitter and large swings
+        const MIN_SCALE: f32 = 0.5;
+        const MAX_SCALE: f32 = 2.0;
+        let scale = (trust_ratio * balance_scale).clamp(MIN_SCALE, MAX_SCALE);
+        let adaptive_lr = base_lr * scale;
 
         // Log adaptive LR for debugging (use RUST_LOG=debug to see)
         if layer_idx <= 2 || layer_idx >= 12 {
@@ -853,7 +924,7 @@ impl LLM {
                 grad_norm = grad_norm,
                 base_lr = base_lr,
                 adaptive_lr = adaptive_lr,
-                scale = scale_clamped,
+                scale = scale,
                 "Bidirectional LARS"
             );
         }
