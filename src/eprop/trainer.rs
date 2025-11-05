@@ -293,23 +293,25 @@ impl EPropTrainer {
         }
     }
     
-    /// Compute layer-wise adaptive learning rate using bidirectional LARS
+    /// Compute layer-wise adaptive learning rate using trust-ratio + bidirectional balance
     /// Reference: "LARS: Layer-wise Adaptive Rate Scaling" (You et al., 2017)
     ///
-    /// Bidirectional approach: Balance gradient flow across all layers
-    /// Formula: lr_layer = lr_base * (target_norm / (grad_norm + ε))^power
-    fn compute_adaptive_lr(base_lr: f32, grad_norm: f32) -> f32 {
+    /// Formula:
+    /// lr_layer = lr_base * clamp( (||W|| / (||∇W|| + ε)) * (median_grad_norm / (||∇W|| + ε))^power, [min,max] )
+    fn compute_adaptive_lr(base_lr: f32, grad_norm: f32, weight_norm: f32, median_grad_norm: f32) -> f32 {
         const EPSILON: f32 = 1e-6;
-        const TARGET_GRAD_NORM: f32 = 3.0;  // Target gradient norm for stability
-        const POWER: f32 = 0.5;              // Gentle adaptation (sqrt scaling)
-        
-        if grad_norm < EPSILON {
+        if grad_norm < EPSILON || weight_norm < EPSILON {
             return base_lr;
         }
-        
-        let scale = (TARGET_GRAD_NORM / (grad_norm + EPSILON)).powf(POWER);
-        let scale_clamped = scale.clamp(0.3, 3.0);
-        base_lr * scale_clamped
+
+        let trust_ratio = weight_norm / (grad_norm + EPSILON);
+        const POWER_BALANCE: f32 = 0.5; // Gentle correction
+        let balance_scale = (median_grad_norm / (grad_norm + EPSILON)).powf(POWER_BALANCE);
+
+        const MIN_SCALE: f32 = 0.2;
+        const MAX_SCALE: f32 = 5.0;
+        let scale = (trust_ratio * balance_scale).clamp(MIN_SCALE, MAX_SCALE);
+        base_lr * scale
     }
 
     /// Apply weight update using current traces and learning signal
@@ -344,13 +346,34 @@ impl EPropTrainer {
         // Rank-one gradient for recurrent: ∇W_rec = (L_t · ε^f_t) ⊗ z_{t-1}
         let grad_rec = outer_product(&modulated_eps_f, &self.state.filtered_spikes);
         
-        // Compute gradient norms for LARS
+        // Compute gradient norms and corresponding weight norms for trust-ratio LARS
         let grad_in_norm = grad_in.mapv(|x| x * x).sum().sqrt();
         let grad_rec_norm = grad_rec.mapv(|x| x * x).sum().sqrt();
-        
-        // Apply bidirectional LARS: Adaptive learning rates per weight matrix
-        let adaptive_lr_in = Self::compute_adaptive_lr(eta, grad_in_norm);
-        let adaptive_lr_rec = Self::compute_adaptive_lr(eta, grad_rec_norm);
+        let w_in_norm = self.weights_in.iter().map(|&w| w * w).sum::<f32>().sqrt();
+        let w_rec_norm = self.weights_rec.iter().map(|&w| w * w).sum::<f32>().sqrt();
+
+        // Median of non-zero gradient norms (bidirectional balance target)
+        const EPS: f32 = 1e-6;
+        let mut nonzero_norms = Vec::new();
+        if grad_in_norm > EPS { nonzero_norms.push(grad_in_norm); }
+        if grad_rec_norm > EPS { nonzero_norms.push(grad_rec_norm); }
+        let median_grad_norm = match nonzero_norms.len() {
+            0 => (grad_in_norm + grad_rec_norm) * 0.5,
+            1 => nonzero_norms[0],
+            _ => {
+                nonzero_norms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = nonzero_norms.len() / 2;
+                if nonzero_norms.len() % 2 == 0 {
+                    (nonzero_norms[mid - 1] + nonzero_norms[mid]) * 0.5
+                } else {
+                    nonzero_norms[mid]
+                }
+            }
+        };
+
+        // Trust-ratio + bidirectional balance adaptive learning rates
+        let adaptive_lr_in = Self::compute_adaptive_lr(eta, grad_in_norm, w_in_norm, median_grad_norm);
+        let adaptive_lr_rec = Self::compute_adaptive_lr(eta, grad_rec_norm, w_rec_norm, median_grad_norm);
         
         // Gradient clipping (after LARS, before application)
         let (grad_in, grad_rec) = if let Some(clip_val) = self.config.grad_clip {

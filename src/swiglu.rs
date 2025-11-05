@@ -265,4 +265,24 @@ impl Layer for SwiGLU {
         
         Ok(())
     }
+
+    fn weight_norm(&self) -> f32 {
+        let mut sumsq = 0.0f32;
+        sumsq += self.w1.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self.w2.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self.w_out.iter().map(|&w| w * w).sum::<f32>();
+        sumsq += self
+            .swish_activation
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>();
+        sumsq += self
+            .gate_curve
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>();
+        sumsq.sqrt()
+    }
 }

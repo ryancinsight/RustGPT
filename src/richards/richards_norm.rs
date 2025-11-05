@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::llm::Layer;
 use super::{RichardsCurve, Variant};
 
+// EMA smoothing factor for gradient norm tracking inside RichardsNorm
+const EMA_BETA_GRAD: f32 = 0.9;
+
 /// Richards-based Normalization with Dynamic Parameter Adjustments
 ///
 /// Element-wise normalization using Richards curve with adaptive parameter scaling,
@@ -30,6 +33,9 @@ pub struct RichardsNorm {
 
     /// Richards curve for tanh-like computation with learnable parameters and per-feature transformations
     richards: RichardsCurve,
+
+    /// Exponential moving average of parameter gradient norm (for stability-aware adjustments)
+    grad_norm_ema: Option<f32>,
 }
 
 impl RichardsNorm {
@@ -92,6 +98,7 @@ impl RichardsNorm {
         Self {
             cached_input: None,
             richards,
+            grad_norm_ema: None,
         }
     }
 
@@ -111,12 +118,17 @@ impl RichardsNorm {
 
         // Adaptive temperature scaling (inspired by DyT's α parameter)
         // Higher activation scale → sharper transitions (higher temperature)
+        // Additionally, damp aggressiveness when recent gradient norms are large
         let scale_ratio = (frob_norm / target_scale).max(1e-6).min(1e6);
-        let temp_adjustment = scale_ratio.powf(0.5); // Square root for smoother scaling
+        let grad_ema = self.grad_norm_ema.unwrap_or(1.0) as f64;
+        // Stability factor reduces temperature when gradients are high
+        let stability_factor = 1.0 / (1.0 + 0.25 * grad_ema.max(1e-6));
+        let temp_adjustment = scale_ratio.powf(0.5) * stability_factor; // Square root for smoother scaling + gradient-aware damping
         let adjusted_temp = self.richards.temperature.map(|t| t * temp_adjustment);
 
         // Dynamic midpoint adjustment to center around data distribution
-        let midpoint_shift = mean * 0.1; // Small adjustment to avoid instability
+        // Reduce midpoint shifting when gradients are high for stability
+        let midpoint_shift = mean * 0.1 * stability_factor; // Small, gradient-aware adjustment
         let adjusted_m = self.richards.m.map(|m| m + midpoint_shift);
 
         // Adaptive asymmetry based on variance
@@ -285,6 +297,17 @@ impl Layer for RichardsNorm {
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        // Track parameter gradient norm with EMA for stability-aware adjustments
+        let grad_norm: f32 = param_grads
+            .iter()
+            .flat_map(|arr| arr.iter())
+            .map(|&x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        self.grad_norm_ema = Some(match self.grad_norm_ema {
+            Some(prev) => prev * EMA_BETA_GRAD + (1.0 - EMA_BETA_GRAD) * grad_norm,
+            None => grad_norm,
+        });
         // Apply parameter updates; ignore error here since sizes are checked in compute
         let _ = self.apply_gradients(&param_grads, lr);
         input_grads
@@ -292,5 +315,15 @@ impl Layer for RichardsNorm {
 
     fn parameters(&self) -> usize {
         self.richards.weights().len()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let sumsq = self
+            .richards
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>();
+        sumsq.sqrt()
     }
 }

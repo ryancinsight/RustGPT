@@ -122,4 +122,13 @@ impl Layer for TokenEmbeddings {
     fn parameters(&self) -> usize {
         self.token_embeddings.len()
     }
+
+    fn weight_norm(&self) -> f32 {
+        let sumsq = self
+            .token_embeddings
+            .iter()
+            .map(|&w| w * w)
+            .sum::<f32>();
+        sumsq.sqrt()
+    }
 }
