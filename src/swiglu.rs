@@ -62,28 +62,19 @@ impl Layer for SwiGLU {
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         let x1 = input.dot(&self.w1);
         let x2 = input.dot(&self.w2);
-        
-        // Convert to f64 for RichardsActivation and process row by row
-        let mut swish = Array2::<f32>::zeros(x1.raw_dim());
-        let mut gate_sigma = Array2::<f32>::zeros(x2.raw_dim());
-        
-        for (i, (x1_row, x2_row)) in x1.outer_iter().zip(x2.outer_iter()).enumerate() {
-            // Convert to f64 Array1 for RichardsActivation
-            let x1_f64: Array1<f64> = x1_row.mapv(|x| x as f64);
-            let x2_f64: Array1<f64> = x2_row.mapv(|x| x as f64);
-            
-            // Apply RichardsActivation for swish (x * Richards(x))
-            let swish_f64 = self.swish_activation.forward(&x1_f64);
-            // Apply RichardsCurve for gate (just sigmoid)
-            let gate_f64 = self.gate_curve.forward(&x2_f64);
-            
-            // Convert back to f32 and store
-            for (j, (&s, &g)) in swish_f64.iter().zip(gate_f64.iter()).enumerate() {
-                swish[[i, j]] = s as f32;
-                gate_sigma[[i, j]] = g as f32;
-            }
-        }
-        
+
+        // Vectorized processing: convert entire matrices to f64, apply Richards functions, convert back
+        let x1_f64 = x1.mapv(|x| x as f64);
+        let x2_f64 = x2.mapv(|x| x as f64);
+
+        // Apply Richards functions to entire matrices at once
+        let swish_f64 = self.swish_activation.forward_matrix(&x1_f64);
+        let gate_f64 = self.gate_curve.forward_matrix(&x2_f64);
+
+        // Convert back to f32
+        let swish = swish_f64.mapv(|x| x as f32);
+        let gate_sigma = gate_f64.mapv(|x| x as f32);
+
         let gated = &swish * &gate_sigma;
         let output = gated.dot(&self.w_out) + input;
 
