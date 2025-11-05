@@ -383,16 +383,20 @@ impl RichardsCurve {
 
     /// Simple scaling based on max absolute value (for numerical stability)
     /// Only updates scale and shift if they are fixed (Some), not learnable (None)
-    pub fn update_scaling_from_max_abs(&mut self, max_abs_x: f64) {
+    pub fn update_scaling_from_max_abs(&self, max_abs_x: f64) -> Self {
         // Only update if scale and shift are fixed (not learnable)
         if self.scale.is_some() && self.shift.is_some() {
+            let mut updated = self.clone();
             if max_abs_x > 0.0 {
-                self.scale = Some((1.0 / max_abs_x).min(0.5));
-                self.shift = Some(0.0);
+                updated.scale = Some((1.0 / max_abs_x).min(0.5));
+                updated.shift = Some(0.0);
             } else {
-                self.scale = Some(1.0);
-                self.shift = Some(0.0);
+                updated.scale = Some(1.0);
+                updated.shift = Some(0.0);
             }
+            updated
+        } else {
+            self.clone()
         }
     }
 
@@ -463,6 +467,11 @@ impl RichardsCurve {
             });
 
         out
+    }
+
+    /// Vectorized forward pass for matrix input
+    pub fn forward_matrix(&self, x: &Array2<f64>) -> Array2<f64> {
+        x.mapv(|val| self.forward_scalar(val))
     }
 
     /// Forward for a single scalar x (backward compatibility)

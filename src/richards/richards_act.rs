@@ -71,6 +71,12 @@ impl RichardsActivation {
         x * richards_output
     }
 
+    /// Vectorized forward pass for matrix input
+    pub fn forward_matrix(&self, x: &ndarray::Array2<f64>) -> ndarray::Array2<f64> {
+        let richards_output = self.richards_curve.forward_matrix(x);
+        x * &richards_output
+    }
+
     /// Backward pass: derivative of x * Richards(x)
     /// d/dx[x * Richards(x)] = Richards(x) + x * Richards'(x)
     pub fn derivative(&self, x: &Array1<f64>) -> Array1<f64> {
