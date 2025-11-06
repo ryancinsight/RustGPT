@@ -56,18 +56,18 @@ fn main() -> llm::Result<()> {
     // ============================================================================
     // FEEDFORWARD CONFIGURATION
     // ============================================================================
-    // Toggle between FeedForward (ReLU) and SwiGLU for comparison
+    // Toggle between FeedForward (ReLU) and RichardsGlu for comparison
     //
     // FeedForward: Standard ReLU-based feedforward
     //   - Activation: ReLU (x → max(0, x))
     //   - Parameters: 2 weight matrices + 2 bias vectors
     //   - Can suffer from dead neurons
     //
-    // SwiGLU: Modern gated linear unit with Swish activation
-    //   - Activation: Swish (x → x * sigmoid(x))
-    //   - Parameters: 3 weight matrices, no biases
-    //   - Better gradient flow, enhanced capacity through gating
-    //   - Used in LLaMA, PaLM, Mistral
+    // RichardsGlu: Advanced gated linear unit with learned Richards activations
+    //   - Activation: Learned Richards curves for both value and gate functions
+    //   - Parameters: 3 weight matrices + Richards parameters, no biases
+    //   - Adaptive activation functions that learn optimal gating behavior
+    //   - Enhanced gradient flow and numerical stability
     // ============================================================================
 
     // ============================================================================
@@ -330,7 +330,7 @@ fn main() -> llm::Result<()> {
     //   - Expert specialization through learned routing
     //
     // Parameter Budget (for 4 experts, top-2, expert_hidden_dim=64):
-    //   - Baseline SwiGLU: 3 × (128×256) = 196,608 params
+    //   - Baseline RichardsGlu: 3 × (128×256) + Richards parameters = ~200,000+ params
     //   - MoE: 4 × 3 × (128×64) + router = 196,608 + 512 = 197,120 params
     //   - Overhead: +0.26% (within budget)
     //

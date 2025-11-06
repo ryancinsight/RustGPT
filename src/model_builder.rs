@@ -1,12 +1,11 @@
 use crate::{
-    richards::RichardsNorm,
+    richards::{RichardsNorm, RichardsGlu},
     embeddings::TokenEmbeddings,
-    // feed_forward::FeedForward, // Removed: using SwiGLU exclusively
+    // feed_forward::FeedForward, // Removed: using RichardsGlu exclusively
     llm::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     poly_attention::PolyAttention,
-    swiglu::SwiGLU,
 };
 use crate::encoding::Vocab;
 
@@ -81,12 +80,12 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         // Pre-FFN normalization (Pre-LN)
         layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
 
-        // Feedforward layer (SwiGLU only)
-        let swiglu = SwiGLU::new(
+        // Feedforward layer (RichardsGlu only)
+        let richards_glu = RichardsGlu::new(
             config.embedding_dim,
             config.hidden_dim,
         );
-        layers.push(LayerEnum::SwiGLU(Box::new(swiglu)));
+        layers.push(LayerEnum::RichardsGlu(Box::new(richards_glu)));
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)
@@ -123,7 +122,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("  ✓ DynamicTanhNorm (adaptive, tanh-based)");
 
     // Activation
-    println!("  ✓ SwiGLU (gated activation, no bias)");
+    println!("  ✓ RichardsGlu (learned Richards gated activation, no bias)");
 
     // Positional Encoding (CoPE always on; max_pos derived from window)
     let effective_window = if config.use_adaptive_window {
@@ -239,7 +238,7 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
             )));
         }
 
-        layers.push(LayerEnum::SwiGLU(SwiGLU::new(
+        layers.push(LayerEnum::RichardsGlu(RichardsGlu::new(
             config.embedding_dim,
             config.hidden_dim,
         )));

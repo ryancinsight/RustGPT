@@ -1,12 +1,12 @@
 use ndarray::{Array1, Array2};
-use llm::swiglu::SwiGLU;
+use llm::RichardsGlu;
 use llm::llm::Layer;
 
 fn main() {
-    println!("Testing SwiGLU with RichardsActivation...");
-    
-    // Create a SwiGLU layer
-    let mut swiglu = SwiGLU::new(4, 8);
+    println!("Testing RichardsGlu with learned Richards activations...");
+
+    // Create a RichardsGlu layer
+    let mut richards_glu = RichardsGlu::new(4, 8);
     
     // Create test input (batch_size=2, embedding_dim=4)
     let input = Array2::from_shape_vec((2, 4), vec![
@@ -18,34 +18,34 @@ fn main() {
     println!("Input:\n{:?}", input);
     
     // Test forward pass
-    let output = swiglu.forward(&input);
+    let output = richards_glu.forward(&input);
     println!("\nOutput shape: {:?}", output.shape());
     println!("Output:\n{:?}", output);
-    
+
     // Test parameter count
-    let param_count = swiglu.parameters();
+    let param_count = richards_glu.parameters();
     println!("\nTotal parameters: {}", param_count);
-    
+
     // Test gradient computation
     let output_grads = Array2::ones(output.raw_dim());
-    let (input_grads, param_grads) = swiglu.compute_gradients(&input, &output_grads);
-    
+    let (input_grads, param_grads) = richards_glu.compute_gradients(&input, &output_grads);
+
     println!("\nInput gradients shape: {:?}", input_grads.shape());
     println!("Number of parameter gradient blocks: {}", param_grads.len());
-    
+
     for (i, grad) in param_grads.iter().enumerate() {
         println!("Parameter gradient {} shape: {:?}", i, grad.shape());
     }
-    
+
     // Test gradient application
     let lr = 0.001;
-    match swiglu.apply_gradients(&param_grads, lr) {
+    match richards_glu.apply_gradients(&param_grads, lr) {
         Ok(()) => println!("\nGradient application successful!"),
         Err(e) => println!("\nGradient application failed: {:?}", e),
     }
-    
+
     // Test another forward pass to ensure everything still works
-    let output2 = swiglu.forward(&input);
+    let output2 = richards_glu.forward(&input);
     println!("\nSecond forward pass output shape: {:?}", output2.shape());
     
     // Check that outputs are different (parameters should have changed)

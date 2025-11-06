@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 pub mod pade;
 pub mod richards_act;
 pub mod richards_curve;
+pub mod richards_glu;
 pub mod richards_norm;
 
 pub use self::pade::*;
 pub use self::richards_act::*;
 pub use self::richards_curve::{RichardsCurve, WeightsIter};
+pub use self::richards_glu::*;
 pub use self::richards_norm::*;
 
 /// Variant types for Richards curve initialization and constraints

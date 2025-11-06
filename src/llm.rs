@@ -17,8 +17,8 @@ use crate::{
 pub enum LayerEnum {
     TokenEmbeddings(TokenEmbeddings),
     // Removed SelfAttention variant
-    // Removed FeedForward variant; SwiGLU is the only FFN
-    SwiGLU(Box<crate::swiglu::SwiGLU>),
+    // Removed FeedForward variant; RichardsGlu is the only FFN
+    RichardsGlu(Box<crate::richards::RichardsGlu>),
 
     DynamicTanhNorm(crate::richards::RichardsNorm),
     OutputProjection(OutputProjection),
@@ -37,7 +37,7 @@ impl Layer for LayerEnum {
             LayerEnum::TokenEmbeddings(layer) => layer.layer_type(),
             // Removed SelfAttention arm
             // Removed FeedForward arm
-            LayerEnum::SwiGLU(layer) => layer.layer_type(),
+            LayerEnum::RichardsGlu(layer) => layer.layer_type(),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
@@ -52,7 +52,7 @@ impl Layer for LayerEnum {
             LayerEnum::TokenEmbeddings(layer) => layer.forward(input),
             // Removed SelfAttention arm
             // Removed FeedForward arm
-            LayerEnum::SwiGLU(layer) => layer.forward(input),
+            LayerEnum::RichardsGlu(layer) => layer.forward(input),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
@@ -71,7 +71,7 @@ impl Layer for LayerEnum {
             LayerEnum::TokenEmbeddings(layer) => layer.compute_gradients(input, output_grads),
             // Removed SelfAttention arm
             // Removed FeedForward arm
-            LayerEnum::SwiGLU(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
@@ -86,7 +86,7 @@ impl Layer for LayerEnum {
             LayerEnum::TokenEmbeddings(layer) => layer.apply_gradients(param_grads, lr),
             // Removed SelfAttention arm
             // Removed FeedForward arm
-            LayerEnum::SwiGLU(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::RichardsGlu(layer) => layer.apply_gradients(param_grads, lr),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
@@ -101,7 +101,7 @@ impl Layer for LayerEnum {
             LayerEnum::TokenEmbeddings(layer) => layer.backward(grads, lr),
             // Removed SelfAttention arm
             // Removed FeedForward arm
-            LayerEnum::SwiGLU(layer) => layer.backward(grads, lr),
+            LayerEnum::RichardsGlu(layer) => layer.backward(grads, lr),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
@@ -116,7 +116,7 @@ impl Layer for LayerEnum {
             LayerEnum::TokenEmbeddings(layer) => layer.parameters(),
             // Removed SelfAttention arm
             // Removed FeedForward arm
-            LayerEnum::SwiGLU(layer) => layer.parameters(),
+            LayerEnum::RichardsGlu(layer) => layer.parameters(),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
@@ -128,7 +128,7 @@ impl Layer for LayerEnum {
     fn weight_norm(&self) -> f32 {
         match self {
             LayerEnum::TokenEmbeddings(layer) => layer.weight_norm(),
-            LayerEnum::SwiGLU(layer) => layer.weight_norm(),
+            LayerEnum::RichardsGlu(layer) => layer.weight_norm(),
             LayerEnum::DynamicTanhNorm(layer) => layer.weight_norm(),
             LayerEnum::OutputProjection(layer) => layer.weight_norm(),
             LayerEnum::PolyAttention(layer) => layer.weight_norm(),
@@ -466,8 +466,8 @@ impl LLM {
             .map(|input| self.tokenize(input))
             .collect::<Vec<Vec<usize>>>();
 
-        // Store previous swiglu richards weights for delta tracking
-        let mut prev_swiglu_weights: Vec<Vec<f64>> = Vec::new();
+        // Store previous richards_glu richards weights for delta tracking
+        let mut prev_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
 
         for epoch in 0..epochs {
             let mut total_loss = 0.0;
@@ -563,31 +563,31 @@ impl LLM {
             let pred_norm_rms = if pred_norm_count > 0 { pred_norm_sum / pred_norm_count as f32 } else { f32::NAN };
             let avg_active_heads = if heads_layers_count > 0 { avg_heads_per_token_sum / heads_layers_count as f32 } else { f32::NAN };
 
-            // Collect current swiglu richards weights for delta tracking
-            let mut current_swiglu_weights: Vec<Vec<f64>> = Vec::new();
+            // Collect current richards_glu richards weights for delta tracking
+            let mut current_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
             for layer in &self.network {
-                if let LayerEnum::SwiGLU(swiglu) = layer {
-                    current_swiglu_weights.push(swiglu.gate_curve.weights());
+                if let LayerEnum::RichardsGlu(richards_glu) = layer {
+                    current_richards_glu_weights.push(richards_glu.gate_curve.weights());
                 }
             }
 
-            // Compute delta changes in swiglu richards coefficients
-            let mut swiglu_delta_sum = 0.0;
-            let mut swiglu_param_count = 0;
-            if !prev_swiglu_weights.is_empty() && current_swiglu_weights.len() == prev_swiglu_weights.len() {
-                for (prev_layer, curr_layer) in prev_swiglu_weights.iter().zip(current_swiglu_weights.iter()) {
+            // Compute delta changes in richards_glu richards coefficients
+            let mut richards_glu_delta_sum = 0.0;
+            let mut richards_glu_param_count = 0;
+            if !prev_richards_glu_weights.is_empty() && current_richards_glu_weights.len() == prev_richards_glu_weights.len() {
+                for (prev_layer, curr_layer) in prev_richards_glu_weights.iter().zip(current_richards_glu_weights.iter()) {
                     if prev_layer.len() == curr_layer.len() {
                         for (prev_w, curr_w) in prev_layer.iter().zip(curr_layer.iter()) {
-                            swiglu_delta_sum += (curr_w - prev_w).abs();
-                            swiglu_param_count += 1;
+                            richards_glu_delta_sum += (curr_w - prev_w).abs();
+                            richards_glu_param_count += 1;
                         }
                     }
                 }
             }
-            let avg_swiglu_delta = if swiglu_param_count > 0 { swiglu_delta_sum / swiglu_param_count as f64 } else { 0.0 };
+            let avg_richards_glu_delta = if richards_glu_param_count > 0 { richards_glu_delta_sum / richards_glu_param_count as f64 } else { 0.0 };
 
             // Update previous weights
-            prev_swiglu_weights = current_swiglu_weights;
+            prev_richards_glu_weights = current_richards_glu_weights;
 
             // NFR-7.3: Training metrics
             let warmup_status = if epoch < warmup_epochs {
@@ -606,7 +606,7 @@ impl LLM {
                 tau_range = tau_range_log,
                 pred_norm_rms = pred_norm_rms,
                 avg_active_heads = avg_active_heads,
-                swiglu_richards_delta = avg_swiglu_delta,
+                richards_glu_richards_delta = avg_richards_glu_delta,
                 "Training epoch completed{}",
                 warmup_status
             );
