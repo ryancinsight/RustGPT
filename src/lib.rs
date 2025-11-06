@@ -18,7 +18,6 @@ pub mod output_projection;
 // removed: pub mod self_attention;
 pub mod mixtures;
 pub mod poly_attention;
-pub mod swiglu;
 
 // removed: pub mod trm;
 pub mod decoding;
@@ -53,3 +52,5 @@ pub use decoding::{AutoDeco, AutoDecoConfig, GreedyDecoder, TemperatureHead, Top
 pub use mixtures::{HeadSelectionStrategy, HeadSelectionConfig, ThresholdPredictor};
 // Also re-export RichardsNorm as DynamicTanhNorm for compatibility
 pub use richards::RichardsNorm as DynamicTanhNorm;
+// Also re-export RichardsGlu
+pub use richards::RichardsGlu;
