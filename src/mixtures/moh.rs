@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use crate::llm::Layer;
+use crate::richards::RichardsCurve;
 
 /// Strategy for selecting which attention heads to activate
 ///
@@ -230,6 +231,10 @@ pub struct HeadSelectionPredictor {
     pub bias2: ndarray::Array1<f32>,
     /// Richards normalization for adaptive behavior
     pub norm: crate::richards::RichardsNorm,
+    /// Richards sigmoid for stable activation
+    pub sigmoid: crate::richards::RichardsCurve,
+    /// Learned Richards activation replacing ReLU
+    pub activation: crate::richards::RichardsCurve,
 
     /// Cached activations for gradient computation
     #[serde(skip)]
@@ -238,6 +243,8 @@ pub struct HeadSelectionPredictor {
     cached_hidden: Option<ndarray::Array2<f32>>,
     #[serde(skip)]
     cached_normalized: Option<ndarray::Array2<f32>>,
+    #[serde(skip)]
+    cached_activation: Option<ndarray::Array2<f32>>,
     #[serde(skip)]
     cached_activated: Option<ndarray::Array2<f32>>,
     #[serde(skip)]
@@ -267,6 +274,8 @@ impl HeadSelectionPredictor {
         let bias2 = ndarray::Array1::zeros(1);
 
         let norm = crate::richards::RichardsNorm::new(head_hidden_dim);
+        let sigmoid = crate::richards::RichardsCurve::sigmoid(false); // Non-learnable sigmoid
+        let activation = crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation replacing ReLU
 
         Self {
             weights1,
@@ -274,9 +283,12 @@ impl HeadSelectionPredictor {
             weights2,
             bias2,
             norm,
+            sigmoid,
+            activation,
             cached_input: None,
             cached_hidden: None,
             cached_normalized: None,
+            cached_activation: None,
             cached_activated: None,
             cached_output: None,
         }
@@ -299,60 +311,61 @@ impl HeadSelectionPredictor {
         let normalized = self.norm.forward(&hidden);
         self.cached_normalized = Some(normalized.clone());
 
-        // ReLU activation
-        let activated = normalized.mapv(|x| x.max(0.0));
+        // Learned Richards activation replacing ReLU
+        let activation_output = self.activation.forward_matrix(&normalized.mapv(|x| x as f64)).mapv(|x| x as f32);
+        self.cached_activation = Some(activation_output.clone());
+
+        // Second layer input (previously activated)
+        let activated = activation_output;
         self.cached_activated = Some(activated.clone());
 
         // Second layer: W2 * activated + b2
         let output = activated.dot(&self.weights2) + &self.bias2;
         self.cached_output = Some(output.clone());
 
-        // Sigmoid activation to get values in [0, 1] range
-        output.mapv(|z| 1.0 / (1.0 + (-z).exp()))
+        // Richards sigmoid activation to get values in [0, 1] range
+        self.sigmoid.forward_matrix(&output.mapv(|x| x as f64)).mapv(|x| x as f32)
     }
 
-    /// Forward pass for auxiliary loss computation (immutable)
+    /// Forward pass for auxiliary computation (immutable)
     ///
     /// Returns sigmoid-activated values in [0, 1] range suitable for head selection
-    /// Uses simplified computation without Richards normalization for immutable contexts
+    /// Uses consistent Richards normalization and learned Richards activation
     pub fn forward(&self, input: &ndarray::ArrayView2<f32>) -> ndarray::Array2<f32> {
         // First layer: W1 * x + b1
         let hidden = input.dot(&self.weights1) + &self.bias1;
 
-        // Skip Richards normalization for auxiliary loss computation
-        // Use simple batch normalization instead: (x - mean) / (std + eps)
-        let mean = hidden.mean_axis(ndarray::Axis(0)).unwrap();
-        let std = hidden.std_axis(ndarray::Axis(0), 1e-5);
-        let normalized = (hidden - &mean) / &std;
+        // Apply Richards normalization for consistent behavior (immutable version)
+        let normalized = self.norm.normalize_immutable(&hidden);
 
-        // ReLU activation
-        let activated = normalized.mapv(|x| x.max(0.0));
+        // Learned Richards activation replacing ReLU
+        let activated = self.activation.forward_matrix(&normalized.mapv(|x| x as f64)).mapv(|x| x as f32);
 
         // Second layer: W2 * activated + b2
         let output = activated.dot(&self.weights2) + &self.bias2;
 
-        // Sigmoid activation to get values in [0, 1] range
-        output.mapv(|z| 1.0 / (1.0 + (-z).exp()))
+        // Richards sigmoid activation to get values in [0, 1] range
+        let sigmoid = RichardsCurve::sigmoid(false);
+        sigmoid.forward_matrix(&output.mapv(|x| x as f64)).mapv(|x| x as f32)
     }
 
     /// Compute gradients for the two-layer network
     ///
-    /// Returns gradients for (weights1, bias1, weights2, bias2)
-    pub fn compute_gradients(&mut self, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array1<f32>, ndarray::Array2<f32>, ndarray::Array1<f32>) {
+    /// Returns gradients for (weights1, bias1, weights2, bias2, activation_params)
+    pub fn compute_gradients(&mut self, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array1<f32>, ndarray::Array2<f32>, ndarray::Array1<f32>, Vec<f64>) {
         // Retrieve cached activations
         let cached_input = self.cached_input.as_ref().expect("predict must be called before compute_gradients");
         let cached_output = self.cached_output.as_ref().expect("predict must be called before compute_gradients");
         let cached_activated = self.cached_activated.as_ref().expect("predict must be called before compute_gradients");
+        let cached_activation = self.cached_activation.as_ref().expect("predict must be called before compute_gradients");
         let cached_normalized = self.cached_normalized.as_ref().expect("predict must be called before compute_gradients");
         let cached_hidden = self.cached_hidden.as_ref().expect("predict must be called before compute_gradients");
 
-        // Gradient through sigmoid: d(sigmoid)/dz = sigmoid * (1 - sigmoid)
-        let sigmoid_output = cached_output.mapv(|z| 1.0 / (1.0 + (-z).exp()));
-        let ones = ndarray::Array2::<f32>::ones(cached_output.raw_dim());
-        let sigmoid_grad = &sigmoid_output * (&ones - &sigmoid_output);
-
-        // Chain rule: gradient w.r.t. sigmoid input
-        let d_output = output_grads * &sigmoid_grad;
+        // Gradient through Richards sigmoid
+        let output_f64 = cached_output.mapv(|x| x as f64);
+        let output_grads_f64 = output_grads.mapv(|x| x as f64);
+        let sigmoid_grad_f64 = self.sigmoid.backward_matrix(&output_f64, &output_grads_f64);
+        let d_output = sigmoid_grad_f64.mapv(|x| x as f32);
 
         // Second layer gradients
         let grad_weights2 = cached_activated.t().dot(&d_output);
@@ -361,9 +374,11 @@ impl HeadSelectionPredictor {
         // Gradient w.r.t. activated (before second layer)
         let d_activated = d_output.dot(&self.weights2.t());
 
-        // Gradient through ReLU: d(ReLU)/dz = 1 if z > 0, 0 otherwise
-        let relu_grad = cached_normalized.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-        let d_normalized = &d_activated * &relu_grad;
+        // Gradient through Richards activation (replacing ReLU)
+        let normalized_f64 = cached_normalized.mapv(|x| x as f64);
+        let d_activated_f64 = d_activated.mapv(|x| x as f64);
+        let activation_grad_f64 = self.activation.backward_matrix(&normalized_f64, &d_activated_f64);
+        let d_normalized = activation_grad_f64.mapv(|x| x as f32);
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -372,7 +387,10 @@ impl HeadSelectionPredictor {
         let grad_weights1 = cached_input.t().dot(&d_hidden);
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
 
-        (grad_weights1, grad_bias1, grad_weights2, grad_bias2)
+        // Activation parameter gradients (Richards curve parameters)
+        let activation_grads = self.activation.grad_weights_matrix(&normalized_f64, &d_activated_f64);
+
+        (grad_weights1, grad_bias1, grad_weights2, grad_bias2, activation_grads)
     }
 
     /// Get parameters for gradient computation

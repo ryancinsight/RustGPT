@@ -149,33 +149,32 @@ impl RichardsNorm {
         (adjusted_temp, adjusted_m, adjusted_beta)
     }
 
-    /// Forward normalization with dynamic parameter adjustments
+    /// Forward normalization with dynamic parameter adjustments (mutable for training)
     pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Cache input for backward (needed for gradient computation)
         self.cached_input = Some(input.clone());
 
+        self.normalize_impl(input)
+    }
+
+    /// Forward normalization with dynamic parameter adjustments (immutable for inference)
+    pub fn normalize_immutable(&self, input: &Array2<f32>) -> Array2<f32> {
+        self.normalize_impl(input)
+    }
+
+    /// Internal normalization implementation
+    fn normalize_impl(&self, input: &Array2<f32>) -> Array2<f32> {
         // Compute dynamic parameter adjustments
         let (adjusted_temp, adjusted_m, adjusted_beta) = self.compute_dynamic_adjustments(input);
 
-        // Store original parameters
-        let original_temp = self.richards.temperature;
-        let original_m = self.richards.m;
-        let original_beta = self.richards.beta;
-
-        // Apply dynamic adjustments temporarily
-        self.richards.temperature = adjusted_temp;
-        self.richards.m = adjusted_m;
-        self.richards.beta = adjusted_beta;
+        // Create a temporary Richards curve with adjusted parameters
+        let mut temp_richards = self.richards.clone();
+        temp_richards.temperature = adjusted_temp;
+        temp_richards.m = adjusted_m;
+        temp_richards.beta = adjusted_beta;
 
         // Apply Richards curve with per-feature transformations
-        let output = self.richards.forward_matrix(&input.mapv(|x| x as f64)).mapv(|x| x as f32);
-
-        // Restore original parameters
-        self.richards.temperature = original_temp;
-        self.richards.m = original_m;
-        self.richards.beta = original_beta;
-
-        output
+        temp_richards.forward_matrix(&input.mapv(|x| x as f64)).mapv(|x| x as f32)
     }
 }
 
@@ -185,7 +184,7 @@ impl Layer for RichardsNorm {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        self.normalize(&*input)
+        self.normalize(input)
     }
 
     fn compute_gradients(

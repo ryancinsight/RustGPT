@@ -85,12 +85,14 @@ pub struct PolyAttention {
     pub head_selection_config: HeadSelectionConfig,
     /// Learned head selection predictor for dynamic head selection (AutoDeco-inspired)
     pub threshold_predictor: Option<ThresholdPredictor>,
-    /// Optimizer for threshold predictor weights
+    /// Optimizer for threshold predictor weights1
     opt_w_tau: Option<Adam>,
-    /// Optimizer for threshold predictor alpha parameter
-    opt_alpha_tau: Option<Adam>,
-    /// Optimizer for threshold predictor beta parameter
-    opt_beta_tau: Option<Adam>,
+    /// Optimizer for threshold predictor bias1
+    opt_b_tau: Option<Adam>,
+    /// Optimizer for threshold predictor weights2
+    opt_w2_tau: Option<Adam>,
+    /// Optimizer for threshold predictor bias2
+    opt_b2_tau: Option<Adam>,
 
     // CoPE integration and sliding window
     use_cope: bool,
@@ -262,8 +264,9 @@ impl PolyAttention {
             },
             threshold_predictor: None,
             opt_w_tau: None,
-            opt_alpha_tau: None,
-            opt_beta_tau: None,
+            opt_b_tau: None,
+            opt_w2_tau: None,
+            opt_b2_tau: None,
             use_cope,
             cope_max_pos,
             cope_pos_embeddings,
@@ -518,16 +521,23 @@ impl PolyAttention {
         let n_gate_w = self.gate_poly.weights().len();
         let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
-        // Threshold predictor grads
-        let grad_w_tau = if self.head_selection_config.use_learned_threshold {
-            Some(Array2::<f32>::zeros((self.embed_dim, 1)))
-        } else { None };
-        let grad_alpha_tau = if self.head_selection_config.use_learned_threshold {
-            Some(Array2::<f32>::zeros((1, 1)))
-        } else { None };
-        let grad_beta_tau = if self.head_selection_config.use_learned_threshold {
-            Some(Array2::<f32>::zeros((1, 1)))
-        } else { None };
+        // Threshold predictor grads - simplified for now
+        let (grad_w_tau, grad_b_tau, grad_w2_tau, grad_b2_tau, grad_activation_tau) = if self.head_selection_config.use_learned_threshold {
+            if let Some(predictor) = &self.threshold_predictor {
+                // For now, use zero gradients as placeholder
+                // TODO: Implement proper threshold gradient computation with real loss
+                let hidden_dim = predictor.weights1.ncols();
+                (Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),  // weights1 shape
+                 Some(Array2::<f32>::zeros((hidden_dim, 1))),              // bias1 shape (matches optimizer)
+                 Some(Array2::<f32>::zeros((hidden_dim, 1))),              // weights2 shape
+                 Some(Array2::<f32>::zeros((1, 1))),                       // bias2 shape (matches optimizer)
+                 Some(Array2::<f32>::zeros((1, predictor.activation.scalar_weights_len()))))
+            } else {
+                (None, None, None, None, None)
+            }
+        } else {
+            (None, None, None, None, None)
+        };
 
         // CoPE grads accumulator (shared across heads)
         let mut grad_cope_pos = if self.use_cope {
@@ -848,8 +858,15 @@ impl PolyAttention {
         // Threshold predictor grads
         if self.head_selection_config.use_learned_threshold {
             all_param_grads.push(grad_w_tau.unwrap());
-            all_param_grads.push(grad_alpha_tau.unwrap());
-            all_param_grads.push(grad_beta_tau.unwrap());
+            all_param_grads.push(grad_b_tau.unwrap());
+            all_param_grads.push(grad_w2_tau.unwrap());
+            all_param_grads.push(grad_b2_tau.unwrap());
+            // Add activation parameter gradients
+            let grad_activation_tau_f32 = Array2::<f32>::from_shape_vec(
+                (1, grad_activation_tau.as_ref().unwrap().len()),
+                grad_activation_tau.unwrap().into_iter().map(|v| v as f32).collect(),
+            ).unwrap();
+            all_param_grads.push(grad_activation_tau_f32);
         }
 
         if let Some(grad_pe) = grad_cope_pos {
@@ -864,9 +881,9 @@ impl PolyAttention {
         param_grads: &[Array2<f32>],
         lr: f32,
     ) -> crate::errors::Result<()> {
-        // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w
+        // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w + threshold_predictor
         let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
-        if self.head_selection_config.use_learned_threshold { expected += 3; }
+        if self.head_selection_config.use_learned_threshold { expected += 5; } // weights1, bias1, weights2, bias2, activation_params
         if self.use_cope { expected += 1; }
         if param_grads.len() != expected {
             return Err(crate::errors::ModelError::GradientError {
@@ -903,16 +920,26 @@ impl PolyAttention {
         idx += 1;
 
         if self.head_selection_config.use_learned_threshold {
-            if let (Some(predictor), Some(opt_w1), Some(opt_w2)) =
-                (&mut self.threshold_predictor, &mut self.opt_w_tau, &mut self.opt_alpha_tau) {
+            if let (Some(predictor), Some(opt_w1), Some(opt_b1), Some(opt_w2), Some(opt_b2)) =
+                (&mut self.threshold_predictor, &mut self.opt_w_tau, &mut self.opt_b_tau,
+                 &mut self.opt_w2_tau, &mut self.opt_b2_tau) {
                 // Update first layer weights and biases
                 opt_w1.step(&mut predictor.weights1, &param_grads[idx], lr);
-                // Note: bias1 gradients would be at idx+1, but we're skipping for simplicity
+                // bias1 is (hidden_dim,) but gradient is (hidden_dim, 1), so reshape bias to match optimizer
+                let mut bias1_reshaped = predictor.bias1.clone().into_shape((predictor.bias1.len(), 1)).unwrap();
+                opt_b1.step(&mut bias1_reshaped, &param_grads[idx + 1], lr);
+                predictor.bias1.assign(&bias1_reshaped.view().into_shape(predictor.bias1.len()).unwrap());
                 // Update second layer weights and biases
-                opt_w2.step(&mut predictor.weights2, &param_grads[idx + 1], lr);
-                // Note: bias2 gradients would be at idx+2
+                opt_w2.step(&mut predictor.weights2, &param_grads[idx + 2], lr);
+                // bias2 is (1,) but gradient is (1, 1), so reshape bias to match optimizer
+                let mut bias2_reshaped = predictor.bias2.clone().into_shape((predictor.bias2.len(), 1)).unwrap();
+                opt_b2.step(&mut bias2_reshaped, &param_grads[idx + 3], lr);
+                predictor.bias2.assign(&bias2_reshaped.view().into_shape(predictor.bias2.len()).unwrap());
+                // Update Richards activation parameters using its own step method
+                let grad_activation_vec: Vec<f64> = param_grads[idx + 4].iter().map(|&x| x as f64).collect();
+                predictor.activation.step(&grad_activation_vec, lr as f64);
             }
-            idx += 3; // Maintain compatibility with old parameter count
+            idx += 5; // Updated parameter count: weights1, bias1, weights2, bias2, activation_params
         }
         if self.use_cope {
             if let (Some(pe), Some(opt)) = (
@@ -970,9 +997,8 @@ impl PolyAttention {
             // Use smaller hidden dimension like AutoDeco (128 is typical)
             let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
             self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim));
-            self.opt_w_tau = Some(Adam::new((self.embed_dim, 1)));
-            self.opt_alpha_tau = Some(Adam::new((1, 1)));
-            self.opt_beta_tau = Some(Adam::new((1, 1)));
+            // Old optimizer initialization - should not be used with new predictor
+            // Keeping for backward compatibility but this path is deprecated
         }
     }
 
@@ -986,7 +1012,10 @@ impl PolyAttention {
             self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim));
             // Optimizers for the two-layer network
             self.opt_w_tau = Some(Adam::new((self.embed_dim, predictor_hidden_dim)));
-            self.opt_alpha_tau = Some(Adam::new((predictor_hidden_dim, 1)));
+            self.opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
+            self.opt_w2_tau = Some(Adam::new((predictor_hidden_dim, 1)));
+            self.opt_b2_tau = Some(Adam::new((1, 1)));
+            // Note: Richards activation uses its own step method, no Adam optimizer needed
             // Note: RichardsNorm doesn't have trainable parameters, so no optimizer needed
         }
     }
