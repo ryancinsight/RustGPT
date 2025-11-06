@@ -1,6 +1,7 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use crate::adam::Adam;
+use crate::richards::pade::PadeExp;
 use rayon::prelude::*;
 
 /// # Richards Curve: Mathematical Framework and Numerical Methods
@@ -644,7 +645,7 @@ impl RichardsCurve {
         let clamped_exponent = exponent.clamp(-23.0, 23.0); // exp(±23) ≈ 1e±10
         // Extended Richards with beta asymmetry factor
         // y = (beta + (1-beta) * exp(-k*(x-m))) ^ (-1/ν)
-        let beta_term = beta + (1.0 - beta) * clamped_exponent.exp();
+        let beta_term = beta + (1.0 - beta) * PadeExp::exp(clamped_exponent);
                 let extended_richards = if nu <= 0.0 {
                     1.0 / beta_term
                 } else {
@@ -688,9 +689,9 @@ impl RichardsCurve {
         // Clamp exponent to prevent overflow
         let clamped_exponent = exponent.clamp(-23.0, 23.0);
         let sigma = if nu <= 0.0 {
-            1.0 / (1.0 + clamped_exponent.exp())
+            1.0 / (1.0 + PadeExp::exp(clamped_exponent))
         } else {
-            let u = clamped_exponent.exp().powf(1.0 / nu);
+            let u = PadeExp::exp(clamped_exponent).powf(1.0 / nu);
             1.0 / (1.0 + u)
         };
 
@@ -801,9 +802,9 @@ impl RichardsCurve {
                 let input = input_scale * (scale * xi + shift);
                 let exponent: f64 = -k * (input - m);
                 let sigma = if nu <= 0.0 {
-                    1.0 / (1.0 + exponent.exp())
+                    1.0 / (1.0 + PadeExp::exp(exponent))
                 } else {
-                    let u = exponent.exp().powf(1.0 / nu);
+                    let u = PadeExp::exp(exponent).powf(1.0 / nu);
                     1.0 / (1.0 + u)
                 };
 
@@ -831,9 +832,9 @@ impl RichardsCurve {
 
         let exponent = -k * (input - m);
         let sigma = if nu <= 0.0 {
-            1.0 / (1.0 + exponent.exp())
+            1.0 / (1.0 + PadeExp::exp(exponent))
         } else {
-            let u = exponent.exp().powf(1.0 / nu);
+            let u = PadeExp::exp(exponent).powf(1.0 / nu);
             1.0 / (1.0 + u)
         };
         let gate = match self.variant { super::Variant::Tanh => 2.0 * sigma - 1.0, _ => sigma };
@@ -868,7 +869,7 @@ impl RichardsCurve {
             // Let Richards(y) = D^(-1/ν)
             // dRichards/dβ = dRichards/dD * dD/dβ
             // dD/dβ = 1 - exp(-k*(y-m))
-            let exp_term = exponent.exp();
+            let exp_term = PadeExp::exp(exponent);
             let d = beta + (1.0 - beta) * exp_term;
             let d_d_beta = 1.0 - exp_term;
 
@@ -894,12 +895,12 @@ impl RichardsCurve {
 
             let d_richards_d_input = if nu <= 0.0 {
                 // Richards = 1/D, dRichards/dinput = d(1/D)/dinput = -1/D² * dD/dinput
-                let exp_term = exponent.exp();
+                let exp_term = PadeExp::exp(exponent);
                 let d = beta + (1.0 - beta) * exp_term;
                 - (1.0 / (d * d)) * (-k * exp_term * (1.0 - beta))
             } else {
                 // Richards = D^(-1/ν), dRichards/dinput = (-1/ν) * D^(-1/ν-1) * dD/dinput
-                let exp_term = exponent.exp();
+                let exp_term = PadeExp::exp(exponent);
                 let d = beta + (1.0 - beta) * exp_term;
                 (-1.0 / nu) * d.powf(-1.0 / nu - 1.0) * (-k * exp_term * (1.0 - beta))
             };
@@ -957,7 +958,7 @@ impl RichardsCurve {
         let input = input_scale * cx;
 
         let exponent = -k * (input - m);
-        let u = (exponent).exp().powf(1.0 / nu);
+        let u = PadeExp::exp(exponent).powf(1.0 / nu);
         let sigma = 1.0 / (1.0 + u);
 
         // Derivative of Richards sigmoid w.r.t. input
