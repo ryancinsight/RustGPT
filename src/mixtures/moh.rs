@@ -357,7 +357,7 @@ impl HeadSelectionPredictor {
         let cached_input = self.cached_input.as_ref().expect("predict must be called before compute_gradients");
         let cached_output = self.cached_output.as_ref().expect("predict must be called before compute_gradients");
         let cached_activated = self.cached_activated.as_ref().expect("predict must be called before compute_gradients");
-        let cached_activation = self.cached_activation.as_ref().expect("predict must be called before compute_gradients");
+        let _cached_activation = self.cached_activation.as_ref().expect("predict must be called before compute_gradients");
         let cached_normalized = self.cached_normalized.as_ref().expect("predict must be called before compute_gradients");
         let cached_hidden = self.cached_hidden.as_ref().expect("predict must be called before compute_gradients");
 

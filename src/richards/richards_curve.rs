@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use crate::adam::Adam;
-use crate::richards::pade::PadeExp;
+use crate::pade::PadeExp;
 use rayon::prelude::*;
 
 /// # Richards Curve: Mathematical Framework and Numerical Methods
@@ -722,6 +722,11 @@ impl RichardsCurve {
         let mut grads_accum = vec![0.0f64; self.weights_len()];
         let (batch_size, embedding_dim) = x.dim();
 
+        // Bounds checking: ensure dimensions are compatible
+        if x.dim() != output_grads.dim() {
+            return grads_accum;
+        }
+
         // First, accumulate scalar parameter gradients (same as before)
         let scalar_param_count = self.scalar_weights_len();
 
@@ -755,6 +760,12 @@ impl RichardsCurve {
                 // Compute Richards outputs before gamma/bias application
                 let richards_output = self.forward_matrix(x);
 
+                // Bounds checking: ensure gamma_size matches embedding_dim
+                if gamma_size != embedding_dim {
+                    eprintln!("RichardsCurve::grad_weights_matrix: gamma size mismatch - gamma_size: {}, embedding_dim: {}", gamma_size, embedding_dim);
+                    return grads_accum;
+                }
+
                 // For each gamma parameter (one per feature)
                 for feature_idx in 0..gamma_size {
                     let mut gamma_grad = 0.0;
@@ -771,6 +782,12 @@ impl RichardsCurve {
         if self.bias_learnable {
             if let Some(ref bias) = self.bias {
                 let bias_size = bias.len();
+                // Bounds checking: ensure bias_size matches embedding_dim
+                if bias_size != embedding_dim {
+                    eprintln!("RichardsCurve::grad_weights_matrix: bias size mismatch - bias_size: {}, embedding_dim: {}", bias_size, embedding_dim);
+                    return grads_accum;
+                }
+
                 // For each bias parameter (one per feature)
                 for feature_idx in 0..bias_size {
                     let mut bias_grad = 0.0;

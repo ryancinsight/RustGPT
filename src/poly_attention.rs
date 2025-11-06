@@ -4,7 +4,30 @@ use ndarray::{Array2, linalg::general_mat_mul, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, richards::{RichardsCurve, Variant}, mixtures::moh::{HeadSelectionStrategy, HeadSelectionConfig, ThresholdPredictor}};
+use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, richards::{RichardsCurve, Variant}, mixtures::moh::{HeadSelectionStrategy, HeadSelectionConfig, ThresholdPredictor}, attention::position::cope::CoPE};
+
+/// Cached parameter information for PolyAttention
+#[derive(Debug, Clone)]
+pub struct PolyAttentionParamInfo {
+    /// Parameter count per head (w_q, w_k, w_v)
+    pub head_params_per_head: usize,
+    /// Total head parameters (all heads)
+    pub head_params_total: usize,
+    /// Output projection parameters
+    pub output_projection_params: usize,
+    /// Polynomial parameters (a, b, scale)
+    pub polynomial_params: usize,
+    /// Gating parameters (w_g, alpha_g, beta_g)
+    pub gating_params: usize,
+    /// Richards curve parameters for gating
+    pub gate_poly_params: usize,
+    /// Threshold predictor parameters (if present)
+    pub threshold_predictor_params: usize,
+    /// CoPE parameters
+    pub cope_params: usize,
+    /// Total parameter count
+    pub total_params: usize,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyHead {
@@ -95,15 +118,16 @@ pub struct PolyAttention {
     opt_b2_tau: Option<Adam>,
 
     // CoPE integration and sliding window
-    use_cope: bool,
-    cope_max_pos: usize,
-    cope_pos_embeddings: Option<Array2<f32>>, // (max_pos+1, head_dim)
-    opt_cope_pos: Option<Adam>,
+    cope: CoPE,
     window_size: Option<usize>,
 
     // training cache
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>, // (N, embed_dim)
+
+    /// Cached parameter information for dynamic tracking
+    #[serde(skip)]
+    param_info: Option<PolyAttentionParamInfo>,
 }
 
 // Thread-local scratch to avoid allocations per call and avoid locking overhead
@@ -211,14 +235,7 @@ impl PolyAttention {
         let opt_beta_g = Adam::new((1, num_heads));
 
         // CoPE integration (shared pos embeddings across heads)
-        let use_cope = true;
-        let cope_max_pos = max_pos;
-        let normal_pe = Normal::new(0.0, 0.02).unwrap();
-        let pe =
-            Array2::<f32>::from_shape_fn((max_pos + 1, head_dim), |_| normal_pe.sample(&mut rng));
-        let opt = Adam::new((max_pos + 1, head_dim));
-        let cope_pos_embeddings = Some(pe);
-        let opt_cope_pos = Some(opt);
+        let cope = CoPE::new(max_pos, head_dim);
 
         // Richards curve gate (default sigmoid variant, learnable)
         let gate_poly = RichardsCurve::new_learnable(Variant::Sigmoid);
@@ -267,12 +284,10 @@ impl PolyAttention {
             opt_b_tau: None,
             opt_w2_tau: None,
             opt_b2_tau: None,
-            use_cope,
-            cope_max_pos,
-            cope_pos_embeddings,
-            opt_cope_pos,
+            cope,
             window_size,
             cached_input: None,
+            param_info: None,
         }
     }
 
@@ -299,30 +314,6 @@ impl PolyAttention {
         }
     }
 
-    fn cope_pos_logits(
-        &self,
-        q: &Array2<f32>,
-        _k: &Array2<f32>,
-        window_size: Option<usize>,
-    ) -> Array2<f32> {
-        let n = q.nrows();
-        let mut pos_logits = Array2::<f32>::zeros((n, n));
-        if let Some(pe) = &self.cope_pos_embeddings {
-            for i in 0..n {
-                let j_start = match window_size {
-                    Some(w) => i.saturating_sub(w - 1),
-                    None => 0,
-                };
-                for j in j_start..=i {
-                    let pos = i - j;
-                    if pos <= self.cope_max_pos {
-                        pos_logits[[i, j]] = q.row(i).dot(&pe.row(pos));
-                    }
-                }
-            }
-        }
-        pos_logits
-    }
 
     pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
         // input: (N, embed_dim)
@@ -440,22 +431,17 @@ impl PolyAttention {
                     let j_end = if causal { i } else { n - 1 };
 
                     // CoPE q·p_pos caching for row i
-                    let q_pe: Option<Vec<f32>> = if self.use_cope {
-                        if let Some(pe) = &self.cope_pos_embeddings {
-                            let max_pos = usize::min(self.cope_max_pos, i.saturating_sub(j_start));
-                            let mut buf = Vec::with_capacity(max_pos + 1);
-                            buf.extend((0..=max_pos).map(|pos| q.row(i).dot(&pe.row(pos))));
-                            Some(buf)
-                        } else { None }
-                    } else { None };
+                    let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
+                    let mut q_pe = Vec::with_capacity(max_pos + 1);
+                    q_pe.extend((0..=max_pos).map(|pos|
+                        q.row(i).dot(&self.cope.pos_embeddings.row(pos))
+                    ));
 
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        if let Some(ref qpe) = q_pe {
-                            let pos = i.saturating_sub(j);
-                            if pos < qpe.len() { s += qpe[pos]; }
-                        }
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() { s += q_pe[pos]; }
                         let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
                         let phi = scale * (a * sp + b);
                         // yh_row += phi * v[j,:]
@@ -540,11 +526,7 @@ impl PolyAttention {
         };
 
         // CoPE grads accumulator (shared across heads)
-        let mut grad_cope_pos = if self.use_cope {
-            Some(Array2::<f32>::zeros((self.cope_max_pos + 1, self.head_dim)))
-        } else {
-            None
-        };
+        let mut grad_cope_pos = Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
 
         // Per-head param grads (Wq, Wk, Wv) + W_out + scalars + gating params
         let mut all_param_grads: Vec<Array2<f32>> = Vec::new();
@@ -595,11 +577,9 @@ impl PolyAttention {
 
                 // Allocate per-head grads
                 let mut grad_q: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
-                let mut grad_k: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
-                let mut grad_v: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
-                let mut grad_p_local: Option<Array2<f32>> = if self.use_cope {
-                    Some(Array2::<f32>::zeros((self.cope_max_pos + 1, self.head_dim)))
-                } else { None };
+                let mut grad_k: Array2::<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_v: Array2::<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_p_local: Array2<f32> = Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
 
                 for i in 0..n {
                     // g_yh_gated_row from output_grads and W_out block
@@ -613,24 +593,17 @@ impl PolyAttention {
                     let j_end = i; // causal always true here
 
                     // CoPE q·p_pos caching for row i
-                    let q_pe: Option<Vec<f32>> = if self.use_cope {
-                        if let Some(pe) = &self.cope_pos_embeddings {
-                            let max_pos = usize::min(self.cope_max_pos, i.saturating_sub(j_start));
-                            let mut buf = vec![0.0f32; max_pos + 1];
-                            for pos in 0..=max_pos {
-                                buf[pos] = q.row(i).dot(&pe.row(pos));
-                            }
-                            Some(buf)
-                        } else { None }
-                    } else { None };
+                    let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
+                    let mut q_pe = vec![0.0f32; max_pos + 1];
+                    for pos in 0..=max_pos {
+                        q_pe[pos] = q.row(i).dot(&self.cope.pos_embeddings.row(pos));
+                    }
 
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        if let Some(ref qpe) = q_pe {
-                            let pos = i.saturating_sub(j);
-                            if pos < qpe.len() { s += qpe[pos]; }
-                        }
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() { s += q_pe[pos]; }
                         let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
                         let phi = scale * (a * sp + b);
                         for h in 0..self.head_dim { y_pre_row[[0, h]] += phi * v[[j, h]]; }
@@ -689,10 +662,8 @@ impl PolyAttention {
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        if let Some(ref qpe) = q_pe {
-                            let pos = i.saturating_sub(j);
-                            if pos < qpe.len() { s += qpe[pos]; }
-                        }
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() { s += q_pe[pos]; }
                         let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
                         let phi = scale * (a * sp + b);
                         // dV
@@ -712,17 +683,11 @@ impl PolyAttention {
                             grad_k[[j, h]] += d_s_ij * q[[i, h]] * dk_scale;
                         }
                         // CoPE grads
-                        if let Some(ref qpe) = q_pe {
-                            let pos = i.saturating_sub(j);
-                            if pos < qpe.len() {
-                                if let Some(pe) = &self.cope_pos_embeddings {
-                                    for h in 0..self.head_dim {
-                                        grad_q[[i, h]] += d_s_ij * pe[[pos, h]];
-                                        if let Some(gpl) = grad_p_local.as_mut() {
-                                            gpl[[pos, h]] += d_s_ij * q[[i, h]];
-                                        }
-                                    }
-                                }
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() {
+                            for h in 0..self.head_dim {
+                                grad_q[[i, h]] += d_s_ij * self.cope.pos_embeddings[[pos, h]];
+                                grad_p_local[[pos, h]] += d_s_ij * q[[i, h]];
                             }
                         }
                     }
@@ -740,17 +705,15 @@ impl PolyAttention {
                 general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_total);
 
                 // Aggregate CoPE position grads
-                if self.use_cope {
-                    if let Some(gpl) = grad_p_local {
-                        if let Some(grad_pe_global) = grad_cope_pos.as_mut() {
-                            *grad_pe_global += &gpl;
-                        }
-                    }
-                }
+                grad_cope_pos += &grad_p_local;
             }
         }
 
         // ===== Head-selection regularizers (auxiliary losses) =====
+        // TODO: Consider decoupling MoH training like RichardsCurve
+        // Option 1: Keep coupled (current) - MoH learns from attention gradients + auxiliary losses
+        // Option 2: Independent training - MoH learns from separate head-selection objectives
+        // Option 3: Hierarchical training - MoH learns first, then attention layer learns
         if self.head_selection_config.use_learned_threshold && (self.head_selection_config.complexity_loss_weight > 0.0 || self.head_selection_config.load_balance_weight > 0.0 || self.head_selection_config.sparsity_weight > 0.0) {
             // Use the new predictor for threshold computation
             let m_vec = if let Some(predictor) = &self.threshold_predictor {
@@ -869,9 +832,7 @@ impl PolyAttention {
             all_param_grads.push(grad_activation_tau_f32);
         }
 
-        if let Some(grad_pe) = grad_cope_pos {
-            all_param_grads.push(grad_pe);
-        }
+        all_param_grads.push(grad_cope_pos);
 
         (grad_input_total, all_param_grads)
     }
@@ -884,7 +845,7 @@ impl PolyAttention {
         // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w + threshold_predictor
         let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
         if self.head_selection_config.use_learned_threshold { expected += 5; } // weights1, bias1, weights2, bias2, activation_params
-        if self.use_cope { expected += 1; }
+        expected += 1; // CoPE parameters
         if param_grads.len() != expected {
             return Err(crate::errors::ModelError::GradientError {
                 message: format!(
@@ -911,7 +872,10 @@ impl PolyAttention {
         self.opt_alpha_g.step(&mut self.alpha_g, &param_grads[idx + 1], lr);
         self.opt_beta_g.step(&mut self.beta_g, &param_grads[idx + 2], lr);
         idx += 3;
-        // update Richards curve parameters via Adam
+        // TODO: Consider decoupling Richards curve training
+        // Option 1: Keep coupled (current) - Richards learns from attention gradients
+        // Option 2: Independent training - Richards learns from separate objectives
+        // Option 3: Meta-learning - Richards learns across multiple attention layers
         {
             let grad_gate_poly = &param_grads[idx];
             let grad_gate_vec: Vec<f64> = grad_gate_poly.iter().map(|&x| x as f64).collect();
@@ -941,14 +905,7 @@ impl PolyAttention {
             }
             idx += 5; // Updated parameter count: weights1, bias1, weights2, bias2, activation_params
         }
-        if self.use_cope {
-            if let (Some(pe), Some(opt)) = (
-                self.cope_pos_embeddings.as_mut(),
-                self.opt_cope_pos.as_mut(),
-            ) {
-                opt.step(pe, &param_grads[idx], lr);
-            }
-        }
+        self.cope.apply_gradients(&param_grads[idx], lr);
         Ok(())
     }
 
@@ -962,33 +919,90 @@ impl PolyAttention {
         input_grads
     }
 
-    fn parameters(&self) -> usize {
-        let head_params = self
-            .heads
-            .iter()
-            .map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len())
-            .sum::<usize>();
-        let mut total = self.w_out.len()
-            + 3
-            + head_params
-            + self.w_g.len()
-            + self.alpha_g.len()
-            + self.beta_g.len()
-            + self.gate_poly.weights().len();
-        if self.use_cope {
-            total += (self.cope_max_pos + 1) * self.head_dim;
-        }
-        if self.head_selection_config.use_learned_threshold {
-            if let Some(predictor) = &self.threshold_predictor {
-                // Count parameters in the two-layer network: weights1 + bias1 + weights2 + bias2
-                total += predictor.weights1.len() + predictor.bias1.len() +
-                        predictor.weights2.len() + predictor.bias2.len();
+    /// Get parameter information for this PolyAttention layer
+    fn get_param_info(&mut self) -> &PolyAttentionParamInfo {
+        if self.param_info.is_none() {
+            // Calculate parameter counts for each component
+            let head_params_per_head = self.heads.first()
+                .map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len())
+                .unwrap_or(0);
+            let head_params_total = head_params_per_head * self.heads.len();
+
+            let output_projection_params = self.w_out.len();
+
+            let polynomial_params = self.a.len() + self.b.len() + self.scale.len();
+
+            let gating_params = self.w_g.len() + self.alpha_g.len() + self.beta_g.len();
+
+            let gate_poly_params = self.gate_poly.weights().len();
+
+            let threshold_predictor_params = if self.head_selection_config.use_learned_threshold {
+                if let Some(predictor) = &self.threshold_predictor {
+                    predictor.weights1.len() + predictor.bias1.len() +
+                    predictor.weights2.len() + predictor.bias2.len()
+                } else {
+                    // Fallback to old count for compatibility
+                    self.embed_dim + 1 + 1
+                }
             } else {
-                // Fallback to old count for compatibility
-                total += self.embed_dim + 1 + 1;
-            }
+                0
+            };
+
+            let cope_params = self.cope.parameters();
+
+            let total_params = head_params_total + output_projection_params + polynomial_params +
+                             gating_params + gate_poly_params + threshold_predictor_params + cope_params;
+
+            self.param_info = Some(PolyAttentionParamInfo {
+                head_params_per_head,
+                head_params_total,
+                output_projection_params,
+                polynomial_params,
+                gating_params,
+                gate_poly_params,
+                threshold_predictor_params,
+                cope_params,
+                total_params,
+            });
         }
-        total
+
+        self.param_info.as_ref().unwrap()
+    }
+
+    /// Get detailed parameter breakdown for this PolyAttention layer
+    pub fn param_breakdown(&mut self) -> &PolyAttentionParamInfo {
+        self.get_param_info()
+    }
+
+    fn parameters(&self) -> usize {
+        // Use cached value if available, otherwise compute
+        if let Some(ref info) = self.param_info {
+            info.total_params
+        } else {
+            // Fallback to original computation (but this won't be cached)
+            let head_params = self
+                .heads
+                .iter()
+                .map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len())
+                .sum::<usize>();
+            let mut total = self.w_out.len()
+                + 3
+                + head_params
+                + self.w_g.len()
+                + self.alpha_g.len()
+                + self.beta_g.len()
+                + self.gate_poly.weights().len();
+            total += self.cope.parameters();
+            if self.head_selection_config.use_learned_threshold {
+                if let Some(predictor) = &self.threshold_predictor {
+                    total += predictor.weights1.len() + predictor.bias1.len() +
+                            predictor.weights2.len() + predictor.bias2.len();
+                } else {
+                    total += self.embed_dim + 1 + 1;
+                }
+            }
+            total
+        }
     }
 
     // Initialize or ensure learned threshold predictor parameters
@@ -1123,10 +1137,8 @@ impl Layer for PolyAttention {
             .map(|&w| (w as f32) * (w as f32))
             .sum::<f32>();
 
-        // CoPE positional embeddings if present
-        if let Some(pe) = &self.cope_pos_embeddings {
-            sumsq += pe.iter().map(|&w| w * w).sum::<f32>();
-        }
+        // CoPE positional embeddings
+        sumsq += self.cope.weight_norm().powi(2);
 
         // Threshold predictor weights if present
         if let Some(pred) = &self.threshold_predictor {

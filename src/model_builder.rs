@@ -6,6 +6,7 @@ use crate::{
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     poly_attention::PolyAttention,
+    mixtures::moe::{MixtureOfExperts, ExpertRouterConfig},
 };
 use crate::encoding::Vocab;
 
@@ -80,12 +81,23 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
         // Pre-FFN normalization (Pre-LN)
         layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
 
-        // Feedforward layer (RichardsGlu only)
-        let richards_glu = RichardsGlu::new(
-            config.embedding_dim,
-            config.hidden_dim,
-        );
-        layers.push(LayerEnum::RichardsGlu(Box::new(richards_glu)));
+        // Feedforward layer: use MoE if configured, otherwise RichardsGlu
+        if let Some(ref router) = config.moe_router {
+            let router_config = ExpertRouterConfig::from_router(router);
+            let moe_layer = MixtureOfExperts::new(
+                config.embedding_dim,
+                (config.embedding_dim / 4).max(32), // Router hidden dim: embed_dim/4, min 32
+                router_config,
+            );
+            layers.push(LayerEnum::MixtureOfExperts(Box::new(moe_layer)));
+        } else {
+            // Standard RichardsGlu feedforward
+            let richards_glu = RichardsGlu::new(
+                config.embedding_dim,
+                config.hidden_dim,
+            );
+            layers.push(LayerEnum::RichardsGlu(Box::new(richards_glu)));
+        }
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)

@@ -186,13 +186,10 @@ impl Layer for RichardsGlu {
             }
         }
 
-        // Use input directly for weight gradients
-        let cached_input = self
-            .cached_input
-            .as_ref()
-            .expect("forward must cache input before compute_gradients");
-        let grad_w1 = cached_input.t().dot(&grad_x1);
-        let grad_w2 = cached_input.t().dot(&grad_x2);
+        // Use input directly for weight gradients (fallback to cached input if available)
+        let weight_input = self.cached_input.as_ref().unwrap_or(input);
+        let grad_w1 = weight_input.t().dot(&grad_x1);
+        let grad_w2 = weight_input.t().dot(&grad_x2);
 
         // Input gradient (include residual branch)
         let grad_input_glu = grad_x1.dot(&self.w1.t()) + grad_x2.dot(&self.w2.t());
