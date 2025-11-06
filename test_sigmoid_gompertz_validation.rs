@@ -1,4 +1,3 @@
-use std::f64::consts::E;
 
 /// Standard sigmoid function: 1 / (1 + exp(-x))
 fn standard_sigmoid(x: f64) -> f64 {
@@ -46,14 +45,14 @@ fn richards_sigmoid_derivative_manual(x: f64, nu: f64, k: f64, m: f64) -> f64 {
 
 /// Manual implementation of RichardsCurve Gompertz computation
 /// For Gompertz: nu approaches 0, so we use the limit form
-fn richards_gompertz_manual(x: f64, nu: f64, k: f64, m: f64) -> f64 {
+fn richards_gompertz_manual(x: f64, _nu: f64, k: f64, m: f64) -> f64 {
     // As nu -> 0, Richards curve approaches Gompertz: exp(-exp(-k*(x-m)))
     let exp_term = -k * (x - m);
     (-exp_term.exp()).exp()
 }
 
 /// Manual implementation of RichardsCurve Gompertz derivative
-fn richards_gompertz_derivative_manual(x: f64, nu: f64, k: f64, m: f64) -> f64 {
+fn richards_gompertz_derivative_manual(x: f64, _nu: f64, k: f64, m: f64) -> f64 {
     // d/dx [exp(-exp(-k*(x-m)))]
     // = exp(-exp(-k*(x-m))) * (-exp(-k*(x-m))) * k
     // = k * exp(-exp(-k*(x-m))) * exp(-k*(x-m))

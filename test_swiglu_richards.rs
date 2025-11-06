@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use llm::RichardsGlu;
 use llm::llm::Layer;
 

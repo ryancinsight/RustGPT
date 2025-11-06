@@ -32,7 +32,7 @@ fn main() {
     println!("Output (x * tanh_variant(x)): {:?}", tanh_output.to_vec());
     
     // Test 3: Learnable sigmoid attention
-    let mut learnable_attention = RichardsAttention::new_learnable(Variant::Sigmoid);
+    let learnable_attention = RichardsAttention::new_learnable(Variant::Sigmoid);
     
     println!("\n=== Learnable RichardsAttention ===");
     let learnable_output = learnable_attention.forward(&x);

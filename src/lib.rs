@@ -1,10 +1,12 @@
 pub mod adam;
+pub mod attention;
 
-// pub mod cop; // removed: integrated CoPE into PolyAttention
 pub mod dataset_loader;
 pub mod embeddings;
 pub mod errors;
+pub mod pade;
 pub mod richards;
+pub mod softmax;
 
 // removed: pub mod head_router;
 pub mod llm;
@@ -49,7 +51,7 @@ pub use encoding::{Vocab, SimpleTokenizer};
 // Also re-export decoding types for convenience
 pub use decoding::{AutoDeco, AutoDecoConfig, GreedyDecoder, TemperatureHead, TopPHead};
 // Also re-export mixture types for convenience
-pub use mixtures::{HeadSelectionStrategy, HeadSelectionConfig, ThresholdPredictor};
+pub use mixtures::{HeadSelectionStrategy, HeadSelectionConfig, ThresholdPredictor, ExpertRouter, ExpertRouterConfig, MixtureOfExperts};
 // Also re-export RichardsNorm as DynamicTanhNorm for compatibility
 pub use richards::RichardsNorm as DynamicTanhNorm;
 // Also re-export RichardsGlu

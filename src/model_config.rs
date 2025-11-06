@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::mixtures::moh::HeadSelectionStrategy;
+use crate::mixtures::moe::ExpertRouter;
 
 /// Architecture type for model configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +143,14 @@ pub struct ModelConfig {
 
     /// Attention mechanism selection (SelfAttention vs PolyAttention)
     pub attention: AttentionType,
+
+    /// Enable Mixture-of-Experts (MoE) for feedforward layers
+    ///
+    /// When enabled, replaces standard feedforward layers with sparse MoE layers.
+    /// Each MoE layer contains multiple expert networks with learned routing.
+    ///
+    /// Default: None (use standard feedforward)
+    pub moe_router: Option<ExpertRouter>,
 }
 
 impl ModelConfig {
@@ -179,6 +188,7 @@ impl ModelConfig {
                 sparsity_weight: 0.001,
             },
             attention: AttentionType::SelfAttention,
+            moe_router: None, // Default: no MoE (standard feedforward)
         }
     }
 }

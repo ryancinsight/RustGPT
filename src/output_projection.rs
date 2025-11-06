@@ -47,7 +47,6 @@ impl Layer for OutputProjection {
         // grads shape is [sequence_length, vocab_size]
         let input = self.cached_input.as_ref().unwrap();
         let grad_w_out = input.t().dot(output_grads);
-
         let grad_input = output_grads.dot(&self.w_out.t());
 
         (grad_input, vec![grad_w_out])

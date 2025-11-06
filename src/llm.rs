@@ -19,6 +19,7 @@ pub enum LayerEnum {
     // Removed SelfAttention variant
     // Removed FeedForward variant; RichardsGlu is the only FFN
     RichardsGlu(Box<crate::richards::RichardsGlu>),
+    MixtureOfExperts(Box<crate::mixtures::moe::MixtureOfExperts>),
 
     DynamicTanhNorm(crate::richards::RichardsNorm),
     OutputProjection(OutputProjection),
@@ -38,6 +39,7 @@ impl Layer for LayerEnum {
             // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::RichardsGlu(layer) => layer.layer_type(),
+            LayerEnum::MixtureOfExperts(layer) => layer.layer_type(),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.layer_type(),
             LayerEnum::OutputProjection(layer) => layer.layer_type(),
@@ -53,6 +55,7 @@ impl Layer for LayerEnum {
             // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::RichardsGlu(layer) => layer.forward(input),
+            LayerEnum::MixtureOfExperts(layer) => layer.forward(input),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.forward(input),
             LayerEnum::OutputProjection(layer) => layer.forward(input),
@@ -72,6 +75,7 @@ impl Layer for LayerEnum {
             // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::MixtureOfExperts(layer) => layer.compute_gradients(input, output_grads),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
@@ -87,6 +91,7 @@ impl Layer for LayerEnum {
             // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::RichardsGlu(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::MixtureOfExperts(layer) => layer.apply_gradients(param_grads, lr),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.apply_gradients(param_grads, lr),
             LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
@@ -102,6 +107,7 @@ impl Layer for LayerEnum {
             // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::RichardsGlu(layer) => layer.backward(grads, lr),
+            LayerEnum::MixtureOfExperts(layer) => layer.backward(grads, lr),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.backward(grads, lr),
             LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
@@ -117,6 +123,7 @@ impl Layer for LayerEnum {
             // Removed SelfAttention arm
             // Removed FeedForward arm
             LayerEnum::RichardsGlu(layer) => layer.parameters(),
+            LayerEnum::MixtureOfExperts(layer) => layer.parameters(),
 
             LayerEnum::DynamicTanhNorm(layer) => layer.parameters(),
             LayerEnum::OutputProjection(layer) => layer.parameters(),
@@ -129,6 +136,7 @@ impl Layer for LayerEnum {
         match self {
             LayerEnum::TokenEmbeddings(layer) => layer.weight_norm(),
             LayerEnum::RichardsGlu(layer) => layer.weight_norm(),
+            LayerEnum::MixtureOfExperts(layer) => layer.weight_norm(),
             LayerEnum::DynamicTanhNorm(layer) => layer.weight_norm(),
             LayerEnum::OutputProjection(layer) => layer.weight_norm(),
             LayerEnum::PolyAttention(layer) => layer.weight_norm(),
@@ -536,6 +544,10 @@ impl LLM {
             let mut pred_norm_count = 0usize;
             let mut avg_heads_per_token_sum = 0.0f32;
             let mut heads_layers_count = 0usize;
+            let mut avg_experts_sum = 0.0f32;
+            let mut significant_experts_sum = 0.0f32;
+            let mut routing_entropy_sum = 0.0f32;
+            let mut experts_layers_count = 0usize;
 
             for layer in &mut self.network {
                 if let LayerEnum::PolyAttention(pa) = layer {
@@ -555,6 +567,15 @@ impl LLM {
                         heads_layers_count += 1;
                     }
                 }
+                if let LayerEnum::MixtureOfExperts(moe) = layer {
+                    let layer_avg_active_experts = moe.config.get_avg_active_experts();
+                    let layer_significant_experts = moe.config.get_avg_significant_experts();
+                    let layer_routing_entropy = moe.config.get_routing_entropy();
+                    avg_experts_sum += layer_avg_active_experts;
+                    significant_experts_sum += layer_significant_experts;
+                    routing_entropy_sum += layer_routing_entropy;
+                    experts_layers_count += 1;
+                }
             }
 
             let tau_min_log = if tau_available { tau_min_epoch } else { f32::NAN };
@@ -562,6 +583,9 @@ impl LLM {
             let tau_range_log = if tau_available { tau_max_epoch - tau_min_epoch } else { f32::NAN };
             let pred_norm_rms = if pred_norm_count > 0 { pred_norm_sum / pred_norm_count as f32 } else { f32::NAN };
             let avg_active_heads = if heads_layers_count > 0 { avg_heads_per_token_sum / heads_layers_count as f32 } else { f32::NAN };
+            let avg_active_experts = if experts_layers_count > 0 { avg_experts_sum / experts_layers_count as f32 } else { f32::NAN };
+            let avg_significant_experts = if experts_layers_count > 0 { significant_experts_sum / experts_layers_count as f32 } else { f32::NAN };
+            let avg_routing_entropy = if experts_layers_count > 0 { routing_entropy_sum / experts_layers_count as f32 } else { f32::NAN };
 
             // Collect current richards_glu richards weights for delta tracking
             let mut current_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
@@ -606,6 +630,9 @@ impl LLM {
                 tau_range = tau_range_log,
                 pred_norm_rms = pred_norm_rms,
                 avg_active_heads = avg_active_heads,
+                avg_active_experts = avg_active_experts,
+                avg_significant_experts = avg_significant_experts,
+                avg_routing_entropy = avg_routing_entropy,
                 richards_glu_richards_delta = avg_richards_glu_delta,
                 "Training epoch completed{}",
                 warmup_status
@@ -975,30 +1002,20 @@ impl LLM {
 
     #[inline]
     fn softmax(logits: &Array2<f32>) -> Array2<f32> {
-        // logits is seq_len x vocab_size
-        let mut result = logits.clone();
-
-        // Apply softmax row-wise
-        for mut row in result.rows_mut() {
-            // Calculate max value for numerical stability
-            let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-
-            // Compute sum of exp values in one pass
-            let sum_exp: f32 = row.iter().map(|&x| (x - max_val).exp()).sum();
-
-            // Normalize in-place
-            row.mapv_inplace(|x| (x - max_val).exp() / sum_exp);
-        }
-
-        result
+        // Use the shared softmax module for consistent, optimized implementation
+        let softmax = crate::softmax::Softmax::new();
+        softmax.forward_immutable(&logits.view())
     }
 
 
     #[inline]
     fn cross_entropy_loss_step(probs: &Array2<f32>, target: &[usize]) -> f32 {
+        let vocab_size = probs.shape()[1];
         let mut loss = 0.0;
         for row_idx in 0..probs.shape()[0] {
-            let prob_target = probs[[row_idx, target[row_idx]]]; // Get probability of correct token
+            // Clamp target token ID to valid range to prevent index out of bounds
+            let safe_target = target[row_idx].min(vocab_size.saturating_sub(1));
+            let prob_target = probs[[row_idx, safe_target]]; // Get probability of correct token
             loss -= prob_target.max(1e-15).ln(); // Add numerical stability
         }
 
@@ -1023,7 +1040,9 @@ impl LLM {
 
         // Compute correct softmax + cross-entropy gradient: softmax - one_hot(target)
         for row_idx in 0..grads.shape()[0] {
-            grads[[row_idx, target[row_idx]]] -= 1.0; // Convert to: p - y (where y is one-hot)
+            // Clamp target token ID to valid range to prevent index out of bounds
+            let safe_target = target[row_idx].min(grads.shape()[1].saturating_sub(1));
+            grads[[row_idx, safe_target]] -= 1.0; // Convert to: p - y (where y is one-hot)
         }
 
         // Normalize by batch size for stable training

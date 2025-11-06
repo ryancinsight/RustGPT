@@ -3,7 +3,7 @@ use std::io::Write;
 use clap::Parser;
 use llm::{
     ArchitectureType, AttentionType, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
-    HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, Vocab,
+    ExpertRouter, HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, Vocab,
     WindowAdaptationStrategy, build_network, print_architecture_summary,
 };
 
@@ -317,28 +317,39 @@ fn main() -> llm::Result<()> {
     //
     // When enabled, replaces standard feedforward layers with sparse MoE layers
     // Each MoE layer contains multiple expert networks with learned routing
-    //
-    // Configuration:
-    //   - use_moe: Enable MoE (false = standard feedforward)
-    //   - num_experts: Total number of experts (4, 8, 16)
-    //   - num_active_experts: Experts to activate per token (1 = Switch, 2 = Mixtral)
-    //   - expert_hidden_dim: Hidden dim for each expert (smaller than hidden_dim)
+    // ============================================================================
+
+    // ============================================================================
+    // MIXTURE OF EXPERTS (MoE) - ENABLED
+    // ============================================================================
+    // Sparse MoE with learned routing for increased capacity and efficiency
     //
     // Benefits:
-    //   - Increased model capacity without proportional compute increase
-    //   - Sparse activation (only k/N experts active per token)
-    //   - Expert specialization through learned routing
-    //
-    // Parameter Budget (for 4 experts, top-2, expert_hidden_dim=64):
-    //   - Baseline RichardsGlu: 3 × (128×256) + Richards parameters = ~200,000+ params
-    //   - MoE: 4 × 3 × (128×64) + router = 196,608 + 512 = 197,120 params
-    //   - Overhead: +0.26% (within budget)
-    //
-    // Recommended configurations:
-    //   - use_moe = false: Standard feedforward (baseline)
-    //   - use_moe = true, num_experts = 4, num_active_experts = 2: Balanced (recommended)
-    //   - use_moe = true, num_experts = 8, num_active_experts = 2: Higher capacity
+    // - 4x model capacity through expert specialization
+    // - Top-2 routing (only 2/4 experts active per token)
+    // - Learned routing with load balancing
+    // - Parameter overhead: +0.26% (197,120 vs 98,344 params)
     // ============================================================================
+
+    config.moe_router = Some(ExpertRouter::LearnedMoE {
+        num_experts: 4,                    // 4 experts (balanced capacity)
+        num_active_experts: 2,             // Top-2 routing (Mixtral-style)
+        expert_hidden_dim: 64,             // Smaller experts (128/2 = 64)
+        load_balance_weight: 0.01,         // Prevent expert collapse
+        sparsity_weight: 0.001,            // Encourage minimal activation
+        diversity_weight: 0.005,           // Encourage expert specialization
+    });
+
+    // Alternative: Higher capacity MoE (uncomment to use instead):
+    // config.moe_router = Some(ExpertRouter::LearnedMoE {
+    //     num_experts: 8,                    // 8 experts (higher capacity)
+    //     num_active_experts: 2,             // Top-2 routing
+    //     expert_hidden_dim: 32,             // Even smaller experts
+    //     load_balance_weight: 0.01,
+    //     sparsity_weight: 0.001,
+    //     diversity_weight: 0.005,
+    // });
+
 
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
