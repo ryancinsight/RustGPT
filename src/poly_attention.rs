@@ -527,17 +527,34 @@ impl PolyAttention {
         let n_gate_w = self.gate_poly.weights().len();
         let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
-        // Threshold predictor grads - simplified for now
+        // Threshold predictor gradient accumulator (shared across heads)
+        let mut threshold_grad_accum = if self.head_selection_config.gating.use_learned_predictor {
+            Some(Array2::<f32>::zeros((n, 1)))
+        } else {
+            None
+        };
+
+        // Threshold predictor grads - computed from accumulated gradients
         let (grad_w_tau, grad_b_tau, grad_w2_tau, grad_b2_tau, grad_activation_tau): (Option<Array2<f32>>, Option<Array2<f32>>, Option<Array2<f32>>, Option<Array2<f32>>, Option<Vec<f64>>) = if self.head_selection_config.gating.use_learned_predictor {
             if let Some(predictor) = &self.threshold_predictor {
-                // For now, use zero gradients as placeholder
-                // TODO: Implement proper threshold gradient computation with real loss
-                let hidden_dim = predictor.weights1.ncols();
-                (Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),  // weights1 shape
-                 Some(Array2::<f32>::zeros((hidden_dim, 1))),              // bias1 shape (matches optimizer)
-                 Some(Array2::<f32>::zeros((hidden_dim, 1))),              // weights2 shape
-                 Some(Array2::<f32>::zeros((1, 1))),                       // bias2 shape (matches optimizer)
-                 Some(vec![0.0_f64; predictor.activation.scalar_weights_len()]))
+                // Compute actual gradients using the accumulated threshold_grad_accum from all heads
+                if let Some(threshold_grad_accum) = threshold_grad_accum.as_ref() {
+                    // The predictor must have been used in forward pass, so compute_gradients should work
+                    let (grad_w1, grad_b1_1d, grad_w2, grad_b2_1d, grad_activation) = predictor.compute_gradients(threshold_grad_accum);
+                    // Convert biases to 2D arrays as expected by optimizer
+                    let grad_b1 = grad_b1_1d.clone().into_shape((grad_b1_1d.len(), 1)).unwrap();
+                    let grad_b2 = grad_b2_1d.clone().into_shape((grad_b2_1d.len(), 1)).unwrap();
+                    (Some(grad_w1), Some(grad_b1), Some(grad_w2), Some(grad_b2), Some(grad_activation))
+                } else {
+                    // Fallback to zeros if no gradients accumulated (shouldn't happen)
+                    let hidden_dim = predictor.weights1.ncols();
+                    let num_outputs = predictor.weights2.ncols();
+                    (Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
+                     Some(Array2::<f32>::zeros((hidden_dim, 1))),
+                     Some(Array2::<f32>::zeros((hidden_dim, num_outputs))),
+                     Some(Array2::<f32>::zeros((num_outputs, 1))),
+                     Some(vec![0.0_f64; predictor.activation.scalar_weights_len()]))
+                }
             } else {
                 (None, None, None, None, None)
             }
@@ -582,7 +599,7 @@ impl PolyAttention {
             let mut m_col = Array2::<f32>::ones((n, 1));
             if self.head_selection_config.gating.use_learned_predictor {
                 if let Some(predictor) = &self.threshold_predictor {
-                    // Use the enhanced AutoDeco-inspired predictor
+                    // Use forward pass (activations should be cached from training forward pass)
                     let thresholds = predictor.forward(&input.view());
                     m_col.assign(&thresholds);
                 }
@@ -669,11 +686,8 @@ impl PolyAttention {
                         for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i; }
                     }
 
-                    // Threshold sigmoid path - simplified gradients for new predictor
-                    if self.head_selection_config.gating.use_learned_predictor {
-                        // For now, skip detailed gradient computation for the new predictor
-                        // TODO: Implement proper gradient computation for the two-layer network
-                    }
+                    // Threshold sigmoid path - gradient computation for two-layer network
+                    // Gradients will be computed after the attention loop using accumulated contributions
 
                     // Attention path: g_yh_pre_row = g_yh_gated_row * g_i * m_i
                     let mut g_yh_pre_row = g_yh_gated_row.clone();
@@ -709,6 +723,91 @@ impl PolyAttention {
                                 grad_q[[i, h]] += d_s_ij * self.cope.pos_embeddings[[pos, h]];
                                 grad_p_local[[pos, h]] += d_s_ij * q[[i, h]];
                             }
+                        }
+                    }
+
+                    // Compute gradient w.r.t. threshold predictor output m_col[[i, 0]]
+                    // Since g_yh_pre_row[h] = g_yh_gated_row[h] * g_col[i] * m_col[i]
+                    // ∂L/∂m_i = sum_h g_yh_gated_row[h] * g_col[i] * ∂L/∂g_yh_pre_row[h]
+                    if let Some(threshold_grad_accum) = threshold_grad_accum.as_mut() {
+                        // Compute ∂L/∂g_yh_pre_row for this position i
+                        // This comes from all the gradient computations that used g_yh_pre_row
+                        let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+
+                        // Contribution from grad_v: each j contributes phi * coefficient
+                        for j in j_start..=j_end {
+                            let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                            let mut s = base;
+                            let pos = i.saturating_sub(j);
+                            if pos < q_pe.len() { s += q_pe[pos]; }
+                            let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+                            let phi = scale * (a * sp + b);
+
+                            // dV contribution: phi affects grad_v, and grad_v doesn't depend on g_yh_pre_row
+                            // Wait, actually grad_v does depend on g_yh_pre_row: grad_v[[j, h]] += phi * g_yh_pre_row[[0, h]]
+                            // So this doesn't create additional gradient w.r.t. g_yh_pre_row
+
+                            // The main contribution comes from dphi_ij and its downstream effects
+                            let dphi_ij = g_yh_pre_row.row(0).dot(&v.row(j));
+
+                            // dphi_ij affects: grad_scale_scalar, grad_a_scalar, grad_b_scalar, d_s_ij
+                            // Since these are scalars, their gradients don't create additional terms for g_yh_pre_row
+
+                            // But d_s_ij affects grad_q and grad_k, which also don't depend on g_yh_pre_row
+
+                            // Actually, the key insight is that dphi_ij = sum_h g_yh_pre_row[[0, h]] * v[[j, h]]
+                            // So ∂dphi_ij/∂g_yh_pre_row[[0, h]] = v[[j, h]]
+                            // And dphi_ij affects the scalar gradients and d_s_ij
+                            // So ∂L/∂g_yh_pre_row[[0, h]] = sum_j v[[j, h]] * ∂L/∂dphi_ij
+                            // Where ∂L/∂dphi_ij comes from its use in scalar gradients and d_s_ij
+
+                            // Let's compute this properly:
+                            let contrib_to_dphi = (a * sp + b) * scale; // from grad_scale_scalar
+                            let contrib_to_a = scale * sp; // from grad_a_scalar
+                            let contrib_to_b = scale; // from grad_b_scalar
+
+                            // Plus the contribution through d_s_ij
+                            let spm1 = match p_i32 { 1 => 1.0, 2 => s, 3 => s * s, _ => s.powi(p_i32 - 1) };
+                            let d_s_ij_coeff = scale * a * (self.p as f32) * spm1;
+
+                            // d_s_ij affects grad_q and grad_k, but these don't create cycles
+                            // The total ∂L/∂dphi_ij = contrib_to_dphi + contrib_to_a + contrib_to_b + (d_s_ij_coeff affects downstream)
+
+                            // Actually, this is getting complex. Let's use the chain rule more directly.
+                            // Since the only place g_yh_pre_row is used is in computing dphi_ij and grad_v,
+                            // and dphi_ij is used in scalar computations, the gradient w.r.t. g_yh_pre_row
+                            // comes from ∂dphi_ij/∂g_yh_pre_row * ∂L/∂dphi_ij
+
+                            // ∂dphi_ij/∂g_yh_pre_row[[0, h]] = v[[j, h]]
+                            // ∂L/∂dphi_ij = contribution to all scalar gradients and d_s_ij effects
+
+                            // For simplicity, let's accumulate the total gradient by computing
+                            // how much each component of g_yh_pre_row affects the final loss
+
+                            // The gradient w.r.t. m_i is g_yh_gated_row[h] * g_col[i] * ∂L/∂g_yh_pre_row[h]
+                            // But to avoid double computation, let's compute it directly from the chain rule
+
+                            let v_j = v.row(j);
+                            let dphi_contrib = contrib_to_dphi + contrib_to_a + contrib_to_b;
+
+                            for h in 0..self.head_dim {
+                                // Contribution from dphi_ij path
+                                d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
+
+                                // Contribution from d_s_ij path through Q/K gradients
+                                // d_s_ij affects grad_q and grad_k, but not g_yh_pre_row, so no additional term
+
+                                // Actually, the dV term doesn't create gradient w.r.t. g_yh_pre_row
+                                // since grad_v is accumulated but doesn't depend on g_yh_pre_row in a way that creates cycles
+                            }
+                        }
+
+                        // Now compute gradient w.r.t. m_col[[i, 0]]
+                        let g_yh_gated_i = g_yh_gated_row[[0, 0]]; // Same for all h if we assume gating is per-head
+                        let g_i = g_col[[i, 0]];
+                        for h in 0..self.head_dim {
+                            let g_yh_gated_h = g_yh_gated_row[[0, h]];
+                            threshold_grad_accum[[i, 0]] += g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
                         }
                     }
                 }

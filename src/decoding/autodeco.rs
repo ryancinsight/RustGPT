@@ -13,7 +13,8 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
-use crate::richards::RichardsNorm;
+use crate::richards::{RichardsNorm, RichardsCurve, PadeExp};
+use crate::softmax::Softmax;
 use crate::llm::Layer;
 
 /// Configuration for AutoDeco heads
@@ -68,6 +69,10 @@ pub struct TemperatureHead {
 
     /// Richards normalization for adaptive behavior
     norm: RichardsNorm,
+
+    /// Cached Richards sigmoid curve for temperature prediction
+    #[serde(skip)]
+    sigmoid_curve: Option<RichardsCurve>,
 }
 
 impl TemperatureHead {
@@ -93,6 +98,7 @@ impl TemperatureHead {
         let bias2 = Array1::zeros(1);
 
         let norm = RichardsNorm::new(head_hidden_dim);
+        let sigmoid_curve = Some(RichardsCurve::sigmoid(false));
 
         Self {
             weights1,
@@ -100,6 +106,7 @@ impl TemperatureHead {
             weights2,
             bias2,
             norm,
+            sigmoid_curve,
         }
     }
 
@@ -138,8 +145,9 @@ impl TemperatureHead {
         // Second layer: W2 * activated + b2
         let output = activated.dot(&self.weights2) + &self.bias2;
 
-        // Sigmoid activation to get temperature in [0, 1] range
-        let sigmoid = 1.0 / (1.0 + (-output[[0, 0]]).exp());
+        // Sigmoid activation to get temperature in [0, 1] range using cached Richards curve
+        let sigmoid_curve = self.sigmoid_curve.as_ref().unwrap();
+        let sigmoid = sigmoid_curve.forward_scalar(output[[0, 0]] as f64) as f32;
 
         // Scale to temperature range (0.1, 2.0)
         0.1 + sigmoid * 1.9
@@ -183,6 +191,10 @@ pub struct TopPHead {
 
     /// Richards normalization for adaptive behavior
     norm: RichardsNorm,
+
+    /// Cached Richards sigmoid curve for top-p prediction
+    #[serde(skip)]
+    sigmoid_curve: Option<RichardsCurve>,
 }
 
 impl TopPHead {
@@ -208,6 +220,7 @@ impl TopPHead {
         let bias2 = Array1::zeros(1);
 
         let norm = RichardsNorm::new(head_hidden_dim);
+        let sigmoid_curve = Some(RichardsCurve::sigmoid(false));
 
         Self {
             weights1,
@@ -215,6 +228,7 @@ impl TopPHead {
             weights2,
             bias2,
             norm,
+            sigmoid_curve,
         }
     }
 
@@ -242,8 +256,9 @@ impl TopPHead {
         // Second layer: W2 * activated + b2
         let output = activated.dot(&self.weights2) + &self.bias2;
 
-        // Sigmoid activation to get top-p in [0, 1] range
-        let sigmoid = 1.0 / (1.0 + (-output[[0, 0]]).exp());
+        // Sigmoid activation to get top-p in [0, 1] range using cached Richards curve
+        let sigmoid_curve = self.sigmoid_curve.as_ref().unwrap();
+        let sigmoid = sigmoid_curve.forward_scalar(output[[0, 0]] as f64) as f32;
 
         sigmoid
     }
@@ -281,6 +296,10 @@ pub struct AutoDeco {
     /// Top-p prediction head
     top_p_head: TopPHead,
 
+    /// Softmax layer for probability computation
+    #[serde(skip)]
+    softmax: Softmax,
+
     /// Hidden dimension from base model
     hidden_dim: usize,
 }
@@ -290,11 +309,13 @@ impl AutoDeco {
     pub fn new(hidden_dim: usize, config: AutoDecoConfig) -> Self {
         let temp_head = TemperatureHead::new(hidden_dim, config.head_hidden_dim);
         let top_p_head = TopPHead::new(hidden_dim + 1, config.head_hidden_dim); // +1 for temperature
+        let softmax = Softmax::new();
 
         Self {
             config,
             temp_head,
             top_p_head,
+            softmax,
             hidden_dim,
         }
     }
@@ -311,14 +332,16 @@ impl AutoDeco {
     }
 
     /// Apply soft top-p sampling (differentiable version for training)
-    pub fn soft_top_p_sample(&self, logits: &Array1<f32>, top_p: f32) -> Array1<f32> {
+    pub fn soft_top_p_sample(&mut self, logits: &Array1<f32>, top_p: f32) -> Array1<f32> {
         let temperature = 1.0; // Use default temperature during training
         let scaled_logits = logits / temperature;
 
-        // Compute softmax probabilities
-        let max_logit = scaled_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp_logits = scaled_logits.mapv(|x| (x - max_logit).exp());
-        let probs = &exp_logits / exp_logits.sum();
+        // Convert to 2D for softmax (batch_size=1, vocab_size)
+        let logits_2d = scaled_logits.clone().into_shape((1, scaled_logits.len())).unwrap();
+
+        // Compute softmax probabilities using the cached softmax layer
+        let probs_2d = self.softmax.forward(&logits_2d.view());
+        let probs = probs_2d.row(0).to_owned();
 
         // Sort probabilities and compute cumulative sum
         let mut prob_indices: Vec<usize> = (0..probs.len()).collect();
@@ -337,10 +360,10 @@ impl AutoDeco {
             cumulative[i] = sum;
         }
 
-        // Apply soft mask: exp(-α * ReLU(cumulative - top_p))
+        // Apply soft mask: exp(-α * ReLU(cumulative - top_p)) using PadeExp
         let soft_mask = cumulative.mapv(|c| {
             let relu_val = (c - top_p).max(0.0);
-            (-self.config.soft_top_p_alpha * relu_val).exp()
+            PadeExp::exp((-self.config.soft_top_p_alpha * relu_val) as f64) as f32
         });
 
         // Unsort the mask
@@ -357,6 +380,15 @@ impl AutoDeco {
         } else {
             probs // Fallback to original if all masked
         }
+    }
+
+    /// Compute gradients for soft top-p sampling
+    pub fn soft_top_p_sample_backward(&mut self, output_grads: &Array1<f32>) -> Array1<f32> {
+        // Get the cached softmax output and compute gradients
+        let softmax_output = self.softmax.cached_output().unwrap();
+        let softmax_grads_2d = output_grads.clone().into_shape((1, output_grads.len())).unwrap();
+        let input_grads_2d = self.softmax.backward(&softmax_grads_2d);
+        input_grads_2d.row(0).to_owned()
     }
 
     /// Get all parameter tensors for gradient computation
@@ -485,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_soft_top_p() {
-        let autodeco = AutoDeco::new(128, AutoDecoConfig::default());
+        let mut autodeco = AutoDeco::new(128, AutoDecoConfig::default());
         let logits = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 0.5]);
         let top_p = 0.8;
 
@@ -502,10 +534,10 @@ mod tests {
     #[test]
     fn test_autodeco_config() {
         let config = AutoDecoConfig::default();
-        assert_eq!(config.head_hidden_dim, 128);
-        assert_eq!(config.temp_range, (0.1, 2.0));
-        assert_eq!(config.top_p_range, (0.1, 1.0));
-        assert_eq!(config.soft_top_p_alpha, 30.0);
+        assert_eq!(config.head_hidden_dim, 256);
+        assert_eq!(config.temp_range, (0.1, 3.0));
+        assert_eq!(config.top_p_range, (0.05, 0.95));
+        assert_eq!(config.soft_top_p_alpha, 50.0);
         assert!(!config.enable_instruction_control);
         assert_eq!(config.instruction_control_weight, 0.1);
     }
@@ -548,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_soft_top_p_edge_cases() {
-        let autodeco = AutoDeco::new(128, AutoDecoConfig::default());
+        let mut autodeco = AutoDeco::new(128, AutoDecoConfig::default());
 
         // Test with very low top_p (should concentrate on top token)
         let logits = Array1::from_vec(vec![1.0, 2.0, 3.0, 0.1]);

@@ -71,7 +71,7 @@ impl Default for GatingConfig {
     fn default() -> Self {
         Self {
             use_learned_predictor: false,
-            num_active: 1,
+            num_active: 2,
             load_balance_weight: 0.0,
             sparsity_weight: 0.0,
             complexity_loss_weight: 0.0,
@@ -189,7 +189,7 @@ mod tests {
     fn test_gating_config_default() {
         let config = GatingConfig::default();
         assert!(!config.use_learned_predictor);
-        assert_eq!(config.num_active, 1);
+        assert_eq!(config.num_active, 2);
         assert_eq!(config.load_balance_weight, 0.0);
     }
 
@@ -215,6 +215,7 @@ mod tests {
     fn test_load_balance_loss() {
         let mut config = GatingConfig::default();
         // Simulate unbalanced gating: component 0 gets all tokens, others get none
+        config.metrics.resize(8);
         config.metrics.token_count_per_component = vec![100, 0, 0, 0, 0, 0, 0, 0];
         config.metrics.total_decisions = 100;
 

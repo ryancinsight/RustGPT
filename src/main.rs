@@ -417,7 +417,7 @@ fn main() -> llm::Result<()> {
     );
 
     // Use warmup + cosine annealing for instruction tuning stability
-    let warmup_epochs = 15;
+    let warmup_epochs = 25;
     llm.train_with_warmup(
         chat_training_examples,
         instruction_epochs,

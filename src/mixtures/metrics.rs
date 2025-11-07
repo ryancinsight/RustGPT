@@ -148,10 +148,6 @@ impl MixtureMetrics {
 
     /// Get sparsity loss for training (encourages minimal component usage)
     pub fn compute_sparsity_loss(&self, num_active: usize) -> f32 {
-        if self.total_decisions == 0 {
-            return 0.0;
-        }
-
         let avg_components_per_token = num_active as f32;
         let target_sparsity = 1.0; // Target: 1 component per token on average
         (avg_components_per_token - target_sparsity).powi(2)

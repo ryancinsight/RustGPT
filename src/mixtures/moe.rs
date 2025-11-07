@@ -1050,9 +1050,9 @@ mod tests {
     fn test_expert_router_config_default() {
         let config = ExpertRouterConfig::default();
         assert_eq!(config.num_experts, 4);
-        assert_eq!(config.num_active_experts, 2);
+        assert_eq!(config.gating.num_active, 2);
         assert_eq!(config.expert_hidden_dim, 64);
-        assert_eq!(config.load_balance_weight, 0.01);
+        assert_eq!(config.gating.load_balance_weight, 0.0);
     }
 
     #[test]
@@ -1068,9 +1068,9 @@ mod tests {
 
         let config = ExpertRouterConfig::from_router(&router);
         assert_eq!(config.num_experts, 8);
-        assert_eq!(config.num_active_experts, 3);
+        assert_eq!(config.gating.num_active, 3);
         assert_eq!(config.expert_hidden_dim, 32);
-        assert_eq!(config.load_balance_weight, 0.1);
+        assert_eq!(config.gating.load_balance_weight, 0.1);
     }
 
     #[test]
@@ -1117,8 +1117,9 @@ mod tests {
     fn test_load_balance_loss() {
         let mut config = ExpertRouterConfig::default();
         // Simulate unbalanced routing: expert 0 gets all tokens, others get none
-        config.metrics_token_count_per_expert = vec![100, 0, 0, 0];
-        config.metrics_total_routings = 100;
+        config.gating.metrics.resize(4);
+        config.gating.metrics.token_count_per_component = vec![100, 0, 0, 0];
+        config.gating.metrics.total_decisions = 100;
 
         let loss = config.compute_load_balance_loss();
         assert!(loss > 0.0); // Should have high loss due to imbalance
@@ -1137,11 +1138,14 @@ mod tests {
     fn test_moe_forward() {
         let config = ExpertRouterConfig {
             num_experts: 4,
-            num_active_experts: 2,
             expert_hidden_dim: 32,
-            load_balance_weight: 0.01,
-            sparsity_weight: 0.001,
             diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 2,
+                load_balance_weight: 0.01,
+                sparsity_weight: 0.001,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -1158,11 +1162,14 @@ mod tests {
     fn test_moe_gradient_computation() {
         let config = ExpertRouterConfig {
             num_experts: 4,
-            num_active_experts: 2,
             expert_hidden_dim: 32,
-            load_balance_weight: 0.01,
-            sparsity_weight: 0.001,
             diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 2,
+                load_balance_weight: 0.01,
+                sparsity_weight: 0.001,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -1193,11 +1200,14 @@ mod tests {
     fn test_moe_apply_gradients() {
         let config = ExpertRouterConfig {
             num_experts: 4,
-            num_active_experts: 2,
             expert_hidden_dim: 32,
-            load_balance_weight: 0.01,
-            sparsity_weight: 0.001,
             diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 2,
+                load_balance_weight: 0.01,
+                sparsity_weight: 0.001,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
