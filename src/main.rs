@@ -235,9 +235,8 @@ fn main() -> llm::Result<()> {
         // - Efficiency gain: 15-25% (vs 5-8% for standard MoH)
         // ============================================================================
         // SOFT ROUTING: Differentiable routing with continuous weights
-        HeadSelectionStrategy::FullyAdaptiveMoH {
-            min_heads: 1,                // Minimum heads for simple inputs (safety constraint)
-            max_heads: 8,                // Maximum heads for complex inputs (efficiency constraint)
+        HeadSelectionStrategy::Learned {
+            num_active: 8,               // Maximum heads for complex inputs (efficiency constraint)
             load_balance_weight: 0.1,    // INCREASED 10x: was 0.01 (too weak)
             complexity_loss_weight: 0.1, // INCREASED 10x: was 0.01 (too weak)
             sparsity_weight: 0.01,       // INCREASED 10x: was 0.001 (too weak)
