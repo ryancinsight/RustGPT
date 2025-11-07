@@ -128,21 +128,19 @@ impl MixtureMetrics {
         let total_tokens = self.total_decisions as f32;
         let expected_per_component = total_tokens / self.active_sum_per_component.len() as f32;
 
-        // Coefficient of variation across components
-        let mean_count = self.token_count_per_component.iter()
-            .map(|&count| count as f32)
-            .sum::<f32>() / self.active_sum_per_component.len() as f32;
+        // Coefficient of variation across components using iterator chains
+        let component_count = self.active_sum_per_component.len() as f32;
+        let counts_f32: Vec<f32> = self.token_count_per_component.iter().map(|&x| x as f32).collect();
+
+        let mean_count = counts_f32.iter().sum::<f32>() / component_count;
 
         if mean_count == 0.0 {
             return 0.0;
         }
 
-        let variance = self.token_count_per_component.iter()
-            .map(|&count| {
-                let diff = count as f32 - expected_per_component;
-                diff * diff
-            })
-            .sum::<f32>() / self.active_sum_per_component.len() as f32;
+        let variance = counts_f32.iter()
+            .map(|&count| (count - expected_per_component).powi(2))
+            .sum::<f32>() / component_count;
 
         let std_dev = variance.sqrt();
         std_dev / mean_count // Coefficient of variation
@@ -202,20 +200,18 @@ impl MixtureMetrics {
             return 0.0;
         }
 
-        // Calculate entropy of the average gate values
+        // Calculate entropy of the average gate values using iterator chains
         let total_sum: f32 = self.active_sum_per_component.iter().sum();
         if total_sum == 0.0 {
             return 0.0;
         }
 
-        let mut entropy = 0.0;
-        for &sum in &self.active_sum_per_component {
-            let prob = sum / total_sum;
-            if prob > 0.0 {
-                entropy -= prob * prob.ln();
-            }
-        }
-        entropy
+        self.active_sum_per_component.iter()
+            .map(|&sum| sum / total_sum)
+            .filter(|&prob| prob > 0.0)
+            .map(|prob| prob * prob.ln())
+            .sum::<f32>()
+            .abs() // Entropy is always positive
     }
 
     /// Get RMS of gate values (useful for monitoring training stability)

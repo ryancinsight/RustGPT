@@ -1,40 +1,36 @@
-//! # Component Routing Predictor
+//! # Shared Threshold Predictor for Mixture Models
 //!
-//! This module implements learned routing predictors for dynamic component selection
-//! in mixture models, supporting both Mixture-of-Heads (MoH) and Mixture-of-Experts (MoE).
+//! This module provides a shared threshold predictor for dynamic gating in mixture models.
+//! Implements AutoDeco-inspired neural architecture with Richards normalization.
 //!
 //! ## Overview
 //!
-//! Provides a unified neural network architecture for predicting routing decisions:
-//! - **MoH**: Predicts gating thresholds for head selection (1 output)
-//! - **MoE**: Predicts routing probabilities for expert selection (N outputs)
+//! The threshold predictor learns to predict gating thresholds for component selection.
+//! Uses a two-layer neural network with Xavier initialization, Richards normalization,
+//! and learned Richards activations replacing traditional ReLU.
 //!
 //! ## Architecture
 //!
-//! AutoDeco-inspired two-layer neural network: input → hidden layer → normalization →
-//! Richards activation → output layer → activation (sigmoid for thresholds, softmax for routing).
-//!
-//! ## Key Components
-//!
-//! - **Flexible outputs**: Configurable number of output values
-//! - **Richards components**: Normalization and activation for adaptive behavior
-//! - **Xavier initialization**: Proper weight initialization for stable training
-//! - **Unified interface**: Single predictor handles both MoH and MoE routing
+//! Based on AutoDeco's design principles with the following components:
+//! - Two-layer neural network (embed_dim → hidden_dim → 1)
+//! - Xavier weight initialization
+//! - Richards normalization for adaptive behavior
+//! - Learned Richards activation replacing ReLU
+//! - Richards sigmoid for stable [0,1] output range
 
 use serde::{Deserialize, Serialize};
 use crate::llm::Layer;
 
-/// Unified routing predictor for component selection
+/// Enhanced threshold predictor inspired by AutoDeco
 ///
-/// This implements a flexible two-layer neural network for routing prediction
-/// with configurable output dimensions. Supports both threshold prediction (MoH)
-/// and routing probability prediction (MoE).
+/// This implements a two-layer neural network for threshold prediction with proper
+/// forward and backward computations. The architecture follows AutoDeco's
+/// design principles with Xavier initialization and Richards normalization.
 ///
-/// Architecture follows AutoDeco's design principles with Xavier initialization
-/// and Richards normalization for stable, adaptive behavior.
+/// Used for predicting gating thresholds in both MoH and MoE systems.
 /// Supports multiple output dimensions for different use cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComponentPredictor {
+pub struct ThresholdPredictor {
     /// First layer weights (embed_dim x hidden_dim)
     pub weights1: ndarray::Array2<f32>,
     /// First layer biases (hidden_dim)
