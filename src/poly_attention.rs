@@ -4,7 +4,7 @@ use ndarray::{Array2, linalg::general_mat_mul, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, richards::{RichardsCurve, Variant}, mixtures::moh::{HeadSelectionStrategy, HeadSelectionConfig, ThresholdPredictor}, attention::position::cope::CoPE};
+use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, richards::{RichardsCurve, Variant}, mixtures::{moh::{HeadSelectionStrategy, HeadSelectionConfig}, threshold::ThresholdPredictor}, attention::position::cope::CoPE};
 
 /// Cached parameter information for PolyAttention
 #[derive(Debug, Clone)]
@@ -264,14 +264,9 @@ impl PolyAttention {
             opt_beta_g,
             gate_poly,
             head_selection_config: HeadSelectionConfig {
-                use_learned_threshold: false,
+                gating: crate::mixtures::gating::GatingConfig::default(),
                 min_heads: 1,
                 max_heads: num_heads,
-                load_balance_weight: 0.0,
-                sparsity_weight: 0.0,
-                complexity_loss_weight: 0.0,
-                metrics_active_sum_per_head: vec![0.0; num_heads],
-                metrics_token_count_per_head: vec![0; num_heads],
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,
@@ -327,12 +322,12 @@ impl PolyAttention {
         // Streamed accumulation: avoid building a large concat buffer
         let mut out = input.to_owned();
 
-        if self.head_selection_config.use_learned_threshold {
+        if self.head_selection_config.gating.use_learned_predictor {
             self.ensure_threshold_predictor();
         }
 
         // Pre-compute threshold predictor for all heads if needed
-        let thresholds_global = if self.head_selection_config.use_learned_threshold {
+        let thresholds_global = if self.head_selection_config.gating.use_learned_predictor {
             if let Some(predictor) = &mut self.threshold_predictor {
                 Some(predictor.predict(&input.view()))
             } else {
@@ -343,7 +338,7 @@ impl PolyAttention {
         };
 
         // Zero-copy iterator-based head processing with accumulation
-        let (active_sums_tmp, token_counts_tmp, (tau_min_local, tau_max_local, tau_sum_local, tau_count_local), (g_sq_sum_local, g_count_local), projections_acc) =
+        let (active_sums_tmp, token_counts_tmp, (tau_min_local, tau_max_local, tau_sum_local, tau_count_local), (g_sq_sum_local, g_count_local), gate_values_acc, projections_acc) =
             self.heads.iter().enumerate()
             .map(|(h_idx, head)| {
                 // Project to Q, K, V using zero-copy views
@@ -374,8 +369,8 @@ impl PolyAttention {
                 let (_m_col, tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
                     // Use learned thresholds
                     let threshold_sum: f32 = thresholds.iter().sum();
-                    let threshold_min = thresholds.iter().fold(f32::INFINITY, |m, &z| m.min(z));
-                    let threshold_max = thresholds.iter().fold(f32::NEG_INFINITY, |m, &z| m.max(z));
+                    let threshold_min = thresholds.iter().fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
+                    let threshold_max = thresholds.iter().fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
                     let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
                     let eff_col = &g_col * thresholds;
                     (thresholds.clone(), tau_metrics, eff_col)
@@ -389,12 +384,12 @@ impl PolyAttention {
                 let token_count = n;
 
                 // Return (projections, gates, metrics) for this head
-                ((q, k, v, g_col, eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics)
+                ((q, k, v, g_col.clone(), eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, g_col)
             })
             .fold(
-                (vec![], vec![], (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0), (0.0, 0), vec![]),
-                |(mut active_acc, mut token_acc, mut tau_acc, mut g_acc, mut projections_acc),
-                 ((q, k, v, g_col, eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics)| {
+                (vec![], vec![], (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0), (0.0, 0), vec![], vec![]),
+                |(mut active_acc, mut token_acc, mut tau_acc, mut g_acc, mut gate_values_acc, mut projections_acc),
+                 ((q, k, v, g_col, eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, gate_col)| {
                     active_acc.push(active_sum);
                     token_acc.push(token_count);
                     tau_acc = (
@@ -404,13 +399,27 @@ impl PolyAttention {
                         tau_acc.3 + tau_metrics.3,
                     );
                     g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
+                    gate_values_acc.push(gate_col);
                     projections_acc.push((q, k, v, g_col, eff_col));
-                    (active_acc, token_acc, tau_acc, g_acc, projections_acc)
+                    (active_acc, token_acc, tau_acc, g_acc, gate_values_acc, projections_acc)
                 }
             );
 
         // Extract projections for the attention computation loop
         let head_projections = projections_acc;
+
+        // Create gate values array for metrics update
+        // gate_values_acc contains one (N, 1) array per head, we need to concatenate them
+        let gate_values = if !gate_values_acc.is_empty() {
+            let n_tokens = gate_values_acc[0].nrows();
+            let mut gate_values = ndarray::Array2::<f32>::zeros((n_tokens, self.heads.len()));
+            for (h_idx, gate_col) in gate_values_acc.into_iter().enumerate() {
+                gate_values.column_mut(h_idx).assign(&gate_col.column(0));
+            }
+            gate_values
+        } else {
+            ndarray::Array2::<f32>::zeros((0, 0))
+        };
 
         // Process attention computation for each head
         for (h_idx, (q, k, v, _g_col, eff_col)) in head_projections.into_iter().enumerate() {
@@ -463,17 +472,22 @@ impl PolyAttention {
             }
         }
 
-        // Flush temporary metrics into persistent accumulators
-        self.head_selection_config.update_metrics(
-            &active_sums_tmp,
-            &token_counts_tmp,
-            tau_min_local,
-            tau_max_local,
-            tau_sum_local,
-            tau_count_local,
-            g_sq_sum_local,
-            g_count_local,
-        );
+        // Update gating metrics with collected gate values
+        if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+            self.head_selection_config.update_metrics(&gate_values.view());
+        }
+
+        // Update tau metrics from accumulated values
+        if tau_count_local > 0 { // tau_count > 0
+            self.head_selection_config.metrics_tau_min = tau_min_local;
+            self.head_selection_config.metrics_tau_max = tau_max_local;
+            self.head_selection_config.metrics_tau_sum = tau_sum_local;
+            self.head_selection_config.metrics_tau_count = tau_count_local;
+        }
+
+        // Update gate metrics from accumulated values
+        self.head_selection_config.metrics_g_sq_sum = g_sq_sum_local;
+        self.head_selection_config.metrics_g_count = g_count_local;
 
         out
     }
@@ -508,7 +522,7 @@ impl PolyAttention {
         let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
         // Threshold predictor grads - simplified for now
-        let (grad_w_tau, grad_b_tau, grad_w2_tau, grad_b2_tau, grad_activation_tau) = if self.head_selection_config.use_learned_threshold {
+        let (grad_w_tau, grad_b_tau, grad_w2_tau, grad_b2_tau, grad_activation_tau): (Option<Array2<f32>>, Option<Array2<f32>>, Option<Array2<f32>>, Option<Array2<f32>>, Option<Vec<f64>>) = if self.head_selection_config.gating.use_learned_predictor {
             if let Some(predictor) = &self.threshold_predictor {
                 // For now, use zero gradients as placeholder
                 // TODO: Implement proper threshold gradient computation with real loss
@@ -517,7 +531,7 @@ impl PolyAttention {
                  Some(Array2::<f32>::zeros((hidden_dim, 1))),              // bias1 shape (matches optimizer)
                  Some(Array2::<f32>::zeros((hidden_dim, 1))),              // weights2 shape
                  Some(Array2::<f32>::zeros((1, 1))),                       // bias2 shape (matches optimizer)
-                 Some(Array2::<f32>::zeros((1, predictor.activation.scalar_weights_len()))))
+                 Some(vec![0.0_f64; predictor.activation.scalar_weights_len()]))
             } else {
                 (None, None, None, None, None)
             }
@@ -560,7 +574,7 @@ impl PolyAttention {
 
             // Threshold path forward
             let mut m_col = Array2::<f32>::ones((n, 1));
-            if self.head_selection_config.use_learned_threshold {
+            if self.head_selection_config.gating.use_learned_predictor {
                 if let Some(predictor) = &self.threshold_predictor {
                     // Use the enhanced AutoDeco-inspired predictor
                     let thresholds = predictor.forward(&input.view());
@@ -650,7 +664,7 @@ impl PolyAttention {
                     }
 
                     // Threshold sigmoid path - simplified gradients for new predictor
-                    if self.head_selection_config.use_learned_threshold {
+                    if self.head_selection_config.gating.use_learned_predictor {
                         // For now, skip detailed gradient computation for the new predictor
                         // TODO: Implement proper gradient computation for the two-layer network
                     }
@@ -714,7 +728,7 @@ impl PolyAttention {
         // Option 1: Keep coupled (current) - MoH learns from attention gradients + auxiliary losses
         // Option 2: Independent training - MoH learns from separate head-selection objectives
         // Option 3: Hierarchical training - MoH learns first, then attention layer learns
-        if self.head_selection_config.use_learned_threshold && (self.head_selection_config.complexity_loss_weight > 0.0 || self.head_selection_config.load_balance_weight > 0.0 || self.head_selection_config.sparsity_weight > 0.0) {
+        if self.head_selection_config.gating.use_learned_predictor && (self.head_selection_config.gating.complexity_loss_weight > 0.0 || self.head_selection_config.gating.load_balance_weight > 0.0 || self.head_selection_config.gating.sparsity_weight > 0.0) {
             // Use the new predictor for threshold computation
             let m_vec = if let Some(predictor) = &self.threshold_predictor {
                 predictor.forward(&input.view())
@@ -760,11 +774,11 @@ impl PolyAttention {
  
                 // base derivative for complexity and sparsity (normalized)
                 let mut base_d = 0.0f32;
-                if self.head_selection_config.complexity_loss_weight > 0.0 {
-                    base_d += self.head_selection_config.complexity_loss_weight * (s - target_heads) * inv_n;
+                if self.head_selection_config.gating.complexity_loss_weight > 0.0 {
+                    base_d += self.head_selection_config.gating.complexity_loss_weight * (s - target_heads) * inv_n;
                 }
                 // sparsity derivative normalized by tokens and heads
-                base_d += self.head_selection_config.sparsity_weight * inv_n * inv_h;
+                base_d += self.head_selection_config.gating.sparsity_weight * inv_n * inv_h;
  
                 // accumulate threshold gradient across heads
                 let mut _d_m_total = 0.0f32;
@@ -772,8 +786,8 @@ impl PolyAttention {
                 for h in 0..self.num_heads {
                     let eff_h = eff_mat[[i, h]];
                     let mut d_eff_h = base_d;
-                    if self.head_selection_config.load_balance_weight > 0.0 {
-                        d_eff_h += 2.0 * self.head_selection_config.load_balance_weight * inv_n * inv_h * (eff_h - mean);
+                    if self.head_selection_config.gating.load_balance_weight > 0.0 {
+                        d_eff_h += 2.0 * self.head_selection_config.gating.load_balance_weight * inv_n * inv_h * (eff_h - mean);
                     }
                     // gating path
                     let d_g_i = d_eff_h * m_i;
@@ -819,7 +833,7 @@ impl PolyAttention {
         all_param_grads.push(grad_gate_poly);
 
         // Threshold predictor grads
-        if self.head_selection_config.use_learned_threshold {
+        if self.head_selection_config.gating.use_learned_predictor {
             all_param_grads.push(grad_w_tau.unwrap());
             all_param_grads.push(grad_b_tau.unwrap());
             all_param_grads.push(grad_w2_tau.unwrap());
@@ -844,7 +858,7 @@ impl PolyAttention {
     ) -> crate::errors::Result<()> {
         // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w + threshold_predictor
         let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
-        if self.head_selection_config.use_learned_threshold { expected += 5; } // weights1, bias1, weights2, bias2, activation_params
+        if self.head_selection_config.gating.use_learned_predictor { expected += 5; } // weights1, bias1, weights2, bias2, activation_params
         expected += 1; // CoPE parameters
         if param_grads.len() != expected {
             return Err(crate::errors::ModelError::GradientError {
@@ -883,7 +897,7 @@ impl PolyAttention {
         }
         idx += 1;
 
-        if self.head_selection_config.use_learned_threshold {
+        if self.head_selection_config.gating.use_learned_predictor {
             if let (Some(predictor), Some(opt_w1), Some(opt_b1), Some(opt_w2), Some(opt_b2)) =
                 (&mut self.threshold_predictor, &mut self.opt_w_tau, &mut self.opt_b_tau,
                  &mut self.opt_w2_tau, &mut self.opt_b2_tau) {
@@ -936,7 +950,7 @@ impl PolyAttention {
 
             let gate_poly_params = self.gate_poly.weights().len();
 
-            let threshold_predictor_params = if self.head_selection_config.use_learned_threshold {
+            let threshold_predictor_params = if self.head_selection_config.gating.use_learned_predictor {
                 if let Some(predictor) = &self.threshold_predictor {
                     predictor.weights1.len() + predictor.bias1.len() +
                     predictor.weights2.len() + predictor.bias2.len()
@@ -993,7 +1007,7 @@ impl PolyAttention {
                 + self.beta_g.len()
                 + self.gate_poly.weights().len();
             total += self.cope.parameters();
-            if self.head_selection_config.use_learned_threshold {
+            if self.head_selection_config.gating.use_learned_predictor {
                 if let Some(predictor) = &self.threshold_predictor {
                     total += predictor.weights1.len() + predictor.bias1.len() +
                             predictor.weights2.len() + predictor.bias2.len();
@@ -1007,10 +1021,10 @@ impl PolyAttention {
 
     // Initialize or ensure learned threshold predictor parameters
     fn ensure_threshold_predictor(&mut self) {
-        if self.head_selection_config.use_learned_threshold && self.threshold_predictor.is_none() {
+        if self.head_selection_config.gating.use_learned_predictor && self.threshold_predictor.is_none() {
             // Use smaller hidden dimension like AutoDeco (128 is typical)
             let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
-            self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim));
+            self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim, 1));
             // Old optimizer initialization - should not be used with new predictor
             // Keeping for backward compatibility but this path is deprecated
         }
@@ -1020,10 +1034,10 @@ impl PolyAttention {
         self.head_selection_config = HeadSelectionConfig::from_strategy(strategy, self.num_heads);
 
         // Initialize threshold predictor if needed (AutoDeco-inspired architecture)
-        if self.head_selection_config.use_learned_threshold && self.threshold_predictor.is_none() {
+        if self.head_selection_config.gating.use_learned_predictor && self.threshold_predictor.is_none() {
             // Use smaller hidden dimension like AutoDeco (128 is typical)
             let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
-            self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim));
+            self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim, 1));
             // Optimizers for the two-layer network
             self.opt_w_tau = Some(Adam::new((self.embed_dim, predictor_hidden_dim)));
             self.opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
@@ -1037,13 +1051,13 @@ impl PolyAttention {
     pub fn get_head_metrics_and_reset(&mut self) -> Vec<(f32, usize)> {
         let mut res = Vec::with_capacity(self.num_heads);
         for h in 0..self.num_heads {
-            let tokens = self.head_selection_config.metrics_token_count_per_head[h];
+            let tokens = self.head_selection_config.gating.metrics.token_count_per_component[h];
             let avg = if tokens > 0 {
-                self.head_selection_config.metrics_active_sum_per_head[h] / tokens as f32
+                self.head_selection_config.gating.metrics.active_sum_per_component[h] / tokens as f32
             } else { 0.0 };
             res.push((avg, tokens));
-            self.head_selection_config.metrics_active_sum_per_head[h] = 0.0;
-            self.head_selection_config.metrics_token_count_per_head[h] = 0;
+            self.head_selection_config.gating.metrics.active_sum_per_component[h] = 0.0;
+            self.head_selection_config.gating.metrics.token_count_per_component[h] = 0;
         }
         res
     }

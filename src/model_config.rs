@@ -134,11 +134,11 @@ pub struct ModelConfig {
 
     /// Strategy for selecting which attention heads to activate
     ///
-    /// Only `FullyAdaptiveMoH` is supported: complexity-aware dynamic head selection
+    /// Only `Learned` gating is supported: complexity-aware dynamic component selection
     /// where all heads are candidates and the number of active heads per token
     /// is determined by learned predictors.
     ///
-    /// Default: `FullyAdaptiveMoH`
+    /// Default: `Learned` gating with adaptive component selection
     pub head_selection: HeadSelectionStrategy,
 
     /// Attention mechanism selection (SelfAttention vs PolyAttention)
@@ -180,9 +180,8 @@ impl ModelConfig {
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::FullyAdaptiveMoH {
-                min_heads: 1,
-                max_heads: num_heads.unwrap_or(8),
+            head_selection: HeadSelectionStrategy::Learned {
+                num_active: num_heads.unwrap_or(8),
                 load_balance_weight: 0.01,
                 complexity_loss_weight: 0.01,
                 sparsity_weight: 0.001,

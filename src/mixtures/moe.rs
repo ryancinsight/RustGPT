@@ -26,6 +26,8 @@
 
 use serde::{Deserialize, Serialize};
 use crate::llm::Layer;
+use crate::mixtures::gating::{GatingStrategy, GatingConfig, select_top_k_components};
+use crate::mixtures::threshold::ThresholdPredictor;
 
 /// Strategy for selecting which experts to activate
 ///
@@ -33,10 +35,7 @@ use crate::llm::Layer;
 /// Based on "Switch Transformers" (Fedus et al., 2021) with learned routing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExpertRouter {
-    /// Learned Mixture-of-Experts: AutoDeco-inspired dynamic expert selection
-    ///
-    /// Uses a two-layer neural network with Richards normalization to learn optimal
-    /// expert activation patterns. All experts are candidates for selection.
+    /// Learned Mixture-of-Experts: Uses shared gating strategy with expert-specific config
     LearnedMoE {
         /// Number of experts in the mixture
         num_experts: usize,
@@ -54,46 +53,33 @@ pub enum ExpertRouter {
 }
 
 /// Configuration for expert routing metrics and learned parameters
+///
+/// Extends the shared GatingConfig with MoE-specific parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpertRouterConfig {
+    /// Shared gating configuration
+    pub gating: GatingConfig,
     /// Number of experts in the mixture
     pub num_experts: usize,
-    /// Number of experts to activate per token
-    pub num_active_experts: usize,
     /// Hidden dimension for each expert
     pub expert_hidden_dim: usize,
-    /// Weight for load balance loss
-    pub load_balance_weight: f32,
-    /// Weight for sparsity loss
-    pub sparsity_weight: f32,
-    /// Weight for diversity loss
+    /// Weight for diversity loss (encourages expert specialization)
     pub diversity_weight: f32,
-    /// Metrics: sum of activation values per expert (for load balancing)
-    pub metrics_active_sum_per_expert: Vec<f32>,
-    /// Metrics: token count per expert (for load balancing)
-    pub metrics_token_count_per_expert: Vec<usize>,
     /// Metrics: average routing probability per expert
     pub metrics_avg_routing_prob: Vec<f32>,
     /// Metrics: diversity score (average pairwise expert correlation)
     pub metrics_diversity_score: f32,
-    /// Metrics: total routing decisions made
-    pub metrics_total_routings: usize,
 }
 
 impl Default for ExpertRouterConfig {
     fn default() -> Self {
         Self {
+            gating: GatingConfig::default(),
             num_experts: 4,
-            num_active_experts: 2,
             expert_hidden_dim: 64,
-            load_balance_weight: 0.01,
-            sparsity_weight: 0.001,
             diversity_weight: 0.005,
-            metrics_active_sum_per_expert: vec![0.0; 4],
-            metrics_token_count_per_expert: vec![0; 4],
             metrics_avg_routing_prob: vec![0.0; 4],
             metrics_diversity_score: 0.0,
-            metrics_total_routings: 0,
         }
     }
 }
@@ -110,107 +96,67 @@ impl ExpertRouterConfig {
                 sparsity_weight,
                 diversity_weight,
             } => Self {
+                gating: GatingConfig::from_strategy(
+                    &GatingStrategy::Learned {
+                        num_active: *num_active_experts,
+                        load_balance_weight: *load_balance_weight,
+                        sparsity_weight: *sparsity_weight,
+                        complexity_loss_weight: 0.005, // Default
+                    },
+                    *num_experts
+                ),
                 num_experts: *num_experts,
-                num_active_experts: *num_active_experts,
                 expert_hidden_dim: *expert_hidden_dim,
-                load_balance_weight: *load_balance_weight,
-                sparsity_weight: *sparsity_weight,
                 diversity_weight: *diversity_weight,
-                metrics_active_sum_per_expert: vec![0.0; *num_experts],
-                metrics_token_count_per_expert: vec![0; *num_experts],
                 metrics_avg_routing_prob: vec![0.0; *num_experts],
                 metrics_diversity_score: 0.0,
-                metrics_total_routings: 0,
             },
         }
     }
 
     /// Reset metrics when router changes
     pub fn reset_metrics(&mut self) {
-        for e in 0..self.metrics_active_sum_per_expert.len() {
-            self.metrics_active_sum_per_expert[e] = 0.0;
-            self.metrics_token_count_per_expert[e] = 0;
+        self.gating.reset_metrics();
+        for e in 0..self.metrics_avg_routing_prob.len() {
             self.metrics_avg_routing_prob[e] = 0.0;
         }
         self.metrics_diversity_score = 0.0;
-        self.metrics_total_routings = 0;
     }
 
     /// Update routing metrics for training optimization
     /// routing_probs: shape (num_tokens, num_experts) - routing probabilities for each token-expert pair
     pub fn update_metrics(&mut self, routing_probs: &ndarray::ArrayView2<f32>) {
-        // Update per-expert activation sums across all tokens
-        for expert_idx in 0..self.num_experts {
-            let expert_sum: f32 = routing_probs.column(expert_idx).sum();
-            self.metrics_active_sum_per_expert[expert_idx] += expert_sum;
-        }
+        // Update shared gating metrics
+        self.gating.update_metrics(routing_probs);
 
-        // For token counts, count experts with routing prob > threshold as "active"
-        // This maintains compatibility with existing load balancing logic
-        for token_idx in 0..routing_probs.nrows() {
-            let token_probs = routing_probs.row(token_idx);
-            for expert_idx in 0..self.num_experts {
-                if token_probs[expert_idx] > 0.1 {  // Threshold for "active"
-                    self.metrics_token_count_per_expert[expert_idx] += 1;
-                }
-            }
-        }
-
-        // Update routing probability averages
+        // Update MoE-specific routing probability averages
         let num_tokens = routing_probs.nrows() as f32;
-        let total_tokens = self.metrics_total_routings as f32 + num_tokens;
+        let total_decisions = self.gating.metrics.total_decisions as f32 + num_tokens;
         for expert_idx in 0..self.num_experts {
             let expert_avg_prob = routing_probs.column(expert_idx).mean().unwrap_or(0.0);
             let current_avg = self.metrics_avg_routing_prob[expert_idx];
-            self.metrics_avg_routing_prob[expert_idx] = current_avg + (expert_avg_prob - current_avg) * num_tokens / total_tokens;
+            self.metrics_avg_routing_prob[expert_idx] = current_avg + (expert_avg_prob - current_avg) * num_tokens / total_decisions;
         }
-
-        self.metrics_total_routings += routing_probs.nrows();
     }
 
     /// Get load balancing loss for training (prevents single expert dominance)
     pub fn compute_load_balance_loss(&self) -> f32 {
-        if self.metrics_token_count_per_expert.is_empty() || self.metrics_total_routings == 0 {
-            return 0.0;
-        }
-
-        let total_tokens = self.metrics_total_routings as f32;
-        let expected_per_expert = total_tokens / self.num_experts as f32;
-
-        // Coefficient of variation across experts
-        let mean_count = self.metrics_token_count_per_expert.iter()
-            .map(|&count| count as f32)
-            .sum::<f32>() / self.num_experts as f32;
-
-        if mean_count == 0.0 {
-            return 0.0;
-        }
-
-        let variance = self.metrics_token_count_per_expert.iter()
-            .map(|&count| {
-                let diff = count as f32 - expected_per_expert;
-                diff * diff
-            })
-            .sum::<f32>() / self.num_experts as f32;
-
-        let std_dev = variance.sqrt();
-        std_dev / mean_count // Coefficient of variation
+        self.gating.compute_load_balance_loss()
     }
 
     /// Get sparsity loss for training (encourages minimal expert usage)
     pub fn compute_sparsity_loss(&self) -> f32 {
-        if self.metrics_total_routings == 0 {
-            return 0.0;
-        }
+        self.gating.compute_sparsity_loss()
+    }
 
-        let avg_experts_per_token = self.num_active_experts as f32;
-        let target_sparsity = 1.0; // Target: 1 expert per token on average
-        (avg_experts_per_token - target_sparsity).powi(2)
+    /// Get complexity alignment loss for training (aligns expert usage with predicted complexity)
+    pub fn compute_complexity_loss(&self, target_avg_experts: f32) -> f32 {
+        self.gating.compute_complexity_loss(target_avg_experts)
     }
 
     /// Get diversity loss for training (encourages expert specialization)
     pub fn compute_diversity_loss(&self) -> f32 {
-        if self.metrics_total_routings == 0 {
+        if self.gating.metrics.total_decisions == 0 {
             return 0.0;
         }
 
@@ -245,43 +191,17 @@ impl ExpertRouterConfig {
 
     /// Get average number of active experts per token (soft routing equivalent)
     pub fn get_avg_active_experts(&self) -> f32 {
-        if self.metrics_total_routings == 0 {
-            return 0.0;
-        }
-
-        // For soft routing, this will always be 1.0 since probabilities sum to 1
-        // Average active experts = sum of all routing probabilities / total tokens
-        let total_active_sum: f32 = self.metrics_active_sum_per_expert.iter().sum();
-        total_active_sum / self.metrics_total_routings as f32
+        self.gating.get_avg_active_components()
     }
 
     /// Get average number of experts with significant routing probability (> 0.1)
     pub fn get_avg_significant_experts(&self) -> f32 {
-        if self.metrics_total_routings == 0 {
-            return 0.0;
-        }
-
-        // Count experts with routing probability > 0.1 as "significant"
-        let significant_count: usize = self.metrics_avg_routing_prob.iter()
-            .map(|&prob| if prob > 0.1 { 1 } else { 0 })
-            .sum();
-        significant_count as f32
+        self.gating.get_avg_significant_components()
     }
 
     /// Get routing entropy (higher = more uniform distribution across experts)
     pub fn get_routing_entropy(&self) -> f32 {
-        if self.metrics_total_routings == 0 {
-            return 0.0;
-        }
-
-        // Calculate entropy of the average routing probabilities
-        let mut entropy = 0.0;
-        for &prob in &self.metrics_avg_routing_prob {
-            if prob > 0.0 {
-                entropy -= prob * prob.ln();
-            }
-        }
-        entropy
+        self.gating.get_gating_entropy()
     }
 }
 
@@ -305,8 +225,8 @@ struct RouterParamInfo {
 /// Enhanced expert selector inspired by AutoDeco
 ///
 /// This implements a two-layer neural network for expert routing with proper
-/// forward and backward computations. The architecture follows AutoDeco's
-/// design principles with Xavier initialization and Richards normalization.
+/// forward and backward computations. Follows the same architecture as the shared
+/// ThresholdPredictor (AutoDeco-inspired with Richards normalization).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpertSelector {
     /// First layer weights (embed_dim x router_hidden_dim)
@@ -371,7 +291,7 @@ impl ExpertSelector {
 
         let norm = crate::richards::RichardsNorm::new(router_hidden_dim);
         let sigmoid = crate::richards::RichardsCurve::sigmoid(false); // Non-learnable sigmoid
-        let activation = crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation
+        let activation = crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation replacing ReLU
 
         Self {
             weights1,
@@ -422,7 +342,10 @@ impl ExpertSelector {
         self.cached_logits = Some(logits.clone());
 
         // Softmax normalization for routing probabilities
-        self.softmax.forward(&logits.view())
+        let output = self.softmax.forward(&logits.view());
+        self.cached_output = Some(output.clone());
+
+        output
     }
 
     /// Forward pass for auxiliary computation (immutable)
