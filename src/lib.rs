@@ -19,7 +19,6 @@ pub mod output_projection;
 // removed: pub mod routing;
 // removed: pub mod self_attention;
 pub mod mixtures;
-pub mod poly_attention;
 
 // removed: pub mod trm;
 pub mod decoding;

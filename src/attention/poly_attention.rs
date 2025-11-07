@@ -1,75 +1,8 @@
-use std::{cell::RefCell, thread_local};
-
 use ndarray::{Array2, linalg::general_mat_mul, s};
-use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_SEQ_LEN, adam::Adam, llm::Layer, richards::{RichardsCurve, Variant}, mixtures::{moh::{HeadSelectionStrategy, HeadSelectionConfig}, threshold::ThresholdPredictor}, attention::position::cope::CoPE};
+use crate::{adam::Adam, llm::Layer, richards::RichardsCurve, mixtures::{moh::{HeadSelectionStrategy, HeadSelectionConfig}, threshold::ThresholdPredictor}, attention::{config::{init_attention_heads, init_cope, init_gate_polynomial, init_gating_params, init_output_projection, init_polynomial_params}, head::PolyHead, params::PolyAttentionParamInfo, position::cope::CoPE}};
 
-/// Cached parameter information for PolyAttention
-#[derive(Debug, Clone)]
-pub struct PolyAttentionParamInfo {
-    /// Parameter count per head (w_q, w_k, w_v)
-    pub head_params_per_head: usize,
-    /// Total head parameters (all heads)
-    pub head_params_total: usize,
-    /// Output projection parameters
-    pub output_projection_params: usize,
-    /// Polynomial parameters (a, b, scale)
-    pub polynomial_params: usize,
-    /// Gating parameters (w_g, alpha_g, beta_g)
-    pub gating_params: usize,
-    /// Richards curve parameters for gating
-    pub gate_poly_params: usize,
-    /// Threshold predictor parameters (if present)
-    pub threshold_predictor_params: usize,
-    /// CoPE parameters
-    pub cope_params: usize,
-    /// Total parameter count
-    pub total_params: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PolyHead {
-    pub w_q: Array2<f32>,
-    pub w_k: Array2<f32>,
-    pub w_v: Array2<f32>,
-
-    opt_w_q: Adam,
-    opt_w_k: Adam,
-    opt_w_v: Adam,
-}
-
-impl PolyHead {
-    fn new(embed_dim: usize, head_dim: usize) -> Self {
-        let std_qk = (2.0f32 / (embed_dim as f32 + head_dim as f32)).sqrt();
-        let std_v = (2.0f32 / (embed_dim as f32 + head_dim as f32)).sqrt();
-
-        let mut rng = rand::rng();
-        let normal_qk = Normal::new(0.0, std_qk).unwrap();
-        let normal_v = Normal::new(0.0, std_v).unwrap();
-
-        let w_q =
-            Array2::<f32>::from_shape_fn((embed_dim, head_dim), |_| normal_qk.sample(&mut rng));
-        let w_k =
-            Array2::<f32>::from_shape_fn((embed_dim, head_dim), |_| normal_qk.sample(&mut rng));
-        let w_v =
-            Array2::<f32>::from_shape_fn((embed_dim, head_dim), |_| normal_v.sample(&mut rng));
-
-        let opt_w_q = Adam::new((embed_dim, head_dim));
-        let opt_w_k = Adam::new((embed_dim, head_dim));
-        let opt_w_v = Adam::new((embed_dim, head_dim));
-
-        Self {
-            w_q,
-            w_k,
-            w_v,
-            opt_w_q,
-            opt_w_k,
-            opt_w_v,
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyAttention {
@@ -130,62 +63,6 @@ pub struct PolyAttention {
     param_info: Option<PolyAttentionParamInfo>,
 }
 
-// Thread-local scratch to avoid allocations per call and avoid locking overhead
-thread_local! {
-    static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
-    static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
-    static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
-}
-
-#[inline]
-fn with_tls_scores<R>(n: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> R {
-    TLS_SCORES.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        let need = match &*opt {
-            Some(a) => a.shape() != [n, n],
-            None => true,
-        };
-        if need {
-            *opt = Some(Array2::<f32>::zeros((n, n)));
-        }
-        let mat = opt.as_mut().unwrap();
-        f(mat)
-    })
-}
-
-#[inline]
-fn with_tls_work<R>(n: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> R {
-    TLS_WORK.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        let need = match &*opt {
-            Some(a) => a.shape() != [n, n],
-            None => true,
-        };
-        if need {
-            *opt = Some(Array2::<f32>::zeros((n, n)));
-        }
-        let mat = opt.as_mut().unwrap();
-        f(mat)
-    })
-}
-
-#[inline]
-fn with_tls_yh<R>(n: usize, d: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> R {
-    TLS_YH.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        let need = match &*opt {
-            Some(a) => a.shape() != [n, d],
-            None => true,
-        };
-        if need {
-            *opt = Some(Array2::<f32>::zeros((n, d)));
-        }
-        let mat = opt.as_mut().unwrap();
-        f(mat)
-    })
-}
-
-
 impl PolyAttention {
     pub fn new(
         embed_dim: usize,
@@ -201,46 +78,13 @@ impl PolyAttention {
         assert!(p % 2 == 1, "p must be an odd integer for stability");
         let head_dim = embed_dim / num_heads;
 
-        // Initialize heads
-        let heads = (0..num_heads)
-            .map(|_| PolyHead::new(embed_dim, head_dim))
-            .collect::<Vec<_>>();
-
-        // Output projection (concat heads -> embed_dim)
-        let mut rng = rand::rng();
-        let std_out = (2.0f32 / (embed_dim as f32 + embed_dim as f32)).sqrt();
-        let normal_out = Normal::new(0.0, std_out).unwrap();
-        let w_out =
-            Array2::<f32>::from_shape_fn((embed_dim, embed_dim), |_| normal_out.sample(&mut rng));
-        let opt_w_out = Adam::new((embed_dim, embed_dim));
-
-        // Polynomial scalars
-        let a = Array2::<f32>::from_shape_vec((1, 1), vec![1.0]).unwrap();
-        let b = Array2::<f32>::from_shape_vec((1, 1), vec![0.0]).unwrap();
-        let scale =
-            Array2::<f32>::from_shape_vec((1, 1), vec![1.0 / (MAX_SEQ_LEN as f32).sqrt()]).unwrap();
-        let opt_a = Adam::new((1, 1));
-        let opt_b = Adam::new((1, 1));
-        let opt_scale = Adam::new((1, 1));
-
-        // Learned gating params: W_g (D,H), alpha_g (1,H), beta_g (1,H)
-        let std_g = (2.0f32 / embed_dim as f32).sqrt();
-        let normal_g = Normal::new(0.0, std_g).unwrap();
-        let w_g =
-            Array2::<f32>::from_shape_fn((embed_dim, num_heads), |_| normal_g.sample(&mut rng));
-        let alpha_g = Array2::<f32>::ones((1, num_heads));
-        let beta_g = Array2::<f32>::zeros((1, num_heads));
-        let opt_w_g = Adam::new((embed_dim, num_heads));
-        let opt_alpha_g = Adam::new((1, num_heads));
-        let opt_beta_g = Adam::new((1, num_heads));
-
-        // CoPE integration (shared pos embeddings across heads)
-        let cope = CoPE::new(max_pos, head_dim);
-
-        // Richards curve gate (default sigmoid variant, learnable)
-        let gate_poly = RichardsCurve::new_learnable(Variant::Sigmoid);
-
-        // Threshold predictor defaults are handled in HeadSelectionConfig
+        // Initialize all components using configuration utilities
+        let heads = init_attention_heads(embed_dim, num_heads);
+        let (w_out, opt_w_out) = init_output_projection(embed_dim);
+        let (a, b, scale, opt_a, opt_b, opt_scale) = init_polynomial_params();
+        let (w_g, alpha_g, beta_g, opt_w_g, opt_alpha_g, opt_beta_g) = init_gating_params(embed_dim, num_heads);
+        let cope = init_cope(max_pos, head_dim);
+        let gate_poly = init_gate_polynomial();
 
         Self {
             embed_dim,
@@ -286,29 +130,6 @@ impl PolyAttention {
         }
     }
 
-    #[inline]
-    fn apply_causal_mask_inplace(mat: &mut Array2<f32>) {
-        let n = mat.nrows();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                mat[[i, j]] = 0.0;
-            }
-        }
-    }
-
-    #[inline]
-    fn apply_sliding_window_mask_inplace(mat: &mut Array2<f32>, window: Option<usize>) {
-        if let Some(w) = window {
-            let n = mat.nrows();
-            for i in 0..n {
-                let j_min = i.saturating_sub(w - 1);
-                for j in 0..j_min {
-                    mat[[i, j]] = 0.0;
-                }
-            }
-        }
-    }
-
 
     pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
         // input: (N, embed_dim)
@@ -322,9 +143,8 @@ impl PolyAttention {
         // Streamed accumulation: avoid building a large concat buffer
         let mut out = input.to_owned();
 
-        if self.head_selection_config.gating.use_learned_predictor {
-            self.ensure_threshold_predictor();
-        }
+        // Threshold predictor should already be initialized during construction/configuration
+        // No initialization needed during forward pass to avoid gradient instability
 
         // Pre-compute threshold predictor for all heads if needed
         let thresholds_global = if self.head_selection_config.gating.use_learned_predictor {
@@ -976,9 +796,9 @@ impl PolyAttention {
         }
         let mut idx = 0;
         for head in &mut self.heads {
-            head.opt_w_q.step(&mut head.w_q, &param_grads[idx], lr);
-            head.opt_w_k.step(&mut head.w_k, &param_grads[idx + 1], lr);
-            head.opt_w_v.step(&mut head.w_v, &param_grads[idx + 2], lr);
+            head.step_w_q(&param_grads[idx], lr);
+            head.step_w_k(&param_grads[idx + 1], lr);
+            head.step_w_v(&param_grads[idx + 2], lr);
             idx += 3;
         }
         self.opt_w_out.step(&mut self.w_out, &param_grads[idx], lr);
@@ -1045,13 +865,6 @@ impl PolyAttention {
             let head_params_per_head = self.heads.first()
                 .map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len())
                 .unwrap_or(0);
-            let head_params_total = head_params_per_head * self.heads.len();
-
-            let output_projection_params = self.w_out.len();
-
-            let polynomial_params = self.a.len() + self.b.len() + self.scale.len();
-
-            let gating_params = self.w_g.len() + self.alpha_g.len() + self.beta_g.len();
 
             let gate_poly_params = self.gate_poly.weights().len();
 
@@ -1069,20 +882,14 @@ impl PolyAttention {
 
             let cope_params = self.cope.parameters();
 
-            let total_params = head_params_total + output_projection_params + polynomial_params +
-                             gating_params + gate_poly_params + threshold_predictor_params + cope_params;
-
-            self.param_info = Some(PolyAttentionParamInfo {
+            self.param_info = Some(PolyAttentionParamInfo::new(
+                self.embed_dim,
+                self.num_heads,
                 head_params_per_head,
-                head_params_total,
-                output_projection_params,
-                polynomial_params,
-                gating_params,
                 gate_poly_params,
                 threshold_predictor_params,
                 cope_params,
-                total_params,
-            });
+            ));
         }
 
         self.param_info.as_ref().unwrap()
@@ -1125,32 +932,18 @@ impl PolyAttention {
     }
 
     // Initialize or ensure learned threshold predictor parameters
-    fn ensure_threshold_predictor(&mut self) {
-        if self.head_selection_config.gating.use_learned_predictor && self.threshold_predictor.is_none() {
-            // Use smaller hidden dimension like AutoDeco (128 is typical)
-            let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
-            self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim, 1));
-            // Old optimizer initialization - should not be used with new predictor
-            // Keeping for backward compatibility but this path is deprecated
-        }
-    }
 
     pub fn set_head_selection_config(&mut self, strategy: &HeadSelectionStrategy) {
-        self.head_selection_config = HeadSelectionConfig::from_strategy(strategy, self.num_heads);
-
-        // Initialize threshold predictor if needed (AutoDeco-inspired architecture)
-        if self.head_selection_config.gating.use_learned_predictor && self.threshold_predictor.is_none() {
-            // Use smaller hidden dimension like AutoDeco (128 is typical)
-            let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
-            self.threshold_predictor = Some(ThresholdPredictor::new(self.embed_dim, predictor_hidden_dim, 1));
-            // Optimizers for the two-layer network
-            self.opt_w_tau = Some(Adam::new((self.embed_dim, predictor_hidden_dim)));
-            self.opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
-            self.opt_w2_tau = Some(Adam::new((predictor_hidden_dim, 1)));
-            self.opt_b2_tau = Some(Adam::new((1, 1)));
-            // Note: Richards activation uses its own step method, no Adam optimizer needed
-            // Note: RichardsNorm doesn't have trainable parameters, so no optimizer needed
-        }
+        crate::attention::config::configure_head_selection(
+            &mut self.head_selection_config,
+            &mut self.threshold_predictor,
+            self.embed_dim,
+            &mut self.opt_w_tau,
+            &mut self.opt_b_tau,
+            &mut self.opt_w2_tau,
+            &mut self.opt_b2_tau,
+            strategy,
+        );
     }
 
     pub fn get_head_metrics_and_reset(&mut self) -> Vec<(f32, usize)> {

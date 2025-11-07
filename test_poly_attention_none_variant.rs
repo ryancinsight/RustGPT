@@ -1,5 +1,5 @@
 use llm::richards::{RichardsCurve, Variant};
-use llm::poly_attention::PolyAttention;
+use llm::attention::poly_attention::PolyAttention;
 use llm::Layer;
 use ndarray::{Array2, ShapeBuilder};
 

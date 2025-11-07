@@ -407,7 +407,7 @@ fn main() -> llm::Result<()> {
 
     println!("\n=== INSTRUCTION TUNING ===");
     // Use same LR as pre-training
-    let instruction_lr = 0.001;
+    let instruction_lr = 0.002;
     let instruction_epochs = 100;
     println!(
         "Instruction tuning on {} examples for {} epochs with learning rate {}",

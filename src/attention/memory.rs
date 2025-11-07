@@ -1,0 +1,60 @@
+use std::{cell::RefCell, thread_local};
+use ndarray::Array2;
+
+/// Thread-local scratch memory management to avoid allocations per call and reduce locking overhead
+thread_local! {
+    static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
+    static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
+    static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
+}
+
+/// Get or create a thread-local scratch buffer for attention scores (N×N matrices)
+#[inline]
+pub fn with_tls_scores<R>(n: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> R {
+    TLS_SCORES.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let need = match &*opt {
+            Some(a) => a.shape() != [n, n],
+            None => true,
+        };
+        if need {
+            *opt = Some(Array2::<f32>::zeros((n, n)));
+        }
+        let mat = opt.as_mut().unwrap();
+        f(mat)
+    })
+}
+
+/// Get or create a thread-local scratch buffer for intermediate work matrices (N×N)
+#[inline]
+pub fn with_tls_work<R>(n: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> R {
+    TLS_WORK.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let need = match &*opt {
+            Some(a) => a.shape() != [n, n],
+            None => true,
+        };
+        if need {
+            *opt = Some(Array2::<f32>::zeros((n, n)));
+        }
+        let mat = opt.as_mut().unwrap();
+        f(mat)
+    })
+}
+
+/// Get or create a thread-local scratch buffer for head outputs (N×d_h matrices)
+#[inline]
+pub fn with_tls_yh<R>(n: usize, d: usize, f: impl FnOnce(&mut Array2<f32>) -> R) -> R {
+    TLS_YH.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let need = match &*opt {
+            Some(a) => a.shape() != [n, d],
+            None => true,
+        };
+        if need {
+            *opt = Some(Array2::<f32>::zeros((n, d)));
+        }
+        let mat = opt.as_mut().unwrap();
+        f(mat)
+    })
+}
