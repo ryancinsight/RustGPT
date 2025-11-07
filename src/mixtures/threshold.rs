@@ -161,7 +161,7 @@ impl ThresholdPredictor {
     /// Compute gradients for the two-layer threshold network
     ///
     /// Returns gradients for (weights1, bias1, weights2, bias2, activation_params)
-    pub fn compute_gradients(&mut self, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array1<f32>, ndarray::Array2<f32>, ndarray::Array1<f32>, Vec<f64>) {
+    pub fn compute_gradients(&self, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array1<f32>, ndarray::Array2<f32>, ndarray::Array1<f32>, Vec<f64>) {
         // Retrieve cached activations
         let cached_input = self.cached_input.as_ref().expect("predict must be called before compute_gradients");
         let cached_output = self.cached_output.as_ref().expect("predict must be called before compute_gradients");

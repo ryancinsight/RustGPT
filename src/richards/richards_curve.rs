@@ -1109,8 +1109,9 @@ impl RichardsCurve {
     }
 
     /// Return current learnable parameter values as a vector (only learnable parameters)
+    /// Note: Returns default values until parameters are actually trained/updated
     pub fn weights(&self) -> Vec<f64> {
-        std::iter::empty()
+        let weights: Vec<f64> = std::iter::empty()
             .chain(self.nu_learnable.then(|| self.get_param(self.nu, self.learned_nu, 1.0)))
             .chain(self.k_learnable.then(|| self.get_param(self.k, self.learned_k, 1.0)))
             .chain(self.m_learnable.then(|| self.get_param(self.m, self.learned_m, 0.0)))
@@ -1126,12 +1127,37 @@ impl RichardsCurve {
             .chain(self.bias_learnable.then(|| {
                 self.bias.as_ref().map(|b| b.iter().map(|&x| x as f64).collect::<Vec<f64>>()).unwrap_or_default()
             }).into_iter().flatten())
-            .collect()
+            .collect();
+
+        // Debug: Log if weights are still at defaults (indicating no training occurred)
+        if weights.is_empty() {
+            tracing::debug!("RichardsCurve weights() returned empty vector - no learnable parameters");
+        }
+
+        weights
     }
 
     /// Number of scalar learnable parameters (excluding per-feature gamma/bias)
     pub fn scalar_weights_len(&self) -> usize {
         [self.nu_learnable, self.k_learnable, self.m_learnable, self.beta_learnable, self.temperature_learnable, self.output_gain_learnable, self.output_bias_learnable, self.scale_learnable, self.shift_learnable].iter().filter(|&&b| b).count()
+    }
+
+    /// Check if any parameters have been trained (learned values exist and differ from defaults)
+    pub fn has_trained_parameters(&self) -> bool {
+        // Check if any learned parameters exist and differ significantly from defaults
+        let checks = [
+            self.learned_nu.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_k.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_m.map_or(false, |v| v.abs() > 1e-6),
+            self.learned_beta.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_temperature.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_output_gain.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_output_bias.map_or(false, |v| v.abs() > 1e-6),
+            self.learned_scale.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_shift.map_or(false, |v| v.abs() > 1e-6),
+        ];
+
+        checks.iter().any(|&x| x)
     }
 
     /// Number of learnable parameters in the internal order

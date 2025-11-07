@@ -589,24 +589,68 @@ impl LLM {
 
             // Collect current richards_glu richards weights for delta tracking
             let mut current_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
+            let mut richards_training_status: Vec<bool> = Vec::new();
             for layer in &self.network {
                 if let LayerEnum::RichardsGlu(richards_glu) = layer {
                     current_richards_glu_weights.push(richards_glu.gate_curve.weights());
+                    richards_training_status.push(richards_glu.gate_curve.has_trained_parameters());
                 }
+            }
+
+            // Debug: Check if Richards parameters are being trained
+            let trained_layers = richards_training_status.iter().filter(|&&trained| trained).count();
+            if current_richards_glu_weights.len() > 0 {
+                tracing::debug!("RichardsGlu training status: {}/{} layers have trained parameters",
+                    trained_layers, current_richards_glu_weights.len());
             }
 
             // Compute delta changes in richards_glu richards coefficients
             let mut richards_glu_delta_sum = 0.0;
             let mut richards_glu_param_count = 0;
+            let mut total_weight_changes = 0;
+            let mut significant_changes = 0;
+
             if !prev_richards_glu_weights.is_empty() && current_richards_glu_weights.len() == prev_richards_glu_weights.len() {
-                for (prev_layer, curr_layer) in prev_richards_glu_weights.iter().zip(current_richards_glu_weights.iter()) {
+                for (layer_idx, (prev_layer, curr_layer)) in prev_richards_glu_weights.iter().zip(current_richards_glu_weights.iter()).enumerate() {
                     if prev_layer.len() == curr_layer.len() {
-                        for (prev_w, curr_w) in prev_layer.iter().zip(curr_layer.iter()) {
-                            richards_glu_delta_sum += (curr_w - prev_w).abs();
+                        for (param_idx, (prev_w, curr_w)) in prev_layer.iter().zip(curr_layer.iter()).enumerate() {
+                            let delta = (curr_w - prev_w).abs();
+                            richards_glu_delta_sum += delta;
                             richards_glu_param_count += 1;
+                            total_weight_changes += 1;
+
+                            // Count significant changes (> 1e-6 relative change)
+                            if delta > 1e-6 {
+                                significant_changes += 1;
+                            }
+
+                            // Debug: Log unusual parameter values
+                            if delta > 1.0 {
+                                tracing::debug!("Large Richards parameter change in layer {} param {}: {:.6} -> {:.6} (delta: {:.6})",
+                                    layer_idx, param_idx, prev_w, curr_w, delta);
+                            }
                         }
+                    } else {
+                        tracing::warn!("RichardsGlu layer {} weight length mismatch: prev={}, curr={}",
+                            layer_idx, prev_layer.len(), curr_layer.len());
                     }
                 }
+            } else {
+                if prev_richards_glu_weights.is_empty() {
+                    tracing::debug!("No previous RichardsGlu weights available (first epoch)");
+                } else {
+                    tracing::warn!("RichardsGlu layer count mismatch: prev={}, curr={}",
+                        prev_richards_glu_weights.len(), current_richards_glu_weights.len());
+                }
+            }
+
+            // Debug: Log parameter change statistics
+            if richards_glu_param_count > 0 {
+                let avg_delta = richards_glu_delta_sum / richards_glu_param_count as f64;
+                let significant_ratio = significant_changes as f64 / total_weight_changes as f64;
+
+                tracing::debug!("RichardsGlu delta stats: {} params, avg_delta={:.2e}, significant_changes={}/{} ({:.1}%)",
+                    richards_glu_param_count, avg_delta, significant_changes, total_weight_changes, significant_ratio * 100.0);
             }
             let avg_richards_glu_delta = if richards_glu_param_count > 0 { richards_glu_delta_sum / richards_glu_param_count as f64 } else { 0.0 };
 
