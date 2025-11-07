@@ -25,7 +25,7 @@ pub enum LayerEnum {
     OutputProjection(OutputProjection),
 
     // Removed TRMBlock variant
-    PolyAttention(Box<crate::poly_attention::PolyAttention>),
+    PolyAttention(Box<crate::attention::poly_attention::PolyAttention>),
 }
 
 impl LayerEnum {

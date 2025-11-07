@@ -5,7 +5,7 @@ use crate::{
     llm::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
-    poly_attention::PolyAttention,
+    attention::poly_attention::PolyAttention,
     mixtures::moe::{MixtureOfExperts, ExpertRouterConfig},
 };
 use crate::encoding::Vocab;
