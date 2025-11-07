@@ -384,7 +384,7 @@ impl PolyAttention {
                 let token_count = n;
 
                 // Return (projections, gates, metrics) for this head
-                ((q, k, v, g_col.clone(), eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, g_col)
+                ((q, k, v, g_col.clone(), eff_col.clone()), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, eff_col)
             })
             .fold(
                 (vec![], vec![], (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0), (0.0, 0), vec![], vec![]),
@@ -409,14 +409,20 @@ impl PolyAttention {
         let head_projections = projections_acc;
 
         // Create gate values array for metrics update
-        // gate_values_acc contains one (N, 1) array per head, we need to concatenate them
+        // gate_values_acc contains effective gating values (g * thresholds) per head, concatenate them
         let gate_values = if !gate_values_acc.is_empty() {
             let n_tokens = gate_values_acc[0].nrows();
-            let mut gate_values = ndarray::Array2::<f32>::zeros((n_tokens, self.heads.len()));
-            for (h_idx, gate_col) in gate_values_acc.into_iter().enumerate() {
-                gate_values.column_mut(h_idx).assign(&gate_col.column(0));
-            }
-            gate_values
+            let n_heads = gate_values_acc.len();
+
+            // Use iterator chain to collect all gate values in correct order
+            let gate_data: Vec<f32> = (0..n_tokens)
+                .flat_map(|token_idx| {
+                    gate_values_acc.iter().map(move |gate_col| gate_col[[token_idx, 0]])
+                })
+                .collect();
+
+            ndarray::Array2::from_shape_vec((n_tokens, n_heads), gate_data)
+                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n_tokens, n_heads)))
         } else {
             ndarray::Array2::<f32>::zeros((0, 0))
         };

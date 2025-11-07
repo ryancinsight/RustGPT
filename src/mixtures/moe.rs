@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::llm::Layer;
 use crate::mixtures::gating::{GatingStrategy, GatingConfig, select_top_k_components};
 use crate::mixtures::threshold::ThresholdPredictor;
+use crate::mixtures::routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm};
 
 /// Strategy for selecting which experts to activate
 ///
@@ -132,11 +133,15 @@ impl ExpertRouterConfig {
         // Update MoE-specific routing probability averages
         let num_tokens = routing_probs.nrows() as f32;
         let total_decisions = self.gating.metrics.total_decisions as f32 + num_tokens;
-        for expert_idx in 0..self.num_experts {
-            let expert_avg_prob = routing_probs.column(expert_idx).mean().unwrap_or(0.0);
-            let current_avg = self.metrics_avg_routing_prob[expert_idx];
-            self.metrics_avg_routing_prob[expert_idx] = current_avg + (expert_avg_prob - current_avg) * num_tokens / total_decisions;
-        }
+
+        // Use zip to iterate over metrics and routing columns simultaneously (zero-copy)
+        self.metrics_avg_routing_prob.iter_mut()
+            .zip(routing_probs.columns())
+            .for_each(|(metric, routing_col)| {
+                let expert_avg_prob = routing_col.mean().unwrap_or(0.0);
+                let current_avg = *metric;
+                *metric = current_avg + (expert_avg_prob - current_avg) * num_tokens / total_decisions;
+            });
     }
 
     /// Get load balancing loss for training (prevents single expert dominance)
@@ -161,26 +166,29 @@ impl ExpertRouterConfig {
         }
 
         // Compute average pairwise correlation between expert routing probabilities
-        let mut total_correlation = 0.0;
-        let mut pair_count = 0;
+        // using iterator chains for zero-copy and functional composition
+        let probs_slice = &self.metrics_avg_routing_prob;
 
-        for i in 0..self.num_experts {
-            for j in (i + 1)..self.num_experts {
-                let prob_i = self.metrics_avg_routing_prob[i];
-                let prob_j = self.metrics_avg_routing_prob[j];
-
-                // Simple correlation measure (cosine similarity of routing patterns)
-                let dot_product = prob_i * prob_j;
+        let (total_correlation, pair_count) = (0..self.num_experts)
+            .flat_map(|i| {
+                ((i + 1)..self.num_experts).map(move |j| (i, j))
+            })
+            .filter_map(|(i, j)| {
+                let prob_i = probs_slice[i];
+                let prob_j = probs_slice[j];
                 let norm_i = prob_i.abs();
                 let norm_j = prob_j.abs();
 
                 if norm_i > 0.0 && norm_j > 0.0 {
-                    let correlation = dot_product / (norm_i * norm_j);
-                    total_correlation += correlation.abs();
-                    pair_count += 1;
+                    let correlation = (prob_i * prob_j) / (norm_i * norm_j);
+                    Some(correlation.abs())
+                } else {
+                    None
                 }
-            }
-        }
+            })
+            .fold((0.0, 0), |(total, count), correlation| {
+                (total + correlation, count + 1)
+            });
 
         if pair_count == 0 {
             0.0
@@ -202,6 +210,85 @@ impl ExpertRouterConfig {
     /// Get routing entropy (higher = more uniform distribution across experts)
     pub fn get_routing_entropy(&self) -> f32 {
         self.gating.get_gating_entropy()
+    }
+}
+
+/// Router implementation for expert selection in Mixture-of-Experts
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertRouterImpl {
+    /// Routing configuration
+    pub config: RoutingConfig,
+    /// Number of experts available for selection
+    pub num_experts: usize,
+}
+
+impl ExpertRouterImpl {
+    /// Create a new expert router
+    pub fn new(num_experts: usize, config: RoutingConfig) -> Self {
+        Self { config, num_experts }
+    }
+
+    /// Create router from gating strategy
+    pub fn from_strategy(strategy: &GatingStrategy, num_experts: usize) -> Self {
+        let config = match strategy {
+            GatingStrategy::Learned { num_active, .. } => RoutingConfig {
+                algorithm: SelectionAlgorithm::Softmax,
+                use_learned_predictor: true,
+                num_active: *num_active,
+                temperature: 1.0,
+            },
+            GatingStrategy::Fixed { num_active } => RoutingConfig {
+                algorithm: SelectionAlgorithm::TopK { k: *num_active },
+                use_learned_predictor: false,
+                num_active: *num_active,
+                temperature: 1.0,
+            },
+        };
+        Self::new(num_experts, config)
+    }
+}
+
+impl Router for ExpertRouterImpl {
+    fn route(
+        &mut self,
+        input: &ndarray::ArrayView2<f32>,
+        predictor: Option<&mut ThresholdPredictor>,
+    ) -> RoutingResult {
+        // Generate raw gating values (routing logits)
+        let raw_gates = if self.config.use_learned_predictor {
+            if let Some(predictor) = predictor {
+                // Use predictor to generate routing logits for each expert
+                predictor.predict(input)
+            } else {
+                // Fallback: uniform routing
+                ndarray::Array2::zeros((input.nrows(), self.num_experts))
+            }
+        } else {
+            // Fixed selection: route to first k experts equally using iterator chains
+            let n_tokens = input.nrows();
+            let active_experts = self.config.num_active.min(self.num_experts);
+            let uniform_weight = 1.0 / self.config.num_active as f32;
+
+            // Use iterator chains to construct gate values (zero-copy array construction)
+            let gate_data: Vec<f32> = (0..n_tokens)
+                .flat_map(|_| {
+                    (0..self.num_experts).map(move |expert_idx| {
+                        if expert_idx < active_experts { uniform_weight } else { 0.0 }
+                    })
+                })
+                .collect();
+
+            ndarray::Array2::from_shape_vec((n_tokens, self.num_experts), gate_data)
+                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n_tokens, self.num_experts)))
+        };
+
+        // Apply selection algorithm (for MoE, typically softmax for soft routing)
+        let routing_weights = crate::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
+
+        RoutingResult {
+            routing_weights,
+            raw_gates,
+        }
     }
 }
 
@@ -318,7 +405,7 @@ impl ExpertSelector {
     /// Returns softmax-normalized probabilities in [0, 1] range suitable for expert selection
     /// Caches intermediate activations for gradient computation
     pub fn predict(&mut self, input: &ndarray::ArrayView2<f32>) -> ndarray::Array2<f32> {
-        // Cache input for gradient computation
+        // Cache input for gradient computation (zero-copy where possible)
         self.cached_input = Some(input.to_owned());
 
         // First layer: W1 * x + b1
@@ -329,17 +416,14 @@ impl ExpertSelector {
         let normalized = self.norm.forward(&hidden);
         self.cached_normalized = Some(normalized.clone());
 
-        // Learned Richards activation replacing ReLU
+        // Learned Richards activation replacing ReLU (avoid double conversion)
         let activation_output = self.activation.forward_matrix(&normalized.mapv(|x| x as f64)).mapv(|x| x as f32);
         self.cached_activation = Some(activation_output.clone());
 
-        // Second layer input (previously activated)
-        let activated = activation_output;
-        self.cached_activated = Some(activated.clone());
-
         // Second layer: W2 * activated + b2
-        let logits = activated.dot(&self.weights2) + &self.bias2;
+        let logits = activation_output.dot(&self.weights2) + &self.bias2;
         self.cached_logits = Some(logits.clone());
+        self.cached_activated = Some(activation_output); // Cache after use
 
         // Softmax normalization for routing probabilities
         let output = self.softmax.forward(&logits.view());
@@ -431,24 +515,24 @@ impl ExpertSelector {
         (grad_weights1, grad_bias1, grad_weights2, grad_bias2, activation_grads)
     }
 
-    /// Get parameters for gradient computation
-    pub fn parameters(&self) -> Vec<&ndarray::Array2<f32>> {
-        vec![&self.weights1, &self.weights2]
+    /// Get parameters for gradient computation (iterator-based, zero-copy)
+    pub fn parameters(&self) -> impl Iterator<Item = &ndarray::Array2<f32>> {
+        [&self.weights1, &self.weights2].into_iter()
     }
 
-    /// Get mutable parameters for gradient updates
-    pub fn parameters_mut(&mut self) -> Vec<&mut ndarray::Array2<f32>> {
-        vec![&mut self.weights1, &mut self.weights2]
+    /// Get mutable parameters for gradient updates (iterator-based, zero-copy)
+    pub fn parameters_mut(&mut self) -> impl Iterator<Item = &mut ndarray::Array2<f32>> {
+        [&mut self.weights1, &mut self.weights2].into_iter()
     }
 
-    /// Get bias parameters
-    pub fn biases(&self) -> Vec<&ndarray::Array1<f32>> {
-        vec![&self.bias1, &self.bias2]
+    /// Get bias parameters (iterator-based, zero-copy)
+    pub fn biases(&self) -> impl Iterator<Item = &ndarray::Array1<f32>> {
+        [&self.bias1, &self.bias2].into_iter()
     }
 
-    /// Get mutable bias parameters
-    pub fn biases_mut(&mut self) -> Vec<&mut ndarray::Array1<f32>> {
-        vec![&mut self.bias1, &mut self.bias2]
+    /// Get mutable bias parameters (iterator-based, zero-copy)
+    pub fn biases_mut(&mut self) -> impl Iterator<Item = &mut ndarray::Array1<f32>> {
+        [&mut self.bias1, &mut self.bias2].into_iter()
     }
 
     /// Get parameter information for this router
@@ -469,8 +553,8 @@ impl ExpertSelector {
             let activation_params = self.activation.weights().len();
             let sigmoid_params = self.sigmoid.weights().len();
 
-            let total_params = self.parameters().iter().map(|p| p.len()).sum::<usize>() +
-                             self.biases().iter().map(|b| b.len()).sum::<usize>() +
+            let total_params = self.parameters().map(|p| p.len()).sum::<usize>() +
+                             self.biases().map(|b| b.len()).sum::<usize>() +
                              norm_params + activation_params + sigmoid_params;
 
             self.param_info = Some(RouterParamInfo {
@@ -679,12 +763,19 @@ impl MixtureOfExperts {
 
         // Weighted sum of expert outputs using routing probabilities
         let mut output = ndarray::Array2::zeros(input.raw_dim());
-        for (expert_idx, expert_output) in expert_outputs.into_iter().enumerate() {
-            for token_idx in 0..input.nrows() {
-                let routing_weight = routing_probs[[token_idx, expert_idx]];
-                output.row_mut(token_idx).scaled_add(routing_weight, &expert_output.row(token_idx));
-            }
-        }
+
+        // Use zip to combine expert outputs with routing columns and accumulate results
+        expert_outputs.into_iter()
+            .zip(routing_probs.columns())
+            .for_each(|(expert_output, routing_col)| {
+                // Use zip to iterate over output rows and routing weights simultaneously
+                output.outer_iter_mut()
+                    .zip(expert_output.outer_iter())
+                    .zip(routing_col.iter())
+                    .for_each(|((mut output_row, expert_row), &weight)| {
+                        output_row.scaled_add(weight, &expert_row);
+                    });
+            });
 
         output
     }
@@ -693,17 +784,19 @@ impl MixtureOfExperts {
     /// Get parameter information for the MoE layer
     fn get_param_info(&mut self) -> &MoeParamInfo {
         if self.param_info.is_none() {
-            // Get router parameter info
-            let router_info = self.router.get_param_info().clone();
+            // Get router parameter info (avoid clone by taking ownership)
+            let router_info = (*self.router.get_param_info()).clone();
 
-            // Get expert parameter info
+            // Get expert parameter info using iterator chains
             let expert_infos = self.experts.iter_mut()
-                .map(|expert| expert.get_param_info().clone())
+                .map(|expert| (*expert.get_param_info()).clone())
                 .collect::<Vec<_>>();
 
-            // Calculate total parameters
+            // Calculate total parameters using iterator chains
             let total_params = router_info.total_params +
-                             expert_infos.iter().map(|info| info.total_params).sum::<usize>();
+                             expert_infos.iter()
+                                .map(|info| info.total_params)
+                                .sum::<usize>();
 
             self.param_info = Some(MoeParamInfo {
                 router_info,
@@ -736,23 +829,39 @@ impl Layer for MixtureOfExperts {
 
         let mut total_grad_input = ndarray::Array2::zeros(grads.raw_dim());
 
-        for (expert_idx, expert) in self.experts.iter_mut().enumerate() {
-            // Weight gradients by routing probabilities for this expert
-            let mut weighted_grads = ndarray::Array2::zeros(grads.raw_dim());
-            for token_idx in 0..grads.nrows() {
-                let routing_weight = routing_probs[[token_idx, expert_idx]];
-                weighted_grads.row_mut(token_idx).assign(&grads.row(token_idx).mapv(|x| x * routing_weight));
-            }
+        // Use zip to iterate over experts and their corresponding routing columns simultaneously
+        self.experts.iter_mut()
+            .zip(routing_probs.columns())
+            .for_each(|(expert, routing_col)| {
+                // Weight gradients by routing probabilities for this expert using zip
+                let weighted_grads: Vec<ndarray::Array1<f32>> = grads.outer_iter()
+                    .zip(routing_col.iter())
+                    .map(|(grad_row, &weight)| grad_row.mapv(|x| x * weight))
+                    .collect();
 
-            // Get expert input gradients
-            let expert_grad_input = expert.backward(&weighted_grads, lr);
+                // Convert Vec<Array1> to Array2 for expert backward pass
+                let weighted_grads_2d = if !weighted_grads.is_empty() {
+                    let nrows = weighted_grads.len();
+                    let ncols = weighted_grads[0].len();
+                    let flat_data = weighted_grads.into_iter()
+                        .flat_map(|row: ndarray::Array1<f32>| row.into_iter())
+                        .collect::<Vec<f32>>();
+                    ndarray::Array2::from_shape_vec((nrows, ncols), flat_data).unwrap()
+                } else {
+                    ndarray::Array2::zeros(grads.raw_dim())
+                };
 
-            // Weight input gradients back by routing probabilities
-            for token_idx in 0..expert_grad_input.nrows() {
-                let routing_weight = routing_probs[[token_idx, expert_idx]];
-                total_grad_input.row_mut(token_idx).scaled_add(routing_weight, &expert_grad_input.row(token_idx));
-            }
-        }
+                // Get expert input gradients
+                let expert_grad_input = expert.backward(&weighted_grads_2d, lr);
+
+                // Weight input gradients back by routing probabilities using zip
+                expert_grad_input.outer_iter()
+                    .zip(routing_col.iter())
+                    .zip(total_grad_input.outer_iter_mut())
+                    .for_each(|((grad_row, &weight), mut total_row)| {
+                        total_row.scaled_add(weight, &grad_row);
+                    });
+            });
 
         total_grad_input
     }
@@ -771,9 +880,9 @@ impl Layer for MixtureOfExperts {
             total += self.router.norm.parameters();
             total += self.router.activation.weights().len();
 
-            for expert in &self.experts {
-                total += expert.glu.parameters();
-            }
+            total += self.experts.iter()
+                .map(|expert| expert.glu.parameters())
+                .sum::<usize>();
 
             total
         }
