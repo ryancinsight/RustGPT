@@ -236,12 +236,21 @@ impl ExpertRouterImpl {
                 use_learned_predictor: true,
                 num_active: *num_active,
                 temperature: 1.0,
+                soft_top_p_alpha: 50.0,
+            },
+            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha } => RoutingConfig {
+                algorithm: SelectionAlgorithm::SoftTopP { top_p: *top_p },
+                use_learned_predictor: false,
+                num_active: num_experts, // All experts available for soft selection
+                temperature: 1.0,
+                soft_top_p_alpha: *soft_top_p_alpha,
             },
             GatingStrategy::Fixed { num_active } => RoutingConfig {
                 algorithm: SelectionAlgorithm::TopK { k: *num_active },
                 use_learned_predictor: false,
                 num_active: *num_active,
                 temperature: 1.0,
+                soft_top_p_alpha: 50.0,
             },
         };
         Self::new(num_experts, config)

@@ -234,12 +234,10 @@ fn main() -> llm::Result<()> {
         // - Average heads: 3-4 (50% reduction from AllHeads baseline of 8)
         // - Efficiency gain: 15-25% (vs 5-8% for standard MoH)
         // ============================================================================
-        // SOFT ROUTING: Differentiable routing with continuous weights
-        HeadSelectionStrategy::Learned {
-            num_active: 8,               // Maximum heads for complex inputs (efficiency constraint)
-            load_balance_weight: 0.1,    // INCREASED 10x: was 0.01 (too weak)
-            complexity_loss_weight: 0.1, // INCREASED 10x: was 0.01 (too weak)
-            sparsity_weight: 0.01,       // INCREASED 10x: was 0.001 (too weak)
+        // SOFT TOP-P: Differentiable top-p sampling for learned hard selection
+        HeadSelectionStrategy::SoftTopP {
+            top_p: 0.9,                  // Use 90% probability mass for head selection
+            soft_top_p_alpha: 15.0,      // Reduced for stability - smoother transitions
         }
 
         // Alternative: Standard MoH (for comparison)

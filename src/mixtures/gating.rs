@@ -38,6 +38,16 @@ pub enum GatingStrategy {
         /// Weight for complexity alignment loss (aligns usage with predicted complexity)
         complexity_loss_weight: f32,
     },
+    /// Soft top-p gating: Differentiable top-p selection using AutoDeco-inspired soft sampling
+    ///
+    /// Uses soft top-p sampling for learned hard selection. Provides differentiable
+    /// training while maintaining discrete selection behavior during inference.
+    SoftTopP {
+        /// Top-p threshold for component selection (0.0 to 1.0)
+        top_p: f32,
+        /// Steepness parameter for soft top-p decay (higher = sharper transitions)
+        soft_top_p_alpha: f32,
+    },
     /// Fixed gating: Select fixed number of components per token
     ///
     /// Simple deterministic selection without learning.
@@ -55,8 +65,14 @@ pub enum GatingStrategy {
 pub struct GatingConfig {
     /// Use learned predictor for dynamic gating
     pub use_learned_predictor: bool,
+    /// Use soft top-p sampling for differentiable selection
+    pub use_soft_top_p: bool,
     /// Number of components to activate per token
     pub num_active: usize,
+    /// Top-p threshold for soft top-p selection
+    pub top_p: f32,
+    /// Steepness parameter for soft top-p decay
+    pub soft_top_p_alpha: f32,
     /// Weight for load balance loss
     pub load_balance_weight: f32,
     /// Weight for sparsity loss
@@ -71,7 +87,10 @@ impl Default for GatingConfig {
     fn default() -> Self {
         Self {
             use_learned_predictor: false,
+            use_soft_top_p: false,
             num_active: 2,
+            top_p: 0.9,
+            soft_top_p_alpha: 50.0,
             load_balance_weight: 0.0,
             sparsity_weight: 0.0,
             complexity_loss_weight: 0.0,
@@ -91,15 +110,32 @@ impl GatingConfig {
                 complexity_loss_weight,
             } => Self {
                 use_learned_predictor: true,
+                use_soft_top_p: false,
                 num_active: *num_active,
+                top_p: 0.9,
+                soft_top_p_alpha: 50.0,
                 load_balance_weight: *load_balance_weight,
                 sparsity_weight: *sparsity_weight,
                 complexity_loss_weight: *complexity_loss_weight,
                 metrics: MixtureMetrics::new(num_components),
             },
+            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha } => Self {
+                use_learned_predictor: false,
+                use_soft_top_p: true,
+                num_active: num_components, // All components available for selection
+                top_p: *top_p,
+                soft_top_p_alpha: *soft_top_p_alpha,
+                load_balance_weight: 0.0,
+                sparsity_weight: 0.0,
+                complexity_loss_weight: 0.0,
+                metrics: MixtureMetrics::new(num_components),
+            },
             GatingStrategy::Fixed { num_active } => Self {
                 use_learned_predictor: false,
+                use_soft_top_p: false,
                 num_active: *num_active,
+                top_p: 0.9,
+                soft_top_p_alpha: 50.0,
                 load_balance_weight: 0.0,
                 sparsity_weight: 0.0,
                 complexity_loss_weight: 0.0,
