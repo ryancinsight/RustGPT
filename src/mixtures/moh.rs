@@ -19,7 +19,25 @@
 //!
 //! - **HeadSelectionStrategy**: Configuration for fully adaptive head selection
 //! - **HeadSelectionPredictor**: AutoDeco-inspired two-layer network for threshold prediction
+//! - **Soft Top-P Sampling**: Differentiable top-p selection for learned hard selection
 //! - **Complexity-aware routing**: Learns optimal head usage patterns
+//!
+//! ## Usage Examples
+//!
+//! ### Using Soft Top-P Sampling for Mixture of Heads
+//! ```rust
+//! use crate::mixtures::gating::GatingStrategy;
+//! use crate::mixtures::moh::{HeadSelectionStrategy, HeadSelectionConfig};
+//!
+//! // Create a soft top-p strategy with 90% probability mass and sharp transitions
+//! let strategy = HeadSelectionStrategy::SoftTopP {
+//!     top_p: 0.9,
+//!     soft_top_p_alpha: 50.0,  // Higher = sharper top-p cutoff
+//! };
+//!
+//! // Create head selection config from strategy
+//! let config = HeadSelectionConfig::from_strategy(&strategy, 8); // 8 heads
+//! ```
 
 use serde::{Deserialize, Serialize};
 use crate::llm::Layer;
@@ -88,6 +106,17 @@ impl HeadSelectionConfig {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1, // Default min, could be parameterized
                 max_heads: *num_active,
+                metrics_tau_min: f32::INFINITY,
+                metrics_tau_max: f32::NEG_INFINITY,
+                metrics_tau_sum: 0.0,
+                metrics_tau_count: 0,
+                metrics_g_sq_sum: 0.0,
+                metrics_g_count: 0,
+            },
+            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha: _ } => Self {
+                gating: GatingConfig::from_strategy(strategy, num_heads),
+                min_heads: 1, // Allow flexible selection with soft top-p
+                max_heads: num_heads, // All heads available for selection
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,
@@ -164,12 +193,21 @@ impl HeadRouter {
                 use_learned_predictor: true,
                 num_active: *num_active,
                 temperature: 1.0,
+                soft_top_p_alpha: 50.0,
+            },
+            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha } => RoutingConfig {
+                algorithm: SelectionAlgorithm::SoftTopP { top_p: *top_p },
+                use_learned_predictor: false,
+                num_active: num_heads, // All heads available for soft selection
+                temperature: 1.0,
+                soft_top_p_alpha: *soft_top_p_alpha,
             },
             GatingStrategy::Fixed { num_active } => RoutingConfig {
                 algorithm: SelectionAlgorithm::TopK { k: *num_active },
                 use_learned_predictor: false,
                 num_active: *num_active,
                 temperature: 1.0,
+                soft_top_p_alpha: 50.0,
             },
         };
         Self::new(num_heads, config)

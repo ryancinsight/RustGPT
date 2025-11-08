@@ -1,7 +1,7 @@
 use ndarray::{Array2, linalg::general_mat_mul, s};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, llm::Layer, richards::RichardsCurve, mixtures::{moh::{HeadSelectionStrategy, HeadSelectionConfig}, threshold::ThresholdPredictor}, attention::{config::{init_attention_heads, init_cope, init_gate_polynomial, init_gating_params, init_output_projection, init_polynomial_params}, head::PolyHead, params::PolyAttentionParamInfo, position::cope::CoPE}};
+use crate::{adam::Adam, llm::Layer, richards::RichardsCurve, mixtures::{moh::{HeadSelectionStrategy, HeadSelectionConfig}, threshold::ThresholdPredictor}, attention::{config::{init_attention_heads, init_cope, init_gate_polynomial, init_gating_params, init_output_projection, init_polynomial_params}, forward::{ForwardContext, compute_poly_attention_forward}, head::PolyHead, params::PolyAttentionParamInfo, position::cope::CoPE}};
 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -132,190 +132,40 @@ impl PolyAttention {
 
 
     pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
-        // input: (N, embed_dim)
-        let (n, d_model) = (input.nrows(), input.ncols());
-        assert_eq!(d_model, self.embed_dim);
-
         self.cached_input = Some(input.clone());
 
-        let dk_scale = 1.0f32 / (self.head_dim as f32).sqrt();
-
-        // Streamed accumulation: avoid building a large concat buffer
-        let mut out = input.to_owned();
-
-        // Threshold predictor should already be initialized during construction/configuration
-        // No initialization needed during forward pass to avoid gradient instability
-
-        // Pre-compute threshold predictor for all heads if needed
-        let thresholds_global = if self.head_selection_config.gating.use_learned_predictor {
-            if let Some(predictor) = &mut self.threshold_predictor {
-                Some(predictor.predict(&input.view()))
-            } else {
-                None
-            }
-        } else {
-            None
+        let mut ctx = ForwardContext {
+            input,
+            heads: &mut self.heads,
+            w_out: &self.w_out,
+            w_g: &self.w_g,
+            alpha_g: &self.alpha_g,
+            beta_g: &self.beta_g,
+            gate_poly: &mut self.gate_poly,
+            cope: &mut self.cope,
+            head_selection_config: &mut self.head_selection_config,
+            threshold_predictor: &mut self.threshold_predictor,
+            embed_dim: self.embed_dim,
+            num_heads: self.num_heads,
+            head_dim: self.head_dim,
+            p: self.p,
+            a: &self.a,
+            b: &self.b,
+            scale: &self.scale,
+            window_size: self.window_size,
         };
 
-        // Zero-copy iterator-based head processing with accumulation
-        let (active_sums_tmp, token_counts_tmp, (tau_min_local, tau_max_local, tau_sum_local, tau_count_local), (g_sq_sum_local, g_count_local), gate_values_acc, projections_acc) =
-            self.heads.iter().enumerate()
-            .map(|(h_idx, head)| {
-                // Project to Q, K, V using zero-copy views
-                let q: Array2<f32> = input.dot(&head.w_q); // (N, d_h)
-                let k: Array2<f32> = input.dot(&head.w_k); // (N, d_h)
-                let v: Array2<f32> = input.dot(&head.w_v); // (N, d_h)
+        let result = compute_poly_attention_forward(&mut ctx, causal);
 
-                // Compute per-token gating for this head: g = Richards(alpha * (X·w_g_col) + beta)
-                let w_g_col = self.w_g.slice(s![.., h_idx..h_idx + 1]); // (D,1)
-                let xw_col = input.dot(&w_g_col); // (N,1)
-                let a_h = self.alpha_g[[0, h_idx]];
-                let b_h = self.beta_g[[0, h_idx]];
-
-                // Compute gate values and metrics using iterator chains
-                let max_abs_z = xw_col.iter()
-                    .map(|&v| (a_h * v + b_h) as f64)
-                    .fold(0.0_f64, |m, z| m.max(z.abs()));
-
-                let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
-
-                let g_col = xw_col.mapv(|xw| gate_poly.forward_scalar((a_h * xw + b_h) as f64) as f32);
-
-                // RMS tracking for gating predictor
-                let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
-                let g_count = n;
-
-                // Learned threshold predictor m = sigmoid(alpha_tau * (X·W_tau) + beta_tau)
-                let (_m_col, tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
-                    // Use learned thresholds
-                    let threshold_sum: f32 = thresholds.iter().sum();
-                    let threshold_min = thresholds.iter().fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
-                    let threshold_max = thresholds.iter().fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
-                    let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
-                    let eff_col = &g_col * thresholds;
-                    (thresholds.clone(), tau_metrics, eff_col)
-                } else {
-                    // No learned thresholds: m = 1, so eff = g
-                    let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
-                    let eff_col = g_col.clone();
-                    (Array2::<f32>::ones((n, 1)), tau_metrics, eff_col)
-                };
-                let active_sum = eff_col.sum();
-                let token_count = n;
-
-                // Return (projections, gates, metrics) for this head
-                ((q, k, v, g_col.clone(), eff_col.clone()), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, eff_col)
-            })
-            .fold(
-                (vec![], vec![], (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0), (0.0, 0), vec![], vec![]),
-                |(mut active_acc, mut token_acc, mut tau_acc, mut g_acc, mut gate_values_acc, mut projections_acc),
-                 ((q, k, v, g_col, eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, gate_col)| {
-                    active_acc.push(active_sum);
-                    token_acc.push(token_count);
-                    tau_acc = (
-                        tau_acc.0.min(tau_metrics.0),
-                        tau_acc.1.max(tau_metrics.1),
-                        tau_acc.2 + tau_metrics.2,
-                        tau_acc.3 + tau_metrics.3,
-                    );
-                    g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
-                    gate_values_acc.push(gate_col);
-                    projections_acc.push((q, k, v, g_col, eff_col));
-                    (active_acc, token_acc, tau_acc, g_acc, gate_values_acc, projections_acc)
-                }
-            );
-
-        // Extract projections for the attention computation loop
-        let head_projections = projections_acc;
-
-        // Create gate values array for metrics update
-        // gate_values_acc contains effective gating values (g * thresholds) per head, concatenate them
-        let gate_values = if !gate_values_acc.is_empty() {
-            let n_tokens = gate_values_acc[0].nrows();
-            let n_heads = gate_values_acc.len();
-
-            // Use iterator chain to collect all gate values in correct order
-            let gate_data: Vec<f32> = (0..n_tokens)
-                .flat_map(|token_idx| {
-                    gate_values_acc.iter().map(move |gate_col| gate_col[[token_idx, 0]])
-                })
-                .collect();
-
-            ndarray::Array2::from_shape_vec((n_tokens, n_heads), gate_data)
-                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n_tokens, n_heads)))
-        } else {
-            ndarray::Array2::<f32>::zeros((0, 0))
-        };
-
-        // Process attention computation for each head
-        for (h_idx, (q, k, v, _g_col, eff_col)) in head_projections.into_iter().enumerate() {
-
-            {
-                // True banded computation per row (avoids building N×N scores)
-                let a = self.a[[0, 0]];
-                let b = self.b[[0, 0]];
-                let scale = self.scale[[0, 0]];
-                let p_i32 = self.p as i32;
-                let start = h_idx * self.head_dim;
-                let end = start + self.head_dim;
-                let w_block = self.w_out.slice(s![start..end, ..]); // (d_h, D)
-
-                for i in 0..n {
-                    let mut yh_row = Array2::<f32>::zeros((1, self.head_dim));
-                    let j_start = match self.window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
-                    let j_end = if causal { i } else { n - 1 };
-
-                    // CoPE q·p_pos caching for row i
-                    let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
-                    let mut q_pe = Vec::with_capacity(max_pos + 1);
-                    q_pe.extend((0..=max_pos).map(|pos|
-                        q.row(i).dot(&self.cope.pos_embeddings.row(pos))
-                    ));
-
-                    for j in j_start..=j_end {
-                        let base = q.row(i).dot(&k.row(j)) * dk_scale;
-                        let mut s = base;
-                        let pos = i.saturating_sub(j);
-                        if pos < q_pe.len() { s += q_pe[pos]; }
-                        let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
-                        let phi = scale * (a * sp + b);
-                        // yh_row += phi * v[j,:]
-                        for h in 0..self.head_dim {
-                            yh_row[[0, h]] += phi * v[[j, h]];
-                        }
-                    }
-
-                    // Apply gating: eff = g * m for token i (precomputed in eff_col)
-                    let eff_i = eff_col[[i, 0]];
-                    for h in 0..self.head_dim {
-                        yh_row[[0, h]] *= eff_i;
-                    }
-
-                    // Accumulate into output row i via W_out block
-                    let mut out_row = out.slice_mut(s![i..i + 1, ..]);
-                    general_mat_mul(1.0, &yh_row, &w_block, 1.0, &mut out_row);
-                }
-            }
+        // Update metrics from the result
+        if let Some((tau_min, tau_max)) = result.tau_metrics {
+            // Metrics already updated in the forward function
+        }
+        if let Some(_pred_norm) = result.pred_norm {
+            // Metrics already updated in the forward function
         }
 
-        // Update gating metrics with collected gate values
-        if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-            self.head_selection_config.update_metrics(&gate_values.view());
-        }
-
-        // Update tau metrics from accumulated values
-        if tau_count_local > 0 { // tau_count > 0
-            self.head_selection_config.metrics_tau_min = tau_min_local;
-            self.head_selection_config.metrics_tau_max = tau_max_local;
-            self.head_selection_config.metrics_tau_sum = tau_sum_local;
-            self.head_selection_config.metrics_tau_count = tau_count_local;
-        }
-
-        // Update gate metrics from accumulated values
-        self.head_selection_config.metrics_g_sq_sum = g_sq_sum_local;
-        self.head_selection_config.metrics_g_count = g_count_local;
-
-        out
+        result.output
     }
 
     fn compute_gradients(

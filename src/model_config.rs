@@ -180,11 +180,9 @@ impl ModelConfig {
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::Learned {
-                num_active: num_heads.unwrap_or(8),
-                load_balance_weight: 0.01,
-                complexity_loss_weight: 0.01,
-                sparsity_weight: 0.001,
+            head_selection: HeadSelectionStrategy::SoftTopP {
+                top_p: 0.9,
+                soft_top_p_alpha: 15.0,  // Reduced for numerical stability
             },
             attention: AttentionType::SelfAttention,
             moe_router: None, // Default: no MoE (standard feedforward)

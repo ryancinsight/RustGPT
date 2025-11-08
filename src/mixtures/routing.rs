@@ -24,6 +24,8 @@ use crate::mixtures::threshold::ThresholdPredictor;
 pub enum SelectionAlgorithm {
     /// Select top-k components with highest gating values (hard selection)
     TopK { k: usize },
+    /// Apply differentiable soft top-p sampling (AutoDeco-inspired)
+    SoftTopP { top_p: f32 },
     /// Apply softmax to gating values for soft routing probabilities
     Softmax,
     /// Use raw gating values without modification
@@ -41,6 +43,8 @@ pub struct RoutingConfig {
     pub num_active: usize,
     /// Temperature for softmax (only used with Softmax algorithm)
     pub temperature: f32,
+    /// Steepness parameter for soft top-p decay (only used with SoftTopP algorithm)
+    pub soft_top_p_alpha: f32,
 }
 
 impl Default for RoutingConfig {
@@ -50,6 +54,7 @@ impl Default for RoutingConfig {
             use_learned_predictor: false,
             num_active: 1,
             temperature: 1.0,
+            soft_top_p_alpha: 50.0,
         }
     }
 }
@@ -90,6 +95,9 @@ pub fn apply_selection_algorithm(
         SelectionAlgorithm::TopK { k } => {
             apply_top_k_selection(raw_gates, *k)
         }
+        SelectionAlgorithm::SoftTopP { top_p } => {
+            apply_soft_top_p_selection(raw_gates, *top_p, config.soft_top_p_alpha)
+        }
         SelectionAlgorithm::Softmax => {
             apply_softmax_selection(raw_gates, config.temperature)
         }
@@ -118,6 +126,68 @@ fn apply_top_k_selection(gates: &ndarray::ArrayView2<f32>, k: usize) -> ndarray:
             result[[token_idx, idx]] = 1.0;
         });
     });
+
+    result
+}
+
+/// Apply soft top-p selection to gating values (AutoDeco-inspired)
+/// Returns differentiable probability distribution using soft top-p sampling
+fn apply_soft_top_p_selection(gates: &ndarray::ArrayView2<f32>, top_p: f32, alpha: f32) -> ndarray::Array2<f32> {
+    let mut result = ndarray::Array2::<f32>::zeros(gates.raw_dim());
+
+    // Process each token
+    for (token_idx, token_gates) in gates.outer_iter().enumerate() {
+        // Convert to 1D array for processing
+        let token_gates_1d = token_gates.as_slice().unwrap();
+
+        // Sort probabilities and compute cumulative sum (following AutoDeco approach)
+        let mut prob_indices: Vec<usize> = (0..token_gates_1d.len()).collect();
+        prob_indices.sort_by(|&i, &j| token_gates_1d[j].partial_cmp(&token_gates_1d[i]).unwrap());
+
+        let mut sorted_probs = Vec::with_capacity(token_gates_1d.len());
+        for &idx in &prob_indices {
+            sorted_probs.push(token_gates_1d[idx]);
+        }
+
+        // Compute cumulative sum
+        let mut cumulative = Vec::with_capacity(sorted_probs.len());
+        let mut sum = 0.0;
+        for &val in &sorted_probs {
+            sum += val;
+            cumulative.push(sum);
+        }
+
+        // Apply soft mask: exp(-α * ReLU(cumulative - top_p)) using PadeExp
+        let mut soft_mask = Vec::with_capacity(cumulative.len());
+        for &c in &cumulative {
+            let relu_val = (c - top_p).max(0.0);
+            soft_mask.push(crate::richards::PadeExp::exp((-alpha * relu_val) as f64) as f32);
+        }
+
+        // Unsort the mask
+        let mut unsorted_mask = vec![0.0; token_gates_1d.len()];
+        for (i, &idx) in prob_indices.iter().enumerate() {
+            unsorted_mask[idx] = soft_mask[i];
+        }
+
+        // Apply mask and renormalize
+        let mut masked_probs = Vec::with_capacity(token_gates_1d.len());
+        for (i, &prob) in token_gates_1d.iter().enumerate() {
+            masked_probs.push(prob * unsorted_mask[i]);
+        }
+
+        let sum_masked: f32 = masked_probs.iter().sum();
+        if sum_masked > 0.0 {
+            for (i, prob) in masked_probs.into_iter().enumerate() {
+                result[[token_idx, i]] = prob / sum_masked;
+            }
+        } else {
+            // Fallback to original if all masked
+            for (i, &prob) in token_gates_1d.iter().enumerate() {
+                result[[token_idx, i]] = prob;
+            }
+        }
+    }
 
     result
 }
@@ -183,6 +253,32 @@ mod tests {
         assert_eq!(result[[1, 0]], 1.0);  // selected
         assert_eq!(result[[1, 1]], 0.0);  // not selected
         assert_eq!(result[[1, 2]], 0.0);  // not selected
+    }
+
+    #[test]
+    fn test_soft_top_p_selection() {
+        let gates = Array2::from_shape_vec((1, 4), vec![
+            0.4, 0.3, 0.2, 0.1,  // Single token with decreasing probabilities
+        ]).unwrap();
+
+        // Test with top_p = 0.7 (should keep top 2 components: 0.4 + 0.3 = 0.7)
+        let result = apply_soft_top_p_selection(&gates.view(), 0.7, 50.0);
+
+        // Check that result is properly normalized
+        let total: f32 = result.row(0).iter().sum();
+        assert!((total - 1.0).abs() < 1e-6, "Soft top-p result should be normalized, got {}", total);
+
+        // With high alpha (50.0), the third component should be almost zero
+        assert!(result[[0, 2]] < 0.01, "Third component should be heavily penalized");
+
+        // First two components should have non-zero probability
+        assert!(result[[0, 0]] > 0.0, "First component should have positive probability");
+        assert!(result[[0, 1]] > 0.0, "Second component should have positive probability");
+
+        // Test with top_p = 1.0 (should keep all components)
+        let result_all = apply_soft_top_p_selection(&gates.view(), 1.0, 50.0);
+        let total_all: f32 = result_all.row(0).iter().sum();
+        assert!((total_all - 1.0).abs() < 1e-6, "Soft top-p with top_p=1.0 should be normalized");
     }
 
     #[test]
