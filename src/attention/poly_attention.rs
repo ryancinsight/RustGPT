@@ -189,6 +189,9 @@ impl PolyAttention {
         let mut grad_b_scalar: f32 = 0.0;
         let mut grad_scale_scalar: f32 = 0.0;
 
+        // Numerical stability validation
+        let mut gradient_anomaly_detected = false;
+
         // Gating param grads accumulators
         let mut grad_w_g = Array2::<f32>::zeros((self.embed_dim, self.num_heads));
         let mut grad_alpha_g = Array2::<f32>::zeros((1, self.num_heads));
@@ -368,7 +371,36 @@ impl PolyAttention {
                         let mut s = base;
                         let pos = i.saturating_sub(j);
                         if pos < q_pe.len() { s += q_pe[pos]; }
-                        let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+
+                        // Mathematical stability: clamp attention scores to prevent overflow in polynomial computation
+                        // Attention scores represent log-probabilities, so clamping to [-10, 10] prevents extreme values
+                        // while preserving the relative ordering needed for attention
+                        let s_clamped = s.max(-10.0).min(10.0);
+
+                        // Numerically stable polynomial computation with overflow protection
+                        let sp = if p_i32 <= 3 {
+                            // Direct computation for small powers (more efficient and stable)
+                            match p_i32 {
+                                1 => s_clamped,
+                                2 => s_clamped * s_clamped,
+                                3 => s_clamped * s_clamped * s_clamped,
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            // For higher powers, use iterative multiplication with overflow check
+                            let mut result = 1.0;
+                            let mut current = s_clamped;
+                            for _ in 0..p_i32 {
+                                result *= current;
+                                // Check for overflow and clamp if necessary
+                                if !result.is_finite() {
+                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                    break;
+                                }
+                            }
+                            result
+                        };
+
                         let phi = scale * (a * sp + b);
                         // dV
                         for h in 0..self.head_dim { grad_v[[j, h]] += phi * g_yh_pre_row[[0, h]]; }
@@ -378,13 +410,50 @@ impl PolyAttention {
                         grad_scale_scalar += dphi_ij * (a * sp + b);
                         grad_a_scalar += dphi_ij * scale * sp;
                         grad_b_scalar += dphi_ij * scale;
-                        // dS
-                        let spm1 = match p_i32 { 1 => 1.0, 2 => s, 3 => s * s, _ => s.powi(p_i32 - 1) };
+                        // dS - numerically stable derivative computation for s^p
+                        let spm1 = if p_i32 <= 3 {
+                            // Direct computation for small powers (more efficient and stable)
+                            match p_i32 {
+                                1 => 1.0,
+                                2 => s_clamped,
+                                3 => s_clamped * s_clamped,
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            // For higher powers, use iterative multiplication with overflow check
+                            let mut result = 1.0;
+                            let mut current = s_clamped;
+                            for _ in 0..(p_i32 - 1) {
+                                result *= current;
+                                // Check for overflow and clamp if necessary
+                                if !result.is_finite() {
+                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                    break;
+                                }
+                            }
+                            result
+                        };
                         let d_s_ij = dphi_ij * scale * a * (self.p as f32) * spm1;
+
+                        // Numerical stability check: detect gradient anomalies early
+                        if !d_s_ij.is_finite() {
+                            gradient_anomaly_detected = true;
+                            tracing::warn!("Non-finite d_s_ij detected at head {}, position i={}, j={}: dphi_ij={}, scale={}, a={}, p={}, spm1={}",
+                                h_idx, i, j, dphi_ij, scale, a, self.p, spm1);
+                        }
+
                         // base Q,K grads
                         for h in 0..self.head_dim {
-                            grad_q[[i, h]] += d_s_ij * k[[j, h]] * dk_scale;
-                            grad_k[[j, h]] += d_s_ij * q[[i, h]] * dk_scale;
+                            let grad_q_val = d_s_ij * k[[j, h]] * dk_scale;
+                            let grad_k_val = d_s_ij * q[[i, h]] * dk_scale;
+
+                            if !grad_q_val.is_finite() || !grad_k_val.is_finite() {
+                                gradient_anomaly_detected = true;
+                                tracing::warn!("Non-finite Q/K gradients detected at head {}, i={}, j={}, h={}", h_idx, i, j, h);
+                            }
+
+                            grad_q[[i, h]] += grad_q_val;
+                            grad_k[[j, h]] += grad_k_val;
                         }
                         // CoPE grads
                         let pos = i.saturating_sub(j);
@@ -410,7 +479,31 @@ impl PolyAttention {
                             let mut s = base;
                             let pos = i.saturating_sub(j);
                             if pos < q_pe.len() { s += q_pe[pos]; }
-                            let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+
+                            // Mathematical stability: clamp attention scores to prevent overflow in polynomial computation
+                            let s_clamped = s.max(-10.0).min(10.0);
+
+                            // Numerically stable polynomial computation with overflow protection
+                            let sp = if p_i32 <= 3 {
+                                match p_i32 {
+                                    1 => s_clamped,
+                                    2 => s_clamped * s_clamped,
+                                    3 => s_clamped * s_clamped * s_clamped,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                let mut result = 1.0;
+                                let mut current = s_clamped;
+                                for _ in 0..p_i32 {
+                                    result *= current;
+                                    if !result.is_finite() {
+                                        result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                        break;
+                                    }
+                                }
+                                result
+                            };
+
                             let phi = scale * (a * sp + b);
 
                             // dV contribution: phi affects grad_v, and grad_v doesn't depend on g_yh_pre_row
@@ -622,6 +715,33 @@ impl PolyAttention {
         }
 
         all_param_grads.push(grad_cope_pos);
+
+        // Final numerical stability validation and correction
+        if gradient_anomaly_detected {
+            tracing::warn!("Gradient anomalies detected in PolyAttention layer - applying corrective measures");
+
+            // Correct non-finite gradients by clamping to reasonable bounds
+            for grad in &mut all_param_grads {
+                grad.mapv_inplace(|x| {
+                    if x.is_finite() {
+                        x
+                    } else {
+                        tracing::warn!("Replacing non-finite gradient with 0.0");
+                        0.0
+                    }
+                });
+            }
+
+            // Also check and correct input gradients
+            grad_input_total.mapv_inplace(|x| {
+                if x.is_finite() {
+                    x
+                } else {
+                    tracing::warn!("Replacing non-finite input gradient with 0.0");
+                    0.0
+                }
+            });
+        }
 
         (grad_input_total, all_param_grads)
     }

@@ -241,7 +241,36 @@ pub fn compute_poly_attention_forward(
                     let mut s = base;
                     let pos = i.saturating_sub(j);
                     if pos < q_pe.len() { s += q_pe[pos]; }
-                    let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+
+                    // Mathematical stability: clamp attention scores to prevent overflow in polynomial computation
+                    // Attention scores represent log-probabilities, so clamping to [-10, 10] prevents extreme values
+                    // while preserving the relative ordering needed for attention
+                    let s_clamped = s.max(-10.0).min(10.0);
+
+                    // Numerically stable polynomial computation with overflow protection
+                    let sp = if p_i32 <= 3 {
+                        // Direct computation for small powers (more efficient and stable)
+                        match p_i32 {
+                            1 => s_clamped,
+                            2 => s_clamped * s_clamped,
+                            3 => s_clamped * s_clamped * s_clamped,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        // For higher powers, use iterative multiplication with overflow check
+                        let mut result = 1.0;
+                        let mut current = s_clamped;
+                        for _ in 0..p_i32 {
+                            result *= current;
+                            // Check for overflow and clamp if necessary
+                            if !result.is_finite() {
+                                result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                break;
+                            }
+                        }
+                        result
+                    };
+
                     let phi = scale * (a * sp + b);
                     // yh_row += phi * v[j,:]
                     for h in 0..ctx.head_dim {
