@@ -801,8 +801,12 @@ impl LLM {
                     .map(|grad| grad / batch.len() as f32)
                     .collect();
 
-                // Apply global gradient clipping to prevent numerical instability
-                const MAX_TOTAL_GRAD_NORM: f32 = 100.0; // Maximum total gradient norm across all parameters
+                // Apply mathematically justified gradient clipping based on attention mechanism properties
+                // For attention mechanisms, gradients should be bounded by softmax properties and attention score ranges
+                // Maximum gradient norm = sqrt(n_params) * max_reasonable_gradient_per_param
+                // where max_reasonable_gradient_per_param ≈ 10.0 (based on clamped attention scores [-10, 10])
+                let max_reasonable_grad_per_param = 10.0;
+                let max_total_grad_norm = (averaged_grads.iter().map(|g| g.len()).sum::<usize>() as f32).sqrt() * max_reasonable_grad_per_param;
                 let mut total_layer_grad_norm_sq = 0.0;
 
                 // First pass: compute total gradient norm for this layer
@@ -811,9 +815,9 @@ impl LLM {
                 }
                 let total_layer_grad_norm = total_layer_grad_norm_sq.sqrt();
 
-                // Second pass: clip if needed
-                let scale = if total_layer_grad_norm > MAX_TOTAL_GRAD_NORM {
-                    MAX_TOTAL_GRAD_NORM / total_layer_grad_norm
+                // Second pass: clip if needed using mathematically justified threshold
+                let scale = if total_layer_grad_norm > max_total_grad_norm {
+                    max_total_grad_norm / total_layer_grad_norm
                 } else {
                     1.0
                 };
