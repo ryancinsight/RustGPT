@@ -1,5 +1,7 @@
 pub mod adam;
 pub mod attention;
+pub mod transformer;
+pub mod trm;
 
 pub mod dataset_loader;
 pub mod embeddings;
@@ -45,6 +47,7 @@ pub use model_builder::{build_network, print_architecture_summary};
 pub use model_config::{
     ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy,
 };
+pub use trm::TRM;
 // Also re-export encoding types for convenience
 pub use encoding::{Vocab, SimpleTokenizer};
 // Also re-export decoding types for convenience

@@ -1,12 +1,11 @@
 use crate::{
-    richards::{RichardsNorm, RichardsGlu},
+    richards::RichardsNorm,
     embeddings::TokenEmbeddings,
-    // feed_forward::FeedForward, // Removed: using RichardsGlu exclusively
     llm::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
-    attention::poly_attention::PolyAttention,
-    mixtures::moe::{MixtureOfExperts, ExpertRouterConfig},
+    transformer::TransformerBlock,
+    trm::TRM,
 };
 use crate::encoding::Vocab;
 
@@ -34,6 +33,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         ArchitectureType::Transformer => {
             build_transformer_layers(&mut layers, config);
         }
+        ArchitectureType::TRM => {
+            build_trm_layers(&mut layers, config);
+        }
     }
 
     // Add output projection layer (common to all architectures)
@@ -42,72 +44,47 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         vocab.size(),
     )));
 
+    // Set TRM layers to inference mode by default for speed
+    for layer in &mut layers {
+        if let LayerEnum::TRM(trm) = layer {
+            trm.set_training_mode(false);
+        }
+    }
+
     layers
 }
 
 /// Build Transformer architecture layers
 ///
-/// Creates a Pre-LN-style transformer architecture with:
-/// - DynamicTanhNorm before each sublayer
-/// - PolyAttention self-attention (with optional CoPE) and SwiGLU feedforward
-/// - Residual connections handled inside layers (SwiGLU, PolyAttention)
-/// - Final normalization before the output projection
+/// Creates a Pre-LN-style transformer architecture using consolidated TransformerBlock components.
+/// Each TransformerBlock encapsulates:
+/// - Pre-attention normalization
+/// - Attention mechanism (PolyAttention with CoPE)
+/// - Pre-feedforward normalization
+/// - Feedforward network (RichardsGlu or MixtureOfExperts)
+/// - Residual connections
 fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    let num_heads = config.get_num_heads();
-
-    for _layer_idx in 0..config.num_layers {
-        // Pre-Attention normalization (Pre-LN)
-        layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
-
-        // PolyAttention block with CoPE enabled; derive max_pos from window settings
-        let effective_window = if config.use_adaptive_window {
-            config.max_window_size
-        } else if let Some(w) = config.window_size {
-            w
-        } else {
-            config.max_seq_len
-        };
-        let cope_max_pos = effective_window.saturating_sub(1);
-        let mut poly = PolyAttention::new(
-            config.embedding_dim,
-            num_heads,
-            config.get_poly_degree_p(),
-            cope_max_pos,
-            config.window_size,
-        );
-        poly.set_head_selection_config(&config.head_selection);
-        layers.push(LayerEnum::PolyAttention(Box::new(poly)));
-
-        // Pre-FFN normalization (Pre-LN)
-        layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
-
-        // Feedforward layer: use MoE if configured, otherwise RichardsGlu
-        if let Some(ref router) = config.moe_router {
-            let router_config = ExpertRouterConfig::from_router(router);
-            let moe_layer = MixtureOfExperts::new(
-                config.embedding_dim,
-                (config.embedding_dim / 4).max(32), // Router hidden dim: embed_dim/4, min 32
-                router_config,
-            );
-            layers.push(LayerEnum::MixtureOfExperts(Box::new(moe_layer)));
-        } else {
-            // Standard RichardsGlu feedforward
-            let richards_glu = RichardsGlu::new(
-                config.embedding_dim,
-                config.hidden_dim,
-            );
-            layers.push(LayerEnum::RichardsGlu(Box::new(richards_glu)));
-        }
+    for layer_idx in 0..config.num_layers {
+        // Create a complete transformer block that encapsulates all components
+        let transformer_block = TransformerBlock::from_model_config(config, layer_idx);
+        layers.push(LayerEnum::TransformerBlock(Box::new(transformer_block)));
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)
-    let last_is_norm = matches!(
-        layers.last(),
-        Some(LayerEnum::DynamicTanhNorm(_))
-    );
-    if !last_is_norm {
-        layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
-    }
+    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
+}
+
+/// Build TRM (Tiny Recursive Model) layers
+///
+/// Creates a single TRM layer that handles recursive reasoning internally.
+/// TRM uses shared weights across recursive operations for efficient reasoning.
+fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
+    // Create TRM with shared transformer block
+    let trm = TRM::from_model_config(config);
+    layers.push(LayerEnum::TRM(Box::new(trm)));
+
+    // Final normalization layer prior to logits projection
+    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
 }
 
 /// Print architecture summary
@@ -123,7 +100,18 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("  Architecture Type: {:?}", config.architecture);
     println!("  Embedding Dimension: {}", config.embedding_dim);
     println!("  Hidden Dimension: {}", config.hidden_dim);
-    println!("  Number of Layers: {}", config.num_layers);
+
+    match config.architecture {
+        ArchitectureType::Transformer => {
+            println!("  Number of Layers: {}", config.num_layers);
+        }
+        ArchitectureType::TRM => {
+            println!("  Recursions per Step: {}", 2); // From TRM config
+            println!("  Max Supervision Steps: {}", 16); // Training mode
+            println!("  Max Inference Steps: {}", 3); // Inference mode (much faster)
+        }
+    }
+
     println!("  Max Sequence Length: {}", config.max_seq_len);
 
 
@@ -185,16 +173,18 @@ mod tests {
     #[test]
     fn test_build_transformer_network() {
         let vocab = Vocab::new(vec!["a", "b", "c"]);
-        let config = ModelConfig::transformer(128, 256, 2, 80, None, Some(8));
+        let config = ModelConfig::transformer(128, 256, 1, 80, None, Some(8));
 
         let layers = build_network(&config, &vocab);
 
-        // Should have: Embeddings + (Norm + Attention + Norm + FF) * 2 + Final Norm + OutputProjection
-        // = 1 + 4*2 + 1 + 1 = 11 layers
-        assert_eq!(layers.len(), 11);
+        // Should have: Embeddings + TransformerBlock * 1 + Final Norm + OutputProjection
+        // = 1 + 1 + 1 + 1 = 4 layers
+        assert_eq!(layers.len(), 4);
 
         // Check first and last layers
         assert_eq!(layers[0].layer_type(), "TokenEmbeddings");
+        assert_eq!(layers[1].layer_type(), "TransformerBlock");
+        assert_eq!(layers[2].layer_type(), "RichardsNorm");
         assert_eq!(layers[layers.len() - 1].layer_type(), "OutputProjection");
     }
 }
