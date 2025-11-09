@@ -47,9 +47,9 @@ fn main() -> llm::Result<()> {
     // Choose architecture: Transformer
 
     // let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY
-    // ADAPTIVE MOH
+    // TRM (Tiny Recursive Model) - recursive reasoning with shared weights
 
-    let architecture = ArchitectureType::Transformer; // Tiny Recursive Model (weight sharing)
+    let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing)
 
     let use_dynamic_tanh_norm = true;
 
@@ -215,32 +215,21 @@ fn main() -> llm::Result<()> {
     //   - StaticPruning: Fixed head selection (ablation studies only)
     // ============================================================================
 
-    // Head selection strategy (MoH vs standard MHA)
+    // Head selection strategy (MoH vs standard MHA) - DISABLED for TRM
     let head_selection = {
         // ============================================================================
-        // FULLY ADAPTIVE MIXTURE-OF-HEADS (Phase 1 Implementation)
+        // MIXTURE-OF-HEADS DISABLED for TRM
         // ============================================================================
-        // Complexity-aware dynamic head selection with NO hardcoded shared/routed splits
-        //
-        // Key Features:
-        // - ALL 8 heads are routing candidates (no hardcoded shared heads)
-        // - Complexity predictor learns input difficulty → target head count
-        // - Threshold predictor learns per-token threshold for top-p selection
-        // - Simple inputs use 1-2 heads, complex inputs use 6-8 heads
-        //
-        // Expected Performance:
-        // - Loss: ≤ 0.40 (comparable to standard MoH)
-        // - Gradient norm: ≤ 2.5 (stable)
-        // - Average heads: 3-4 (50% reduction from AllHeads baseline of 8)
-        // - Efficiency gain: 15-25% (vs 5-8% for standard MoH)
+        // TRM uses single shared transformer weights for recursive reasoning,
+        // so MoH dynamic head selection is disabled to focus on core TRM functionality
         // ============================================================================
-        // SOFT TOP-P: Differentiable top-p sampling for learned hard selection
-        HeadSelectionStrategy::SoftTopP {
-            top_p: 0.9,                  // Use 90% probability mass for head selection
-            soft_top_p_alpha: 15.0,      // Reduced for stability - smoother transitions
+        HeadSelectionStrategy::Fixed {
+            num_active: 8, // Use all heads for TRM stability
         }
 
-        // Alternative: Standard MoH (for comparison)
+        // Alternative: MoH configurations (uncomment to re-enable):
+        // HeadSelectionStrategy::SoftTopP {
+        //     top_p: 0.9,                  // Use 90% probability mass for head selection
         // HeadSelectionStrategy::MixtureOfHeads {
         //     num_shared_heads: 2,
         //     num_active_routed_heads: 4,
@@ -289,7 +278,12 @@ fn main() -> llm::Result<()> {
     // Create model configuration
     let mut config = match architecture {
         ArchitectureType::Transformer => {
-            ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 3, MAX_SEQ_LEN, None, Some(8))
+            ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8))
+        }
+        ArchitectureType::TRM => {
+            let mut config = ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8));
+            config.architecture = ArchitectureType::TRM;
+            config
         }
     };
 
@@ -317,34 +311,23 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // ============================================================================
-    // MIXTURE OF EXPERTS (MoE) - ENABLED
+    // MIXTURE OF EXPERTS (MoE) - DISABLED for TRM
     // ============================================================================
-    // Sparse MoE with learned routing for increased capacity and efficiency
-    //
-    // Benefits:
-    // - 4x model capacity through expert specialization
-    // - Top-2 routing (only 2/4 experts active per token)
-    // - Learned routing with load balancing
-    // - Parameter overhead: +0.26% (197,120 vs 98,344 params)
+    // TRM uses single shared transformer weights for recursive reasoning,
+    // so MoE/MoH complexity is disabled to focus on core TRM functionality
     // ============================================================================
 
-    config.moe_router = Some(ExpertRouter::LearnedMoE {
-        num_experts: 4,                    // 4 experts (balanced capacity)
-        num_active_experts: 2,             // Top-2 routing (Mixtral-style)
-        expert_hidden_dim: 64,             // Smaller experts (128/2 = 64)
-        load_balance_weight: 0.01,         // Prevent expert collapse
-        sparsity_weight: 0.001,            // Encourage minimal activation
-        diversity_weight: 0.005,           // Encourage expert specialization
-    });
+    // MoE disabled for TRM - TRM uses single shared weights
+    config.moe_router = None;
 
-    // Alternative: Higher capacity MoE (uncomment to use instead):
+    // Uncomment to re-enable MoE (not recommended with TRM):
     // config.moe_router = Some(ExpertRouter::LearnedMoE {
-    //     num_experts: 8,                    // 8 experts (higher capacity)
-    //     num_active_experts: 2,             // Top-2 routing
-    //     expert_hidden_dim: 32,             // Even smaller experts
-    //     load_balance_weight: 0.01,
-    //     sparsity_weight: 0.001,
-    //     diversity_weight: 0.005,
+    //     num_experts: 4,                    // 4 experts (balanced capacity)
+    //     num_active_experts: 2,             // Top-2 routing (Mixtral-style)
+    //     expert_hidden_dim: 64,             // Smaller experts (128/2 = 64)
+    //     load_balance_weight: 0.01,         // Prevent expert collapse
+    //     sparsity_weight: 0.001,            // Encourage minimal activation
+    //     diversity_weight: 0.005,           // Encourage expert specialization
     // });
 
 

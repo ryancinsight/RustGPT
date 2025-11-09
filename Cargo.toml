@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1.5"
 tempfile = "3.0"
 approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [lib]
 name = "llm"

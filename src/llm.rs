@@ -11,6 +11,8 @@ use crate::{
     embeddings::TokenEmbeddings,
     errors::{ModelError, Result},
     output_projection::OutputProjection,
+    transformer::TransformerBlock,
+    trm::TRM,
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -26,6 +28,8 @@ pub enum LayerEnum {
 
     // Removed TRMBlock variant
     PolyAttention(Box<crate::attention::poly_attention::PolyAttention>),
+    TransformerBlock(Box<TransformerBlock>),
+    TRM(Box<TRM>),
 }
 
 impl LayerEnum {
@@ -46,6 +50,8 @@ impl Layer for LayerEnum {
 
             // Removed TRMBlock arm
             LayerEnum::PolyAttention(layer) => layer.layer_type(),
+            LayerEnum::TransformerBlock(layer) => layer.layer_type(),
+            LayerEnum::TRM(layer) => layer.layer_type(),
         }
     }
 
@@ -62,6 +68,8 @@ impl Layer for LayerEnum {
 
             // Removed TRMBlock arm
             LayerEnum::PolyAttention(layer) => layer.forward(input),
+            LayerEnum::TransformerBlock(layer) => layer.forward(input),
+            LayerEnum::TRM(layer) => layer.forward(input),
         }
     }
 
@@ -82,6 +90,8 @@ impl Layer for LayerEnum {
 
             // Removed TRMBlock arm
             LayerEnum::PolyAttention(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::TransformerBlock(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::TRM(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -98,6 +108,8 @@ impl Layer for LayerEnum {
 
             // Removed TRMBlock arm
             LayerEnum::PolyAttention(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::TransformerBlock(layer) => layer.apply_gradients(param_grads, lr),
+            LayerEnum::TRM(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
 
@@ -114,6 +126,8 @@ impl Layer for LayerEnum {
 
             // Removed TRMBlock arm
             LayerEnum::PolyAttention(layer) => layer.backward(grads, lr),
+            LayerEnum::TransformerBlock(layer) => layer.backward(grads, lr),
+            LayerEnum::TRM(layer) => layer.backward(grads, lr),
         }
     }
 
@@ -129,6 +143,8 @@ impl Layer for LayerEnum {
             LayerEnum::OutputProjection(layer) => layer.parameters(),
             // Removed TRMBlock arm
             LayerEnum::PolyAttention(layer) => layer.parameters(),
+            LayerEnum::TransformerBlock(layer) => layer.parameters(),
+            LayerEnum::TRM(layer) => layer.parameters(),
         }
     }
 
@@ -140,6 +156,8 @@ impl Layer for LayerEnum {
             LayerEnum::DynamicTanhNorm(layer) => layer.weight_norm(),
             LayerEnum::OutputProjection(layer) => layer.weight_norm(),
             LayerEnum::PolyAttention(layer) => layer.weight_norm(),
+            LayerEnum::TransformerBlock(layer) => layer.weight_norm(),
+            LayerEnum::TRM(layer) => layer.weight_norm(),
         }
     }
 }
@@ -298,6 +316,24 @@ impl LLM {
 
         // Add decoder parameters
         network_params + self.decoder.parameters()
+    }
+
+    /// Set TRM layers to inference mode for faster prediction
+    pub fn set_trm_inference_mode(&mut self) {
+        for layer in &mut self.network {
+            if let LayerEnum::TRM(trm) = layer {
+                trm.set_training_mode(false);
+            }
+        }
+    }
+
+    /// Set TRM layers to training mode for full supervision steps
+    pub fn set_trm_training_mode(&mut self) {
+        for layer in &mut self.network {
+            if let LayerEnum::TRM(trm) = layer {
+                trm.set_training_mode(true);
+            }
+        }
     }
 
     #[inline]
@@ -469,6 +505,9 @@ impl LLM {
         batch_size: usize,
         warmup_epochs: usize,
     ) -> Result<()> {
+        // Set TRM layers to training mode (full supervision steps)
+        self.set_trm_training_mode();
+
         let tokenized_data = data
             .par_iter()
             .map(|input| self.tokenize(input))

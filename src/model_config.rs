@@ -7,6 +7,9 @@ use crate::mixtures::moe::ExpertRouter;
 pub enum ArchitectureType {
     /// Standard Transformer with self-attention mechanism
     Transformer,
+
+    /// Tiny Recursive Model (TRM) - recursive reasoning with shared weights
+    TRM,
 }
 
 
