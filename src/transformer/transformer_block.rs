@@ -34,6 +34,11 @@ pub struct TransformerBlock {
 
     /// Configuration for this block
     config: TransformerBlockConfig,
+
+    /// Cached intermediate states from forward pass (for gradient computation)
+    /// (input, norm1_out, attn_out, residual1, norm2_out, ffn_out)
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_intermediates: Option<(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>)>,
 }
 
 /// Configuration for a transformer block
@@ -121,6 +126,7 @@ impl TransformerBlock {
             pre_ffn_norm,
             feedforward,
             config,
+            cached_intermediates: None,
         }
     }
 
@@ -189,6 +195,16 @@ impl Layer for TransformerBlock {
         let ffn_out = self.feedforward.forward(&norm2_out);
         let output = &residual1 + &ffn_out; // Residual: attn_out + ffn(attn_out)
 
+        // Cache intermediate states for gradient computation
+        self.cached_intermediates = Some((
+            input.clone(),
+            norm1_out,
+            attn_out,
+            residual1,
+            norm2_out,
+            ffn_out,
+        ));
+
         output
     }
 
@@ -221,36 +237,82 @@ impl Layer for TransformerBlock {
         _input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        // For TransformerBlock, gradient computation and application is handled entirely
-        // within the backward() method for efficiency. The training loop interface expects
-        // compute_gradients to return parameter gradients, but since we handle them internally,
-        // we return empty parameter gradients here.
+        let mut all_param_grads = Vec::new();
 
-        // Return input gradients (pass through for now, will be corrected by backward)
-        // and empty parameter gradients since we handle them in backward()
-        (output_grads.clone(), Vec::new())
+        if let Some((input, norm1_out, attn_out, residual1, norm2_out, ffn_out)) = &self.cached_intermediates {
+            // Compute gradients through the transformer block layers
+
+            // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out
+            let ffn_grads = output_grads.clone();
+            let residual1_grads = output_grads.clone();
+
+            // Get feedforward gradients
+            let (ffn_input_grad, ffn_param_grads) = match &self.feedforward {
+                FeedForwardVariant::RichardsGlu(layer) => layer.compute_gradients(norm2_out, &ffn_grads),
+                FeedForwardVariant::MixtureOfExperts(layer) => layer.compute_gradients(norm2_out, &ffn_grads),
+            };
+
+            // Get pre-FFN norm gradients (stateless)
+            let residual1_from_ffn = ffn_input_grad;
+
+            // Combine residual gradients
+            let residual1_total_grads = residual1_grads + residual1_from_ffn;
+
+            // residual1 = input + attn_out, so gradients split between input and attn_out
+            let input_grads = &residual1_total_grads * 0.5;
+            let attn_out_grads = &residual1_total_grads * 0.5;
+
+            // Get attention gradients
+            let (attn_input_grad, attn_param_grads) = self.attention.compute_gradients(norm1_out, &attn_out_grads);
+
+            // Get pre-attention norm gradients (stateless)
+            let norm1_input_grad = attn_input_grad;
+
+            // The final input gradients are the gradients w.r.t. the transformer input
+            // (combining gradients from residual and attention path)
+            let final_input_grads = &input_grads + &norm1_input_grad;
+
+            // Collect all parameter gradients
+            all_param_grads.extend(attn_param_grads);
+            all_param_grads.extend(ffn_param_grads);
+
+            // Note: Norms don't have learnable parameters, so no gradients for them
+
+            (final_input_grads, all_param_grads)
+        } else {
+            // No cached intermediates - return pass-through gradients and empty parameter gradients
+            tracing::warn!("TransformerBlock::compute_gradients called without cached intermediates. Call forward() first.");
+            (output_grads.clone(), Vec::new())
+        }
     }
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        // Debug: Check what we're receiving
         if param_grads.is_empty() {
             return Ok(());
         }
 
-        // The training loop accumulates parameter gradients per layer
-        // Since TransformerBlock is a single layer that contains multiple sub-components,
-        // we need to delegate the gradient application to the training loop's backward pass
-        // rather than trying to slice the parameter gradients here.
+        // Split parameter gradients between attention and feedforward components
+        let attention_param_count = self.attention.parameters();
+        let feedforward_param_count = match &self.feedforward {
+            FeedForwardVariant::RichardsGlu(layer) => layer.parameters(),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer.parameters(),
+        };
 
-        // For TransformerBlock, gradient application is handled through the backward() method
-        // which applies gradients directly to each sub-component. The training loop should
-        // not be calling apply_gradients on TransformerBlock directly.
+        // Apply attention gradients
+        if param_grads.len() >= attention_param_count {
+            let attention_grads = &param_grads[0..attention_param_count];
+            self.attention.apply_gradients(attention_grads, lr)?;
+        }
 
-        // If we get here, something is wrong with the training loop setup
-        tracing::warn!(
-            "TransformerBlock::apply_gradients called with {} parameter gradients. This should not happen - gradients should be applied via backward()",
-            param_grads.len()
-        );
+        // Apply feedforward gradients
+        let feedforward_start = attention_param_count;
+        if param_grads.len() >= feedforward_start + feedforward_param_count {
+            let feedforward_grads = &param_grads[feedforward_start..feedforward_start + feedforward_param_count];
+            match &mut self.feedforward {
+                FeedForwardVariant::RichardsGlu(layer) => layer.apply_gradients(feedforward_grads, lr)?,
+                FeedForwardVariant::MixtureOfExperts(layer) => layer.apply_gradients(feedforward_grads, lr)?,
+            }
+        }
 
         Ok(())
     }
