@@ -725,6 +725,165 @@ impl LLM {
         Ok(())
     }
 
+    /// Train TRM layers using autoencoding (pretraining phase)
+    /// During autoencoding, the model learns to reconstruct its input through recursive processing
+    /// This is the first phase of TRM training before chat-tuning
+    #[instrument(skip(self, data))]
+    pub fn train_trm_autoencoding(
+        &mut self,
+        data: Vec<&str>,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+    ) -> Result<()> {
+        // Set TRM layers to training mode (full supervision steps)
+        self.set_trm_training_mode();
+
+        let tokenized_data = data
+            .par_iter()
+            .map(|input| self.tokenize(input))
+            .collect::<Vec<Vec<usize>>>();
+
+        info!("Starting TRM autoencoding pretraining: {} epochs, {} sequences", epochs, tokenized_data.len());
+
+        for epoch in 0..epochs {
+            let mut total_loss = 0.0;
+            let mut total_grad_norm = 0.0;
+            let mut batch_count = 0;
+
+            // Process data in batches
+            for batch in tokenized_data.chunks(batch_size) {
+                let (batch_loss, grad_norm) = self.train_batch_trm_autoencoding(batch, lr)?;
+                total_loss += batch_loss;
+                total_grad_norm += grad_norm;
+                batch_count += 1;
+            }
+
+            let avg_loss = total_loss / tokenized_data.len() as f32;
+            let avg_grad_norm = total_grad_norm / batch_count as f32;
+
+            // NFR-5.2: Training divergence detection
+            if avg_loss.is_nan() || avg_loss.is_infinite() {
+                return Err(ModelError::Training {
+                    message: format!(
+                        "TRM autoencoding diverged at epoch {}: loss is {} (NaN or Inf detected)",
+                        epoch, avg_loss
+                    ),
+                });
+            }
+
+            info!(
+                epoch = epoch,
+                loss = avg_loss,
+                grad_norm = avg_grad_norm,
+                "TRM autoencoding epoch completed"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Complete TRM training pipeline: autoencoding pretraining + chat-tuning
+    /// Phase 1: Autoencoding - TRM learns to reconstruct input through recursion
+    /// Phase 2: Chat-tuning - Standard next-token prediction on conversational data
+    #[instrument(skip(self, pretraining_data, chat_data))]
+    pub fn train_trm_complete(
+        &mut self,
+        pretraining_data: Vec<&str>,
+        chat_data: Vec<&str>,
+        autoencoding_epochs: usize,
+        chat_epochs: usize,
+        lr: f32,
+        batch_size: usize,
+    ) -> Result<()> {
+        info!("Starting TRM complete training: {} autoencoding epochs + {} chat-tuning epochs",
+              autoencoding_epochs, chat_epochs);
+
+        // Phase 1: Autoencoding pretraining
+        if autoencoding_epochs > 0 {
+            info!("Phase 1: TRM Autoencoding Pretraining");
+            self.train_trm_autoencoding(pretraining_data, autoencoding_epochs, lr, batch_size)?;
+        }
+
+        // Phase 2: Chat-tuning (standard next-token prediction)
+        if chat_epochs > 0 {
+            info!("Phase 2: Chat-Tuning (next-token prediction)");
+            self.train_with_warmup(chat_data, chat_epochs, lr, batch_size, 15)?;
+        }
+
+        info!("TRM training completed successfully");
+        Ok(())
+    }
+
+    /// Train on a single batch using TRM autoencoding
+    /// For autoencoding, the TRM layer learns to reconstruct its embedded input
+    fn train_batch_trm_autoencoding(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<(f32, f32)> {
+        let mut batch_loss = 0.0;
+        let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
+        let mut layer_grad_norms: Vec<f32> = Vec::new();
+
+        // Initialize accumulated gradients for each layer
+        for _ in &self.network {
+            accumulated_param_grads.push(Vec::new());
+            layer_grad_norms.push(0.0);
+        }
+
+        // Process each sequence in the batch
+        for sequence in batch {
+            if sequence.is_empty() {
+                continue;
+            }
+
+            // Convert tokens to embeddings
+            let mut input: Array2<f32> = Array2::zeros((1, sequence.len()));
+            for (i, &token_id) in sequence.iter().enumerate() {
+                input[[0, i]] = token_id as f32;
+            }
+
+            // Forward through embedding layer
+            input = self.network[0].forward(&input);
+
+
+            // Forward through remaining layers
+            for layer_idx in 1..self.network.len() {
+                match &mut self.network[layer_idx] {
+                    LayerEnum::TRM(trm) => {
+                        // For TRM layers: autoencoding training
+                        // The TRM should learn to reconstruct its input (pure autoencoding)
+                        let trm_input = input.clone();
+                        let (loss, param_grads) = trm.compute_training_gradients(&trm_input, &trm_input)?;
+                        batch_loss += loss;
+
+                        // Calculate gradient norm before moving param_grads
+                        layer_grad_norms[layer_idx] = param_grads.iter()
+                            .map(|g| g.mapv(|x| x * x).sum().sqrt())
+                            .sum::<f32>();
+
+                        // Store gradients for this TRM layer
+                        accumulated_param_grads[layer_idx] = param_grads;
+
+                        // Update input for next layer (use forward pass, not training)
+                        input = trm.forward(&input);
+                    },
+                    _ => {
+                        // For non-TRM layers: standard forward pass
+                        input = self.network[layer_idx].forward(&input);
+                    }
+                }
+            }
+        }
+
+        // Apply accumulated gradients
+        for (layer_idx, param_grads) in accumulated_param_grads.into_iter().enumerate() {
+            if !param_grads.is_empty() {
+                self.network[layer_idx].apply_gradients(&param_grads, lr)?;
+            }
+        }
+
+        let total_grad_norm = layer_grad_norms.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        Ok((batch_loss, total_grad_norm))
+    }
+
     /// Train on a single batch of sequences
     /// Returns (batch_loss, gradient_norm)
     fn train_batch(&mut self, batch: &[Vec<usize>], lr: f32) -> Result<(f32, f32)> {
