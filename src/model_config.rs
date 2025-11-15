@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use crate::mixtures::moh::HeadSelectionStrategy;
-use crate::mixtures::moe::ExpertRouter;
+
+use crate::mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy};
 
 /// Architecture type for model configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,9 +10,10 @@ pub enum ArchitectureType {
 
     /// Tiny Recursive Model (TRM) - recursive reasoning with shared weights
     TRM,
+
+    /// Diffusion Transformer - generative model using denoising diffusion process
+    Diffusion,
 }
-
-
 
 /// Strategy for adapting sliding window size dynamically
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +34,6 @@ pub enum WindowAdaptationStrategy {
     /// Most advanced, but requires perplexity computation
     PerplexityBased,
 }
-
 
 /// Attention mechanism selection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +154,14 @@ pub struct ModelConfig {
     ///
     /// Default: None (use standard feedforward)
     pub moe_router: Option<ExpertRouter>,
+
+    /// Use diffusion-conditioned blocks inside TRM when architecture=TRM
+    pub trm_use_diffusion: bool,
+
+    pub trm_num_recursions: Option<usize>,
+    pub trm_max_supervision_steps: Option<usize>,
+    pub trm_max_inference_steps: Option<usize>,
+    pub trm_latent_update_alpha: Option<f32>,
 }
 
 impl ModelConfig {
@@ -177,7 +185,7 @@ impl ModelConfig {
             use_dynamic_tanh_norm: true, // Use DynamicTanhNorm
             cope_max_pos: 64,
             num_kv_heads: None,
-            window_size: None,
+            window_size: Some(16),
             use_adaptive_window: false,
             min_window_size: 512,
             max_window_size: 4096,
@@ -185,17 +193,22 @@ impl ModelConfig {
             entropy_ema_alpha: 0.2,
             head_selection: HeadSelectionStrategy::SoftTopP {
                 top_p: 0.9,
-                soft_top_p_alpha: 15.0,  // Reduced for numerical stability
+                soft_top_p_alpha: 15.0, // Reduced for numerical stability
             },
             attention: AttentionType::SelfAttention,
             moe_router: None, // Default: no MoE (standard feedforward)
+            trm_use_diffusion: false,
+            trm_num_recursions: None,
+            trm_max_supervision_steps: None,
+            trm_max_inference_steps: None,
+            trm_latent_update_alpha: None,
         }
     }
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self::transformer(128, 256, 3, 80, None, Some(8))
+        Self::transformer(128, 256, 3, 80, None, Some(4))
     }
 }
 
@@ -233,4 +246,3 @@ impl ModelConfig {
         }
     }
 }
-

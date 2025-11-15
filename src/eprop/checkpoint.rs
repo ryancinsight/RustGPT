@@ -201,7 +201,7 @@ impl CompressedTraceCheckpoint {
         let quantized: Vec<i8> = trace.iter()
             .map(|&x| {
                 let normalized = (x - offset) / scale;
-                (normalized.max(-127.0).min(127.0) as i8)
+                (normalized.clamp(-127.0, 127.0) as i8)
             })
             .collect();
 

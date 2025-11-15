@@ -126,7 +126,16 @@ impl RichardsActivation {
     }
 
     /// Set parameters directly
-    pub fn set_param(&mut self, nu: Option<f64>, k: Option<f64>, m: Option<f64>, beta: Option<f64>, output_gain: Option<f64>, output_bias: Option<f64>) {
-        self.richards_curve.set_param(nu, k, m, beta, output_gain, output_bias);
+    pub fn set_param(
+        &mut self,
+        nu: Option<f64>,
+        k: Option<f64>,
+        m: Option<f64>,
+        beta: Option<f64>,
+        output_gain: Option<f64>,
+        output_bias: Option<f64>,
+    ) {
+        self.richards_curve
+            .set_param(nu, k, m, beta, output_gain, output_bias);
     }
 }

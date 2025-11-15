@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2};
-use serde::{Deserialize, Serialize};
-use crate::adam::Adam;
-use crate::pade::PadeExp;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use crate::{adam::Adam, pade::PadeExp};
 
 /// # Richards Curve: Mathematical Framework and Numerical Methods
 ///
@@ -12,6 +12,14 @@ use rayon::prelude::*;
 /// family of sigmoid functions with the following mathematical formulation:
 ///
 /// σ(x; ν, k, m) = [1 + e^(-k(x-m))]^(-1/ν)
+///
+/// **Literature References**:
+/// - **Richards Curve**: Richards, F. J. (1959). "A flexible growth function for empirical use".
+///   Journal of Experimental Botany.
+/// - **Sigmoid Families**: Nelder, J. A. (1961). "The fitting of a generalization of the logistic
+///   curve". Biometrics.
+/// - **Growth Curve Theory**: Thornley, J. H. M., & Johnson, I. R. (1990). "Plant and crop
+///   modelling: a mathematical approach to plant and crop physiology". Clarendon Press.
 ///
 /// **Parameters:**
 /// - ν (nu): Shape parameter (ν > 0) controlling asymmetry and steepness
@@ -29,6 +37,14 @@ use rayon::prelude::*;
 /// introduces asymmetry control via parameter β:
 ///
 /// σ_β(x; ν, k, m, β) = [β + (1-β) * e^(-k(x-m))]^(-1/ν)
+///
+/// **Literature References**:
+/// - **Asymmetric Sigmoids**: Johnson, N. L., Kotz, S., & Balakrishnan, N. (1995). "Continuous
+///   univariate distributions, Vol. 2". Wiley.
+/// - **Skewed Logistic**: Azzalini, A. (1985). "A class of distributions which includes the normal
+///   ones". Scandinavian Journal of Statistics.
+/// - **Flexible Sigmoid Functions**: Ratkowsky, D. A. (1990). "Handbook of nonlinear regression
+///   models". Marcel Dekker.
 ///
 /// **Asymmetry Properties:**
 /// - β = 1.0: Standard Richards curve (symmetric)
@@ -160,26 +176,25 @@ use rayon::prelude::*;
 /// - **Memory efficiency** through in-place gradient computation
 /// - **Serialization support** for model persistence
 /// - **Zero-allocation iterators** for parameter access
-/// - **Momentum-based optimization** with Adam algorithm
-
-/// Unified Richards curve with variant-based initialization and full parameter learning
-/// Extended with beta parameter for asymmetric control and temperature for sharpness
+/// - **Momentum-based optimization** with Adam algorithm Unified Richards curve with variant-based
+///   initialization and full parameter learning Extended with beta parameter for asymmetric control
+///   and temperature for sharpness
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RichardsCurve {
     // Core Richards parameter values (Some for fixed, None for learnable)
-    pub nu: Option<f64>,    // Shape (asymmetry)
-    pub k: Option<f64>,     // Growth rate
-    pub m: Option<f64>,     // Midpoint
-    pub beta: Option<f64>,  // Asymmetry factor for extended Richards
+    pub nu: Option<f64>,   // Shape (asymmetry)
+    pub k: Option<f64>,    // Growth rate
+    pub m: Option<f64>,    // Midpoint
+    pub beta: Option<f64>, // Asymmetry factor for extended Richards
 
     // Temperature parameter (controls curve sharpness/softness)
-    pub temperature: Option<f64>,  // Temperature scaling factor
+    pub temperature: Option<f64>, // Temperature scaling factor
 
     // Affine parameter values (Some for fixed, None for learnable)
     #[serde(rename = "a")]
-    pub output_gain: Option<f64>,     // Affine output gain (scale)
+    pub output_gain: Option<f64>, // Affine output gain (scale)
     #[serde(rename = "b")]
-    pub output_bias: Option<f64>,     // Affine output bias (shift)
+    pub output_bias: Option<f64>, // Affine output bias (shift)
 
     // Input scaling parameter values (Some for fixed, None for learnable)
     pub scale: Option<f64>, // Input scaling
@@ -189,13 +204,14 @@ pub struct RichardsCurve {
     #[serde(skip_serializing, skip_deserializing)]
     pub gamma: Option<Array2<f32>>, // Per-feature scale (shape: [1, d])
     #[serde(skip_serializing, skip_deserializing)]
-    pub bias: Option<Array2<f32>>,  // Per-feature bias (shape: [1, d])
+    pub bias: Option<Array2<f32>>, // Per-feature bias (shape: [1, d])
 
     // Polynomial input transformation (used by Polynomial variant)
     #[serde(skip_serializing, skip_deserializing)]
-    pub poly_power: Option<usize>,         // Polynomial degree (1-5, 1=identity)
+    pub poly_power: Option<usize>, // Polynomial degree (1-5, 1=identity)
     #[serde(skip_serializing, skip_deserializing)]
-    pub poly_coeffs: Option<Vec<f64>>,     // Polynomial coefficients [ coeff_0, coeff_1, ..., coeff_power]
+    pub poly_coeffs: Option<Vec<f64>>, /* Polynomial coefficients [ coeff_0, coeff_1, ...,
+                                        * coeff_power] */
 
     // Learned values for learnable parameters
     pub learned_nu: Option<f64>,
@@ -222,24 +238,24 @@ pub struct RichardsCurve {
     pub output_bias_learnable: bool,
     pub scale_learnable: bool,
     pub shift_learnable: bool,
-    pub gamma_learnable: bool,  // Whether gamma parameters are learnable
-    pub bias_learnable: bool,   // Whether bias parameters are learnable
+    pub gamma_learnable: bool, // Whether gamma parameters are learnable
+    pub bias_learnable: bool,  // Whether bias parameters are learnable
 
     // Variant configuration
-    pub variant: super::Variant,   // Sigmoid, Tanh, or Gompertz mode
+    pub variant: super::Variant, // Sigmoid, Tanh, or Gompertz mode
 
     // Adaptive normalization (used by Adaptive variant)
     #[serde(skip_serializing, skip_deserializing)]
-    running_sum: Option<f64>,       // Running sum for mean estimation
+    running_sum: Option<f64>, // Running sum for mean estimation
     #[serde(skip_serializing, skip_deserializing)]
-    running_sq_sum: Option<f64>,    // Running sum of squares for variance estimation
+    running_sq_sum: Option<f64>, // Running sum of squares for variance estimation
     #[serde(skip_serializing, skip_deserializing)]
-    count: Option<u64>,             // Number of samples seen
-    pub momentum: f64,              // Momentum for running statistics (0.01 typical)
+    count: Option<u64>, // Number of samples seen
+    pub momentum: f64, // Momentum for running statistics (0.01 typical)
     #[serde(skip_serializing, skip_deserializing)]
-    adaptive_scale: Option<f64>,    // Automatically computed scale factor
+    adaptive_scale: Option<f64>, // Automatically computed scale factor
     #[serde(skip_serializing, skip_deserializing)]
-    adaptive_shift: Option<f64>,    // Automatically computed shift factor
+    adaptive_shift: Option<f64>, // Automatically computed shift factor
 
     // Optimization
     #[serde(skip_serializing, skip_deserializing)]
@@ -252,25 +268,32 @@ pub struct RichardsCurve {
 impl RichardsCurve {
     /// Constructor with learnable params based on variant.
     pub fn new_learnable(variant: super::Variant) -> Self {
-        // Set output_gain/output_bias coefficients based on variant (Some for fixed, None for learnable)
+        // Set output_gain/output_bias coefficients based on variant (Some for fixed, None for
+        // learnable)
         let (output_gain_val, output_bias_val) = match variant {
-            super::Variant::Sigmoid | super::Variant::Gompertz => (Some(1.0), Some(0.0)), // [0, 1] range, fixed
-            super::Variant::Tanh => (Some(1.0), Some(0.0)), // [-1, 1] via 2σ(2x) - 1 transform, fixed
-            super::Variant::Adaptive | super::Variant::None | super::Variant::Polynomial => (None, None), // Fully learnable including output_gain/output_bias
+            super::Variant::Sigmoid | super::Variant::Gompertz => (Some(1.0), Some(0.0)), /* [0, 1] range, fixed */
+            super::Variant::Tanh => (Some(1.0), Some(0.0)), /* [-1, 1] via 2σ(2x) - 1 transform,
+                                                              * fixed */
+            super::Variant::Adaptive | super::Variant::None | super::Variant::Polynomial => {
+                (None, None)
+            } // Fully learnable including output_gain/output_bias
         };
 
         // Determine parameter count based on whether output_gain/output_bias are learnable
         // nu, k, m, beta, temp, scale, shift + optionally output_gain, output_bias
-        let param_count = 7 + if output_gain_val.is_none() { 1 } else { 0 } + if output_bias_val.is_none() { 1 } else { 0 };
+        let param_count = 7
+            + if output_gain_val.is_none() { 1 } else { 0 }
+            + if output_bias_val.is_none() { 1 } else { 0 };
 
         let (adaptive_initialized, momentum) = match variant {
-            super::Variant::Adaptive => (true, 0.01), // Enable adaptive normalization with default momentum
+            super::Variant::Adaptive => (true, 0.01), /* Enable adaptive normalization with
+                                                        * default momentum */
             _ => (false, 0.0), // Disable adaptive for other variants
         };
 
         let polynomial_initialized = match variant {
             super::Variant::Polynomial => true, // Enable polynomial transformation
-            _ => false, // Disable polynomial for other variants
+            _ => false,                         // Disable polynomial for other variants
         };
 
         Self {
@@ -286,8 +309,16 @@ impl RichardsCurve {
             shift: None,
 
             // Polynomial transformation
-            poly_power: if polynomial_initialized { Some(1) } else { None },  // Default to degree 1 (identity)
-            poly_coeffs: if polynomial_initialized { Some(vec![0.0, 1.0]) } else { None }, // [0, 1] = identity
+            poly_power: if polynomial_initialized {
+                Some(1)
+            } else {
+                None
+            }, // Default to degree 1 (identity)
+            poly_coeffs: if polynomial_initialized {
+                Some(vec![0.0, 1.0])
+            } else {
+                None
+            }, // [0, 1] = identity
 
             // Per-feature transformations (None by default - not used in standard RichardsCurve)
             gamma: None,
@@ -314,16 +345,32 @@ impl RichardsCurve {
             output_bias_learnable: output_bias_val.is_none(),
             scale_learnable: true,
             shift_learnable: true,
-            gamma_learnable: false,  // Not learnable by default
-            bias_learnable: false,   // Not learnable by default
+            gamma_learnable: false, // Not learnable by default
+            bias_learnable: false,  // Not learnable by default
 
             // Adaptive normalization
-            running_sum: if adaptive_initialized { Some(0.0) } else { None },
-            running_sq_sum: if adaptive_initialized { Some(0.0) } else { None },
+            running_sum: if adaptive_initialized {
+                Some(0.0)
+            } else {
+                None
+            },
+            running_sq_sum: if adaptive_initialized {
+                Some(0.0)
+            } else {
+                None
+            },
             count: if adaptive_initialized { Some(0) } else { None },
             momentum,
-            adaptive_scale: if adaptive_initialized { Some(1.0) } else { None },
-            adaptive_shift: if adaptive_initialized { Some(0.0) } else { None },
+            adaptive_scale: if adaptive_initialized {
+                Some(1.0)
+            } else {
+                None
+            },
+            adaptive_shift: if adaptive_initialized {
+                Some(0.0)
+            } else {
+                None
+            },
 
             variant,
             optimizer: Some(Adam::new((param_count, 1))),
@@ -363,14 +410,14 @@ impl RichardsCurve {
             output_bias_learnable: false,
             scale_learnable: false,
             shift_learnable: false,
-            gamma_learnable: false,  // Not learnable in default RichardsCurve
-            bias_learnable: false,   // Not learnable in default RichardsCurve
+            gamma_learnable: false, // Not learnable in default RichardsCurve
+            bias_learnable: false,  // Not learnable in default RichardsCurve
             variant: super::Variant::Sigmoid,
-            poly_power: None,         // Not polynomial variant
+            poly_power: None, // Not polynomial variant
             poly_coeffs: None,
-            gamma: None,             // Not used in default RichardsCurve
-            bias: None,              // Not used in default RichardsCurve
-            running_sum: None,       // Not adaptive variant
+            gamma: None,       // Not used in default RichardsCurve
+            bias: None,        // Not used in default RichardsCurve
+            running_sum: None, // Not adaptive variant
             running_sq_sum: None,
             count: None,
             momentum: 0.0,
@@ -416,13 +463,13 @@ impl RichardsCurve {
                 output_bias_learnable: false,
                 scale_learnable: false,
                 shift_learnable: false,
-                gamma_learnable: false,  // Not learnable in sigmoid RichardsCurve
-                bias_learnable: false,   // Not learnable in sigmoid RichardsCurve
+                gamma_learnable: false, // Not learnable in sigmoid RichardsCurve
+                bias_learnable: false,  // Not learnable in sigmoid RichardsCurve
                 variant: super::Variant::Sigmoid,
-                poly_power: None,         // Not polynomial variant
+                poly_power: None, // Not polynomial variant
                 poly_coeffs: None,
-                gamma: None,             // Not used in sigmoid RichardsCurve
-                bias: None,              // Not used in sigmoid RichardsCurve
+                gamma: None, // Not used in sigmoid RichardsCurve
+                bias: None,  // Not used in sigmoid RichardsCurve
                 running_sum: None,
                 running_sq_sum: None,
                 count: None,
@@ -444,14 +491,14 @@ impl RichardsCurve {
         } else {
             Self {
                 nu: Some(1.0),
-                k: Some(1.0),  // Fixed: Changed from 2.0 to 1.0 for accurate tanh approximation
+                k: Some(1.0), // Fixed: Changed from 2.0 to 1.0 for accurate tanh approximation
                 m: Some(0.0),
                 beta: Some(1.0),
                 temperature: Some(1.0),
-                 output_gain: Some(1.0),
-                 output_bias: Some(0.0),
-                 scale: Some(1.0),  // Fixed for specific variant
-                 shift: Some(0.0),  // Fixed for specific variant
+                output_gain: Some(1.0),
+                output_bias: Some(0.0),
+                scale: Some(1.0), // Fixed for specific variant
+                shift: Some(0.0), // Fixed for specific variant
                 learned_nu: None,
                 learned_k: None,
                 learned_m: None,
@@ -470,13 +517,13 @@ impl RichardsCurve {
                 output_bias_learnable: false,
                 scale_learnable: false,
                 shift_learnable: false,
-                gamma_learnable: false,  // Not learnable in tanh RichardsCurve
-                bias_learnable: false,   // Not learnable in tanh RichardsCurve
+                gamma_learnable: false, // Not learnable in tanh RichardsCurve
+                bias_learnable: false,  // Not learnable in tanh RichardsCurve
                 variant: super::Variant::Tanh,
-                poly_power: None,         // Not polynomial variant
+                poly_power: None, // Not polynomial variant
                 poly_coeffs: None,
-                gamma: None,             // Not used in tanh RichardsCurve
-                bias: None,              // Not used in tanh RichardsCurve
+                gamma: None, // Not used in tanh RichardsCurve
+                bias: None,  // Not used in tanh RichardsCurve
                 running_sum: None,
                 running_sq_sum: None,
                 count: None,
@@ -502,10 +549,10 @@ impl RichardsCurve {
                 m: Some(0.0),
                 beta: Some(1.0),
                 temperature: Some(1.0),
-                 output_gain: Some(1.0),
-                 output_bias: Some(0.0),
-                 scale: Some(1.0),  // Fixed for specific variant
-                 shift: Some(0.0),  // Fixed for specific variant
+                output_gain: Some(1.0),
+                output_bias: Some(0.0),
+                scale: Some(1.0), // Fixed for specific variant
+                shift: Some(0.0), // Fixed for specific variant
                 learned_nu: None,
                 learned_k: None,
                 learned_m: None,
@@ -524,13 +571,13 @@ impl RichardsCurve {
                 output_bias_learnable: false,
                 scale_learnable: false,
                 shift_learnable: false,
-                gamma_learnable: false,  // Not learnable in gompertz RichardsCurve
-                bias_learnable: false,   // Not learnable in gompertz RichardsCurve
+                gamma_learnable: false, // Not learnable in gompertz RichardsCurve
+                bias_learnable: false,  // Not learnable in gompertz RichardsCurve
                 variant: super::Variant::Gompertz,
-                poly_power: None,         // Not polynomial variant
+                poly_power: None, // Not polynomial variant
                 poly_coeffs: None,
-                gamma: None,             // Not used in gompertz RichardsCurve
-                bias: None,              // Not used in gompertz RichardsCurve
+                gamma: None, // Not used in gompertz RichardsCurve
+                bias: None,  // Not used in gompertz RichardsCurve
                 running_sum: None,
                 running_sq_sum: None,
                 count: None,
@@ -593,8 +640,8 @@ impl RichardsCurve {
 
     /// Helper: get parameter value (learnable or fixed).
     fn get_param(&self, param: Option<f64>, learned: Option<f64>, default: f64) -> f64 {
-        if param.is_some() {
-            param.unwrap()
+        if let Some(p) = param {
+            p
         } else {
             learned.unwrap_or(default)
         }
@@ -622,7 +669,8 @@ impl RichardsCurve {
         }
     }
 
-    /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise), single-pass.
+    /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise),
+    /// single-pass.
     pub fn forward(&self, x: &Array1<f64>) -> Array1<f64> {
         let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = self.get_all_params();
         let (input_scale, _) = self.get_variant_scales();
@@ -632,30 +680,31 @@ impl RichardsCurve {
         let xs = x.as_slice().unwrap();
         let os = out.as_slice_mut().unwrap();
 
-        xs.par_iter()
-            .zip(os.par_iter_mut())
-            .for_each(|(&xi, o)| {
-                // Apply adaptive normalization first (x - mean) / std for Adaptive variant
-                let adaptive_normalized = adaptive_scale * xi + adaptive_shift;
-                // Apply temperature scaling: sharper when temp < 1, softer when temp > 1
-                let temp_scaled = adaptive_normalized / temp;
-                let input = input_scale * (scale * temp_scaled + shift);
-        let exponent: f64 = -k * (input - m);
-        // Clamp exponent to prevent overflow: exp(exponent) should not exceed 1e10
-        let clamped_exponent = exponent.clamp(-23.0, 23.0); // exp(±23) ≈ 1e±10
-        // Extended Richards with beta asymmetry factor
-        // y = (beta + (1-beta) * exp(-k*(x-m))) ^ (-1/ν)
-        let beta_term = beta + (1.0 - beta) * PadeExp::exp(clamped_exponent);
-                let extended_richards = if nu <= 0.0 {
-                    1.0 / beta_term
-                } else {
-                    beta_term.powf(-1.0 / nu)
-                };
-                let gate = match self.variant { super::Variant::Tanh => 2.0 * extended_richards - 1.0, _ => extended_richards };
-                let output = output_gain * gate + output_bias;
-                // Numerical stability: clamp extreme values to prevent NaN/inf propagation
-                *o = output.clamp(-1e6, 1e6);
-            });
+        xs.par_iter().zip(os.par_iter_mut()).for_each(|(&xi, o)| {
+            // Apply adaptive normalization first (x - mean) / std for Adaptive variant
+            let adaptive_normalized = adaptive_scale * xi + adaptive_shift;
+            // Apply temperature scaling: sharper when temp < 1, softer when temp > 1
+            let temp_scaled = adaptive_normalized / temp;
+            let input = input_scale * (scale * temp_scaled + shift);
+            let exponent: f64 = -k * (input - m);
+            // Clamp exponent to prevent overflow: exp(exponent) should not exceed 1e10
+            let clamped_exponent = exponent.clamp(-23.0, 23.0); // exp(±23) ≈ 1e±10
+            // Extended Richards with beta asymmetry factor
+            // y = (beta + (1-beta) * exp(-k*(x-m))) ^ (-1/ν)
+            let beta_term = beta + (1.0 - beta) * PadeExp::exp(clamped_exponent);
+            let extended_richards = if nu <= 0.0 {
+                1.0 / beta_term
+            } else {
+                beta_term.powf(-1.0 / nu)
+            };
+            let gate = match self.variant {
+                super::Variant::Tanh => 2.0 * extended_richards - 1.0,
+                _ => extended_richards,
+            };
+            let output = output_gain * gate + output_bias;
+            // Numerical stability: clamp extreme values to prevent NaN/inf propagation
+            *o = output.clamp(-1e6, 1e6);
+        });
 
         out
     }
@@ -682,7 +731,7 @@ impl RichardsCurve {
     pub fn forward_scalar(&self, x: f64) -> f64 {
         let (nu, k, m, _, _, output_gain, output_bias, scale, shift) = self.get_all_params();
         let (input_scale, _) = self.get_variant_scales();
-        let temp_scaled = x;  // Backward compatibility: no temperature scaling
+        let temp_scaled = x; // Backward compatibility: no temperature scaling
         let input = input_scale * (scale * temp_scaled + shift);
 
         let exponent = -k * (input - m);
@@ -695,7 +744,10 @@ impl RichardsCurve {
             1.0 / (1.0 + u)
         };
 
-        let gate = match self.variant { super::Variant::Tanh => 2.0 * sigma - 1.0, _ => sigma };
+        let gate = match self.variant {
+            super::Variant::Tanh => 2.0 * sigma - 1.0,
+            _ => sigma,
+        };
         let output = output_gain * gate + output_bias;
         // Numerical stability: clamp extreme values to prevent NaN/inf propagation
         output.clamp(-1e6, 1e6)
@@ -762,7 +814,10 @@ impl RichardsCurve {
 
                 // Bounds checking: ensure gamma_size matches embedding_dim
                 if gamma_size != embedding_dim {
-                    eprintln!("RichardsCurve::grad_weights_matrix: gamma size mismatch - gamma_size: {}, embedding_dim: {}", gamma_size, embedding_dim);
+                    eprintln!(
+                        "RichardsCurve::grad_weights_matrix: gamma size mismatch - gamma_size: {}, embedding_dim: {}",
+                        gamma_size, embedding_dim
+                    );
                     return grads_accum;
                 }
 
@@ -771,7 +826,8 @@ impl RichardsCurve {
                     let mut gamma_grad = 0.0;
                     for sample_idx in 0..batch_size {
                         // d(output)/d(gamma_feature) = richards_output for that feature
-                        gamma_grad += richards_output[[sample_idx, feature_idx]] * output_grads[[sample_idx, feature_idx]];
+                        gamma_grad += richards_output[[sample_idx, feature_idx]]
+                            * output_grads[[sample_idx, feature_idx]];
                     }
                     grads_accum[pos + feature_idx] = gamma_grad / (batch_size as f64);
                 }
@@ -784,7 +840,10 @@ impl RichardsCurve {
                 let bias_size = bias.len();
                 // Bounds checking: ensure bias_size matches embedding_dim
                 if bias_size != embedding_dim {
-                    eprintln!("RichardsCurve::grad_weights_matrix: bias size mismatch - bias_size: {}, embedding_dim: {}", bias_size, embedding_dim);
+                    eprintln!(
+                        "RichardsCurve::grad_weights_matrix: bias size mismatch - bias_size: {}, embedding_dim: {}",
+                        bias_size, embedding_dim
+                    );
                     return grads_accum;
                 }
 
@@ -797,7 +856,6 @@ impl RichardsCurve {
                     }
                     grads_accum[pos + feature_idx] = bias_grad / (batch_size as f64);
                 }
-                pos += bias_size;
             }
         }
 
@@ -813,27 +871,29 @@ impl RichardsCurve {
         let xs = x.as_slice().unwrap();
         let os = out.as_slice_mut().unwrap();
 
-        xs.par_iter()
-            .zip(os.par_iter_mut())
-            .for_each(|(&xi, o)| {
-                let input = input_scale * (scale * xi + shift);
-                let exponent: f64 = -k * (input - m);
-                let sigma = if nu <= 0.0 {
-                    1.0 / (1.0 + PadeExp::exp(exponent))
-                } else {
-                    let u = PadeExp::exp(exponent).powf(1.0 / nu);
-                    1.0 / (1.0 + u)
-                };
+        xs.par_iter().zip(os.par_iter_mut()).for_each(|(&xi, o)| {
+            let input = input_scale * (scale * xi + shift);
+            let exponent: f64 = -k * (input - m);
+            let sigma = if nu <= 0.0 {
+                1.0 / (1.0 + PadeExp::exp(exponent))
+            } else {
+                let u = PadeExp::exp(exponent).powf(1.0 / nu);
+                1.0 / (1.0 + u)
+            };
 
-                let dsig_dinput = if nu <= 0.0 { k * sigma * (1.0 - sigma) } else { (k / nu) * sigma * (1.0 - sigma) };
-                *o = output_gain * dsig_dinput * input_scale * outer_scale * scale;
-            });
+            let dsig_dinput = if nu <= 0.0 {
+                k * sigma * (1.0 - sigma)
+            } else {
+                (k / nu) * sigma * (1.0 - sigma)
+            };
+            *o = output_gain * dsig_dinput * input_scale * outer_scale * scale;
+        });
 
         out
     }
 
-
-    /// Compute gradients w.r.t. learnable parameters for a single scalar input into a preallocated slice
+    /// Compute gradients w.r.t. learnable parameters for a single scalar input into a preallocated
+    /// slice
     pub fn grad_weights_scalar_into(&self, x: f64, grad_output: f64, out: &mut [f64]) {
         // Forward: f(x) = output_gain * gate(x) + output_bias, where gate(x) is Richards sigmoid
         // Variant-specific scaling:
@@ -854,7 +914,10 @@ impl RichardsCurve {
             let u = PadeExp::exp(exponent).powf(1.0 / nu);
             1.0 / (1.0 + u)
         };
-        let gate = match self.variant { super::Variant::Tanh => 2.0 * sigma - 1.0, _ => sigma };
+        let gate = match self.variant {
+            super::Variant::Tanh => 2.0 * sigma - 1.0,
+            _ => sigma,
+        };
 
         let denom = if nu <= 0.0 { 1.0 } else { nu.max(1e-6) };
         let dsigma_dinput = (k / denom) * sigma * (1.0 - sigma);
@@ -914,7 +977,7 @@ impl RichardsCurve {
                 // Richards = 1/D, dRichards/dinput = d(1/D)/dinput = -1/D² * dD/dinput
                 let exp_term = PadeExp::exp(exponent);
                 let d = beta + (1.0 - beta) * exp_term;
-                - (1.0 / (d * d)) * (-k * exp_term * (1.0 - beta))
+                -(1.0 / (d * d)) * (-k * exp_term * (1.0 - beta))
             } else {
                 // Richards = D^(-1/ν), dRichards/dinput = (-1/ν) * D^(-1/ν-1) * dD/dinput
                 let exp_term = PadeExp::exp(exponent);
@@ -926,13 +989,13 @@ impl RichardsCurve {
             pos += 1;
         }
         if self.output_gain_learnable {
-             out[pos] = grad_output * gate;
-             pos += 1;
-         }
-         if self.output_bias_learnable {
-             out[pos] = grad_output;
-             pos += 1;
-         }
+            out[pos] = grad_output * gate;
+            pos += 1;
+        }
+        if self.output_bias_learnable {
+            out[pos] = grad_output;
+            pos += 1;
+        }
         if self.scale_learnable {
             let d_input_d_scale = input_scale * temp_scaled;
             let d_gate_d_scale = outer_scale * dsigma_dinput * d_input_d_scale;
@@ -949,7 +1012,11 @@ impl RichardsCurve {
         // Note: gamma and bias gradients are not computed for scalar inputs
         // They require matrix inputs to make sense (per-feature parameters)
 
-        debug_assert_eq!(pos, out.len(), "grad_weights_scalar_into: slice length mismatch");
+        debug_assert_eq!(
+            pos,
+            out.len(),
+            "grad_weights_scalar_into: slice length mismatch"
+        );
     }
 
     /// Compute gradients w.r.t. scalar learnable parameters for a single scalar input
@@ -998,36 +1065,81 @@ impl RichardsCurve {
         let param_count = self.weights_len();
 
         // Ensure optimizer is properly initialized for the correct number of parameters
-        if self.optimizer.is_none() ||
-           (self.optimizer.as_ref().unwrap().m.shape() != &[param_count, 1]) {
+        if self.optimizer.is_none()
+            || (self.optimizer.as_ref().unwrap().m.shape() != &[param_count, 1])
+        {
             self.optimizer = Some(Adam::new((param_count, 1)));
         }
 
         // Extract current parameter values for learnable parameters
-        let param_values: Vec<f32> = std::iter::empty()
-            .chain(self.nu_learnable.then(|| self.get_param(self.nu, self.learned_nu, 1.0) as f32))
-            .chain(self.k_learnable.then(|| self.get_param(self.k, self.learned_k, 1.0) as f32))
-            .chain(self.m_learnable.then(|| self.get_param(self.m, self.learned_m, 0.0) as f32))
-            .chain(self.beta_learnable.then(|| self.get_param(self.beta, self.learned_beta, 1.0) as f32))
-            .chain(self.temperature_learnable.then(|| self.get_param(self.temperature, self.learned_temperature, 1.0) as f32))
-            .chain(self.output_gain_learnable.then(|| self.get_param(self.output_gain, self.learned_output_gain, 1.0) as f32))
-            .chain(self.output_bias_learnable.then(|| self.get_param(self.output_bias, self.learned_output_bias, 0.0) as f32))
-            .chain(self.scale_learnable.then(|| self.get_param(self.scale, self.learned_scale, 1.0) as f32))
-            .chain(self.shift_learnable.then(|| self.get_param(self.shift, self.learned_shift, 0.0) as f32))
-            .chain(self.gamma_learnable.then(|| {
-                self.gamma.as_ref().map(|g| g.iter().map(|&x| x).collect::<Vec<f32>>()).unwrap_or_default()
-            }).into_iter().flatten())
-            .chain(self.bias_learnable.then(|| {
-                self.bias.as_ref().map(|b| b.iter().map(|&x| x).collect::<Vec<f32>>()).unwrap_or_default()
-            }).into_iter().flatten())
-            .collect();
+        let param_values: Vec<f32> =
+            std::iter::empty()
+                .chain(
+                    self.nu_learnable
+                        .then(|| self.get_param(self.nu, self.learned_nu, 1.0) as f32),
+                )
+                .chain(
+                    self.k_learnable
+                        .then(|| self.get_param(self.k, self.learned_k, 1.0) as f32),
+                )
+                .chain(
+                    self.m_learnable
+                        .then(|| self.get_param(self.m, self.learned_m, 0.0) as f32),
+                )
+                .chain(
+                    self.beta_learnable
+                        .then(|| self.get_param(self.beta, self.learned_beta, 1.0) as f32),
+                )
+                .chain(self.temperature_learnable.then(|| {
+                    self.get_param(self.temperature, self.learned_temperature, 1.0) as f32
+                }))
+                .chain(self.output_gain_learnable.then(|| {
+                    self.get_param(self.output_gain, self.learned_output_gain, 1.0) as f32
+                }))
+                .chain(self.output_bias_learnable.then(|| {
+                    self.get_param(self.output_bias, self.learned_output_bias, 0.0) as f32
+                }))
+                .chain(
+                    self.scale_learnable
+                        .then(|| self.get_param(self.scale, self.learned_scale, 1.0) as f32),
+                )
+                .chain(
+                    self.shift_learnable
+                        .then(|| self.get_param(self.shift, self.learned_shift, 0.0) as f32),
+                )
+                .chain(
+                    self.gamma_learnable
+                        .then(|| {
+                            self.gamma
+                                .as_ref()
+                                .map(|g| g.iter().map(|&x| x).collect::<Vec<f32>>())
+                                .unwrap_or_default()
+                        })
+                        .into_iter()
+                        .flatten(),
+                )
+                .chain(
+                    self.bias_learnable
+                        .then(|| {
+                            self.bias
+                                .as_ref()
+                                .map(|b| b.iter().map(|&x| x).collect::<Vec<f32>>())
+                                .unwrap_or_default()
+                        })
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect();
 
         if let Some(ref mut optimizer) = self.optimizer {
             // Create 2D arrays for Adam optimizer interface
             let mut params = Array2::from_shape_vec((param_count, 1), param_values)
                 .expect("Failed to create params array");
-            let grads = Array2::from_shape_vec((param_count, 1), gradients.iter().map(|&g| g as f32).collect())
-                .expect("Failed to create grads array");
+            let grads = Array2::from_shape_vec(
+                (param_count, 1),
+                gradients.iter().map(|&g| g as f32).collect(),
+            )
+            .expect("Failed to create grads array");
 
             optimizer.step(&mut params, &grads, learning_rate as f32);
 
@@ -1112,26 +1224,71 @@ impl RichardsCurve {
     /// Note: Returns default values until parameters are actually trained/updated
     pub fn weights(&self) -> Vec<f64> {
         let weights: Vec<f64> = std::iter::empty()
-            .chain(self.nu_learnable.then(|| self.get_param(self.nu, self.learned_nu, 1.0)))
-            .chain(self.k_learnable.then(|| self.get_param(self.k, self.learned_k, 1.0)))
-            .chain(self.m_learnable.then(|| self.get_param(self.m, self.learned_m, 0.0)))
-            .chain(self.beta_learnable.then(|| self.get_param(self.beta, self.learned_beta, 1.0)))
-            .chain(self.temperature_learnable.then(|| self.get_param(self.temperature, self.learned_temperature, 1.0)))
-            .chain(self.output_gain_learnable.then(|| self.get_param(self.output_gain, self.learned_output_gain, 1.0)))
-            .chain(self.output_bias_learnable.then(|| self.get_param(self.output_bias, self.learned_output_bias, 0.0)))
-            .chain(self.scale_learnable.then(|| self.get_param(self.scale, self.learned_scale, 1.0)))
-            .chain(self.shift_learnable.then(|| self.get_param(self.shift, self.learned_shift, 0.0)))
-            .chain(self.gamma_learnable.then(|| {
-                self.gamma.as_ref().map(|g| g.iter().map(|&x| x as f64).collect::<Vec<f64>>()).unwrap_or_default()
-            }).into_iter().flatten())
-            .chain(self.bias_learnable.then(|| {
-                self.bias.as_ref().map(|b| b.iter().map(|&x| x as f64).collect::<Vec<f64>>()).unwrap_or_default()
-            }).into_iter().flatten())
+            .chain(
+                self.nu_learnable
+                    .then(|| self.get_param(self.nu, self.learned_nu, 1.0)),
+            )
+            .chain(
+                self.k_learnable
+                    .then(|| self.get_param(self.k, self.learned_k, 1.0)),
+            )
+            .chain(
+                self.m_learnable
+                    .then(|| self.get_param(self.m, self.learned_m, 0.0)),
+            )
+            .chain(
+                self.beta_learnable
+                    .then(|| self.get_param(self.beta, self.learned_beta, 1.0)),
+            )
+            .chain(
+                self.temperature_learnable
+                    .then(|| self.get_param(self.temperature, self.learned_temperature, 1.0)),
+            )
+            .chain(
+                self.output_gain_learnable
+                    .then(|| self.get_param(self.output_gain, self.learned_output_gain, 1.0)),
+            )
+            .chain(
+                self.output_bias_learnable
+                    .then(|| self.get_param(self.output_bias, self.learned_output_bias, 0.0)),
+            )
+            .chain(
+                self.scale_learnable
+                    .then(|| self.get_param(self.scale, self.learned_scale, 1.0)),
+            )
+            .chain(
+                self.shift_learnable
+                    .then(|| self.get_param(self.shift, self.learned_shift, 0.0)),
+            )
+            .chain(
+                self.gamma_learnable
+                    .then(|| {
+                        self.gamma
+                            .as_ref()
+                            .map(|g| g.iter().map(|&x| x as f64).collect::<Vec<f64>>())
+                            .unwrap_or_default()
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
+            .chain(
+                self.bias_learnable
+                    .then(|| {
+                        self.bias
+                            .as_ref()
+                            .map(|b| b.iter().map(|&x| x as f64).collect::<Vec<f64>>())
+                            .unwrap_or_default()
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
             .collect();
 
         // Debug: Log if weights are still at defaults (indicating no training occurred)
         if weights.is_empty() {
-            tracing::debug!("RichardsCurve weights() returned empty vector - no learnable parameters");
+            tracing::debug!(
+                "RichardsCurve weights() returned empty vector - no learnable parameters"
+            );
         }
 
         weights
@@ -1139,22 +1296,37 @@ impl RichardsCurve {
 
     /// Number of scalar learnable parameters (excluding per-feature gamma/bias)
     pub fn scalar_weights_len(&self) -> usize {
-        [self.nu_learnable, self.k_learnable, self.m_learnable, self.beta_learnable, self.temperature_learnable, self.output_gain_learnable, self.output_bias_learnable, self.scale_learnable, self.shift_learnable].iter().filter(|&&b| b).count()
+        [
+            self.nu_learnable,
+            self.k_learnable,
+            self.m_learnable,
+            self.beta_learnable,
+            self.temperature_learnable,
+            self.output_gain_learnable,
+            self.output_bias_learnable,
+            self.scale_learnable,
+            self.shift_learnable,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count()
     }
 
     /// Check if any parameters have been trained (learned values exist and differ from defaults)
     pub fn has_trained_parameters(&self) -> bool {
         // Check if any learned parameters exist and differ significantly from defaults
         let checks = [
-            self.learned_nu.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_k.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_m.map_or(false, |v| v.abs() > 1e-6),
-            self.learned_beta.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_temperature.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_output_gain.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_output_bias.map_or(false, |v| v.abs() > 1e-6),
-            self.learned_scale.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_shift.map_or(false, |v| v.abs() > 1e-6),
+            self.learned_nu.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_k.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_m.is_some_and(|v| v.abs() > 1e-6),
+            self.learned_beta.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_temperature
+                .is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_output_gain
+                .is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_output_bias.is_some_and(|v| v.abs() > 1e-6),
+            self.learned_scale.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_shift.is_some_and(|v| v.abs() > 1e-6),
         ];
 
         checks.iter().any(|&x| x)
@@ -1179,7 +1351,10 @@ impl RichardsCurve {
 
     /// Iterator over current learnable parameter values (zero-allocation)
     pub fn weights_iter(&self) -> WeightsIter<'_> {
-        WeightsIter { curve: self, idx: 0 }
+        WeightsIter {
+            curve: self,
+            idx: 0,
+        }
     }
 
     /// Get current scaling parameters
@@ -1190,7 +1365,15 @@ impl RichardsCurve {
     }
 
     /// Setter for learning updates (e.g., from optimizer).
-    pub fn set_param(&mut self, nu: Option<f64>, k: Option<f64>, m: Option<f64>, beta: Option<f64>, output_gain: Option<f64>, output_bias: Option<f64>) {
+    pub fn set_param(
+        &mut self,
+        nu: Option<f64>,
+        k: Option<f64>,
+        m: Option<f64>,
+        beta: Option<f64>,
+        output_gain: Option<f64>,
+        output_bias: Option<f64>,
+    ) {
         if let Some(nu_val) = nu {
             self.nu = Some(nu_val);
         }
@@ -1232,8 +1415,9 @@ impl RichardsCurve {
 
         // Update running statistics with momentum
         let momentum = self.momentum.max(1e-7); // Ensure minimum momentum for stability
-        let new_running_sum = (self.running_sum.unwrap() * momentum + x.sum() * (1.0 - momentum)) as f64;
-        let new_running_sq_sum = (self.running_sq_sum.unwrap() * momentum + batch_var_sum * (1.0 - momentum)) as f64;
+        let new_running_sum = self.running_sum.unwrap() * momentum + x.sum() * (1.0 - momentum);
+        let new_running_sq_sum =
+            (self.running_sq_sum.unwrap() * momentum + batch_var_sum * (1.0 - momentum)) as f64;
 
         self.running_sum = Some(new_running_sum);
         self.running_sq_sum = Some(new_running_sq_sum);
@@ -1244,10 +1428,13 @@ impl RichardsCurve {
 
     /// Update adaptive scale and shift from running statistics
     fn update_adaptive_scaling(&mut self) {
-        if let (Some(running_sum), Some(running_sq_sum), Some(count)) = (self.running_sum, self.running_sq_sum, self.count) {
+        if let (Some(running_sum), Some(running_sq_sum), Some(count)) =
+            (self.running_sum, self.running_sq_sum, self.count)
+        {
             if count > 1 {
                 let mean = running_sum / count as f64;
-                let variance = (running_sq_sum / (count - 1) as f64) - (running_sum.powi(2) / count as f64) / (count - 1) as f64;
+                let variance = (running_sq_sum / (count - 1) as f64)
+                    - (running_sum.powi(2) / count as f64) / (count - 1) as f64;
                 let std = variance.sqrt().max(1e-6); // Minimum std for numerical stability
 
                 // Adaptive normalization: center at mean, scale to unit variance
@@ -1260,7 +1447,10 @@ impl RichardsCurve {
     /// Get adaptive scaling parameters (or default to (1.0, 0.0) if not adaptive)
     fn get_adaptive_scaling(&self) -> (f64, f64) {
         if self.variant == super::Variant::Adaptive {
-            (self.adaptive_scale.unwrap_or(1.0), self.adaptive_shift.unwrap_or(0.0))
+            (
+                self.adaptive_scale.unwrap_or(1.0),
+                self.adaptive_shift.unwrap_or(0.0),
+            )
         } else {
             (1.0, 0.0) // Identity transformation for non-adaptive variants
         }
@@ -1284,42 +1474,21 @@ impl RichardsCurve {
         if self.variant != super::Variant::Polynomial {
             return Err("Can only set polynomial coefficients for Polynomial variant".to_string());
         }
-        if power < 1 || power > 5 {
+        if !(1..=5).contains(&power) {
             return Err("Polynomial degree must be between 1 and 5".to_string());
         }
         if coeffs.len() != power + 1 {
-            return Err(format!("Expected {} coefficients for degree {}, got {}", power + 1, power, coeffs.len()));
+            return Err(format!(
+                "Expected {} coefficients for degree {}, got {}",
+                power + 1,
+                power,
+                coeffs.len()
+            ));
         }
 
         self.poly_power = Some(power);
         self.poly_coeffs = Some(coeffs);
         Ok(())
-    }
-
-    /// Get polynomial degree (or 1 for identity if not polynomial variant)
-    fn get_polynomial_power(&self) -> usize {
-        self.poly_power.unwrap_or(1)
-    }
-
-    /// Evaluate polynomial at a given point
-    fn evaluate_polynomial(&self, x: f64) -> f64 {
-        if let Some(coeffs) = &self.poly_coeffs {
-            coeffs.iter().enumerate().fold(0.0, |sum, (i, &coeff)| {
-                sum + coeff * x.powi(i as i32)
-            })
-        } else {
-            // Identity if no coefficients set
-            x
-        }
-    }
-
-    /// Get polynomial-input scaling (applied before Richards activation)
-    fn get_polynomial_scaling(&self) -> f64 {
-        if self.variant == super::Variant::Polynomial {
-            self.evaluate_polynomial(1.0) // Evaluate at x=1 for scaling check
-        } else {
-            1.0 // Identity scaling for non-polynomial variants
-        }
     }
 }
 
@@ -1338,55 +1507,89 @@ impl<'a> Iterator for WeightsIter<'a> {
                 0 => {
                     self.idx += 1;
                     if self.curve.nu_learnable {
-                        return Some(self.curve.get_param(self.curve.nu, self.curve.learned_nu, 1.0));
+                        return Some(self.curve.get_param(
+                            self.curve.nu,
+                            self.curve.learned_nu,
+                            1.0,
+                        ));
                     }
                 }
                 1 => {
                     self.idx += 1;
                     if self.curve.k_learnable {
-                        return Some(self.curve.get_param(self.curve.k, self.curve.learned_k, 1.0));
+                        return Some(
+                            self.curve
+                                .get_param(self.curve.k, self.curve.learned_k, 1.0),
+                        );
                     }
                 }
                 2 => {
                     self.idx += 1;
                     if self.curve.m_learnable {
-                        return Some(self.curve.get_param(self.curve.m, self.curve.learned_m, 0.0));
+                        return Some(
+                            self.curve
+                                .get_param(self.curve.m, self.curve.learned_m, 0.0),
+                        );
                     }
                 }
                 3 => {
                     self.idx += 1;
                     if self.curve.beta_learnable {
-                        return Some(self.curve.get_param(self.curve.beta, self.curve.learned_beta, 1.0));
+                        return Some(self.curve.get_param(
+                            self.curve.beta,
+                            self.curve.learned_beta,
+                            1.0,
+                        ));
                     }
                 }
                 4 => {
                     self.idx += 1;
                     if self.curve.temperature_learnable {
-                        return Some(self.curve.get_param(self.curve.temperature, self.curve.learned_temperature, 1.0));
+                        return Some(self.curve.get_param(
+                            self.curve.temperature,
+                            self.curve.learned_temperature,
+                            1.0,
+                        ));
                     }
                 }
                 5 => {
                     self.idx += 1;
                     if self.curve.output_gain_learnable {
-                        return Some(self.curve.get_param(self.curve.output_gain, self.curve.learned_output_gain, 1.0));
+                        return Some(self.curve.get_param(
+                            self.curve.output_gain,
+                            self.curve.learned_output_gain,
+                            1.0,
+                        ));
                     }
                 }
                 6 => {
                     self.idx += 1;
                     if self.curve.output_bias_learnable {
-                        return Some(self.curve.get_param(self.curve.output_bias, self.curve.learned_output_bias, 0.0));
+                        return Some(self.curve.get_param(
+                            self.curve.output_bias,
+                            self.curve.learned_output_bias,
+                            0.0,
+                        ));
                     }
                 }
                 7 => {
                     self.idx += 1;
                     if self.curve.scale_learnable {
-                        return Some(self.curve.get_param(self.curve.scale, self.curve.learned_scale, 1.0));
+                        return Some(self.curve.get_param(
+                            self.curve.scale,
+                            self.curve.learned_scale,
+                            1.0,
+                        ));
                     }
                 }
                 8 => {
                     self.idx += 1;
                     if self.curve.shift_learnable {
-                        return Some(self.curve.get_param(self.curve.shift, self.curve.learned_shift, 0.0));
+                        return Some(self.curve.get_param(
+                            self.curve.shift,
+                            self.curve.learned_shift,
+                            0.0,
+                        ));
                     }
                 }
                 _ => return None,

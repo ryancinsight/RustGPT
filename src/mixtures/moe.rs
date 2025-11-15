@@ -25,10 +25,15 @@
 //! - **Load balancing**: Prevents routing collapse to single expert
 
 use serde::{Deserialize, Serialize};
-use crate::llm::Layer;
-use crate::mixtures::gating::{GatingStrategy, GatingConfig, select_top_k_components};
-use crate::mixtures::threshold::ThresholdPredictor;
-use crate::mixtures::routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm};
+
+use crate::{
+    llm::Layer,
+    mixtures::{
+        gating::{GatingConfig, GatingStrategy},
+        routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm},
+        threshold::ThresholdPredictor,
+    },
+};
 
 /// Strategy for selecting which experts to activate
 ///
@@ -104,7 +109,7 @@ impl ExpertRouterConfig {
                         sparsity_weight: *sparsity_weight,
                         complexity_loss_weight: 0.005, // Default
                     },
-                    *num_experts
+                    *num_experts,
                 ),
                 num_experts: *num_experts,
                 expert_hidden_dim: *expert_hidden_dim,
@@ -125,7 +130,8 @@ impl ExpertRouterConfig {
     }
 
     /// Update routing metrics for training optimization
-    /// routing_probs: shape (num_tokens, num_experts) - routing probabilities for each token-expert pair
+    /// routing_probs: shape (num_tokens, num_experts) - routing probabilities for each token-expert
+    /// pair
     pub fn update_metrics(&mut self, routing_probs: &ndarray::ArrayView2<f32>) {
         // Update shared gating metrics
         self.gating.update_metrics(routing_probs);
@@ -135,12 +141,14 @@ impl ExpertRouterConfig {
         let total_decisions = self.gating.metrics.total_decisions as f32 + num_tokens;
 
         // Use zip to iterate over metrics and routing columns simultaneously (zero-copy)
-        self.metrics_avg_routing_prob.iter_mut()
+        self.metrics_avg_routing_prob
+            .iter_mut()
             .zip(routing_probs.columns())
             .for_each(|(metric, routing_col)| {
                 let expert_avg_prob = routing_col.mean().unwrap_or(0.0);
                 let current_avg = *metric;
-                *metric = current_avg + (expert_avg_prob - current_avg) * num_tokens / total_decisions;
+                *metric =
+                    current_avg + (expert_avg_prob - current_avg) * num_tokens / total_decisions;
             });
     }
 
@@ -170,9 +178,7 @@ impl ExpertRouterConfig {
         let probs_slice = &self.metrics_avg_routing_prob;
 
         let (total_correlation, pair_count) = (0..self.num_experts)
-            .flat_map(|i| {
-                ((i + 1)..self.num_experts).map(move |j| (i, j))
-            })
+            .flat_map(|i| ((i + 1)..self.num_experts).map(move |j| (i, j)))
             .filter_map(|(i, j)| {
                 let prob_i = probs_slice[i];
                 let prob_j = probs_slice[j];
@@ -225,7 +231,10 @@ pub struct ExpertRouterImpl {
 impl ExpertRouterImpl {
     /// Create a new expert router
     pub fn new(num_experts: usize, config: RoutingConfig) -> Self {
-        Self { config, num_experts }
+        Self {
+            config,
+            num_experts,
+        }
     }
 
     /// Create router from gating strategy
@@ -238,7 +247,10 @@ impl ExpertRouterImpl {
                 temperature: 1.0,
                 soft_top_p_alpha: 50.0,
             },
-            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha } => RoutingConfig {
+            GatingStrategy::SoftTopP {
+                top_p,
+                soft_top_p_alpha,
+            } => RoutingConfig {
                 algorithm: SelectionAlgorithm::SoftTopP { top_p: *top_p },
                 use_learned_predictor: false,
                 num_active: num_experts, // All experts available for soft selection
@@ -282,7 +294,11 @@ impl Router for ExpertRouterImpl {
             let gate_data: Vec<f32> = (0..n_tokens)
                 .flat_map(|_| {
                     (0..self.num_experts).map(move |expert_idx| {
-                        if expert_idx < active_experts { uniform_weight } else { 0.0 }
+                        if expert_idx < active_experts {
+                            uniform_weight
+                        } else {
+                            0.0
+                        }
                     })
                 })
                 .collect();
@@ -292,7 +308,8 @@ impl Router for ExpertRouterImpl {
         };
 
         // Apply selection algorithm (for MoE, typically softmax for soft routing)
-        let routing_weights = crate::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
+        let routing_weights =
+            crate::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
 
         RoutingResult {
             routing_weights,
@@ -387,7 +404,8 @@ impl ExpertSelector {
 
         let norm = crate::richards::RichardsNorm::new(router_hidden_dim);
         let sigmoid = crate::richards::RichardsCurve::sigmoid(false); // Non-learnable sigmoid
-        let activation = crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation replacing ReLU
+        let activation =
+            crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation replacing ReLU
 
         Self {
             weights1,
@@ -426,7 +444,10 @@ impl ExpertSelector {
         self.cached_normalized = Some(normalized.clone());
 
         // Learned Richards activation replacing ReLU (avoid double conversion)
-        let activation_output = self.activation.forward_matrix(&normalized.mapv(|x| x as f64)).mapv(|x| x as f32);
+        let activation_output = self
+            .activation
+            .forward_matrix(&normalized.mapv(|x| x as f64))
+            .mapv(|x| x as f32);
         self.cached_activation = Some(activation_output.clone());
 
         // Second layer: W2 * activated + b2
@@ -452,7 +473,10 @@ impl ExpertSelector {
         let normalized = self.norm.normalize_immutable(&hidden);
 
         // Learned Richards activation
-        let activated = self.activation.forward_matrix(&normalized.mapv(|x| x as f64)).mapv(|x| x as f32);
+        let activated = self
+            .activation
+            .forward_matrix(&normalized.mapv(|x| x as f64))
+            .mapv(|x| x as f32);
 
         // Second layer: W2 * activated + b2
         let logits = activated.dot(&self.weights2) + &self.bias2;
@@ -462,11 +486,16 @@ impl ExpertSelector {
     }
 
     /// Select top-k experts based on routing probabilities
-    pub fn select_experts(&self, routing_probs: &ndarray::Array2<f32>, k: usize) -> Vec<Vec<usize>> {
+    pub fn select_experts(
+        &self,
+        routing_probs: &ndarray::Array2<f32>,
+        k: usize,
+    ) -> Vec<Vec<usize>> {
         let mut selections = Vec::new();
 
         for row in routing_probs.outer_iter() {
-            let mut expert_probs: Vec<(usize, f32)> = row.iter()
+            let mut expert_probs: Vec<(usize, f32)> = row
+                .iter()
                 .enumerate()
                 .map(|(idx, &prob)| (idx, prob))
                 .collect();
@@ -475,7 +504,8 @@ impl ExpertSelector {
             expert_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
             // Take top-k experts
-            let selected: Vec<usize> = expert_probs.into_iter()
+            let selected: Vec<usize> = expert_probs
+                .into_iter()
                 .take(k)
                 .map(|(idx, _)| idx)
                 .collect();
@@ -487,13 +517,37 @@ impl ExpertSelector {
     }
 
     /// Compute gradients for the two-layer routing network
-    pub fn compute_gradients(&mut self, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array1<f32>, ndarray::Array2<f32>, ndarray::Array1<f32>, Vec<f64>) {
+    pub fn compute_gradients(
+        &mut self,
+        output_grads: &ndarray::Array2<f32>,
+    ) -> (
+        ndarray::Array2<f32>,
+        ndarray::Array1<f32>,
+        ndarray::Array2<f32>,
+        ndarray::Array1<f32>,
+        Vec<f64>,
+    ) {
         // Retrieve cached activations
-        let cached_input = self.cached_input.as_ref().expect("predict must be called before compute_gradients");
-        let cached_activated = self.cached_activated.as_ref().expect("predict must be called before compute_gradients");
-        let _cached_activation = self.cached_activation.as_ref().expect("predict must be called before compute_gradients");
-        let cached_normalized = self.cached_normalized.as_ref().expect("predict must be called before compute_gradients");
-        let cached_hidden = self.cached_hidden.as_ref().expect("predict must be called before compute_gradients");
+        let cached_input = self
+            .cached_input
+            .as_ref()
+            .expect("predict must be called before compute_gradients");
+        let cached_activated = self
+            .cached_activated
+            .as_ref()
+            .expect("predict must be called before compute_gradients");
+        let _cached_activation = self
+            .cached_activation
+            .as_ref()
+            .expect("predict must be called before compute_gradients");
+        let cached_normalized = self
+            .cached_normalized
+            .as_ref()
+            .expect("predict must be called before compute_gradients");
+        let cached_hidden = self
+            .cached_hidden
+            .as_ref()
+            .expect("predict must be called before compute_gradients");
 
         // Gradient through softmax
         let d_output = self.softmax.backward(output_grads);
@@ -508,7 +562,9 @@ impl ExpertSelector {
         // Gradient through Richards activation (replacing ReLU)
         let normalized_f64 = cached_normalized.mapv(|x| x as f64);
         let d_activated_f64 = d_activated.mapv(|x| x as f64);
-        let activation_grad_f64 = self.activation.backward_matrix(&normalized_f64, &d_activated_f64);
+        let activation_grad_f64 = self
+            .activation
+            .backward_matrix(&normalized_f64, &d_activated_f64);
         let d_normalized = activation_grad_f64.mapv(|x| x as f32);
 
         // Gradient through Richards normalization
@@ -519,9 +575,17 @@ impl ExpertSelector {
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
 
         // Activation parameter gradients (Richards curve parameters)
-        let activation_grads = self.activation.grad_weights_matrix(&normalized_f64, &d_activated_f64);
+        let activation_grads = self
+            .activation
+            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
 
-        (grad_weights1, grad_bias1, grad_weights2, grad_bias2, activation_grads)
+        (
+            grad_weights1,
+            grad_bias1,
+            grad_weights2,
+            grad_bias2,
+            activation_grads,
+        )
     }
 
     /// Get parameters for gradient computation (iterator-based, zero-copy)
@@ -553,18 +617,17 @@ impl ExpertSelector {
                 (self.weights2.nrows(), self.weights2.ncols()),
             ];
 
-            let bias_shapes = vec![
-                self.bias1.len(),
-                self.bias2.len(),
-            ];
+            let bias_shapes = vec![self.bias1.len(), self.bias2.len()];
 
             let norm_params = self.norm.parameters();
             let activation_params = self.activation.weights().len();
             let sigmoid_params = self.sigmoid.weights().len();
 
-            let total_params = self.parameters().map(|p| p.len()).sum::<usize>() +
-                             self.biases().map(|b| b.len()).sum::<usize>() +
-                             norm_params + activation_params + sigmoid_params;
+            let total_params = self.parameters().map(|p| p.len()).sum::<usize>()
+                + self.biases().map(|b| b.len()).sum::<usize>()
+                + norm_params
+                + activation_params
+                + sigmoid_params;
 
             self.param_info = Some(RouterParamInfo {
                 weight_shapes,
@@ -587,7 +650,13 @@ impl ExpertSelector {
     /// Get parameter shapes for gradient computation
     pub fn param_shapes(&mut self) -> (&[(usize, usize)], &[usize], usize, usize, usize) {
         let info = self.get_param_info();
-        (&info.weight_shapes, &info.bias_shapes, info.norm_params, info.activation_params, info.sigmoid_params)
+        (
+            &info.weight_shapes,
+            &info.bias_shapes,
+            info.norm_params,
+            info.activation_params,
+            info.sigmoid_params,
+        )
     }
 }
 
@@ -660,7 +729,11 @@ impl RichardsExpert {
     /// Get parameter shapes for gradient computation
     pub fn param_shapes(&mut self) -> (&[(usize, usize)], usize, usize) {
         let info = self.get_param_info();
-        (&info.weight_shapes, info.richards_activation_params, info.richards_gate_params)
+        (
+            &info.weight_shapes,
+            info.richards_activation_params,
+            info.richards_gate_params,
+        )
     }
 }
 
@@ -681,11 +754,19 @@ impl Layer for RichardsExpert {
         self.glu.parameters()
     }
 
-    fn compute_gradients(&self, _input: &ndarray::Array2<f32>, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, Vec<ndarray::Array2<f32>>) {
+    fn compute_gradients(
+        &self,
+        _input: &ndarray::Array2<f32>,
+        output_grads: &ndarray::Array2<f32>,
+    ) -> (ndarray::Array2<f32>, Vec<ndarray::Array2<f32>>) {
         self.glu.compute_gradients(_input, output_grads)
     }
 
-    fn apply_gradients(&mut self, param_grads: &[ndarray::Array2<f32>], lr: f32) -> Result<(), crate::errors::ModelError> {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[ndarray::Array2<f32>],
+        lr: f32,
+    ) -> Result<(), crate::errors::ModelError> {
         self.glu.apply_gradients(param_grads, lr)
     }
 
@@ -697,10 +778,6 @@ impl Layer for RichardsExpert {
 /// Parameter information for the MoE layer
 #[derive(Debug, Clone)]
 struct MoeParamInfo {
-    /// Router parameter information
-    router_info: RouterParamInfo,
-    /// Expert parameter information (one per expert)
-    expert_infos: Vec<ExpertParamInfo>,
     /// Total parameter count across all components
     total_params: usize,
 }
@@ -774,11 +851,13 @@ impl MixtureOfExperts {
         let mut output = ndarray::Array2::zeros(input.raw_dim());
 
         // Use zip to combine expert outputs with routing columns and accumulate results
-        expert_outputs.into_iter()
+        expert_outputs
+            .into_iter()
             .zip(routing_probs.columns())
             .for_each(|(expert_output, routing_col)| {
                 // Use zip to iterate over output rows and routing weights simultaneously
-                output.outer_iter_mut()
+                output
+                    .outer_iter_mut()
                     .zip(expert_output.outer_iter())
                     .zip(routing_col.iter())
                     .for_each(|((mut output_row, expert_row), &weight)| {
@@ -789,7 +868,6 @@ impl MixtureOfExperts {
         output
     }
 
-
     /// Get parameter information for the MoE layer
     fn get_param_info(&mut self) -> &MoeParamInfo {
         if self.param_info.is_none() {
@@ -797,21 +875,20 @@ impl MixtureOfExperts {
             let router_info = (*self.router.get_param_info()).clone();
 
             // Get expert parameter info using iterator chains
-            let expert_infos = self.experts.iter_mut()
+            let expert_infos = self
+                .experts
+                .iter_mut()
                 .map(|expert| (*expert.get_param_info()).clone())
                 .collect::<Vec<_>>();
 
             // Calculate total parameters using iterator chains
-            let total_params = router_info.total_params +
-                             expert_infos.iter()
-                                .map(|info| info.total_params)
-                                .sum::<usize>();
+            let total_params = router_info.total_params
+                + expert_infos
+                    .iter()
+                    .map(|info| info.total_params)
+                    .sum::<usize>();
 
-            self.param_info = Some(MoeParamInfo {
-                router_info,
-                expert_infos,
-                total_params,
-            });
+            self.param_info = Some(MoeParamInfo { total_params });
         }
 
         self.param_info.as_ref().unwrap()
@@ -834,16 +911,21 @@ impl Layer for MixtureOfExperts {
 
     fn backward(&mut self, grads: &ndarray::Array2<f32>, lr: f32) -> ndarray::Array2<f32> {
         // Simplified backward: route gradients to all experts weighted by routing probabilities
-        let routing_probs = self.cached_routing_probs.as_ref().expect("forward must be called before backward");
+        let routing_probs = self
+            .cached_routing_probs
+            .as_ref()
+            .expect("forward must be called before backward");
 
         let mut total_grad_input = ndarray::Array2::zeros(grads.raw_dim());
 
         // Use zip to iterate over experts and their corresponding routing columns simultaneously
-        self.experts.iter_mut()
+        self.experts
+            .iter_mut()
             .zip(routing_probs.columns())
             .for_each(|(expert, routing_col)| {
                 // Weight gradients by routing probabilities for this expert using zip
-                let weighted_grads: Vec<ndarray::Array1<f32>> = grads.outer_iter()
+                let weighted_grads: Vec<ndarray::Array1<f32>> = grads
+                    .outer_iter()
                     .zip(routing_col.iter())
                     .map(|(grad_row, &weight)| grad_row.mapv(|x| x * weight))
                     .collect();
@@ -852,7 +934,8 @@ impl Layer for MixtureOfExperts {
                 let weighted_grads_2d = if !weighted_grads.is_empty() {
                     let nrows = weighted_grads.len();
                     let ncols = weighted_grads[0].len();
-                    let flat_data = weighted_grads.into_iter()
+                    let flat_data = weighted_grads
+                        .into_iter()
                         .flat_map(|row: ndarray::Array1<f32>| row.into_iter())
                         .collect::<Vec<f32>>();
                     ndarray::Array2::from_shape_vec((nrows, ncols), flat_data).unwrap()
@@ -864,7 +947,8 @@ impl Layer for MixtureOfExperts {
                 let expert_grad_input = expert.backward(&weighted_grads_2d, lr);
 
                 // Weight input gradients back by routing probabilities using zip
-                expert_grad_input.outer_iter()
+                expert_grad_input
+                    .outer_iter()
                     .zip(routing_col.iter())
                     .zip(total_grad_input.outer_iter_mut())
                     .for_each(|((grad_row, &weight), mut total_row)| {
@@ -889,7 +973,9 @@ impl Layer for MixtureOfExperts {
             total += self.router.norm.parameters();
             total += self.router.activation.weights().len();
 
-            total += self.experts.iter()
+            total += self
+                .experts
+                .iter()
                 .map(|expert| expert.glu.parameters())
                 .sum::<usize>();
 
@@ -897,17 +983,32 @@ impl Layer for MixtureOfExperts {
         }
     }
 
-    fn compute_gradients(&self, _input: &ndarray::Array2<f32>, output_grads: &ndarray::Array2<f32>) -> (ndarray::Array2<f32>, Vec<ndarray::Array2<f32>>) {
-        let cached_input = self.cached_input.as_ref().expect("forward must be called before compute_gradients");
-        let cached_routing_probs = self.cached_routing_probs.as_ref().expect("forward must be called before compute_gradients");
-        let cached_expert_outputs = self.cached_expert_outputs.as_ref().expect("forward must be called before compute_gradients");
+    fn compute_gradients(
+        &self,
+        _input: &ndarray::Array2<f32>,
+        output_grads: &ndarray::Array2<f32>,
+    ) -> (ndarray::Array2<f32>, Vec<ndarray::Array2<f32>>) {
+        let cached_input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let cached_routing_probs = self
+            .cached_routing_probs
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let cached_expert_outputs = self
+            .cached_expert_outputs
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
 
         // 1. Route gradients to all experts weighted by routing probabilities
-        let mut expert_output_grads = vec![ndarray::Array2::zeros(output_grads.raw_dim()); self.config.num_experts];
+        let mut expert_output_grads =
+            vec![ndarray::Array2::zeros(output_grads.raw_dim()); self.config.num_experts];
         for expert_idx in 0..self.config.num_experts {
             for token_idx in 0..output_grads.nrows() {
                 let routing_weight = cached_routing_probs[[token_idx, expert_idx]];
-                expert_output_grads[expert_idx].row_mut(token_idx)
+                expert_output_grads[expert_idx]
+                    .row_mut(token_idx)
                     .assign(&output_grads.row(token_idx).mapv(|x| x * routing_weight));
             }
         }
@@ -918,12 +1019,15 @@ impl Layer for MixtureOfExperts {
 
         for (expert_idx, expert) in self.experts.iter().enumerate() {
             let expert_grads = &expert_output_grads[expert_idx];
-            let (expert_input_grad, expert_param_grads) = expert.compute_gradients(cached_input, expert_grads);
+            let (expert_input_grad, expert_param_grads) =
+                expert.compute_gradients(cached_input, expert_grads);
 
             // Weight input gradients by routing probabilities
             for token_idx in 0..expert_input_grad.nrows() {
                 let routing_weight = cached_routing_probs[[token_idx, expert_idx]];
-                grad_input.row_mut(token_idx).scaled_add(routing_weight, &expert_input_grad.row(token_idx));
+                grad_input
+                    .row_mut(token_idx)
+                    .scaled_add(routing_weight, &expert_input_grad.row(token_idx));
             }
 
             all_param_grads.extend(expert_param_grads);
@@ -936,21 +1040,45 @@ impl Layer for MixtureOfExperts {
             let token_output_grad = output_grads.row(token_idx);
             for expert_idx in 0..self.config.num_experts {
                 let expert_output = cached_expert_outputs[expert_idx].row(token_idx);
-                let dot_product = token_output_grad.iter().zip(expert_output.iter()).map(|(&g, &o)| g * o).sum::<f32>();
+                let dot_product = token_output_grad
+                    .iter()
+                    .zip(expert_output.iter())
+                    .map(|(&g, &o)| g * o)
+                    .sum::<f32>();
                 routing_grads[[token_idx, expert_idx]] = dot_product;
             }
         }
 
         // Compute router gradients manually using cached activations
         // Use cached router activations from the predict() call
-        let cached_activated = self.router.cached_activated.as_ref().expect("Router predict must be called before MoE gradient computation");
-        let cached_hidden = self.router.cached_hidden.as_ref().expect("Router predict must be called before MoE gradient computation");
-        let cached_normalized = self.router.cached_normalized.as_ref().expect("Router predict must be called before MoE gradient computation");
-        let cached_logits = self.router.cached_logits.as_ref().expect("Router predict must be called before MoE gradient computation");
+        let cached_activated = self
+            .router
+            .cached_activated
+            .as_ref()
+            .expect("Router predict must be called before MoE gradient computation");
+        let cached_hidden = self
+            .router
+            .cached_hidden
+            .as_ref()
+            .expect("Router predict must be called before MoE gradient computation");
+        let cached_normalized = self
+            .router
+            .cached_normalized
+            .as_ref()
+            .expect("Router predict must be called before MoE gradient computation");
+        let _cached_logits = self
+            .router
+            .cached_logits
+            .as_ref()
+            .expect("Router predict must be called before MoE gradient computation");
 
-        // Compute softmax gradients manually: dL/d_logits = routing_grads * (routing_probs * (1 - routing_probs))
-        // But since routing_grads is already w.r.t. routing_probs, we need to compute the Jacobian
-        let routing_probs = self.cached_routing_probs.as_ref().expect("routing probs must be cached");
+        // Compute softmax gradients manually: dL/d_logits = routing_grads * (routing_probs * (1 -
+        // routing_probs)) But since routing_grads is already w.r.t. routing_probs, we need
+        // to compute the Jacobian
+        let routing_probs = self
+            .cached_routing_probs
+            .as_ref()
+            .expect("routing probs must be cached");
         let mut d_logits = ndarray::Array2::zeros(routing_grads.raw_dim());
 
         for i in 0..routing_grads.nrows() {
@@ -960,7 +1088,11 @@ impl Layer for MixtureOfExperts {
 
                 for k in 0..routing_grads.ncols() {
                     let y_k = routing_probs[[i, k]];
-                    let dy_k_d_logits_j = if j == k { y_j * (1.0 - y_j) } else { -y_j * y_k };
+                    let dy_k_d_logits_j = if j == k {
+                        y_j * (1.0 - y_j)
+                    } else {
+                        -y_j * y_k
+                    };
                     grad_sum += routing_grads[[i, k]] * dy_k_d_logits_j;
                 }
 
@@ -978,18 +1110,27 @@ impl Layer for MixtureOfExperts {
         // Gradient through Richards activation (replacing ReLU)
         let normalized_f64 = cached_normalized.mapv(|x| x as f64);
         let d_activated_f64 = d_activated.mapv(|x| x as f64);
-        let activation_grad_f64 = self.router.activation.backward_matrix(&normalized_f64, &d_activated_f64);
+        let activation_grad_f64 = self
+            .router
+            .activation
+            .backward_matrix(&normalized_f64, &d_activated_f64);
         let d_normalized = activation_grad_f64.mapv(|x| x as f32);
 
         // Gradient through Richards normalization
-        let (d_hidden, _) = self.router.norm.compute_gradients(cached_hidden, &d_normalized);
+        let (d_hidden, _) = self
+            .router
+            .norm
+            .compute_gradients(cached_hidden, &d_normalized);
 
         // First layer gradients
         let grad_weights1 = cached_input.t().dot(&d_hidden);
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
 
         // Activation parameter gradients
-        let activation_grads = self.router.activation.grad_weights_matrix(&normalized_f64, &d_activated_f64);
+        let activation_grads = self
+            .router
+            .activation
+            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
 
         // Convert to the format expected by apply_gradients (Vec<Array2<f32>>)
         let router_grads = vec![
@@ -997,14 +1138,22 @@ impl Layer for MixtureOfExperts {
             grad_bias1.insert_axis(ndarray::Axis(0)),
             grad_weights2,
             grad_bias2.insert_axis(ndarray::Axis(0)),
-            ndarray::Array2::from_shape_vec((1, activation_grads.len()), activation_grads.into_iter().map(|x| x as f32).collect()).unwrap(),
+            ndarray::Array2::from_shape_vec(
+                (1, activation_grads.len()),
+                activation_grads.into_iter().map(|x| x as f32).collect(),
+            )
+            .unwrap(),
         ];
         all_param_grads.extend(router_grads);
 
         (grad_input, all_param_grads)
     }
 
-    fn apply_gradients(&mut self, param_grads: &[ndarray::Array2<f32>], lr: f32) -> Result<(), crate::errors::ModelError> {
+    fn apply_gradients(
+        &mut self,
+        param_grads: &[ndarray::Array2<f32>],
+        lr: f32,
+    ) -> Result<(), crate::errors::ModelError> {
         let mut grad_idx = 0;
 
         // Apply gradients to each expert
@@ -1014,8 +1163,11 @@ impl Layer for MixtureOfExperts {
 
             if grad_idx + num_expert_params > param_grads.len() {
                 return Err(crate::errors::ModelError::GradientError {
-                    message: format!("Not enough gradients for experts: expected at least {}, got {}",
-                                   grad_idx + num_expert_params, param_grads.len()),
+                    message: format!(
+                        "Not enough gradients for experts: expected at least {}, got {}",
+                        grad_idx + num_expert_params,
+                        param_grads.len()
+                    ),
                 });
             }
 
@@ -1028,27 +1180,49 @@ impl Layer for MixtureOfExperts {
         let router_grad_count = 5; // weights1, bias1, weights2, bias2, activation
         if grad_idx + router_grad_count <= param_grads.len() {
             self.router.weights1.scaled_add(-lr, &param_grads[grad_idx]);
-            self.router.bias1.scaled_add(-lr, &param_grads[grad_idx + 1].row(0));
-            self.router.weights2.scaled_add(-lr, &param_grads[grad_idx + 2]);
-            self.router.bias2.scaled_add(-lr, &param_grads[grad_idx + 3].row(0));
+            self.router
+                .bias1
+                .scaled_add(-lr, &param_grads[grad_idx + 1].row(0));
+            self.router
+                .weights2
+                .scaled_add(-lr, &param_grads[grad_idx + 2]);
+            self.router
+                .bias2
+                .scaled_add(-lr, &param_grads[grad_idx + 3].row(0));
 
             // Apply activation parameter gradients
-            let activation_grads_f64: Vec<f64> = param_grads[grad_idx + 4].iter().map(|&x| x as f64).collect();
-            self.router.activation.step(&activation_grads_f64, lr as f64);
+            let activation_grads_f64: Vec<f64> = param_grads[grad_idx + 4]
+                .iter()
+                .map(|&x| x as f64)
+                .collect();
+            self.router
+                .activation
+                .step(&activation_grads_f64, lr as f64);
         }
 
         Ok(())
     }
 
     fn weight_norm(&self) -> f32 {
-        let router_norm = self.router.weights1.iter().map(|&w| w * w).sum::<f32>().sqrt() +
-                         self.router.weights2.iter().map(|&w| w * w).sum::<f32>().sqrt();
+        let router_norm = self
+            .router
+            .weights1
+            .iter()
+            .map(|&w| w * w)
+            .sum::<f32>()
+            .sqrt()
+            + self
+                .router
+                .weights2
+                .iter()
+                .map(|&w| w * w)
+                .sum::<f32>()
+                .sqrt();
 
         let expert_norm = self.experts.iter().map(|e| e.weight_norm()).sum::<f32>();
 
         router_norm + expert_norm
     }
-
 }
 
 #[cfg(test)]
@@ -1105,10 +1279,14 @@ mod tests {
     #[test]
     fn test_expert_selection() {
         let selector = ExpertSelector::new(64, 32, 4);
-        let routing_probs = ndarray::Array2::from_shape_vec((2, 4), vec![
-            0.1, 0.7, 0.1, 0.1,  // Token 1: expert 1 has highest prob
-            0.2, 0.2, 0.5, 0.1,  // Token 2: expert 2 has highest prob
-        ]).unwrap();
+        let routing_probs = ndarray::Array2::from_shape_vec(
+            (2, 4),
+            vec![
+                0.1, 0.7, 0.1, 0.1, // Token 1: expert 1 has highest prob
+                0.2, 0.2, 0.5, 0.1, // Token 2: expert 2 has highest prob
+            ],
+        )
+        .unwrap();
 
         let selections = selector.select_experts(&routing_probs, 2);
 
@@ -1193,16 +1371,21 @@ mod tests {
         let (grad_input, param_grads) = moe.compute_gradients(&input, &output_grads);
 
         // Check that gradients are computed (not empty)
-        assert!(!param_grads.is_empty(), "Parameter gradients should not be empty");
+        assert!(
+            !param_grads.is_empty(),
+            "Parameter gradients should not be empty"
+        );
 
         // Check that input gradients have correct shape
         assert_eq!(grad_input.shape(), input.shape());
 
-        // Verify that router gradients are included (5 matrices: weights1, bias1, weights2, bias2, activation)
-        // Expert gradients come first, then router gradients
+        // Verify that router gradients are included (5 matrices: weights1, bias1, weights2, bias2,
+        // activation) Expert gradients come first, then router gradients
         let expected_router_grad_start = moe.experts.len() * 5; // 5 parameters per expert (w1, w2, w_out, richards_activation, gate_curve)
-        assert!(param_grads.len() >= expected_router_grad_start + 5,
-               "Should have gradients for all experts plus 5 router matrices");
+        assert!(
+            param_grads.len() >= expected_router_grad_start + 5,
+            "Should have gradients for all experts plus 5 router matrices"
+        );
     }
 
     #[test]
@@ -1233,10 +1416,17 @@ mod tests {
         let original_expert_w1 = moe.experts[0].glu.w1.clone();
 
         // Apply gradients
-        moe.apply_gradients(&param_grads, 0.01).expect("Apply gradients should succeed");
+        moe.apply_gradients(&param_grads, 0.01)
+            .expect("Apply gradients should succeed");
 
         // Check that weights were updated
-        assert_ne!(moe.router.weights1, original_router_w1, "Router weights should be updated");
-        assert_ne!(moe.experts[0].glu.w1, original_expert_w1, "Expert weights should be updated");
+        assert_ne!(
+            moe.router.weights1, original_router_w1,
+            "Router weights should be updated"
+        );
+        assert_ne!(
+            moe.experts[0].glu.w1, original_expert_w1,
+            "Expert weights should be updated"
+        );
     }
 }

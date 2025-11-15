@@ -67,3 +67,7 @@ This module provides the foundation for implementing:
 - **Transformer Recurrent Model (TRM)**: Recurrent transformer variants
 - **Other transformer variants**: Any architecture that uses the standard transformer block pattern
 
+
+
+
+

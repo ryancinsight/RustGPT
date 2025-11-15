@@ -131,16 +131,16 @@ impl Vocab {
 
     /// Default words for testing and initialization
     pub fn default_words() -> Vec<&'static str> {
-        vec!["hello", "world", "this", "is", "rust", "</s>"]
+        vec![
+            "hello", "world", "this", "is", "rust", "</s>", "<unk>", "<mask>",
+        ]
     }
-
 
     /// Tokenize text using simple word-level tokenization
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
         let tokenizer = super::tokenizer::SimpleTokenizer::new();
         tokenizer.tokenize(text, self)
     }
-
 
     /// Build vocabulary from a stream of texts
     /// This is the primary method for creating vocabularies from training data
@@ -154,6 +154,7 @@ impl Vocab {
         // Always include special tokens
         vocab_set.insert("</s>".to_string());
         vocab_set.insert("<unk>".to_string());
+        vocab_set.insert("<mask>".to_string());
 
         // Process each text to extract tokens
         for text in texts {
@@ -178,7 +179,7 @@ impl Vocab {
                 .chain(
                     word.chars()
                         .filter(|c| c.is_ascii_punctuation())
-                        .map(|c| c.to_string())
+                        .map(|c| c.to_string()),
                 );
 
             for token in tokens {

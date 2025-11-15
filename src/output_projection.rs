@@ -63,8 +63,17 @@ impl Layer for OutputProjection {
                     .to_string(),
             });
         }
-
-        self.optimizer.step(&mut self.w_out, &param_grads[0], lr);
+        let mut grad = param_grads[0].clone();
+        grad.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+        let gnorm: f32 = grad.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let wnorm = self.weight_norm().max(1e-6);
+        let clip = 5.0f32;
+        let mut scale = (wnorm / gnorm.max(1e-6)).clamp(0.5, 2.0);
+        if gnorm.is_finite() && gnorm > clip && gnorm > 0.0 {
+            scale *= clip / gnorm;
+        }
+        grad.mapv_inplace(|x| x * scale);
+        self.optimizer.step(&mut self.w_out, &grad, lr);
         Ok(())
     }
 

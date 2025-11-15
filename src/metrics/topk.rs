@@ -24,8 +24,11 @@ pub fn select_top_k(scores: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
 
     // Create and sort indices in descending score order with direct comparison
     let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_unstable_by(|&a, &b| scores[b].partial_cmp(&scores[a])
-        .unwrap_or(std::cmp::Ordering::Equal));
+    indices.sort_unstable_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Single-pass: collect scores and compute sum simultaneously
     let mut top_indices = Vec::with_capacity(k_actual);
@@ -48,9 +51,11 @@ pub fn select_top_k(scores: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
 }
 
 /// Compute NIM (Number of Important Mixture components) for a row of scores.
-/// NIM measures the effective number of components: 1 / sum(p²) where p are normalized probabilities.
+/// NIM measures the effective number of components: 1 / sum(p²) where p are normalized
+/// probabilities.
 ///
-/// Uses optimized single-pass computation with better numerical stability and cache-efficient chunked processing.
+/// Uses optimized single-pass computation with better numerical stability and cache-efficient
+/// chunked processing.
 ///
 /// # Arguments
 /// * `scores` - Vector of scores for each component
@@ -71,11 +76,17 @@ pub fn compute_nim(scores: &[f32]) -> f32 {
 
     // Process 8 elements at a time for optimal cache usage
     for chunk in chunks_8 {
-        let s0 = chunk[0]; let s1 = chunk[1]; let s2 = chunk[2]; let s3 = chunk[3];
-        let s4 = chunk[4]; let s5 = chunk[5]; let s6 = chunk[6]; let s7 = chunk[7];
+        let s0 = chunk[0];
+        let s1 = chunk[1];
+        let s2 = chunk[2];
+        let s3 = chunk[3];
+        let s4 = chunk[4];
+        let s5 = chunk[5];
+        let s6 = chunk[6];
+        let s7 = chunk[7];
 
         sum_all += s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;
-        sum_sq += s0*s0 + s1*s1 + s2*s2 + s3*s3 + s4*s4 + s5*s5 + s6*s6 + s7*s7;
+        sum_sq += s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4 + s5 * s5 + s6 * s6 + s7 * s7;
     }
 
     // Handle remainder elements
@@ -115,7 +126,8 @@ pub fn compute_nim_from_normalized(normalized_probs: &[f32]) -> f32 {
     // Manual unrolling for small arrays (common case)
     let (chunks_4, remainder) = normalized_probs.as_chunks::<4>();
     for chunk in chunks_4 {
-        sum_p_sq += chunk[0]*chunk[0] + chunk[1]*chunk[1] + chunk[2]*chunk[2] + chunk[3]*chunk[3];
+        sum_p_sq +=
+            chunk[0] * chunk[0] + chunk[1] * chunk[1] + chunk[2] * chunk[2] + chunk[3] * chunk[3];
     }
 
     // Handle remainder

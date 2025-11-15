@@ -57,8 +57,9 @@ impl GreedyDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
+
+    use super::*;
 
     #[test]
     fn test_greedy_decode_single() {
@@ -74,9 +75,12 @@ mod tests {
         let decoder = GreedyDecoder::new();
         let probs = Array2::from_shape_vec(
             (2, 3),
-            vec![0.2, 0.7, 0.1,  // First sequence: index 1 should be selected
-                 0.9, 0.05, 0.05] // Second sequence: index 0 should be selected
-        ).unwrap();
+            vec![
+                0.2, 0.7, 0.1, // First sequence: index 1 should be selected
+                0.9, 0.05, 0.05,
+            ], // Second sequence: index 0 should be selected
+        )
+        .unwrap();
 
         let result = decoder.decode(&probs);
         assert_eq!(result, vec![1, 0]);

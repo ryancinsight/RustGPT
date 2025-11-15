@@ -13,6 +13,7 @@
 
 use ndarray::{Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
+
 use crate::pade::PadeExp;
 
 /// Softmax layer for probability normalization
@@ -89,7 +90,9 @@ impl Softmax {
     /// # Returns
     /// Gradients with respect to input
     pub fn backward(&self, output_grads: &Array2<f32>) -> Array2<f32> {
-        let cached_output = self.cached_output.as_ref()
+        let cached_output = self
+            .cached_output
+            .as_ref()
             .expect("forward must be called before backward");
 
         self.compute_gradients(cached_output, output_grads)
@@ -106,7 +109,11 @@ impl Softmax {
     ///
     /// # Returns
     /// Gradients with respect to input
-    pub fn compute_gradients(&self, output: &Array2<f32>, output_grads: &Array2<f32>) -> Array2<f32> {
+    pub fn compute_gradients(
+        &self,
+        output: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Array2<f32> {
         let mut input_grads = Array2::zeros(output.raw_dim());
 
         // Compute gradients for each row (assuming axis=1, last dimension)
@@ -146,7 +153,8 @@ impl Softmax {
             let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
             // Compute exp(x - max) using PadeExp for better numerical stability
-            let exp_sum: f32 = row.iter()
+            let exp_sum: f32 = row
+                .iter()
                 .map(|&x| PadeExp::exp((x - max_val) as f64) as f32)
                 .sum();
 
@@ -178,8 +186,9 @@ impl Softmax {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
+
+    use super::*;
 
     #[test]
     fn test_softmax_forward() {

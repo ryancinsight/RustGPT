@@ -1,16 +1,25 @@
 use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 
-use crate::{MAX_SEQ_LEN, adam::Adam, richards::{RichardsCurve, Variant}, mixtures::{moh::{HeadSelectionStrategy, HeadSelectionConfig}, threshold::ThresholdPredictor}, attention::{head::PolyHead, position::cope::CoPE}};
+use crate::{
+    MAX_SEQ_LEN,
+    adam::Adam,
+    attention::{head::PolyHead, position::cope::CoPE},
+    mixtures::{
+        moh::{HeadSelectionConfig, HeadSelectionStrategy},
+        threshold::ThresholdPredictor,
+    },
+    richards::{RichardsCurve, Variant},
+};
 
 /// Configuration utilities for PolyAttention initialization and setup
 /// Provides modular functions for initializing different components of attention layers
-
 /// Initialize polynomial attention parameters (a, b, scale)
 pub fn init_polynomial_params() -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
     let a = Array2::<f32>::from_shape_vec((1, 1), vec![1.0]).unwrap();
     let b = Array2::<f32>::from_shape_vec((1, 1), vec![0.0]).unwrap();
-    let scale = Array2::<f32>::from_shape_vec((1, 1), vec![1.0 / (MAX_SEQ_LEN as f32).sqrt()]).unwrap();
+    let scale =
+        Array2::<f32>::from_shape_vec((1, 1), vec![1.0 / (MAX_SEQ_LEN as f32).sqrt()]).unwrap();
 
     let opt_a = Adam::new((1, 1));
     let opt_b = Adam::new((1, 1));
@@ -25,14 +34,18 @@ pub fn init_output_projection(embed_dim: usize) -> (Array2<f32>, Adam) {
     let std_out = (2.0f32 / (embed_dim as f32 + embed_dim as f32)).sqrt();
     let normal_out = Normal::new(0.0, std_out).unwrap();
 
-    let w_out = Array2::<f32>::from_shape_fn((embed_dim, embed_dim), |_| normal_out.sample(&mut rng));
+    let w_out =
+        Array2::<f32>::from_shape_fn((embed_dim, embed_dim), |_| normal_out.sample(&mut rng));
     let opt_w_out = Adam::new((embed_dim, embed_dim));
 
     (w_out, opt_w_out)
 }
 
 /// Initialize gating parameters for mixture-of-heads
-pub fn init_gating_params(embed_dim: usize, num_heads: usize) -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
+pub fn init_gating_params(
+    embed_dim: usize,
+    num_heads: usize,
+) -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
     let mut rng = rand::rng();
     let std_g = (2.0f32 / embed_dim as f32).sqrt();
     let normal_g = Normal::new(0.0, std_g).unwrap();
@@ -107,7 +120,8 @@ pub fn configure_head_selection(
     opt_b2_tau: &mut Option<Adam>,
     strategy: &HeadSelectionStrategy,
 ) {
-    *head_selection_config = HeadSelectionConfig::from_strategy(strategy, head_selection_config.max_heads);
+    *head_selection_config =
+        HeadSelectionConfig::from_strategy(strategy, head_selection_config.max_heads);
 
     // Initialize threshold predictor if needed (AutoDeco-inspired architecture)
     if head_selection_config.gating.use_learned_predictor && threshold_predictor.is_none() {
