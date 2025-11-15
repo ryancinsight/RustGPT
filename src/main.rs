@@ -1,12 +1,31 @@
 use std::io::Write;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use llm::{
-    ArchitectureType, AttentionType, EMBEDDING_DIM, HIDDEN_DIM, LLM, MAX_SEQ_LEN, ModelConfig,
-    Vocab, WindowAdaptationStrategy, build_network,
+    build_network,
     dataset_loader::{Dataset, DatasetType},
     print_architecture_summary,
+    ArchitectureType, AttentionType, ModelConfig, Vocab, WindowAdaptationStrategy, LLM,
+    EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
 };
+use llm::transformer::diffusion_block::DiffusionPredictionTarget;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DiffusionTargetCli {
+    #[value(alias = "eps")]
+    Epsilon,
+    #[value(alias = "v", alias = "vpred")]
+    VPrediction,
+}
+
+impl From<DiffusionTargetCli> for DiffusionPredictionTarget {
+    fn from(arg: DiffusionTargetCli) -> Self {
+        match arg {
+            DiffusionTargetCli::Epsilon => DiffusionPredictionTarget::Epsilon,
+            DiffusionTargetCli::VPrediction => DiffusionPredictionTarget::VPrediction,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "llm")]
@@ -40,6 +59,18 @@ struct Args {
 
     #[arg(long, default_value_t = 0.5)]
     diffusion_ce_weight: f32,
+
+    #[arg(long, default_value_t = 3.0)]
+    diffusion_min_snr_gamma: f32,
+
+    #[arg(long, value_enum, default_value_t = DiffusionTargetCli::Epsilon)]
+    diffusion_prediction_target: DiffusionTargetCli,
+
+    #[arg(long)]
+    ddim_steps: Option<usize>,
+
+    #[arg(long, default_value_t = 0.10)]
+    validation_ratio: f32,
 
 
     #[arg(long)]
@@ -302,6 +333,8 @@ fn main() -> llm::Result<()> {
     let mut config =
         ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8));
     config.architecture = architecture;
+    config.diffusion_prediction_target = args.diffusion_prediction_target.into();
+    config.diffusion_min_snr_gamma = args.diffusion_min_snr_gamma.max(1e-6);
     if args.trm {
         config.trm_use_diffusion = args.diffusion;
         config.trm_num_recursions = args.trm_recursions;
@@ -427,13 +460,29 @@ fn main() -> llm::Result<()> {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        llm.train_diffusion_ce(pre_texts, args.pretrain_epochs, 0.0005, 4, args.diffusion_ce_weight)?;
+        llm.train_diffusion_ce(
+            pre_texts,
+            args.pretrain_epochs,
+            0.0005,
+            4,
+            args.diffusion_ce_weight,
+            args.validation_ratio,
+            args.diffusion_min_snr_gamma,
+        )?;
         let chat_texts: Vec<&str> = dataset
             .chat_training_data
             .iter()
             .map(|s| s.as_str())
             .collect();
-        llm.train_diffusion_ce(chat_texts, args.instruction_epochs, 0.0005, 4, args.diffusion_ce_weight)?;
+        llm.train_diffusion_ce(
+            chat_texts,
+            args.instruction_epochs,
+            0.0005,
+            4,
+            args.diffusion_ce_weight,
+            args.validation_ratio,
+            args.diffusion_min_snr_gamma,
+        )?;
     } else {
         if args.continue_from.is_none() {
             println!("\n=== PRE-TRAINING MODEL ===");

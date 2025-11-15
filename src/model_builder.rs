@@ -108,6 +108,7 @@ fn build_diffusion_layers(
             causal_attention: false,
             discrete_masked: true,
             mask_token_id: Some(mask_id),
+            prediction_target: config.diffusion_prediction_target,
         };
 
         let diffusion_block = DiffusionBlock::new(block_cfg);
@@ -264,6 +265,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transformer::diffusion_block::DiffusionPredictionTarget;
 
     #[test]
     fn test_build_transformer_network() {
@@ -281,6 +283,25 @@ mod tests {
         assert_eq!(layers[1].layer_type(), "TransformerBlock");
         assert_eq!(layers[2].layer_type(), "RichardsNorm");
         assert_eq!(layers[layers.len() - 1].layer_type(), "OutputProjection");
+    }
+
+    #[test]
+    fn test_build_diffusion_network_uses_prediction_target() {
+        let vocab = Vocab::new(vec!["<pad>", "<mask>", "hello"]);
+        let mut config = ModelConfig::transformer(64, 128, 1, 64, None, Some(4));
+        config.architecture = ArchitectureType::Diffusion;
+        config.diffusion_prediction_target = DiffusionPredictionTarget::VPrediction;
+
+        let layers = build_network(&config, &vocab);
+        let prediction = layers
+            .iter()
+            .find_map(|layer| match layer {
+                LayerEnum::DiffusionBlock(block) => Some(block.prediction_target()),
+                _ => None,
+            })
+            .expect("diffusion block not found");
+
+        assert_eq!(prediction, DiffusionPredictionTarget::VPrediction);
     }
 }
 

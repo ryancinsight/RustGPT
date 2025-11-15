@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy};
+use crate::{
+    mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy},
+    transformer::diffusion_block::DiffusionPredictionTarget,
+};
 
 /// Architecture type for model configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +165,12 @@ pub struct ModelConfig {
     pub trm_max_supervision_steps: Option<usize>,
     pub trm_max_inference_steps: Option<usize>,
     pub trm_latent_update_alpha: Option<f32>,
+
+    /// Target parameterization for diffusion blocks (ε vs v prediction)
+    pub diffusion_prediction_target: DiffusionPredictionTarget,
+
+    /// Min-SNR gamma cap used when weighting diffusion losses
+    pub diffusion_min_snr_gamma: f32,
 }
 
 impl ModelConfig {
@@ -202,6 +211,8 @@ impl ModelConfig {
             trm_max_supervision_steps: None,
             trm_max_inference_steps: None,
             trm_latent_update_alpha: None,
+            diffusion_prediction_target: DiffusionPredictionTarget::Epsilon,
+            diffusion_min_snr_gamma: 3.0,
         }
     }
 }
