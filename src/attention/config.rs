@@ -90,22 +90,24 @@ pub fn init_gate_polynomial() -> RichardsCurve {
 pub fn ensure_threshold_predictor_initialized(
     threshold_predictor: &mut Option<ThresholdPredictor>,
     embed_dim: usize,
+    num_heads: usize,
     opt_w_tau: &mut Option<Adam>,
     opt_b_tau: &mut Option<Adam>,
     opt_w2_tau: &mut Option<Adam>,
     opt_b2_tau: &mut Option<Adam>,
 ) {
     if threshold_predictor.is_none() {
-        // Use smaller hidden dimension like AutoDeco (128 is typical)
         let predictor_hidden_dim = 128.min(embed_dim / 2).max(32);
-        *threshold_predictor = Some(ThresholdPredictor::new(embed_dim, predictor_hidden_dim, 1));
+        *threshold_predictor = Some(ThresholdPredictor::new(
+            embed_dim,
+            predictor_hidden_dim,
+            num_heads,
+        ));
 
-        // Optimizers for the two-layer network
         *opt_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
         *opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
-        *opt_w2_tau = Some(Adam::new((predictor_hidden_dim, 1)));
-        *opt_b2_tau = Some(Adam::new((1, 1)));
-        // Note: Richards activation uses its own step method, no Adam optimizer needed
+        *opt_w2_tau = Some(Adam::new((predictor_hidden_dim, num_heads)));
+        *opt_b2_tau = Some(Adam::new((num_heads, 1)));
     }
 }
 
@@ -114,20 +116,21 @@ pub fn configure_head_selection(
     head_selection_config: &mut HeadSelectionConfig,
     threshold_predictor: &mut Option<ThresholdPredictor>,
     embed_dim: usize,
+    num_heads: usize,
     opt_w_tau: &mut Option<Adam>,
     opt_b_tau: &mut Option<Adam>,
     opt_w2_tau: &mut Option<Adam>,
     opt_b2_tau: &mut Option<Adam>,
     strategy: &HeadSelectionStrategy,
 ) {
-    *head_selection_config =
-        HeadSelectionConfig::from_strategy(strategy, head_selection_config.max_heads);
+    *head_selection_config = HeadSelectionConfig::from_strategy(strategy, num_heads);
 
     // Initialize threshold predictor if needed (AutoDeco-inspired architecture)
     if head_selection_config.gating.use_learned_predictor && threshold_predictor.is_none() {
         ensure_threshold_predictor_initialized(
             threshold_predictor,
             embed_dim,
+            num_heads,
             opt_w_tau,
             opt_b_tau,
             opt_w2_tau,

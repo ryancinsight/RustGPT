@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy},
-    transformer::diffusion_block::DiffusionPredictionTarget,
+    transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
 };
 
 /// Architecture type for model configuration
@@ -45,6 +45,15 @@ pub enum AttentionType {
     SelfAttention,
     /// Polynomial attention layer with odd degree p (e.g., p=3)
     PolyAttention { degree_p: usize },
+}
+
+/// Strategy for sampling diffusion timesteps during training
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffusionTimestepStrategy {
+    /// Uniform sampling across the noise schedule
+    Uniform,
+    /// Min-SNR weighted sampling (Karras et al., 2022)
+    MinSnr,
 }
 
 /// Configuration for model architecture and hyperparameters
@@ -171,6 +180,14 @@ pub struct ModelConfig {
 
     /// Min-SNR gamma cap used when weighting diffusion losses
     pub diffusion_min_snr_gamma: f32,
+
+    /// Noise schedule controlling β_t across diffusion timesteps
+    #[serde(default = "diffusion_noise_schedule_default")]
+    pub diffusion_noise_schedule: NoiseSchedule,
+
+    /// Strategy for sampling diffusion timesteps during training
+    #[serde(default = "diffusion_timestep_strategy_default")]
+    pub diffusion_timestep_strategy: DiffusionTimestepStrategy,
 }
 
 impl ModelConfig {
@@ -213,6 +230,8 @@ impl ModelConfig {
             trm_latent_update_alpha: None,
             diffusion_prediction_target: DiffusionPredictionTarget::Epsilon,
             diffusion_min_snr_gamma: 3.0,
+            diffusion_noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
+            diffusion_timestep_strategy: DiffusionTimestepStrategy::Uniform,
         }
     }
 }
@@ -226,6 +245,14 @@ impl Default for ModelConfig {
 // Provide serde default value for entropy_ema_alpha
 fn entropy_ema_alpha_default_model() -> f32 {
     0.2
+}
+
+fn diffusion_noise_schedule_default() -> NoiseSchedule {
+    NoiseSchedule::Cosine { s: 0.008 }
+}
+
+fn diffusion_timestep_strategy_default() -> DiffusionTimestepStrategy {
+    DiffusionTimestepStrategy::Uniform
 }
 
 impl ModelConfig {

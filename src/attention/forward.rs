@@ -155,17 +155,18 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             // Learned threshold predictor or soft top-p selection
             let (_m_col, tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
                 if ctx.head_selection_config.gating.use_learned_predictor {
-                    // Use learned thresholds (1D array per token)
-                    let threshold_sum: f32 = thresholds.iter().sum();
-                    let threshold_min = thresholds
+                    // Use learned thresholds per head (n_tokens x n_heads)
+                    let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
+                    let threshold_sum: f32 = head_thresholds.iter().sum();
+                    let threshold_min = head_thresholds
                         .iter()
                         .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
-                    let threshold_max = thresholds
+                    let threshold_max = head_thresholds
                         .iter()
                         .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
                     let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
-                    let eff_col = &g_col * thresholds;
-                    (thresholds.clone(), tau_metrics, eff_col)
+                    let eff_col = &g_col * &head_thresholds;
+                    (head_thresholds.to_owned(), tau_metrics, eff_col)
                 } else if ctx.head_selection_config.gating.use_soft_top_p {
                     // Use soft top-p selection (2D array: n_tokens x n_heads)
                     let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);

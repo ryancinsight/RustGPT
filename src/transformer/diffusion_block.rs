@@ -15,7 +15,7 @@ use crate::{
         HeadSelectionStrategy,
         moe::{ExpertRouterConfig, MixtureOfExperts},
     },
-    model_config::ModelConfig,
+    model_config::{DiffusionTimestepStrategy, ModelConfig},
     richards::{RichardsGlu, RichardsNorm},
     transformer::transformer_block::TransformerBlockConfig,
 };
@@ -368,6 +368,8 @@ pub struct DiffusionBlockConfig {
     /// Parameterization for model outputs (ε or v-prediction)
     #[serde(default)]
     pub prediction_target: DiffusionPredictionTarget,
+    /// Strategy used when sampling timesteps for training curricula
+    pub timestep_strategy: DiffusionTimestepStrategy,
 }
 
 impl From<TransformerBlockConfig> for DiffusionBlockConfig {
@@ -389,6 +391,7 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         }
     }
 }
@@ -637,11 +640,12 @@ impl DiffusionBlock {
             time_embed_dim: config.embedding_dim, /* Use same dimension as embeddings for time
                                                    * conditioning */
             num_timesteps: 1000, // Standard DDPM timestep count
-            noise_schedule: NoiseSchedule::Cosine { s: 0.008 }, // Improved DDPM cosine schedule
+            noise_schedule: config.diffusion_noise_schedule.clone(),
             causal_attention: false, // Diffusion models use bi-directional attention
             discrete_masked: false,
             mask_token_id: None,
-            prediction_target: DiffusionPredictionTarget::default(),
+            prediction_target: config.diffusion_prediction_target,
+            timestep_strategy: config.diffusion_timestep_strategy,
         };
 
         Self::new(block_config)
@@ -1034,6 +1038,14 @@ impl DiffusionBlock {
 
     pub fn prediction_target(&self) -> DiffusionPredictionTarget {
         self.config.prediction_target
+    }
+
+    pub fn timestep_strategy(&self) -> DiffusionTimestepStrategy {
+        self.config.timestep_strategy
+    }
+
+    pub fn noise_schedule(&self) -> &NoiseSchedule {
+        &self.config.noise_schedule
     }
 }
 
@@ -1493,6 +1505,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
 
         let block = DiffusionBlock::new(config);
@@ -1522,6 +1535,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
 
         let mut block = DiffusionBlock::new(config);
@@ -1551,6 +1565,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
 
         let mut block = DiffusionBlock::new(config);
@@ -1601,6 +1616,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let mut block = DiffusionBlock::new(config);
         let input = Array2::zeros((8, 32));
@@ -1633,6 +1649,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(500);
@@ -1716,6 +1733,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let mut block = DiffusionBlock::new(config);
         let embed_dim = block.config.embed_dim;
@@ -1837,6 +1855,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(10);
@@ -1873,6 +1892,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(10);
@@ -1916,6 +1936,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(5);
@@ -1966,6 +1987,7 @@ mod tests {
             discrete_masked: false,
             mask_token_id: None,
             prediction_target: DiffusionPredictionTarget::default(),
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
         };
         let block = DiffusionBlock::new(config);
         for t in [0usize, 1, 10, 25, 49] {

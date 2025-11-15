@@ -13,6 +13,7 @@ use crate::{
     embeddings::TokenEmbeddings,
     errors::{ModelError, Result},
     metrics::text::corpus_bleu_1_2,
+    model_config::DiffusionTimestepStrategy,
     output_projection::OutputProjection,
     transformer::TransformerBlock,
     trm::TRM,
@@ -1590,9 +1591,39 @@ impl LLM {
         } else {
             1000
         };
+        let timestep_strategy = if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+            b.timestep_strategy()
+        } else {
+            DiffusionTimestepStrategy::Uniform
+        };
         let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
         let mut rng = rand::rng();
         let min_snr_gamma = min_snr_gamma.max(1e-6);
+        let sampling_cdf = if matches!(timestep_strategy, DiffusionTimestepStrategy::MinSnr) {
+            if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
+                let mut weights = Vec::with_capacity(num_timesteps);
+                for t in 0..num_timesteps {
+                    weights.push(b0.min_snr_weight(t, min_snr_gamma).max(1e-6));
+                }
+                let sum: f32 = weights.iter().sum();
+                if sum > 0.0 {
+                    let mut acc = 0.0f32;
+                    weights
+                        .into_iter()
+                        .map(|w| {
+                            acc += w / sum;
+                            acc.min(1.0)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         let lambda_ce_schedule = |t: usize| -> f32 {
             let total = num_timesteps.max(1) as f32;
             let center = 0.5 * total;
@@ -1713,9 +1744,37 @@ impl LLM {
                     };
                     let max_t = ((num_timesteps as f32) * ((epoch + 1) as f32 / epochs as f32))
                         .round() as usize; // curriculum
-                    let base_t = rng.random_range(0..max_t.max(1));
-                    let t = (((1.0 - complexity) * base_t as f32).round() as usize)
-                        .min(max_t.max(1) - 1);
+                    let active_steps = max_t.max(1);
+                    let candidate = match timestep_strategy {
+                        DiffusionTimestepStrategy::Uniform => {
+                            rng.random_range(0..active_steps)
+                        }
+                        DiffusionTimestepStrategy::MinSnr => {
+                            if sampling_cdf.is_empty() {
+                                rng.random_range(0..num_timesteps.max(1))
+                            } else {
+                                let r: f32 = rand::random();
+                                let mut lo = 0usize;
+                                let mut hi = sampling_cdf.len();
+                                while lo < hi {
+                                    let mid = (lo + hi) / 2;
+                                    if sampling_cdf[mid] < r {
+                                        lo = mid + 1;
+                                    } else {
+                                        hi = mid;
+                                    }
+                                }
+                                let idx = if lo >= sampling_cdf.len() {
+                                    sampling_cdf.len() - 1
+                                } else {
+                                    lo
+                                };
+                                idx.min(num_timesteps.saturating_sub(1))
+                            }
+                        }
+                    };
+                    let t = (((1.0 - complexity) * candidate as f32).round() as usize)
+                        .min(active_steps - 1);
                     let (x_t, sqrt_a, sqrt_one_minus_a, discrete_used) = {
                         if is_discrete {
                             let mask_token_id = mask_id_opt
