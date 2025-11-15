@@ -1,7 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use llm::{Layer, trm::TRM};
 use ndarray::Array2;
-use llm::Layer;
-use llm::trm::TRM;
 
 /// Benchmark TRM forward pass performance
 fn bench_trm_forward(c: &mut Criterion) {
@@ -56,11 +55,9 @@ fn bench_trm_training_gradients(c: &mut Criterion) {
 
     group.bench_function("training_gradients", |b| {
         b.iter(|| {
-            let (_loss, _grads) = trm.compute_training_gradients(
-                black_box(&question),
-                black_box(&initial_answer),
-                black_box(&target),
-            ).unwrap();
+            let (_loss, _grads) = trm
+                .compute_training_gradients(black_box(&question), black_box(&target))
+                .unwrap();
         });
     });
 

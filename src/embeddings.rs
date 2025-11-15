@@ -36,19 +36,17 @@ impl TokenEmbeddings {
         Array2::from_shape_fn((vocab_size, embedding_dim), |_| normal.sample(&mut rng))
     }
 
-
-
     #[inline]
     fn get_token_embeddings(embeddings: &Array2<f32>, token_ids: &[usize]) -> Array2<f32> {
         let mut token_embeds = Array2::<f32>::zeros((token_ids.len(), embeddings.ncols()));
         for (i, &token_id) in token_ids.iter().enumerate() {
             let safe_token_id = token_id.min(embeddings.nrows().saturating_sub(1));
-            token_embeds.row_mut(i).assign(&embeddings.row(safe_token_id));
+            token_embeds
+                .row_mut(i)
+                .assign(&embeddings.row(safe_token_id));
         }
         token_embeds
     }
-
-
 
     #[inline]
     pub fn embed_tokens(&self, token_ids: &[usize]) -> Array2<f32> {
@@ -88,7 +86,9 @@ impl Layer for TokenEmbeddings {
             let grad_row = grads.row(i);
 
             // Accumulate gradients
-            token_grads.row_mut(safe_token_id).zip_mut_with(&grad_row, |a, &b| *a += b);
+            token_grads
+                .row_mut(safe_token_id)
+                .zip_mut_with(&grad_row, |a, &b| *a += b);
         }
 
         (output_grads.clone(), vec![token_grads])
@@ -107,8 +107,18 @@ impl Layer for TokenEmbeddings {
                 ),
             });
         }
+        let mut grad = param_grads[0].clone();
+        grad.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+        let gnorm: f32 = grad.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let wnorm = self.weight_norm().max(1e-6);
+        let clip = 5.0f32;
+        let mut scale = (wnorm / gnorm.max(1e-6)).clamp(0.5, 2.0);
+        if gnorm.is_finite() && gnorm > clip && gnorm > 0.0 {
+            scale *= clip / gnorm;
+        }
+        grad.mapv_inplace(|x| x * scale);
         self.token_optimizer
-            .step(&mut self.token_embeddings, &param_grads[0], lr);
+            .step(&mut self.token_embeddings, &grad, lr);
         Ok(())
     }
 
@@ -124,11 +134,7 @@ impl Layer for TokenEmbeddings {
     }
 
     fn weight_norm(&self) -> f32 {
-        let sumsq = self
-            .token_embeddings
-            .iter()
-            .map(|&w| w * w)
-            .sum::<f32>();
+        let sumsq = self.token_embeddings.iter().map(|&w| w * w).sum::<f32>();
         sumsq.sqrt()
     }
 }

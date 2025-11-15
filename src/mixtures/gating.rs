@@ -16,6 +16,7 @@
 //! - **Loss computation**: Delegates to shared metrics module
 
 use serde::{Deserialize, Serialize};
+
 use crate::mixtures::metrics::MixtureMetrics;
 
 /// Strategy for gating component activation (heads or experts)
@@ -119,7 +120,10 @@ impl GatingConfig {
                 complexity_loss_weight: *complexity_loss_weight,
                 metrics: MixtureMetrics::new(num_components),
             },
-            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha } => Self {
+            GatingStrategy::SoftTopP {
+                top_p,
+                soft_top_p_alpha,
+            } => Self {
                 use_learned_predictor: false,
                 use_soft_top_p: true,
                 num_active: num_components, // All components available for selection
@@ -150,13 +154,17 @@ impl GatingConfig {
     }
 
     /// Update metrics with new gating decisions
-    /// gate_values: shape (num_tokens, num_components) - gating values for each token-component pair
+    /// gate_values: shape (num_tokens, num_components) - gating values for each token-component
+    /// pair
     pub fn update_metrics(&mut self, gate_values: &ndarray::ArrayView2<f32>) {
         // Validate that the number of components matches our configuration
         let num_components = gate_values.ncols();
         if self.metrics.active_sum_per_component.len() != num_components {
-            eprintln!("Warning: GatingConfig component count mismatch. Expected {}, got {}. This may indicate improper initialization.",
-                     self.metrics.active_sum_per_component.len(), num_components);
+            eprintln!(
+                "Warning: GatingConfig component count mismatch. Expected {}, got {}. This may indicate improper initialization.",
+                self.metrics.active_sum_per_component.len(),
+                num_components
+            );
         }
         self.metrics.update(gate_values);
     }
@@ -171,7 +179,8 @@ impl GatingConfig {
         self.metrics.compute_sparsity_loss(self.num_active)
     }
 
-    /// Get complexity alignment loss for training (aligns component usage with predicted complexity)
+    /// Get complexity alignment loss for training (aligns component usage with predicted
+    /// complexity)
     pub fn compute_complexity_loss(&self, target_avg_components: f32) -> f32 {
         self.metrics.compute_complexity_loss(target_avg_components)
     }
@@ -197,7 +206,8 @@ pub fn select_top_k_components(gate_values: &ndarray::Array2<f32>, k: usize) -> 
     let mut selections = Vec::new();
 
     for row in gate_values.outer_iter() {
-        let mut component_gates: Vec<(usize, f32)> = row.iter()
+        let mut component_gates: Vec<(usize, f32)> = row
+            .iter()
             .enumerate()
             .map(|(idx, &gate)| (idx, gate))
             .collect();
@@ -206,7 +216,8 @@ pub fn select_top_k_components(gate_values: &ndarray::Array2<f32>, k: usize) -> 
         component_gates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
         // Take top-k components
-        let selected: Vec<usize> = component_gates.into_iter()
+        let selected: Vec<usize> = component_gates
+            .into_iter()
             .take(k)
             .map(|(idx, _)| idx)
             .collect();
@@ -261,10 +272,14 @@ mod tests {
 
     #[test]
     fn test_select_top_k_components() {
-        let gate_values = ndarray::Array2::from_shape_vec((2, 4), vec![
-            0.1, 0.7, 0.1, 0.1,  // Token 1: component 1 has highest gate
-            0.2, 0.2, 0.5, 0.1,  // Token 2: component 2 has highest gate
-        ]).unwrap();
+        let gate_values = ndarray::Array2::from_shape_vec(
+            (2, 4),
+            vec![
+                0.1, 0.7, 0.1, 0.1, // Token 1: component 1 has highest gate
+                0.2, 0.2, 0.5, 0.1, // Token 2: component 2 has highest gate
+            ],
+        )
+        .unwrap();
 
         let selections = select_top_k_components(&gate_values, 2);
 

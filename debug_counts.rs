@@ -1,0 +1,34 @@
+use llm::transformer::transformer_block::{TransformerBlock, TransformerBlockConfig};
+use llm::transformer::diffusion_block::{DiffusionBlock, DiffusionBlockConfig};
+use llm::mixtures::HeadSelectionStrategy;
+use llm::Layer;
+use ndarray::Array2;
+
+fn main() {
+    let tcfg = TransformerBlockConfig {
+        embed_dim: 64,
+        hidden_dim: 128,
+        num_heads: 8,
+        poly_degree: 3,
+        max_pos: 79,
+        window_size: None,
+        use_moe: false,
+        moe_config: None,
+        head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
+    };
+    let mut tblock = TransformerBlock::new(tcfg.clone());
+
+    let dcfg: DiffusionBlockConfig = tcfg.into();
+    let mut dblock = DiffusionBlock::new(dcfg);
+    dblock.set_timestep(10);
+
+    let input = Array2::zeros((16, 64));
+    let _ = tblock.forward(&input);
+    let _ = dblock.forward(&input);
+
+    let grads = Array2::ones((16, 64));
+    let (_t_in_grad, t_param_grads) = tblock.compute_gradients(&input, &grads);
+    let (_d_in_grad, d_param_grads) = dblock.compute_gradients(&input, &grads);
+    println!("t_param_grads_len={}", t_param_grads.len());
+    println!("d_param_grads_len={}", d_param_grads.len());
+}

@@ -22,7 +22,8 @@ impl CoPE {
     pub fn new(max_pos: usize, embed_dim: usize) -> Self {
         let mut rng = rand::rng();
         let normal_pe = Normal::new(0.0, 0.02).unwrap();
-        let pe = Array2::<f32>::from_shape_fn((max_pos + 1, embed_dim), |_| normal_pe.sample(&mut rng));
+        let pe =
+            Array2::<f32>::from_shape_fn((max_pos + 1, embed_dim), |_| normal_pe.sample(&mut rng));
         let optimizer = Adam::new((max_pos + 1, embed_dim));
 
         Self {
@@ -31,7 +32,6 @@ impl CoPE {
             optimizer,
         }
     }
-
 
     /// Get the positional embedding for a specific position
     pub fn get_pos_embedding(&self, pos: usize) -> Option<ndarray::ArrayView1<'_, f32>> {
@@ -54,7 +54,11 @@ impl CoPE {
 
     /// Get the weight norm (L2 norm) of the positional embeddings
     pub fn weight_norm(&self) -> f32 {
-        self.pos_embeddings.iter().map(|&w| w * w).sum::<f32>().sqrt()
+        self.pos_embeddings
+            .iter()
+            .map(|&w| w * w)
+            .sum::<f32>()
+            .sqrt()
     }
 }
 
@@ -68,5 +72,4 @@ mod tests {
         assert_eq!(cope.max_pos, 10);
         assert_eq!(cope.pos_embeddings.shape(), &[11, 8]); // max_pos + 1
     }
-
 }

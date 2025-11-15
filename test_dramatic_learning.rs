@@ -24,27 +24,36 @@ fn main() {
     };
 
     println!("1. Initial Parameter States:");
-    println!("  Sigmoid (6 learnable): {:?}", get_all_params(&sigmoid_curve));
+    println!(
+        "  Sigmoid (6 learnable): {:?}",
+        get_all_params(&sigmoid_curve)
+    );
     println!("  None (8 learnable): {:?}", get_all_params(&none_curve));
-    println!("  Fully learnable (8 learnable): {:?}", get_all_params(&fully_learnable_curve));
+    println!(
+        "  Fully learnable (8 learnable): {:?}",
+        get_all_params(&fully_learnable_curve)
+    );
     println!();
 
     // Aggressive training parameters
-    let learning_rate = 0.5;  // Much higher learning rate
-    let epochs = 100;         // More epochs
-    
-    println!("2. Aggressive Training (LR={}, Epochs={}):", learning_rate, epochs);
+    let learning_rate = 0.5; // Much higher learning rate
+    let epochs = 100; // More epochs
+
+    println!(
+        "2. Aggressive Training (LR={}, Epochs={}):",
+        learning_rate, epochs
+    );
     println!("   Training with synthetic data to maximize parameter changes...\n");
 
     // Training loop with diverse inputs and targets
     for epoch in 0..epochs {
         // Use multiple diverse training examples per epoch
         let training_examples = [
-            (0.1, 0.9),   // Low input, high target
-            (0.5, 0.2),   // Mid input, low target  
-            (0.9, 0.8),   // High input, high target
-            (-0.5, 0.1),  // Negative input, low target
-            (1.5, 0.7),   // Large input, mid target
+            (0.1, 0.9),  // Low input, high target
+            (0.5, 0.2),  // Mid input, low target
+            (0.9, 0.8),  // High input, high target
+            (-0.5, 0.1), // Negative input, low target
+            (1.5, 0.7),  // Large input, mid target
         ];
 
         for (x, target) in training_examples.iter() {
@@ -72,7 +81,10 @@ fn main() {
             println!("   Epoch {}:", epoch);
             println!("     Sigmoid: {:?}", get_all_params(&sigmoid_curve));
             println!("     None: {:?}", get_all_params(&none_curve));
-            println!("     Fully learnable: {:?}", get_all_params(&fully_learnable_curve));
+            println!(
+                "     Fully learnable: {:?}",
+                get_all_params(&fully_learnable_curve)
+            );
             println!();
         }
     }
@@ -93,49 +105,74 @@ fn main() {
     let fully_initial = vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
 
     println!("4. Parameter Change Magnitudes:");
-    
+
     // Sigmoid changes (only first 6 parameters are learnable)
-    let sigmoid_changes: Vec<f64> = sigmoid_initial[0..6].iter()
+    let sigmoid_changes: Vec<f64> = sigmoid_initial[0..6]
+        .iter()
         .zip(sigmoid_final[0..6].iter())
         .map(|(init, final_val)| (final_val - init).abs())
         .collect();
     println!("  Sigmoid changes: {:?}", sigmoid_changes);
-    println!("  Sigmoid max change: {:.6}", sigmoid_changes.iter().fold(0.0f64, |a, &b| a.max(b)));
+    println!(
+        "  Sigmoid max change: {:.6}",
+        sigmoid_changes.iter().fold(0.0f64, |a, &b| a.max(b))
+    );
 
     // None variant changes (all 8 parameters are learnable)
-    let none_changes: Vec<f64> = none_initial.iter()
+    let none_changes: Vec<f64> = none_initial
+        .iter()
         .zip(none_final.iter())
         .map(|(init, final_val)| (final_val - init).abs())
         .collect();
     println!("  None changes: {:?}", none_changes);
-    println!("  None max change: {:.6}", none_changes.iter().fold(0.0f64, |a, &b| a.max(b)));
+    println!(
+        "  None max change: {:.6}",
+        none_changes.iter().fold(0.0f64, |a, &b| a.max(b))
+    );
 
     // Fully learnable changes (all 8 parameters are learnable)
-    let fully_changes: Vec<f64> = fully_initial.iter()
+    let fully_changes: Vec<f64> = fully_initial
+        .iter()
         .zip(fully_final.iter())
         .map(|(init, final_val)| (final_val - init).abs())
         .collect();
     println!("  Fully learnable changes: {:?}", fully_changes);
-    println!("  Fully learnable max change: {:.6}", fully_changes.iter().fold(0.0f64, |a, &b| a.max(b)));
+    println!(
+        "  Fully learnable max change: {:.6}",
+        fully_changes.iter().fold(0.0f64, |a, &b| a.max(b))
+    );
     println!();
 
     // Verify a,b coefficient behavior
     println!("5. Richards Coefficients (a,b) Analysis:");
-    println!("  Sigmoid a,b: {:.6}, {:.6} (should remain 1.0, 0.0)", 
-             sigmoid_curve.output_gain.unwrap_or(1.0), sigmoid_curve.output_bias.unwrap_or(0.0));
-    println!("  None a,b: {:.6}, {:.6} (should change dramatically)", 
-             none_curve.output_gain.unwrap_or(1.0), none_curve.output_bias.unwrap_or(0.0));
-    println!("  Fully learnable a,b: {:.6}, {:.6} (should change dramatically)", 
-             fully_learnable_curve.output_gain.unwrap_or(1.0), fully_learnable_curve.output_bias.unwrap_or(0.0));
+    println!(
+        "  Sigmoid a,b: {:.6}, {:.6} (should remain 1.0, 0.0)",
+        sigmoid_curve.output_gain.unwrap_or(1.0),
+        sigmoid_curve.output_bias.unwrap_or(0.0)
+    );
+    println!(
+        "  None a,b: {:.6}, {:.6} (should change dramatically)",
+        none_curve.output_gain.unwrap_or(1.0),
+        none_curve.output_bias.unwrap_or(0.0)
+    );
+    println!(
+        "  Fully learnable a,b: {:.6}, {:.6} (should change dramatically)",
+        fully_learnable_curve.output_gain.unwrap_or(1.0),
+        fully_learnable_curve.output_bias.unwrap_or(0.0)
+    );
 
     // Verify equivalence between None and fully_learnable
-    let none_vs_fully_diff: f64 = none_final.iter()
+    let none_vs_fully_diff: f64 = none_final
+        .iter()
         .zip(fully_final.iter())
         .map(|(a, b)| (a - b).abs())
         .sum();
-    
+
     println!("\n6. Equivalence Check:");
-    println!("  None vs Fully learnable difference: {:.10}", none_vs_fully_diff);
+    println!(
+        "  None vs Fully learnable difference: {:.10}",
+        none_vs_fully_diff
+    );
     if none_vs_fully_diff < 1e-6 {
         println!("  ✅ None variant and new_fully_learnable() are equivalent!");
     } else {

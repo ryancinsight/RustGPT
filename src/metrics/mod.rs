@@ -3,11 +3,12 @@
 //! This module contains metrics structures and utility functions commonly used
 //! in mixture models (MoE, MoH) and potentially other components.
 
+pub mod text;
 pub mod topk;
 
-pub use topk::{select_top_k, compute_nim, compute_nim_from_normalized};
-
 use serde::{Deserialize, Serialize};
+pub use text::{bleu_1_2, corpus_bleu_1_2};
+pub use topk::{compute_nim, compute_nim_from_normalized, select_top_k};
 
 /// Per-head metrics used by MoH (and potentially other head-based mixtures).
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
@@ -62,8 +63,12 @@ impl PerHeadMetrics {
     }
 
     pub fn reset_head_metrics(&mut self) {
-        for v in &mut self.active_sum_per_head { *v = 0.0; }
-        for c in &mut self.token_count_per_head { *c = 0; }
+        for v in &mut self.active_sum_per_head {
+            *v = 0.0;
+        }
+        for c in &mut self.token_count_per_head {
+            *c = 0;
+        }
         self.tau_min = f32::INFINITY;
         self.tau_max = f32::NEG_INFINITY;
         self.tau_sum = 0.0;
@@ -79,7 +84,9 @@ impl PerHeadMetrics {
             let tokens = self.token_count_per_head[h];
             let avg = if tokens > 0 {
                 self.active_sum_per_head[h] / tokens as f32
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             res.push((avg, tokens));
             self.active_sum_per_head[h] = 0.0;
             self.token_count_per_head[h] = 0;
@@ -96,7 +103,9 @@ impl PerHeadMetrics {
             self.tau_sum = 0.0;
             self.tau_count = 0;
             Some((min, max))
-        } else { None }
+        } else {
+            None
+        }
     }
 
     pub fn take_pred_norm(&mut self) -> Option<f32> {
@@ -105,7 +114,9 @@ impl PerHeadMetrics {
             self.g_sq_sum = 0.0;
             self.g_count = 0;
             Some(rms)
-        } else { None }
+        } else {
+            None
+        }
     }
 }
 
@@ -120,8 +131,8 @@ pub struct NimMetrics {
 
 impl NimMetrics {
     pub fn new() -> Self {
-        Self { 
-            nim_sum: 0.0, 
+        Self {
+            nim_sum: 0.0,
             token_count: 0,
             actual_expert_count_sum: 0,
             actual_expert_token_count: 0,
@@ -132,7 +143,7 @@ impl NimMetrics {
         self.nim_sum += nim;
         self.token_count += 1;
     }
-    
+
     pub fn add_actual_count(&mut self, actual_count: usize) {
         self.actual_expert_count_sum += actual_count;
         self.actual_expert_token_count += 1;
@@ -145,15 +156,19 @@ impl NimMetrics {
             self.nim_sum = 0.0;
             self.token_count = 0;
             Some((avg, tokens))
-        } else { None }
+        } else {
+            None
+        }
     }
-    
+
     pub fn get_actual_and_reset(&mut self) -> Option<f32> {
         if self.actual_expert_token_count > 0 {
             let avg = self.actual_expert_count_sum as f32 / self.actual_expert_token_count as f32;
             self.actual_expert_count_sum = 0;
             self.actual_expert_token_count = 0;
             Some(avg)
-        } else { None }
+        } else {
+            None
+        }
     }
 }

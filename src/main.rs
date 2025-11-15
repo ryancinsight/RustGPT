@@ -2,9 +2,10 @@ use std::io::Write;
 
 use clap::Parser;
 use llm::{
-    ArchitectureType, AttentionType, Dataset, DatasetType, EMBEDDING_DIM, HIDDEN_DIM,
-    ExpertRouter, HeadSelectionStrategy, LLM, MAX_SEQ_LEN, ModelConfig, Vocab,
-    WindowAdaptationStrategy, build_network, print_architecture_summary,
+    ArchitectureType, AttentionType, EMBEDDING_DIM, HIDDEN_DIM, LLM, MAX_SEQ_LEN, ModelConfig,
+    Vocab, WindowAdaptationStrategy, build_network,
+    dataset_loader::{Dataset, DatasetType},
+    print_architecture_summary,
 };
 
 #[derive(Parser)]
@@ -14,6 +15,49 @@ struct Args {
     /// Enable interactive prompt after training
     #[arg(short)]
     interactive: bool,
+
+    /// Use hard head selection (top-k) instead of soft gating for MoH
+    /// Hard mode: Only compute attention for selected heads (saves computation)
+    /// Soft mode (default): Compute all heads and apply soft gating weights
+    #[arg(long)]
+    hard_heads: bool,
+
+    /// Continue training from an existing model file (skips pre-training)
+    #[arg(long)]
+    continue_from: Option<String>,
+
+    /// Use E-prop (Eligibility Propagation) training instead of standard backpropagation
+    /// E-prop is a biologically plausible online learning algorithm for spiking neural networks
+    /// with O(N) complexity vs O(N²) for standard e-prop
+    #[arg(long)]
+    eprop: bool,
+
+    #[arg(long)]
+    diffusion: bool,
+
+    #[arg(long)]
+    trm: bool,
+
+    #[arg(long, default_value_t = 0.5)]
+    diffusion_ce_weight: f32,
+
+
+    #[arg(long)]
+    trm_recursions: Option<usize>,
+
+    #[arg(long)]
+    trm_supervision_steps: Option<usize>,
+
+    #[arg(long)]
+    trm_inference_steps: Option<usize>,
+
+    /// Number of epochs to run during pre-training (default 100)
+    #[arg(long, default_value_t = 100)]
+    pretrain_epochs: usize,
+
+    /// Number of epochs to run during instruction tuning (default 100)
+    #[arg(long, default_value_t = 100)]
+    instruction_epochs: usize,
 }
 
 fn main() -> llm::Result<()> {
@@ -47,27 +91,34 @@ fn main() -> llm::Result<()> {
     // Choose architecture: Transformer
 
     // let architecture = ArchitectureType::Transformer; // Standard transformer - TESTING FULLY
-    // TRM (Tiny Recursive Model) - recursive reasoning with shared weights
+    // ADAPTIVE MOH
 
-    let architecture = ArchitectureType::TRM; // Tiny Recursive Model (weight sharing)
+    let architecture = if args.trm {
+        ArchitectureType::TRM
+    } else if args.diffusion {
+        ArchitectureType::Diffusion
+    } else {
+        ArchitectureType::Transformer
+    };
 
     let use_dynamic_tanh_norm = true;
+    let _use_hard_head_selection = args.hard_heads;
 
     // ============================================================================
     // FEEDFORWARD CONFIGURATION
     // ============================================================================
-    // Toggle between FeedForward (ReLU) and RichardsGlu for comparison
+    // Toggle between FeedForward (ReLU) and SwiGLU for comparison
     //
     // FeedForward: Standard ReLU-based feedforward
     //   - Activation: ReLU (x → max(0, x))
     //   - Parameters: 2 weight matrices + 2 bias vectors
     //   - Can suffer from dead neurons
     //
-    // RichardsGlu: Advanced gated linear unit with learned Richards activations
-    //   - Activation: Learned Richards curves for both value and gate functions
-    //   - Parameters: 3 weight matrices + Richards parameters, no biases
-    //   - Adaptive activation functions that learn optimal gating behavior
-    //   - Enhanced gradient flow and numerical stability
+    // SwiGLU: Modern gated linear unit with Swish activation
+    //   - Activation: Swish (x → x * sigmoid(x))
+    //   - Parameters: 3 weight matrices, no biases
+    //   - Better gradient flow, enhanced capacity through gating
+    //   - Used in LLaMA, PaLM, Mistral
     // ============================================================================
 
     // ============================================================================
@@ -215,34 +266,6 @@ fn main() -> llm::Result<()> {
     //   - StaticPruning: Fixed head selection (ablation studies only)
     // ============================================================================
 
-    // Head selection strategy (MoH vs standard MHA) - DISABLED for TRM
-    let head_selection = {
-        // ============================================================================
-        // MIXTURE-OF-HEADS DISABLED for TRM
-        // ============================================================================
-        // TRM uses single shared transformer weights for recursive reasoning,
-        // so MoH dynamic head selection is disabled to focus on core TRM functionality
-        // ============================================================================
-        HeadSelectionStrategy::Fixed {
-            num_active: 8, // Use all heads for TRM stability
-        }
-
-        // Alternative: MoH configurations (uncomment to re-enable):
-        // HeadSelectionStrategy::SoftTopP {
-        //     top_p: 0.9,                  // Use 90% probability mass for head selection
-        // HeadSelectionStrategy::MixtureOfHeads {
-        //     num_shared_heads: 2,
-        //     num_active_routed_heads: 4,
-        //     load_balance_weight: 0.01,
-        //     threshold_p_base: 0.4,
-        //     dynamic_loss_weight_base: 5e-5,
-        //     use_learned_threshold: true,
-        //     target_avg_routed_heads: 3.5,
-        //     confidence_threshold: 0.4,
-        //     use_confidence_fallback: false,
-        // }
-    };
-
     // Alternative configurations: (Mixture-of-Heads variants only)
 
     // ============================================================================
@@ -276,16 +299,15 @@ fn main() -> llm::Result<()> {
     // ============================================================================
 
     // Create model configuration
-    let mut config = match architecture {
-        ArchitectureType::Transformer => {
-            ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8))
-        }
-        ArchitectureType::TRM => {
-            let mut config = ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8));
-            config.architecture = ArchitectureType::TRM;
-            config
-        }
-    };
+    let mut config =
+        ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8));
+    config.architecture = architecture;
+    if args.trm {
+        config.trm_use_diffusion = args.diffusion;
+        config.trm_num_recursions = args.trm_recursions;
+        config.trm_max_supervision_steps = args.trm_supervision_steps;
+        config.trm_max_inference_steps = args.trm_inference_steps;
+    }
 
     // Apply modern LLM enhancements configuration
     config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
@@ -296,9 +318,8 @@ fn main() -> llm::Result<()> {
     config.min_window_size = min_window_size;
     config.max_window_size = max_window_size;
     config.window_adaptation_strategy = window_adaptation_strategy;
-    config.head_selection = head_selection;
 
-    // Set attention mechanism: use PolyAttention as an alternative to SelfAttention
+    // Set attention mechanism: use PolyAttention with learned head selection metrics
     config.attention = AttentionType::PolyAttention { degree_p: 3 };
 
     // ============================================================================
@@ -308,44 +329,42 @@ fn main() -> llm::Result<()> {
     //
     // When enabled, replaces standard feedforward layers with sparse MoE layers
     // Each MoE layer contains multiple expert networks with learned routing
+    //
+    // Configuration:
+    //   - use_moe: Enable MoE (false = standard feedforward)
+    //   - num_experts: Total number of experts (4, 8, 16)
+    //   - num_active_experts: Experts to activate per token (1 = Switch, 2 = Mixtral)
+    //   - expert_hidden_dim: Hidden dim for each expert (smaller than hidden_dim)
+    //
+    // Benefits:
+    //   - Increased model capacity without proportional compute increase
+    //   - Sparse activation (only k/N experts active per token)
+    //   - Expert specialization through learned routing
+    //
+    // Parameter Budget (for 4 experts, top-2, expert_hidden_dim=64):
+    //   - Baseline SwiGLU: 3 × (128×256) = 196,608 params
+    //   - MoE: 4 × 3 × (128×64) + router = 196,608 + 512 = 197,120 params
+    //   - Overhead: +0.26% (within budget)
+    //
+    // Recommended configurations:
+    //   - use_moe = false: Standard feedforward (baseline)
+    //   - use_moe = true, num_experts = 4, num_active_experts = 2: Balanced (recommended)
+    //   - use_moe = true, num_experts = 8, num_active_experts = 2: Higher capacity
     // ============================================================================
-
-    // ============================================================================
-    // MIXTURE OF EXPERTS (MoE) - DISABLED for TRM
-    // ============================================================================
-    // TRM uses single shared transformer weights for recursive reasoning,
-    // so MoE/MoH complexity is disabled to focus on core TRM functionality
-    // ============================================================================
-
-    // MoE disabled for TRM - TRM uses single shared weights
-    config.moe_router = None;
-
-    // Uncomment to re-enable MoE (not recommended with TRM):
-    // config.moe_router = Some(ExpertRouter::LearnedMoE {
-    //     num_experts: 4,                    // 4 experts (balanced capacity)
-    //     num_active_experts: 2,             // Top-2 routing (Mixtral-style)
-    //     expert_hidden_dim: 64,             // Smaller experts (128/2 = 64)
-    //     load_balance_weight: 0.01,         // Prevent expert collapse
-    //     sparsity_weight: 0.001,            // Encourage minimal activation
-    //     diversity_weight: 0.005,           // Encourage expert specialization
-    // });
-
 
     // Mock input - test conversational format
     let string = String::from("User: How do mountains form?");
 
-    let dataset = Dataset::new(
-        String::from("data/pretraining_data.json"),
-        String::from("data/chat_training_data.json"),
-        DatasetType::JSON,
-    )?;
+    // Streaming file paths
+    let pre_path = String::from("data/pretraining_data.json");
+    let chat_path = String::from("data/chat_training_data.json");
 
-    // Build vocabulary from training data
-    let all_texts = dataset.pretraining_data.iter()
-        .chain(dataset.chat_training_data.iter())
-        .cloned();
+    let dataset = Dataset::new(pre_path.clone(), chat_path.clone(), DatasetType::JSON)?;
 
-    let vocab = Vocab::build_from_texts(all_texts);
+    let mut all_texts = Vec::new();
+    all_texts.extend(dataset.pretraining_data.iter().cloned());
+    all_texts.extend(dataset.chat_training_data.iter().cloned());
+    let vocab = Vocab::build_from_texts(all_texts.iter());
 
     // Build network based on configuration
     let network = build_network(&config, &vocab);
@@ -353,8 +372,14 @@ fn main() -> llm::Result<()> {
     // Print architecture summary
     print_architecture_summary(&config, &network);
 
-    // Create LLM with the configured network
-    let mut llm = LLM::new(vocab, network);
+    // Create or load LLM
+    let mut llm = if let Some(ref model_path) = args.continue_from {
+        println!("\n=== LOADING EXISTING MODEL ===");
+        println!("Loading model from: {}", model_path);
+        LLM::load_versioned(model_path)?
+    } else {
+        LLM::new(vocab, network)
+    };
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
@@ -364,48 +389,84 @@ fn main() -> llm::Result<()> {
     println!("Input: {}", string);
     println!("Output: {}", llm.predict(&string));
 
-    println!("\n=== PRE-TRAINING MODEL ===");
-    println!(
-        "Pre-training on {} examples for {} epochs with learning rate {}",
-        dataset.pretraining_data.len(),
-        100,
-        0.0005
-    );
+    // Determine training mode
+    let use_eprop = args.eprop;
+    if use_eprop {
+        println!("\n✓ ES-D-RTRL E-PROP TRAINING MODE ENABLED");
+        println!("Using online eligibility-based learning with O(N) trace approximation.");
+        println!("ES-D-RTRL characteristics:");
+        println!("  • Diagonal Jacobian approximation (D-RTRL)");
+        println!("  • Rank-one exponential smoothing");
+        println!("  • Forward-mode gradient computation");
+        println!("  • Enhanced numerical stability controls");
+        println!("  • O(N) complexity vs O(N²) standard e-prop\n");
+    }
 
-    let pretraining_examples: Vec<&str> = dataset
-        .pretraining_data
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    let chat_training_examples: Vec<&str> = dataset
-        .chat_training_data
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    llm.train_with_batch_size(pretraining_examples, 100, 0.001, 256)?;
-
-    println!("\n=== INSTRUCTION TUNING ===");
-    // Use same LR as pre-training
-    let instruction_lr = 0.002;
-    let instruction_epochs = 100;
-    println!(
-        "Instruction tuning on {} examples for {} epochs with learning rate {}",
-        dataset.chat_training_data.len(),
-        instruction_epochs,
-        instruction_lr
-    );
-
-    // Use warmup + cosine annealing for instruction tuning stability
-    let warmup_epochs = 25;
-    llm.train_with_warmup(
-        chat_training_examples,
-        instruction_epochs,
-        instruction_lr,
-        64,
-        warmup_epochs,
-    )?;
+    if args.trm {
+        let pre_texts: Vec<&str> = dataset
+            .pretraining_data
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let chat_texts: Vec<&str> = dataset
+            .chat_training_data
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        llm.train_trm_complete(
+            pre_texts,
+            chat_texts,
+            args.pretrain_epochs,
+            args.instruction_epochs,
+            0.0005,
+            4,
+        )?;
+    } else if args.diffusion {
+        let pre_texts: Vec<&str> = dataset
+            .pretraining_data
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        llm.train_diffusion_ce(pre_texts, args.pretrain_epochs, 0.0005, 4, args.diffusion_ce_weight)?;
+        let chat_texts: Vec<&str> = dataset
+            .chat_training_data
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        llm.train_diffusion_ce(chat_texts, args.instruction_epochs, 0.0005, 4, args.diffusion_ce_weight)?;
+    } else {
+        if args.continue_from.is_none() {
+            println!("\n=== PRE-TRAINING MODEL ===");
+            let pre_count = dataset.pretraining_data.len();
+            println!(
+                "Pre-training on {} examples for {} epochs with learning rate {}",
+                pre_count, args.pretrain_epochs, 0.0005
+            );
+            let pre_texts: Vec<&str> = dataset
+                .pretraining_data
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            llm.train_with_warmup(pre_texts, args.pretrain_epochs, 0.0005, 4, 15)?;
+        } else {
+            println!("\n=== SKIPPING PRE-TRAINING ===");
+            println!("Model already trained, proceeding directly to instruction tuning");
+        }
+        println!("\n=== INSTRUCTION TUNING ===");
+        let instruction_lr = 0.0005;
+        let instruction_epochs = args.instruction_epochs;
+        let chat_count = dataset.chat_training_data.len();
+        println!(
+            "Instruction tuning on {} examples for {} epochs with learning rate {}",
+            chat_count, instruction_epochs, instruction_lr
+        );
+        let chat_texts: Vec<&str> = dataset
+            .chat_training_data
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        llm.train_with_warmup(chat_texts, instruction_epochs, instruction_lr, 4, 15)?;
+    }
 
     // Save trained model to disk for inference
     std::fs::create_dir_all("models").ok();
@@ -423,7 +484,7 @@ fn main() -> llm::Result<()> {
     if args.interactive {
         println!("\n--- Interactive Mode ---");
         println!("Type a prompt and press Enter to generate text.");
-        println!("Using greedy decoding");
+        println!("Using speculative beam search (balanced preset: beam_width=4, lookahead=3)");
         println!("Type 'exit' to quit.");
 
         let mut input = String::new();

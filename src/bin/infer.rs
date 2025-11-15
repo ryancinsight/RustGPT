@@ -5,7 +5,7 @@ use llm::{LLM, MAX_SEQ_LEN};
 
 #[derive(Parser, Debug)]
 #[command(name = "infer")]
-#[command(about = "Interactive chat using a saved RustGPT model")] 
+#[command(about = "Interactive chat using a saved RustGPT model")]
 struct Args {
     /// Path to the saved model (versioned .json or .bin)
     #[arg(short, long, default_value = "models/rustgpt.bin")]
@@ -24,8 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut llm = LLM::load_versioned(&args.model)?;
     println!(
         "Loaded model from {} (max seq len: {}).",
-        &args.model,
-        MAX_SEQ_LEN
+        &args.model, MAX_SEQ_LEN
     );
     println!("Network: {}", llm.network_description());
     println!("Total parameters: {}", llm.total_parameters());

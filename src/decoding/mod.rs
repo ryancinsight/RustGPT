@@ -8,14 +8,12 @@
 //! ```text
 //! decoding/
 //! ├── mod.rs              # Main module exports and coordination
-//! ├── greedy.rs           # Greedy decoding implementation
-//! └── autodeco.rs         # AutoDeco advanced decoding system
+//! └── greedy.rs           # Greedy decoding implementation
 //! ```
 //!
 //! ## Key Components
 //!
 //! - **GreedyDecoder**: Simple greedy token selection
-//! - **AutoDeco**: Advanced end-to-end decoding with learned parameters
 //!
 //! ## Design Principles
 //!
@@ -25,8 +23,6 @@
 //! - **Extensible Design**: Easy to add new decoding methods
 
 pub mod greedy;
-pub mod autodeco;
 
 // Re-export main types for convenience
 pub use greedy::GreedyDecoder;
-pub use autodeco::{AutoDeco, AutoDecoConfig, TemperatureHead, TopPHead};

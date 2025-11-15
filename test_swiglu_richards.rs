@@ -1,22 +1,19 @@
+use llm::{RichardsGlu, llm::Layer};
 use ndarray::Array2;
-use llm::RichardsGlu;
-use llm::llm::Layer;
 
 fn main() {
     println!("Testing RichardsGlu with learned Richards activations...");
 
     // Create a RichardsGlu layer
     let mut richards_glu = RichardsGlu::new(4, 8);
-    
+
     // Create test input (batch_size=2, embedding_dim=4)
-    let input = Array2::from_shape_vec((2, 4), vec![
-        1.0, 0.5, -0.5, 2.0,
-        -1.0, 1.5, 0.0, -0.5,
-    ]).unwrap();
-    
+    let input =
+        Array2::from_shape_vec((2, 4), vec![1.0, 0.5, -0.5, 2.0, -1.0, 1.5, 0.0, -0.5]).unwrap();
+
     println!("Input shape: {:?}", input.shape());
     println!("Input:\n{:?}", input);
-    
+
     // Test forward pass
     let output = richards_glu.forward(&input);
     println!("\nOutput shape: {:?}", output.shape());
@@ -47,16 +44,16 @@ fn main() {
     // Test another forward pass to ensure everything still works
     let output2 = richards_glu.forward(&input);
     println!("\nSecond forward pass output shape: {:?}", output2.shape());
-    
+
     // Check that outputs are different (parameters should have changed)
     let diff_norm = (&output - &output2).mapv(|x| x * x).sum().sqrt();
     println!("Difference norm between outputs: {:.6}", diff_norm);
-    
+
     if diff_norm > 1e-6 {
         println!("✓ Parameters updated successfully (outputs differ)");
     } else {
         println!("⚠ Parameters may not have updated (outputs identical)");
     }
-    
+
     println!("\nSwiGLU with RichardsActivation test completed!");
 }

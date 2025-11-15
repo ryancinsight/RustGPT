@@ -95,6 +95,22 @@ impl Adam {
 
     #[inline]
     pub fn step(&mut self, params: &mut Array2<f32>, grads: &Array2<f32>, lr: f32) {
+        // Validate shapes to avoid runtime panics
+        if params.dim() != grads.dim() {
+            tracing::warn!(
+                "Adam::step shape mismatch: params={:?}, grads={:?} — skipping update",
+                params.dim(),
+                grads.dim()
+            );
+            return;
+        }
+        if self.m.dim() != grads.dim() || self.v.dim() != grads.dim() {
+            self.m = Array2::zeros(grads.dim());
+            self.v = Array2::zeros(grads.dim());
+            if self.use_amsgrad {
+                self.v_hat_max = Some(Array2::zeros(grads.dim()));
+            }
+        }
         self.timestep += 1;
 
         // Apply weight decay (AdamW style: decoupled from gradients)

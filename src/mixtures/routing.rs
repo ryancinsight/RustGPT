@@ -14,10 +14,10 @@
 //! - **SelectionAlgorithm**: Common selection algorithms (TopK, Softmax, etc.)
 //! - **RoutingConfig**: Shared configuration for routing behavior
 
-use serde::{Deserialize, Serialize};
 use ndarray::ArrayView2;
-use crate::softmax::Softmax;
-use crate::mixtures::threshold::ThresholdPredictor;
+use serde::{Deserialize, Serialize};
+
+use crate::{mixtures::threshold::ThresholdPredictor, softmax::Softmax};
 
 /// Common selection algorithms for routing decisions
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,18 +92,12 @@ pub fn apply_selection_algorithm(
     config: &RoutingConfig,
 ) -> ndarray::Array2<f32> {
     match &config.algorithm {
-        SelectionAlgorithm::TopK { k } => {
-            apply_top_k_selection(raw_gates, *k)
-        }
+        SelectionAlgorithm::TopK { k } => apply_top_k_selection(raw_gates, *k),
         SelectionAlgorithm::SoftTopP { top_p } => {
             apply_soft_top_p_selection(raw_gates, *top_p, config.soft_top_p_alpha)
         }
-        SelectionAlgorithm::Softmax => {
-            apply_softmax_selection(raw_gates, config.temperature)
-        }
-        SelectionAlgorithm::Raw => {
-            raw_gates.to_owned()
-        }
+        SelectionAlgorithm::Softmax => apply_softmax_selection(raw_gates, config.temperature),
+        SelectionAlgorithm::Raw => raw_gates.to_owned(),
     }
 }
 
@@ -113,26 +107,34 @@ fn apply_top_k_selection(gates: &ndarray::ArrayView2<f32>, k: usize) -> ndarray:
     let mut result = ndarray::Array2::<f32>::zeros(gates.raw_dim());
 
     // Process each token using iterator chains
-    gates.outer_iter().enumerate().for_each(|(token_idx, token_gates)| {
-        // Create sorted indices by value (descending) using iterator chains
-        let mut indices: Vec<usize> = (0..token_gates.len()).collect();
-        indices.sort_by(|&a, &b| {
-            token_gates[b].partial_cmp(&token_gates[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+    gates
+        .outer_iter()
+        .enumerate()
+        .for_each(|(token_idx, token_gates)| {
+            // Create sorted indices by value (descending) using iterator chains
+            let mut indices: Vec<usize> = (0..token_gates.len()).collect();
+            indices.sort_by(|&a, &b| {
+                token_gates[b]
+                    .partial_cmp(&token_gates[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-        // Set top-k indices to 1.0
-        indices.into_iter().take(k).for_each(|idx| {
-            result[[token_idx, idx]] = 1.0;
+            // Set top-k indices to 1.0
+            indices.into_iter().take(k).for_each(|idx| {
+                result[[token_idx, idx]] = 1.0;
+            });
         });
-    });
 
     result
 }
 
 /// Apply soft top-p selection to gating values (AutoDeco-inspired)
 /// Returns differentiable probability distribution using soft top-p sampling
-fn apply_soft_top_p_selection(gates: &ndarray::ArrayView2<f32>, top_p: f32, alpha: f32) -> ndarray::Array2<f32> {
+fn apply_soft_top_p_selection(
+    gates: &ndarray::ArrayView2<f32>,
+    top_p: f32,
+    alpha: f32,
+) -> ndarray::Array2<f32> {
     let mut result = ndarray::Array2::<f32>::zeros(gates.raw_dim());
 
     // Process each token
@@ -194,7 +196,10 @@ fn apply_soft_top_p_selection(gates: &ndarray::ArrayView2<f32>, top_p: f32, alph
 
 /// Apply softmax selection to gating values
 /// Returns probability distribution over components
-fn apply_softmax_selection(gates: &ndarray::ArrayView2<f32>, temperature: f32) -> ndarray::Array2<f32> {
+fn apply_softmax_selection(
+    gates: &ndarray::ArrayView2<f32>,
+    temperature: f32,
+) -> ndarray::Array2<f32> {
     let mut softmax = Softmax::new();
 
     // Scale gates by temperature
@@ -209,76 +214,102 @@ pub fn compute_routing_entropy(routing_weights: &ndarray::ArrayView2<f32>) -> f3
     let num_tokens = routing_weights.nrows() as f32;
 
     // Use iterator chains for zero-copy entropy computation
-    routing_weights.outer_iter()
+    routing_weights
+        .outer_iter()
         .map(|token_weights| {
-            token_weights.iter()
+            token_weights
+                .iter()
                 .filter(|&&weight| weight > 0.0)
                 .map(|&weight| weight * weight.ln())
                 .sum::<f32>()
         })
         .sum::<f32>()
-        .abs() / num_tokens
+        .abs()
+        / num_tokens
 }
 
 /// Get average number of active components per token
 pub fn compute_avg_active_components(routing_weights: &ndarray::ArrayView2<f32>) -> f32 {
     // Use iterator chains for zero-copy computation
-    routing_weights.outer_iter()
-        .map(|token_weights| {
-            token_weights.iter()
-                .filter(|&&w| w > 0.1)
-                .count() as f32
-        })
-        .sum::<f32>() / routing_weights.nrows() as f32
+    routing_weights
+        .outer_iter()
+        .map(|token_weights| token_weights.iter().filter(|&&w| w > 0.1).count() as f32)
+        .sum::<f32>()
+        / routing_weights.nrows() as f32
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
+
+    use super::*;
 
     #[test]
     fn test_top_k_selection() {
-        let gates = Array2::from_shape_vec((2, 3), vec![
-            0.1, 0.5, 0.3,  // token 0: should select idx 1
-            0.8, 0.2, 0.4,  // token 1: should select idx 0
-        ]).unwrap();
+        let gates = Array2::from_shape_vec(
+            (2, 3),
+            vec![
+                0.1, 0.5, 0.3, // token 0: should select idx 1
+                0.8, 0.2, 0.4, // token 1: should select idx 0
+            ],
+        )
+        .unwrap();
 
         let result = apply_top_k_selection(&gates.view(), 1);
 
-        assert_eq!(result[[0, 0]], 0.0);  // not selected
-        assert_eq!(result[[0, 1]], 1.0);  // selected
-        assert_eq!(result[[0, 2]], 0.0);  // not selected
+        assert_eq!(result[[0, 0]], 0.0); // not selected
+        assert_eq!(result[[0, 1]], 1.0); // selected
+        assert_eq!(result[[0, 2]], 0.0); // not selected
 
-        assert_eq!(result[[1, 0]], 1.0);  // selected
-        assert_eq!(result[[1, 1]], 0.0);  // not selected
-        assert_eq!(result[[1, 2]], 0.0);  // not selected
+        assert_eq!(result[[1, 0]], 1.0); // selected
+        assert_eq!(result[[1, 1]], 0.0); // not selected
+        assert_eq!(result[[1, 2]], 0.0); // not selected
     }
 
     #[test]
     fn test_soft_top_p_selection() {
-        let gates = Array2::from_shape_vec((1, 4), vec![
-            0.4, 0.3, 0.2, 0.1,  // Single token with decreasing probabilities
-        ]).unwrap();
+        let gates = Array2::from_shape_vec(
+            (1, 4),
+            vec![
+                0.4, 0.3, 0.2, 0.1, // Single token with decreasing probabilities
+            ],
+        )
+        .unwrap();
 
         // Test with top_p = 0.7 (should keep top 2 components: 0.4 + 0.3 = 0.7)
         let result = apply_soft_top_p_selection(&gates.view(), 0.7, 50.0);
 
         // Check that result is properly normalized
         let total: f32 = result.row(0).iter().sum();
-        assert!((total - 1.0).abs() < 1e-6, "Soft top-p result should be normalized, got {}", total);
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "Soft top-p result should be normalized, got {}",
+            total
+        );
 
         // With high alpha (50.0), the third component should be almost zero
-        assert!(result[[0, 2]] < 0.01, "Third component should be heavily penalized");
+        assert!(
+            result[[0, 2]] < 0.01,
+            "Third component should be heavily penalized"
+        );
 
         // First two components should have non-zero probability
-        assert!(result[[0, 0]] > 0.0, "First component should have positive probability");
-        assert!(result[[0, 1]] > 0.0, "Second component should have positive probability");
+        assert!(
+            result[[0, 0]] > 0.0,
+            "First component should have positive probability"
+        );
+        assert!(
+            result[[0, 1]] > 0.0,
+            "Second component should have positive probability"
+        );
 
         // Test with top_p = 1.0 (should keep all components)
         let result_all = apply_soft_top_p_selection(&gates.view(), 1.0, 50.0);
         let total_all: f32 = result_all.row(0).iter().sum();
-        assert!((total_all - 1.0).abs() < 1e-6, "Soft top-p with top_p=1.0 should be normalized");
+        assert!(
+            (total_all - 1.0).abs() < 1e-6,
+            "Soft top-p with top_p=1.0 should be normalized"
+        );
     }
 
     #[test]
@@ -306,6 +337,6 @@ mod tests {
         let single_entropy = compute_routing_entropy(&single.view());
 
         assert!(uniform_entropy > single_entropy);
-        assert!(single_entropy < 1e-6);  // approximately 0
+        assert!(single_entropy < 1e-6); // approximately 0
     }
 }

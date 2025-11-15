@@ -1,9 +1,11 @@
 use ndarray::{Array2, s};
-use serde::{Deserialize, Serialize};
+use rayon::prelude::*;
 
-use crate::attention::{head::PolyHead, position::cope::CoPE};
-use crate::mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor};
-use crate::richards::RichardsCurve;
+use crate::{
+    attention::{head::PolyHead, position::cope::CoPE},
+    mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
+    richards::RichardsCurve,
+};
 
 /// Context structure containing all data needed for forward computation
 #[derive(Debug)]
@@ -26,6 +28,7 @@ pub struct ForwardContext<'a> {
     pub b: &'a Array2<f32>,
     pub scale: &'a Array2<f32>,
     pub window_size: Option<usize>,
+    pub cached_soft_top_p_mask: &'a mut Option<Array2<f32>>,
 }
 
 /// Forward computation result containing output and metrics
@@ -37,13 +40,13 @@ pub struct ForwardResult {
 }
 
 /// Compute polynomial attention forward pass
-pub fn compute_poly_attention_forward(
-    ctx: &mut ForwardContext,
-    causal: bool,
-) -> ForwardResult {
+pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) -> ForwardResult {
     // input: (N, embed_dim)
     let (n, d_model) = (ctx.input.nrows(), ctx.input.ncols());
     assert_eq!(d_model, ctx.embed_dim);
+
+    // Reset cached soft top-p mask for this forward pass
+    ctx.cached_soft_top_p_mask.take();
 
     let dk_scale = 1.0f32 / (ctx.head_dim as f32).sqrt();
 
@@ -68,7 +71,8 @@ pub fn compute_poly_attention_forward(
             let a_h = ctx.alpha_g[[0, h_idx]];
             let b_h = ctx.beta_g[[0, h_idx]];
 
-            let max_abs_z = xw_col.iter()
+            let max_abs_z = xw_col
+                .iter()
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
 
@@ -83,7 +87,9 @@ pub fn compute_poly_attention_forward(
             let n_tokens = all_gates[0].nrows();
             let gate_data: Vec<f32> = (0..n_tokens)
                 .flat_map(|token_idx| {
-                    all_gates.iter().map(move |gate_col| gate_col[[token_idx, 0]])
+                    all_gates
+                        .iter()
+                        .map(move |gate_col| gate_col[[token_idx, 0]])
                 })
                 .collect();
 
@@ -94,11 +100,14 @@ pub fn compute_poly_attention_forward(
         };
 
         // Apply soft top-p selection using PadeExp and Richards activation
-        let soft_weights = apply_soft_top_p_with_richards(
+        let mut soft_weights = apply_soft_top_p_with_richards(
             &gate_matrix.view(),
             ctx.head_selection_config.gating.top_p,
             ctx.head_selection_config.gating.soft_top_p_alpha,
         );
+        let activation_scale = ctx.head_selection_config.max_heads.max(1) as f32;
+        soft_weights.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
+        *ctx.cached_soft_top_p_mask = Some(soft_weights.clone());
 
         Some(soft_weights)
     } else {
@@ -106,8 +115,17 @@ pub fn compute_poly_attention_forward(
     };
 
     // Zero-copy iterator-based head processing with accumulation
-    let (active_sums_tmp, token_counts_tmp, (tau_min_local, tau_max_local, tau_sum_local, tau_count_local), (g_sq_sum_local, g_count_local), gate_values_acc, projections_acc) =
-        ctx.heads.iter().enumerate()
+    let (
+        _active_sums_tmp,
+        _token_counts_tmp,
+        (tau_min_local, tau_max_local, tau_sum_local, tau_count_local),
+        (g_sq_sum_local, g_count_local),
+        gate_values_acc,
+        projections_acc,
+    ) = ctx
+        .heads
+        .iter()
+        .enumerate()
         .map(|(h_idx, head)| {
             // Project to Q, K, V using zero-copy views
             let q: Array2<f32> = ctx.input.dot(&head.w_q); // (N, d_h)
@@ -121,7 +139,8 @@ pub fn compute_poly_attention_forward(
             let b_h = ctx.beta_g[[0, h_idx]];
 
             // Compute gate values and metrics using iterator chains
-            let max_abs_z = xw_col.iter()
+            let max_abs_z = xw_col
+                .iter()
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
 
@@ -138,8 +157,12 @@ pub fn compute_poly_attention_forward(
                 if ctx.head_selection_config.gating.use_learned_predictor {
                     // Use learned thresholds (1D array per token)
                     let threshold_sum: f32 = thresholds.iter().sum();
-                    let threshold_min = thresholds.iter().fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
-                    let threshold_max = thresholds.iter().fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
+                    let threshold_min = thresholds
+                        .iter()
+                        .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
+                    let threshold_max = thresholds
+                        .iter()
+                        .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
                     let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
                     let eff_col = &g_col * thresholds;
                     (thresholds.clone(), tau_metrics, eff_col)
@@ -147,8 +170,12 @@ pub fn compute_poly_attention_forward(
                     // Use soft top-p selection (2D array: n_tokens x n_heads)
                     let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
                     let threshold_sum: f32 = head_thresholds.iter().sum();
-                    let threshold_min = head_thresholds.iter().fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
-                    let threshold_max = head_thresholds.iter().fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
+                    let threshold_min = head_thresholds
+                        .iter()
+                        .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
+                    let threshold_max = head_thresholds
+                        .iter()
+                        .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
                     let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
                     let eff_col = &g_col * &head_thresholds;
                     (head_thresholds.to_owned(), tau_metrics, eff_col)
@@ -168,12 +195,38 @@ pub fn compute_poly_attention_forward(
             let token_count = n;
 
             // Return (projections, gates, metrics) for this head
-            ((q, k, v, g_col.clone(), eff_col.clone()), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, eff_col)
+            (
+                (q, k, v, g_col.clone(), eff_col.clone()),
+                (active_sum, token_count),
+                (g_sq_sum, g_count),
+                tau_metrics,
+                eff_col,
+            )
         })
         .fold(
-            (vec![], vec![], (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0), (0.0, 0), vec![], vec![]),
-            |(mut active_acc, mut token_acc, mut tau_acc, mut g_acc, mut gate_values_acc, mut projections_acc),
-             ((q, k, v, g_col, eff_col), (active_sum, token_count), (g_sq_sum, g_count), tau_metrics, gate_col)| {
+            (
+                vec![],
+                vec![],
+                (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
+                (0.0, 0),
+                vec![],
+                vec![],
+            ),
+            |(
+                mut active_acc,
+                mut token_acc,
+                mut tau_acc,
+                mut g_acc,
+                mut gate_values_acc,
+                mut projections_acc,
+            ),
+             (
+                (q, k, v, g_col, eff_col),
+                (active_sum, token_count),
+                (g_sq_sum, g_count),
+                tau_metrics,
+                gate_col,
+            )| {
                 active_acc.push(active_sum);
                 token_acc.push(token_count);
                 tau_acc = (
@@ -185,8 +238,15 @@ pub fn compute_poly_attention_forward(
                 g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
                 gate_values_acc.push(gate_col);
                 projections_acc.push((q, k, v, g_col, eff_col));
-                (active_acc, token_acc, tau_acc, g_acc, gate_values_acc, projections_acc)
-            }
+                (
+                    active_acc,
+                    token_acc,
+                    tau_acc,
+                    g_acc,
+                    gate_values_acc,
+                    projections_acc,
+                )
+            },
         );
 
     // Extract projections for the attention computation loop
@@ -201,7 +261,9 @@ pub fn compute_poly_attention_forward(
         // Use iterator chain to collect all gate values in correct order
         let gate_data: Vec<f32> = (0..n_tokens)
             .flat_map(|token_idx| {
-                gate_values_acc.iter().map(move |gate_col| gate_col[[token_idx, 0]])
+                gate_values_acc
+                    .iter()
+                    .map(move |gate_col| gate_col[[token_idx, 0]])
             })
             .collect();
 
@@ -213,87 +275,95 @@ pub fn compute_poly_attention_forward(
 
     // Process attention computation for each head
     for (h_idx, (q, k, v, _g_col, eff_col)) in head_projections.into_iter().enumerate() {
-
         {
-            // True banded computation per row (avoids building N×N scores)
             let a = ctx.a[[0, 0]];
             let b = ctx.b[[0, 0]];
             let scale = ctx.scale[[0, 0]];
             let p_i32 = ctx.p as i32;
             let start = h_idx * ctx.head_dim;
             let end = start + ctx.head_dim;
-            let w_block = ctx.w_out.slice(s![start..end, ..]); // (d_h, D)
-
-            for i in 0..n {
-                let mut yh_row = Array2::<f32>::zeros((1, ctx.head_dim));
-                let j_start = match ctx.window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
-                let j_end = if causal { i } else { n - 1 };
-
-                // CoPE q·p_pos caching for row i
-                let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
-                let mut q_pe = Vec::with_capacity(max_pos + 1);
-                q_pe.extend((0..=max_pos).map(|pos|
-                    q.row(i).dot(&ctx.cope.pos_embeddings.row(pos))
-                ));
-
-                for j in j_start..=j_end {
-                    let base = q.row(i).dot(&k.row(j)) * dk_scale;
-                    let mut s = base;
-                    let pos = i.saturating_sub(j);
-                    if pos < q_pe.len() { s += q_pe[pos]; }
-
-                    // Mathematical stability: clamp attention scores to prevent overflow in polynomial computation
-                    // Attention scores represent log-probabilities, so clamping to [-10, 10] prevents extreme values
-                    // while preserving the relative ordering needed for attention
-                    let s_clamped = s.max(-10.0).min(10.0);
-
-                    // Numerically stable polynomial computation with overflow protection
-                    let sp = if p_i32 <= 3 {
-                        // Direct computation for small powers (more efficient and stable)
-                        match p_i32 {
-                            1 => s_clamped,
-                            2 => s_clamped * s_clamped,
-                            3 => s_clamped * s_clamped * s_clamped,
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        // For higher powers, use iterative multiplication with overflow check
-                        let mut result = 1.0;
-                        let mut current = s_clamped;
-                        for _ in 0..p_i32 {
-                            result *= current;
-                            // Check for overflow and clamp if necessary
-                            if !result.is_finite() {
-                                result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
-                                break;
-                            }
-                        }
-                        result
+            let w_block = ctx.w_out.slice(s![start..end, ..]);
+            let row_buffers: Vec<(usize, Array2<f32>)> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let j_start = match ctx.window_size {
+                        Some(w) => i.saturating_sub(w - 1),
+                        None => 0,
                     };
+                    let j_end_excl = if causal { i + 1 } else { n };
 
-                    let phi = scale * (a * sp + b);
-                    // yh_row += phi * v[j,:]
-                    for h in 0..ctx.head_dim {
-                        yh_row[[0, h]] += phi * v[[j, h]];
+                    let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
+                    let mut q_pe = Vec::with_capacity(max_pos + 1);
+                    q_pe.extend(
+                        (0..=max_pos).map(|pos| q.row(i).dot(&ctx.cope.pos_embeddings.row(pos))),
+                    );
+
+                    let k_slice = k.slice(s![j_start..j_end_excl, ..]);
+                    let k_slice_t = k_slice.t();
+                    let scores_row = q.row(i).dot(&k_slice_t) * dk_scale;
+                    let m = j_end_excl.saturating_sub(j_start);
+
+                    let mut phi_row = ndarray::Array1::<f32>::zeros(m);
+                    for idx in 0..m {
+                        let j = j_start + idx;
+                        let mut s_val = scores_row[idx];
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() {
+                            s_val += q_pe[pos];
+                        }
+                        let s_clamped = s_val.clamp(-8.0, 8.0);
+                        let sp = if p_i32 <= 3 {
+                            match p_i32 {
+                                1 => s_clamped,
+                                2 => s_clamped * s_clamped,
+                                3 => s_clamped * s_clamped * s_clamped,
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            let mut result: f32 = 1.0;
+                            let current = s_clamped;
+                            for _ in 0..p_i32 {
+                                result *= current;
+                                if !result.is_finite() {
+                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                    break;
+                                }
+                            }
+                            result
+                        };
+                        phi_row[idx] = scale * (a * sp + b);
                     }
-                }
 
-                // Apply gating: eff = g * m for token i (precomputed in eff_col)
-                let eff_i = eff_col[[i, 0]];
-                for h in 0..ctx.head_dim {
-                    yh_row[[0, h]] *= eff_i;
-                }
+                    let v_slice = v.slice(s![j_start..j_end_excl, ..]);
+                    let mut row_buf = Array2::<f32>::zeros((1, ctx.head_dim));
+                    ndarray::linalg::general_mat_mul(
+                        1.0,
+                        &phi_row.view().insert_axis(ndarray::Axis(0)),
+                        &v_slice,
+                        0.0,
+                        &mut row_buf,
+                    );
+                    let eff_i = eff_col[[i, 0]];
+                    row_buf.mapv_inplace(|x| x * eff_i);
+                    (i, row_buf)
+                })
+                .collect();
 
-                // Accumulate into output row i via W_out block
-                let mut out_row = out.slice_mut(s![i..i + 1, ..]);
-                ndarray::linalg::general_mat_mul(1.0, &yh_row, &w_block, 1.0, &mut out_row);
+            let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
+            for (i, buf) in row_buffers {
+                let mut y_row = y_head.slice_mut(s![i..i + 1, ..]);
+                y_row.assign(&buf);
             }
+            let mut out_block = Array2::<f32>::zeros((n, ctx.embed_dim));
+            ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 0.0, &mut out_block);
+            out = out + &out_block;
         }
     }
 
     // Update gating metrics with collected gate values
     if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-        ctx.head_selection_config.update_metrics(&gate_values.view());
+        ctx.head_selection_config
+            .update_metrics(&gate_values.view());
     }
 
     // Update tau metrics from accumulated values
@@ -359,15 +429,17 @@ fn apply_soft_top_p_with_richards(
         }
 
         // Apply soft mask using Richards sigmoid for smooth activation
-        // Richards sigmoid is a non-learning activation that provides smooth, well-behaved gradients
+        // Richards sigmoid is a non-learning activation that provides smooth, well-behaved
+        // gradients
         let mut soft_mask = Vec::with_capacity(cumulative.len());
         for &c in &cumulative {
             let diff = c - top_p;
-            // Richards sigmoid: smooth activation with better gradient properties than standard sigmoid
+            // Richards sigmoid: smooth activation with better gradient properties than standard
+            // sigmoid
             let activation = smooth_sigmoid.forward_scalar((alpha * diff) as f64) as f32;
 
             // Add numerical stabilization: clamp the activation before exponential
-            let clamped_activation = activation.max(-5.0).min(5.0);
+            let clamped_activation = activation.clamp(-5.0, 5.0);
 
             // Apply PadeExp directly for numerical stability
             soft_mask.push(crate::pade::PadeExp::exp(clamped_activation as f64) as f32);

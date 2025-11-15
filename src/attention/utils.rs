@@ -2,7 +2,6 @@ use ndarray::Array2;
 
 /// Attention utility functions for common operations
 /// Provides reusable helper functions for attention mechanisms
-
 /// Apply causal mask in-place to an attention matrix
 /// Sets all elements above the diagonal to 0 (causal masking)
 #[inline]
@@ -62,7 +61,12 @@ pub fn compute_weighted_sum(attention_weights: &Array2<f32>, values: &Array2<f32
 /// Combined attention computation: Q·K^T → softmax → weighted sum with V
 /// Performs the complete attention operation in one function
 #[inline]
-pub fn compute_attention(q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, dk_scale: f32) -> Array2<f32> {
+pub fn compute_attention(
+    q: &Array2<f32>,
+    k: &Array2<f32>,
+    v: &Array2<f32>,
+    dk_scale: f32,
+) -> Array2<f32> {
     let mut scores = compute_attention_scores(q, k, dk_scale);
     apply_softmax_attention(&mut scores);
     compute_weighted_sum(&scores, v)

@@ -30,4 +30,3 @@ pub mod vocabulary;
 // Re-export main types for convenience
 pub use tokenizer::SimpleTokenizer;
 pub use vocabulary::Vocab;
-

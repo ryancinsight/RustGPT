@@ -3,18 +3,31 @@
 //! This module provides reusable transformer block components that can be used
 //! across different transformer architectures (standard, hierarchical, recurrent, etc.).
 //!
-//! The core component is the `TransformerBlock` which encapsulates:
-//! - Pre-attention normalization
-//! - Attention mechanism (PolyAttention with CoPE)
-//! - Pre-feedforward normalization
-//! - Feedforward network (RichardsGlu or MixtureOfExperts)
-//! - Residual connections
+//! The core components are:
+//! - `TransformerBlock`: Standard autoregressive transformer block with:
+//!   - Pre-attention normalization
+//!   - Attention mechanism (PolyAttention with CoPE)
+//!   - Pre-feedforward normalization
+//!   - Feedforward network (RichardsGlu or MixtureOfExperts)
+//!   - Residual connections
+//! - `DiffusionBlock`: Diffusion-based transformer that replaces autoregressive prediction with
+//!   denoising, featuring:
+//!   - Time-conditioned attention for noise level awareness
+//!   - Noise scheduling (linear, cosine, quadratic)
+//!   - Forward/reverse diffusion processes
+//!   - Denoising objective for generative modeling
 
+pub mod diffusion_block;
 pub mod transformer_block;
 
+pub use diffusion_block::{
+    DiffusionBlock, DiffusionBlockConfig, NoiseSchedule, NoiseScheduler, TimeEmbedding,
+};
 pub use transformer_block::{TransformerBlock, TransformerBlockConfig};
 
 /// Re-export key types for convenience
 pub use crate::attention::poly_attention::PolyAttention;
-pub use crate::richards::{RichardsGlu, RichardsNorm};
-pub use crate::mixtures::moe::MixtureOfExperts;
+pub use crate::{
+    mixtures::moe::MixtureOfExperts,
+    richards::{RichardsGlu, RichardsNorm},
+};

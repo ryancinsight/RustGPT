@@ -1,7 +1,7 @@
 use std::{cell::RefCell, thread_local};
+
 use ndarray::Array2;
 
-/// Thread-local scratch memory management to avoid allocations per call and reduce locking overhead
 thread_local! {
     static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)

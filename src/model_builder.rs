@@ -1,13 +1,16 @@
 use crate::{
-    richards::RichardsNorm,
     embeddings::TokenEmbeddings,
+    encoding::Vocab,
     llm::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
-    transformer::TransformerBlock,
+    richards::RichardsNorm,
+    transformer::{
+        DiffusionBlock, TransformerBlock,
+        diffusion_block::{DiffusionBlockConfig, NoiseSchedule},
+    },
     trm::TRM,
 };
-use crate::encoding::Vocab;
 
 /// Build a network based on the provided configuration
 ///
@@ -26,7 +29,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 
     // Add embedding layer (common to all architectures)
     // Position embeddings are handled inside attention (CoPE), so only token embeddings
-    layers.push(LayerEnum::TokenEmbeddings(TokenEmbeddings::new(vocab.clone())));
+    layers.push(LayerEnum::TokenEmbeddings(TokenEmbeddings::new(
+        vocab.clone(),
+    )));
 
     // Build architecture-specific layers
     match config.architecture {
@@ -35,6 +40,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         }
         ArchitectureType::TRM => {
             build_trm_layers(&mut layers, config);
+        }
+        ArchitectureType::Diffusion => {
+            build_diffusion_layers(&mut layers, config, vocab);
         }
     }
 
@@ -54,6 +62,64 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
     layers
 }
 
+/// Build Diffusion Transformer architecture layers
+///
+/// Creates a diffusion-based transformer architecture where each layer
+/// is a DiffusionBlock that performs denoising conditioned on timestep.
+/// The architecture follows the same structure as standard transformers
+/// but predicts noise instead of next tokens.
+fn build_diffusion_layers(
+    layers: &mut Vec<LayerEnum>,
+    config: &ModelConfig,
+    vocab: &crate::encoding::Vocab,
+) {
+    for _layer_idx in 0..config.num_layers {
+        // Build LLaDA-style masked diffusion block config
+        let max_pos = if config.use_adaptive_window {
+            config.max_window_size
+        } else if let Some(w) = config.window_size {
+            w
+        } else {
+            config.max_seq_len
+        }
+        .saturating_sub(1);
+
+        let mask_id = vocab
+            .encode("<mask>")
+            .or_else(|| vocab.encode_or_unknown("<mask>"))
+            .unwrap_or_else(|| vocab.encode_or_unknown("<unk>").unwrap_or(0));
+
+        let block_cfg = DiffusionBlockConfig {
+            embed_dim: config.embedding_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.get_num_heads(),
+            poly_degree: config.get_poly_degree_p(),
+            max_pos,
+            window_size: config.window_size,
+            use_moe: config.moe_router.is_some(),
+            moe_config: config
+                .moe_router
+                .as_ref()
+                .map(|router| crate::mixtures::moe::ExpertRouterConfig::from_router(router)),
+            head_selection: config.head_selection.clone(),
+            time_embed_dim: config.embedding_dim,
+            num_timesteps: 1000,
+            noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
+            causal_attention: false,
+            discrete_masked: true,
+            mask_token_id: Some(mask_id),
+        };
+
+        let diffusion_block = DiffusionBlock::new(block_cfg);
+        layers.push(LayerEnum::DiffusionBlock(Box::new(diffusion_block)));
+    }
+
+    // Final normalization layer prior to logits projection (typical Pre-LN pattern)
+    layers.push(LayerEnum::DynamicTanhNorm(
+        crate::richards::RichardsNorm::new(config.embedding_dim),
+    ));
+}
+
 /// Build Transformer architecture layers
 ///
 /// Creates a Pre-LN-style transformer architecture using consolidated TransformerBlock components.
@@ -71,7 +137,9 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)
-    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
+    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(
+        config.embedding_dim,
+    )));
 }
 
 /// Build TRM (Tiny Recursive Model) layers
@@ -79,12 +147,11 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 /// Creates a single TRM layer that handles recursive reasoning internally.
 /// TRM uses shared weights across recursive operations for efficient reasoning.
 fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    // Create TRM with shared transformer block
     let trm = TRM::from_model_config(config);
     layers.push(LayerEnum::TRM(Box::new(trm)));
-
-    // Final normalization layer prior to logits projection
-    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(config.embedding_dim)));
+    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(
+        config.embedding_dim,
+    )));
 }
 
 /// Print architecture summary
@@ -109,11 +176,23 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
             println!("  Recursions per Step: {}", 2); // From TRM config
             println!("  Max Supervision Steps: {}", 16); // Training mode
             println!("  Max Inference Steps: {}", 3); // Inference mode (much faster)
+            println!(
+                "  TRM Mode: {}",
+                if config.trm_use_diffusion {
+                    "Diffusion"
+                } else {
+                    "Autoregressive"
+                }
+            );
+        }
+        ArchitectureType::Diffusion => {
+            println!("  Number of Layers: {}", config.num_layers);
+            println!("  Diffusion Timesteps: 1000");
+            println!("  Noise Schedule: Cosine (improved DDPM)");
         }
     }
 
     println!("  Max Sequence Length: {}", config.max_seq_len);
-
 
     // Modern LLM Enhancements
     println!("\n🚀 Modern LLM Enhancements:");
@@ -142,7 +221,13 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
         AttentionType::PolyAttention { degree_p } => {
             println!("  ✓ Polynomial Attention (p = {})", degree_p);
             println!("    - Grouped-query heads: {}", config.get_num_heads());
-            println!("    - Sliding window: {}", config.window_size.map(|w: usize| w.to_string()).unwrap_or_else(|| "disabled".to_string()));
+            println!(
+                "    - Sliding window: {}",
+                config
+                    .window_size
+                    .map(|w: usize| w.to_string())
+                    .unwrap_or_else(|| "disabled".to_string())
+            );
         }
         AttentionType::SelfAttention => {
             println!("  ✓ Scaled Dot-Product Self-Attention");
@@ -151,7 +236,17 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     println!("\n🧱 Layer Stack:");
     for (i, layer) in layers.iter().enumerate() {
-        println!("  {}: {}", i, layer.layer_type());
+        let name = match layer {
+            crate::llm::LayerEnum::TRM(_) => {
+                if config.trm_use_diffusion {
+                    "TRM[Diffusion]"
+                } else {
+                    "TRM[Autoregressive]"
+                }
+            }
+            _ => layer.layer_type(),
+        };
+        println!("  {}: {}", i, name);
     }
 
     // Parameter count summary
@@ -254,5 +349,3 @@ fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<Laye
 
     layers
 }
-
-

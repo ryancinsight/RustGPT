@@ -1,4 +1,3 @@
-
 /// Standard sigmoid function: 1 / (1 + exp(-x))
 fn standard_sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
@@ -35,11 +34,11 @@ fn richards_sigmoid_derivative_manual(x: f64, nu: f64, k: f64, m: f64) -> f64 {
     let exp_term = (-k * (x - m)).exp();
     let base = 1.0 + nu * exp_term;
     let power = -1.0 / nu;
-    
+
     // d/dx [(1 + nu * exp(-k*(x-m)))^(-1/nu)]
     // = (-1/nu) * (1 + nu * exp(-k*(x-m)))^(-1/nu - 1) * nu * exp(-k*(x-m)) * (-k)
     // = k * exp(-k*(x-m)) * (1 + nu * exp(-k*(x-m)))^(-1/nu - 1)
-    
+
     k * exp_term * base.powf(power - 1.0)
 }
 
@@ -56,7 +55,7 @@ fn richards_gompertz_derivative_manual(x: f64, _nu: f64, k: f64, m: f64) -> f64 
     // d/dx [exp(-exp(-k*(x-m)))]
     // = exp(-exp(-k*(x-m))) * (-exp(-k*(x-m))) * k
     // = k * exp(-exp(-k*(x-m))) * exp(-k*(x-m))
-    
+
     let exp_neg_kx = (-k * (x - m)).exp();
     let gompertz = (-exp_neg_kx).exp();
     k * gompertz * exp_neg_kx
@@ -67,7 +66,7 @@ fn main() {
 
     // Test inputs covering various ranges
     let test_inputs = vec![
-        -10.0, -5.0, -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0
+        -10.0, -5.0, -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0,
     ];
 
     // === SIGMOID VALIDATION ===
@@ -84,7 +83,7 @@ fn main() {
     for &x in &test_inputs {
         let richards_output = richards_sigmoid_manual(x, 1.0, 1.0, 0.0);
         let std_sigmoid_output = standard_sigmoid(x);
-        
+
         let abs_diff = (richards_output - std_sigmoid_output).abs();
         let rel_diff = if std_sigmoid_output.abs() > 1e-10 {
             abs_diff / std_sigmoid_output.abs() * 100.0
@@ -95,15 +94,17 @@ fn main() {
         max_sigmoid_abs_diff = max_sigmoid_abs_diff.max(abs_diff);
         max_sigmoid_rel_diff = max_sigmoid_rel_diff.max(rel_diff);
 
-        println!("x={:6.1}: Richards={:8.6}, StdSigmoid={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%", 
-                 x, richards_output, std_sigmoid_output, abs_diff, rel_diff);
+        println!(
+            "x={:6.1}: Richards={:8.6}, StdSigmoid={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%",
+            x, richards_output, std_sigmoid_output, abs_diff, rel_diff
+        );
     }
 
     println!("\nGradient Comparison:");
     for &x in &test_inputs {
         let richards_grad = richards_sigmoid_derivative_manual(x, 1.0, 1.0, 0.0);
         let std_sigmoid_grad = standard_sigmoid_derivative(x);
-        
+
         let grad_abs_diff = (richards_grad - std_sigmoid_grad).abs();
         let grad_rel_diff = if std_sigmoid_grad.abs() > 1e-10 {
             grad_abs_diff / std_sigmoid_grad.abs() * 100.0
@@ -114,22 +115,42 @@ fn main() {
         max_sigmoid_grad_abs_diff = max_sigmoid_grad_abs_diff.max(grad_abs_diff);
         max_sigmoid_grad_rel_diff = max_sigmoid_grad_rel_diff.max(grad_rel_diff);
 
-        println!("x={:6.1}: RichardsGrad={:8.6}, StdSigmoidGrad={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%", 
-                 x, richards_grad, std_sigmoid_grad, grad_abs_diff, grad_rel_diff);
+        println!(
+            "x={:6.1}: RichardsGrad={:8.6}, StdSigmoidGrad={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%",
+            x, richards_grad, std_sigmoid_grad, grad_abs_diff, grad_rel_diff
+        );
     }
 
     println!("\nSigmoid Results Summary:");
-    println!("Max forward pass absolute difference: {:.6}", max_sigmoid_abs_diff);
-    println!("Max forward pass relative difference: {:.4}%", max_sigmoid_rel_diff);
-    println!("Max gradient absolute difference: {:.6}", max_sigmoid_grad_abs_diff);
-    println!("Max gradient relative difference: {:.4}%", max_sigmoid_grad_rel_diff);
+    println!(
+        "Max forward pass absolute difference: {:.6}",
+        max_sigmoid_abs_diff
+    );
+    println!(
+        "Max forward pass relative difference: {:.4}%",
+        max_sigmoid_rel_diff
+    );
+    println!(
+        "Max gradient absolute difference: {:.6}",
+        max_sigmoid_grad_abs_diff
+    );
+    println!(
+        "Max gradient relative difference: {:.4}%",
+        max_sigmoid_grad_rel_diff
+    );
 
     if max_sigmoid_abs_diff < 1e-10 && max_sigmoid_grad_abs_diff < 1e-10 {
-        println!("✅ SUCCESS: RichardsCurve sigmoid matches standard sigmoid with machine precision!");
+        println!(
+            "✅ SUCCESS: RichardsCurve sigmoid matches standard sigmoid with machine precision!"
+        );
     } else if max_sigmoid_abs_diff < 1e-6 && max_sigmoid_grad_abs_diff < 1e-6 {
-        println!("✅ GOOD: RichardsCurve sigmoid matches standard sigmoid within acceptable tolerance!");
+        println!(
+            "✅ GOOD: RichardsCurve sigmoid matches standard sigmoid within acceptable tolerance!"
+        );
     } else {
-        println!("❌ ISSUE: RichardsCurve sigmoid has significant differences from standard sigmoid!");
+        println!(
+            "❌ ISSUE: RichardsCurve sigmoid has significant differences from standard sigmoid!"
+        );
     }
 
     // === GOMPERTZ VALIDATION ===
@@ -146,7 +167,7 @@ fn main() {
     for &x in &test_inputs {
         let richards_output = richards_gompertz_manual(x, 0.01, 1.0, 0.0);
         let std_gompertz_output = standard_gompertz(x);
-        
+
         let abs_diff = (richards_output - std_gompertz_output).abs();
         let rel_diff = if std_gompertz_output.abs() > 1e-10 {
             abs_diff / std_gompertz_output.abs() * 100.0
@@ -157,15 +178,17 @@ fn main() {
         max_gompertz_abs_diff = max_gompertz_abs_diff.max(abs_diff);
         max_gompertz_rel_diff = max_gompertz_rel_diff.max(rel_diff);
 
-        println!("x={:6.1}: Richards={:8.6}, StdGompertz={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%", 
-                 x, richards_output, std_gompertz_output, abs_diff, rel_diff);
+        println!(
+            "x={:6.1}: Richards={:8.6}, StdGompertz={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%",
+            x, richards_output, std_gompertz_output, abs_diff, rel_diff
+        );
     }
 
     println!("\nGradient Comparison:");
     for &x in &test_inputs {
         let richards_grad = richards_gompertz_derivative_manual(x, 0.01, 1.0, 0.0);
         let std_gompertz_grad = standard_gompertz_derivative(x);
-        
+
         let grad_abs_diff = (richards_grad - std_gompertz_grad).abs();
         let grad_rel_diff = if std_gompertz_grad.abs() > 1e-10 {
             grad_abs_diff / std_gompertz_grad.abs() * 100.0
@@ -176,48 +199,70 @@ fn main() {
         max_gompertz_grad_abs_diff = max_gompertz_grad_abs_diff.max(grad_abs_diff);
         max_gompertz_grad_rel_diff = max_gompertz_grad_rel_diff.max(grad_rel_diff);
 
-        println!("x={:6.1}: RichardsGrad={:8.6}, StdGompertzGrad={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%", 
-                 x, richards_grad, std_gompertz_grad, grad_abs_diff, grad_rel_diff);
+        println!(
+            "x={:6.1}: RichardsGrad={:8.6}, StdGompertzGrad={:8.6}, AbsDiff={:10.6}, RelDiff={:7.4}%",
+            x, richards_grad, std_gompertz_grad, grad_abs_diff, grad_rel_diff
+        );
     }
 
     println!("\nGompertz Results Summary:");
-    println!("Max forward pass absolute difference: {:.6}", max_gompertz_abs_diff);
-    println!("Max forward pass relative difference: {:.4}%", max_gompertz_rel_diff);
-    println!("Max gradient absolute difference: {:.6}", max_gompertz_grad_abs_diff);
-    println!("Max gradient relative difference: {:.4}%", max_gompertz_grad_rel_diff);
+    println!(
+        "Max forward pass absolute difference: {:.6}",
+        max_gompertz_abs_diff
+    );
+    println!(
+        "Max forward pass relative difference: {:.4}%",
+        max_gompertz_rel_diff
+    );
+    println!(
+        "Max gradient absolute difference: {:.6}",
+        max_gompertz_grad_abs_diff
+    );
+    println!(
+        "Max gradient relative difference: {:.4}%",
+        max_gompertz_grad_rel_diff
+    );
 
     if max_gompertz_abs_diff < 1e-6 && max_gompertz_grad_abs_diff < 1e-6 {
-        println!("✅ SUCCESS: RichardsCurve Gompertz matches standard Gompertz within excellent tolerance!");
+        println!(
+            "✅ SUCCESS: RichardsCurve Gompertz matches standard Gompertz within excellent tolerance!"
+        );
     } else if max_gompertz_abs_diff < 1e-3 && max_gompertz_grad_abs_diff < 1e-3 {
-        println!("✅ GOOD: RichardsCurve Gompertz matches standard Gompertz within acceptable tolerance!");
+        println!(
+            "✅ GOOD: RichardsCurve Gompertz matches standard Gompertz within acceptable tolerance!"
+        );
     } else {
-        println!("❌ ISSUE: RichardsCurve Gompertz has significant differences from standard Gompertz!");
+        println!(
+            "❌ ISSUE: RichardsCurve Gompertz has significant differences from standard Gompertz!"
+        );
     }
 
     // === PARAMETER ANALYSIS ===
     println!("\n=== PARAMETER ANALYSIS ===");
-    
+
     println!("Sigmoid Parameters Analysis:");
     println!("- nu=1.0: Correct for standard sigmoid (Richards curve reduces to logistic)");
     println!("- k=1.0: Correct growth rate for standard sigmoid");
     println!("- m=0.0: Correct midpoint for standard sigmoid");
-    
+
     println!("\nGompertz Parameters Analysis:");
     println!("- nu=0.01: Small value approximates Gompertz limit (nu→0)");
     println!("- k=1.0: Growth rate parameter");
     println!("- m=0.0: Midpoint parameter");
-    
+
     // Test different nu values for Gompertz to see convergence
     println!("\nGompertz Convergence Test (different nu values):");
     let nu_values = vec![1.0, 0.1, 0.01, 0.001, 0.0001];
     let test_x = 1.0f64;
     let std_gompertz_at_1 = standard_gompertz(test_x);
-    
+
     for &nu in &nu_values {
         let richards_approx = richards_sigmoid_manual(test_x, nu, 1.0, 0.0);
         let diff = (richards_approx - std_gompertz_at_1).abs();
-        println!("nu={:6.4}: Richards={:8.6}, StdGompertz={:8.6}, Diff={:10.6}", 
-                 nu, richards_approx, std_gompertz_at_1, diff);
+        println!(
+            "nu={:6.4}: Richards={:8.6}, StdGompertz={:8.6}, Diff={:10.6}",
+            nu, richards_approx, std_gompertz_at_1, diff
+        );
     }
 
     println!("\n=== OVERALL SUMMARY ===");

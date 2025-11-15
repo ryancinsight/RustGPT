@@ -35,14 +35,14 @@ impl SimpleTokenizer {
                 .chain(
                     word.chars()
                         .filter(|c| c.is_ascii_punctuation())
-                        .map(|c| c.to_string())
+                        .map(|c| c.to_string()),
                 );
 
             for token in word_tokens {
                 if let Some(token_id) = vocab.encode(&token) {
                     tokens.push(token_id);
-                } else if let Some(unk_id) = vocab.unknown_token()
-                    .and_then(|unk| vocab.encode(unk)) {
+                } else if let Some(unk_id) = vocab.unknown_token().and_then(|unk| vocab.encode(unk))
+                {
                     tokens.push(unk_id);
                 }
             }
@@ -50,8 +50,6 @@ impl SimpleTokenizer {
 
         tokens
     }
-
-
 }
 
 impl Default for SimpleTokenizer {

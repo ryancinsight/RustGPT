@@ -26,13 +26,15 @@
 //!
 //! ### Using Soft Top-P Sampling for Mixture of Heads
 //! ```rust
-//! use crate::mixtures::gating::GatingStrategy;
-//! use crate::mixtures::moh::{HeadSelectionStrategy, HeadSelectionConfig};
+//! use llm::mixtures::{
+//!     gating::GatingStrategy,
+//!     moh::{HeadSelectionConfig, HeadSelectionStrategy},
+//! };
 //!
 //! // Create a soft top-p strategy with 90% probability mass and sharp transitions
 //! let strategy = HeadSelectionStrategy::SoftTopP {
 //!     top_p: 0.9,
-//!     soft_top_p_alpha: 50.0,  // Higher = sharper top-p cutoff
+//!     soft_top_p_alpha: 50.0, // Higher = sharper top-p cutoff
 //! };
 //!
 //! // Create head selection config from strategy
@@ -40,10 +42,12 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use crate::llm::Layer;
-use crate::mixtures::gating::{GatingStrategy, GatingConfig};
-use crate::mixtures::threshold::ThresholdPredictor;
-use crate::mixtures::routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm};
+
+use crate::mixtures::{
+    gating::{GatingConfig, GatingStrategy},
+    routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm},
+    threshold::ThresholdPredictor,
+};
 
 /// Strategy for selecting which attention heads to activate
 ///
@@ -99,9 +103,9 @@ impl HeadSelectionConfig {
         match strategy {
             GatingStrategy::Learned {
                 num_active,
-                complexity_loss_weight,
-                load_balance_weight,
-                sparsity_weight,
+                complexity_loss_weight: _complexity_loss_weight,
+                load_balance_weight: _load_balance_weight,
+                sparsity_weight: _sparsity_weight,
             } => Self {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1, // Default min, could be parameterized
@@ -113,9 +117,12 @@ impl HeadSelectionConfig {
                 metrics_g_sq_sum: 0.0,
                 metrics_g_count: 0,
             },
-            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha: _ } => Self {
+            GatingStrategy::SoftTopP {
+                top_p: _top_p,
+                soft_top_p_alpha: _,
+            } => Self {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
-                min_heads: 1, // Allow flexible selection with soft top-p
+                min_heads: 1,         // Allow flexible selection with soft top-p
                 max_heads: num_heads, // All heads available for selection
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
@@ -195,7 +202,10 @@ impl HeadRouter {
                 temperature: 1.0,
                 soft_top_p_alpha: 50.0,
             },
-            GatingStrategy::SoftTopP { top_p, soft_top_p_alpha } => RoutingConfig {
+            GatingStrategy::SoftTopP {
+                top_p,
+                soft_top_p_alpha,
+            } => RoutingConfig {
                 algorithm: SelectionAlgorithm::SoftTopP { top_p: *top_p },
                 use_learned_predictor: false,
                 num_active: num_heads, // All heads available for soft selection
@@ -235,10 +245,12 @@ impl Router for HeadRouter {
             let active_heads = self.config.num_active.min(self.num_heads);
 
             let gate_data: Vec<f32> = (0..n_tokens)
-                .flat_map(|token_idx| {
-                    (0..self.num_heads).map(move |head_idx| {
-                        if head_idx < active_heads { 1.0 } else { 0.0 }
-                    })
+                .flat_map(|_token_idx| {
+                    (0..self.num_heads).map(
+                        move |head_idx| {
+                            if head_idx < active_heads { 1.0 } else { 0.0 }
+                        },
+                    )
                 })
                 .collect();
 
@@ -247,7 +259,8 @@ impl Router for HeadRouter {
         };
 
         // Apply selection algorithm
-        let routing_weights = crate::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
+        let routing_weights =
+            crate::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
 
         RoutingResult {
             routing_weights,
@@ -261,8 +274,9 @@ pub type HeadSelectionPredictor = ThresholdPredictor;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
+
+    use super::*;
 
     #[test]
     fn test_head_selection_config_default() {
@@ -309,12 +323,16 @@ mod tests {
     fn test_load_balance_loss() {
         let mut config = HeadSelectionConfig::default();
         // Simulate gating values for load balancing test
-        let gate_values = ndarray::Array2::from_shape_vec((4, 8), vec![
-            0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, // token 1
-            0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, // token 2
-            0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, // token 3
-            0.1, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, // token 4
-        ]).unwrap();
+        let gate_values = ndarray::Array2::from_shape_vec(
+            (4, 8),
+            vec![
+                0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, // token 1
+                0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, // token 2
+                0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, // token 3
+                0.1, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, // token 4
+            ],
+        )
+        .unwrap();
 
         config.update_metrics(&gate_values.view());
 

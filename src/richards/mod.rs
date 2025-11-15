@@ -6,12 +6,13 @@ pub mod richards_glu;
 pub mod richards_norm;
 
 // Re-export PadeExp from the shared pade module
+pub use self::{
+    richards_act::*,
+    richards_curve::{RichardsCurve, WeightsIter},
+    richards_glu::*,
+    richards_norm::*,
+};
 pub use crate::pade::*;
-
-pub use self::richards_act::*;
-pub use self::richards_curve::{RichardsCurve, WeightsIter};
-pub use self::richards_glu::*;
-pub use self::richards_norm::*;
 
 /// Variant types for Richards curve initialization and constraints
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]

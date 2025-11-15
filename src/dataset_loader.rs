@@ -58,31 +58,55 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
     // convert json file to Vec<String>
     let data_json_raw = fs::read_to_string(path).map_err(ModelError::from)?;
 
-    // First attempt: strict JSON parsing
     match serde_json::from_str::<Vec<String>>(&data_json_raw) {
-        Ok(strict) => return Ok(strict),
+        Ok(strict) => Ok(strict),
         Err(_) => {
-            // Fallback: relaxed line-based parsing to handle comma-only lines or split commas
+            let parsed = serde_json::from_str::<Vec<serde_json::Value>>(&data_json_raw);
+            if let Ok(vals) = parsed {
+                let mut out: Vec<String> = Vec::new();
+                for v in vals {
+                    match v {
+                        serde_json::Value::String(s) => out.push(s),
+                        serde_json::Value::Object(map) => {
+                            if let Some(serde_json::Value::String(s)) = map.get("text") {
+                                out.push(s.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
             let mut items = Vec::new();
             for line in data_json_raw.lines() {
                 let t = line.trim();
-                if t.is_empty() || t == "," || t == "[" || t == "]" { continue; }
-                // Accept lines like "...", or "...",
+                if t.is_empty() || t == "," || t == "[" || t == "]" {
+                    continue;
+                }
                 if t.starts_with('"') {
                     let mut s = t.trim_end_matches(',').to_string();
-                    // Remove surrounding quotes
                     if s.starts_with('"') && s.ends_with('"') {
-                        s = s[1..s.len()-1].to_string();
+                        s = s[1..s.len() - 1].to_string();
                     }
                     items.push(s);
                 }
             }
             if items.is_empty() {
-                // If still empty, return original error for visibility
-                return serde_json::from_str::<Vec<String>>(&data_json_raw).map_err(|e| ModelError::Serialization { source: Box::new(e) });
+                serde_json::from_str::<Vec<String>>(&data_json_raw).map_err(|e| {
+                    ModelError::Serialization {
+                        source: Box::new(e),
+                    }
+                })
+            } else {
+                tracing::warn!(
+                    path = path,
+                    count = items.len(),
+                    "Loaded JSON via relaxed parser (found formatting artifacts)"
+                );
+                Ok(items)
             }
-            tracing::warn!(path = path, count = items.len(), "Loaded JSON via relaxed parser (found formatting artifacts)");
-            Ok(items)
         }
     }
 }
@@ -113,4 +137,34 @@ fn get_data_from_csv(path: &str) -> Result<Vec<String>> {
         data.push(record.iter().collect::<Vec<_>>().join(","));
     }
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_array_of_strings() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "[\"a\",\"b\",\"c\"]").unwrap();
+        let path = f.path().to_str().unwrap();
+        let data = get_data_from_json(path).unwrap();
+        assert_eq!(data.len(), 3);
+        assert_eq!(data[0], "a");
+    }
+
+    #[test]
+    fn test_parse_array_of_objects() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "[{{\"text\":\"hello\"}},{{\"text\":\"world\"}}]").unwrap();
+        let path = f.path().to_str().unwrap();
+        let data = get_data_from_json(path).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0], "hello");
+        assert_eq!(data[1], "world");
+    }
 }
