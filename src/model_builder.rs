@@ -104,11 +104,12 @@ fn build_diffusion_layers(
             head_selection: config.head_selection.clone(),
             time_embed_dim: config.embedding_dim,
             num_timesteps: 1000,
-            noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
+            noise_schedule: config.diffusion_noise_schedule.clone(),
             causal_attention: false,
             discrete_masked: true,
             mask_token_id: Some(mask_id),
             prediction_target: config.diffusion_prediction_target,
+            timestep_strategy: config.diffusion_timestep_strategy,
         };
 
         let diffusion_block = DiffusionBlock::new(block_cfg);
@@ -189,7 +190,16 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
         ArchitectureType::Diffusion => {
             println!("  Number of Layers: {}", config.num_layers);
             println!("  Diffusion Timesteps: 1000");
-            println!("  Noise Schedule: Cosine (improved DDPM)");
+            let schedule_label = match &config.diffusion_noise_schedule {
+                NoiseSchedule::Cosine { .. } => "Cosine (Improved DDPM)",
+                NoiseSchedule::Linear { .. } => "Linear",
+                NoiseSchedule::Quadratic { .. } => "Quadratic",
+            };
+            println!("  Noise Schedule: {}", schedule_label);
+            println!(
+                "  Timestep Sampling: {:?}",
+                config.diffusion_timestep_strategy
+            );
         }
     }
 
@@ -265,7 +275,10 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transformer::diffusion_block::DiffusionPredictionTarget;
+    use crate::{
+        model_config::DiffusionTimestepStrategy,
+        transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
+    };
 
     #[test]
     fn test_build_transformer_network() {
@@ -302,6 +315,38 @@ mod tests {
             .expect("diffusion block not found");
 
         assert_eq!(prediction, DiffusionPredictionTarget::VPrediction);
+    }
+
+    #[test]
+    fn test_diffusion_network_inherits_schedule_and_sampling() {
+        let vocab = Vocab::new(vec!["<pad>", "<mask>", "world"]);
+        let mut config = ModelConfig::transformer(32, 64, 1, 32, None, Some(4));
+        config.architecture = ArchitectureType::Diffusion;
+        config.diffusion_noise_schedule = NoiseSchedule::Linear {
+            beta_min: 1e-4,
+            beta_max: 0.02,
+        };
+        config.diffusion_timestep_strategy = DiffusionTimestepStrategy::MinSnr;
+
+        let layers = build_network(&config, &vocab);
+        let mut found = false;
+        for layer in &layers {
+            if let LayerEnum::DiffusionBlock(block) = layer {
+                match block.noise_schedule() {
+                    NoiseSchedule::Linear { beta_min, beta_max } => {
+                        assert!((*beta_min - 1e-4).abs() < f32::EPSILON);
+                        assert!((*beta_max - 0.02).abs() < f32::EPSILON);
+                    }
+                    other => panic!("unexpected schedule: {:?}", other),
+                }
+                assert_eq!(
+                    block.timestep_strategy(),
+                    DiffusionTimestepStrategy::MinSnr
+                );
+                found = true;
+            }
+        }
+        assert!(found, "diffusion block not constructed");
     }
 }
 

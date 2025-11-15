@@ -2,6 +2,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use llm::{
     Layer,
     mixtures::HeadSelectionStrategy,
+    model_config::DiffusionTimestepStrategy,
     transformer::diffusion_block::{
         DiffusionBlock,
         DiffusionBlockConfig,
@@ -29,6 +30,7 @@ fn bench_forward(c: &mut Criterion) {
         discrete_masked: false,
         mask_token_id: None,
         prediction_target: DiffusionPredictionTarget::default(),
+        timestep_strategy: DiffusionTimestepStrategy::Uniform,
     };
     let mut block = DiffusionBlock::new(config);
     block.set_timestep(500);
@@ -59,6 +61,7 @@ fn bench_sample(c: &mut Criterion) {
         discrete_masked: false,
         mask_token_id: None,
         prediction_target: DiffusionPredictionTarget::default(),
+        timestep_strategy: DiffusionTimestepStrategy::Uniform,
     };
     let mut block = DiffusionBlock::new(config);
     c.bench_function("diffusion_block_sample_50", |b| {

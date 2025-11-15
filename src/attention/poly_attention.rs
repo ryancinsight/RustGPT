@@ -286,18 +286,7 @@ impl PolyAttention {
         let cope = init_cope(max_pos, head_dim);
         let gate_poly = init_gate_polynomial();
 
-        let mut opt_a = opt_a;
-        let mut opt_b = opt_b;
-        let mut opt_scale = opt_scale;
-        let mut opt_w_g = opt_w_g;
-        let mut opt_alpha_g = opt_alpha_g;
-        let mut opt_beta_g = opt_beta_g;
-        opt_a.set_amsgrad(true);
-        opt_b.set_amsgrad(true);
-        opt_scale.set_amsgrad(true);
-        opt_w_g.set_amsgrad(true);
-        opt_alpha_g.set_amsgrad(true);
-        opt_beta_g.set_amsgrad(true);
+        
 
         let mut opt_a = opt_a;
         let mut opt_b = opt_b;
@@ -501,7 +490,7 @@ impl PolyAttention {
 
         // Threshold predictor gradient accumulator (shared across heads)
         let mut threshold_grad_accum = if self.head_selection_config.gating.use_learned_predictor {
-            Some(Array2::<f32>::zeros((n, 1)))
+            Some(Array2::<f32>::zeros((n, self.num_heads)))
         } else {
             None
         };
@@ -573,9 +562,9 @@ impl PolyAttention {
             if self.head_selection_config.gating.use_learned_predictor
                 && let Some(predictor) = &self.threshold_predictor
             {
-                // Use forward pass (activations should be cached from training forward pass)
                 let thresholds = predictor.forward(&input.view());
-                m_col.assign(&thresholds);
+                let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
+                m_col.assign(&head_thresholds);
             } else if self.head_selection_config.gating.use_soft_top_p {
                 if let Some(mask) = &self.cached_soft_top_p_mask {
                     if mask.nrows() == n && mask.ncols() == self.num_heads {
@@ -933,7 +922,7 @@ impl PolyAttention {
                         let g_i = g_col[[i, 0]];
                         for h in 0..self.head_dim {
                             let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                            threshold_grad_accum[[i, 0]] +=
+                            threshold_grad_accum[[i, h_idx]] +=
                                 g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
                         }
                     }
@@ -965,11 +954,10 @@ impl PolyAttention {
                 || self.head_selection_config.gating.load_balance_weight > 0.0
                 || self.head_selection_config.gating.sparsity_weight > 0.0)
         {
-            // Use the new predictor for threshold computation
-            let m_vec = if let Some(predictor) = &self.threshold_predictor {
+            let m_mat = if let Some(predictor) = &self.threshold_predictor {
                 predictor.forward(&input.view())
             } else {
-                Array2::<f32>::ones((n, 1)) // Fallback
+                Array2::<f32>::ones((n, self.num_heads))
             };
 
             // Precompute g(z) and eff per head
@@ -993,7 +981,7 @@ impl PolyAttention {
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
                     g_mat[[i, h]] = g_col[[i, 0]];
-                    eff_mat[[i, h]] = g_col[[i, 0]] * m_vec[[i, 0]];
+                    eff_mat[[i, h]] = g_col[[i, 0]] * m_mat[[i, h]];
                 }
             }
 
@@ -1004,7 +992,7 @@ impl PolyAttention {
                 * 0.5;
 
             for i in 0..n {
-                let m_i = m_vec[[i, 0]];
+                
                 // sum over heads
                 let mut s = 0.0f32;
                 for h in 0..self.num_heads {
@@ -1036,7 +1024,7 @@ impl PolyAttention {
                             * (eff_h - mean);
                     }
                     // gating path
-                    let d_g_i = d_eff_h * m_i;
+                    let d_g_i = d_eff_h * m_mat[[i, h]];
                     let a_h = self.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
                     let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_vec[h]);
@@ -1059,12 +1047,10 @@ impl PolyAttention {
                         grad_input_total[[i, d]] += a_h * self.w_g[[d, h]] * grad_g_i;
                     }
 
-                    // threshold accumulation uses g
-                    _d_m_total += d_eff_h * g_mat[[i, h]];
+                    if let Some(th_acc) = threshold_grad_accum.as_mut() {
+                        th_acc[[i, h]] += d_eff_h * g_mat[[i, h]];
+                    }
                 }
-
-                // threshold predictor grads - simplified for new predictor
-                // TODO: Implement proper gradient computation for the two-layer network
             }
         }
 
@@ -1335,7 +1321,8 @@ impl PolyAttention {
                     && let Some(predictor) = &self.threshold_predictor
                 {
                     let thresholds = predictor.forward(&input.view());
-                    m_col.assign(&thresholds);
+                    let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
+                    m_col.assign(&head_thresholds);
                 } else if self.head_selection_config.gating.use_soft_top_p {
                     if let Some(mask) = &self.cached_soft_top_p_mask {
                         if mask.nrows() == n && mask.ncols() == self.num_heads {
@@ -1364,7 +1351,7 @@ impl PolyAttention {
                 let mut grad_b_scalar_local: f32 = 0.0;
                 let mut grad_scale_scalar_local: f32 = 0.0;
                 let mut threshold_accum_local = if self.head_selection_config.gating.use_learned_predictor {
-                    Some(Array2::<f32>::zeros((n, 1)))
+                    Some(Array2::<f32>::zeros((n, self.num_heads)))
                 } else { None };
                 let mut anomaly = false;
 
@@ -1454,7 +1441,7 @@ impl PolyAttention {
                         let g_i = g_col[[i, 0]];
                         for h in 0..self.head_dim {
                             let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                            threshold_grad_accum[[i, 0]] += g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                            threshold_grad_accum[[i, h_idx]] += g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
                         }
                     }
                 }
@@ -1495,7 +1482,7 @@ impl PolyAttention {
         let mut grad_scale_scalar: f32 = 0.0;
         let mut grad_gate_poly_vec_acc = vec![0.0f64; n_gate_w];
         let mut grad_cope_pos = Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
-        let mut threshold_grad_accum = if self.head_selection_config.gating.use_learned_predictor { Some(Array2::<f32>::zeros((n, 1))) } else { None };
+        let mut threshold_grad_accum = if self.head_selection_config.gating.use_learned_predictor { Some(Array2::<f32>::zeros((n, self.num_heads))) } else { None };
         let mut gradient_anomaly_detected = false;
 
         for (h_idx, (
@@ -1541,7 +1528,7 @@ impl PolyAttention {
                 || self.head_selection_config.gating.load_balance_weight > 0.0
                 || self.head_selection_config.gating.sparsity_weight > 0.0)
         {
-            let m_vec = if let Some(predictor) = &self.threshold_predictor { predictor.forward(&input.view()) } else { Array2::<f32>::ones((n, 1)) };
+            let m_mat = if let Some(predictor) = &self.threshold_predictor { predictor.forward(&input.view()) } else { Array2::<f32>::ones((n, self.num_heads)) };
             let mut g_mat = Array2::<f32>::zeros((n, self.num_heads));
             let mut eff_mat = Array2::<f32>::zeros((n, self.num_heads));
             let mut z_mat = Array2::<f32>::zeros((n, self.num_heads));
@@ -1561,14 +1548,13 @@ impl PolyAttention {
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
                     g_mat[[i, h]] = g_col[[i, 0]];
-                    eff_mat[[i, h]] = g_col[[i, 0]] * m_vec[[i, 0]];
+                    eff_mat[[i, h]] = g_col[[i, 0]] * m_mat[[i, h]];
                 }
             }
             let inv_n = 1.0f32 / (n as f32);
             let inv_h = 1.0f32 / (self.num_heads as f32);
             let target_heads = ((self.head_selection_config.min_heads + self.head_selection_config.max_heads) as f32) * 0.5;
             for i in 0..n {
-                let m_i = m_vec[[i, 0]];
                 let mut s = 0.0f32;
                 for h in 0..self.num_heads { s += eff_mat[[i, h]]; }
                 let mean = s * inv_h;
@@ -1579,7 +1565,7 @@ impl PolyAttention {
                     let eff_h = eff_mat[[i, h]];
                     let mut d_eff_h = base_d;
                     if self.head_selection_config.gating.load_balance_weight > 0.0 { d_eff_h += 2.0 * self.head_selection_config.gating.load_balance_weight * inv_n * inv_h * (eff_h - mean); }
-                    let d_g_i = d_eff_h * m_i;
+                    let d_g_i = d_eff_h * m_mat[[i, h]];
                     let a_h = self.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
                     let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_vec[h]);
@@ -1590,6 +1576,7 @@ impl PolyAttention {
                     grad_alpha_g[[0, h]] += grad_g_i * xw_val;
                     grad_beta_g[[0, h]] += grad_g_i;
                     for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_h * self.w_g[[d, h]] * grad_g_i; }
+                    if let Some(acc) = threshold_grad_accum.as_mut() { acc[[i, h]] += d_eff_h * g_mat[[i, h]]; }
                 }
             }
         }
@@ -1732,6 +1719,7 @@ impl PolyAttention {
             &mut self.head_selection_config,
             &mut self.threshold_predictor,
             self.embed_dim,
+            self.num_heads,
             &mut self.opt_w_tau,
             &mut self.opt_b_tau,
             &mut self.opt_w2_tau,
@@ -1885,6 +1873,35 @@ mod tests {
         let p0 = pa.p;
         pa.adapt_degree(&m);
         assert!(pa.p <= p0);
+    }
+
+    #[test]
+    fn moh_learned_predictor_per_head_thresholds() {
+        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let strategy = crate::mixtures::moh::HeadSelectionStrategy::Learned {
+            num_active: 4,
+            load_balance_weight: 0.1,
+            complexity_loss_weight: 0.05,
+            sparsity_weight: 0.01,
+        };
+        pa.set_head_selection_config(&strategy);
+        let n = 6;
+        let d = 32;
+        let mut input = Array2::<f32>::zeros((n, d));
+        for i in 0..n { for j in 0..d { input[[i,j]] = ((i * d + j) as f32 * 0.003).cos(); } }
+        let _out = pa.forward_impl(&input, true);
+        let tau = pa.take_tau_metrics();
+        assert!(tau.is_some());
+        let pred_norm = pa.take_pred_norm();
+        assert!(pred_norm.is_some());
+
+        let mut output_grads = Array2::<f32>::zeros((n, d));
+        for i in 0..n { for j in 0..d { output_grads[[i,j]] = (((i + j) as f32) * 0.0007).sin(); } }
+        let (gi, pg) = pa.compute_gradients_parallel(&input, &output_grads);
+        let mut non_finite = false;
+        for x in gi.iter() { if !x.is_finite() { non_finite = true; break; } }
+        for g in pg.iter() { for x in g.iter() { if !x.is_finite() { non_finite = true; break; } } }
+        assert!(!non_finite);
     }
 }
 

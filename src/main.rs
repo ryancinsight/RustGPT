@@ -8,7 +8,10 @@ use llm::{
     ArchitectureType, AttentionType, ModelConfig, Vocab, WindowAdaptationStrategy, LLM,
     EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
 };
-use llm::transformer::diffusion_block::DiffusionPredictionTarget;
+use llm::{
+    model_config::DiffusionTimestepStrategy,
+    transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
+};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum DiffusionTargetCli {
@@ -23,6 +26,45 @@ impl From<DiffusionTargetCli> for DiffusionPredictionTarget {
         match arg {
             DiffusionTargetCli::Epsilon => DiffusionPredictionTarget::Epsilon,
             DiffusionTargetCli::VPrediction => DiffusionPredictionTarget::VPrediction,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DiffusionScheduleCli {
+    Cosine,
+    Linear,
+    Quadratic,
+}
+
+impl From<DiffusionScheduleCli> for NoiseSchedule {
+    fn from(arg: DiffusionScheduleCli) -> Self {
+        match arg {
+            DiffusionScheduleCli::Cosine => NoiseSchedule::Cosine { s: 0.008 },
+            DiffusionScheduleCli::Linear => NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            DiffusionScheduleCli::Quadratic => NoiseSchedule::Quadratic {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DiffusionTimestepCli {
+    Uniform,
+    #[value(alias = "minsnr", alias = "min-snr")]
+    MinSnr,
+}
+
+impl From<DiffusionTimestepCli> for DiffusionTimestepStrategy {
+    fn from(arg: DiffusionTimestepCli) -> Self {
+        match arg {
+            DiffusionTimestepCli::Uniform => DiffusionTimestepStrategy::Uniform,
+            DiffusionTimestepCli::MinSnr => DiffusionTimestepStrategy::MinSnr,
         }
     }
 }
@@ -65,6 +107,14 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = DiffusionTargetCli::Epsilon)]
     diffusion_prediction_target: DiffusionTargetCli,
+
+    /// Noise schedule used by diffusion blocks (cosine, linear, quadratic)
+    #[arg(long, value_enum, default_value_t = DiffusionScheduleCli::Cosine)]
+    diffusion_noise_schedule: DiffusionScheduleCli,
+
+    /// Timestep sampling strategy for diffusion training
+    #[arg(long, value_enum, default_value_t = DiffusionTimestepCli::Uniform)]
+    diffusion_timestep_strategy: DiffusionTimestepCli,
 
     #[arg(long)]
     ddim_steps: Option<usize>,
@@ -335,6 +385,8 @@ fn main() -> llm::Result<()> {
     config.architecture = architecture;
     config.diffusion_prediction_target = args.diffusion_prediction_target.into();
     config.diffusion_min_snr_gamma = args.diffusion_min_snr_gamma.max(1e-6);
+    config.diffusion_noise_schedule = args.diffusion_noise_schedule.into();
+    config.diffusion_timestep_strategy = args.diffusion_timestep_strategy.into();
     if args.trm {
         config.trm_use_diffusion = args.diffusion;
         config.trm_num_recursions = args.trm_recursions;
