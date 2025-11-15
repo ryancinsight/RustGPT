@@ -21,6 +21,36 @@ use crate::{
     richards::RichardsCurve,
 };
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AdaptiveDegreeConfig {
+    pub enabled: bool,
+    pub p_min: usize,
+    pub p_max: usize,
+    pub adjust_rate: f32,
+    pub increase_threshold: f32,
+    pub decrease_threshold: f32,
+    pub cooldown_epochs: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AdaptiveDegreeState {
+    pub ema_loss_delta: f32,
+    pub ema_grad_norm: f32,
+    pub ema_epoch_ms: f32,
+    pub last_change_epoch: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DegreeAdaptationMetrics {
+    pub epoch_index: usize,
+    pub loss_delta: f32,
+    pub grad_norm: f32,
+    pub epoch_ms: f32,
+    pub tokens_per_sec: f32,
+    pub tau_range: Option<(f32, f32)>,
+    pub pred_norm_rms: Option<f32>,
+}
+
 /// # Polynomial Attention: Mathematical Framework and Stability Analysis
 ///
 /// ## Core Mathematical Formulation
@@ -227,6 +257,9 @@ pub struct PolyAttention {
     /// Cached parameter information for dynamic tracking
     #[serde(skip)]
     param_info: Option<PolyAttentionParamInfo>,
+
+    adaptive_cfg: AdaptiveDegreeConfig,
+    adaptive_state: AdaptiveDegreeState,
 }
 
 impl PolyAttention {
@@ -266,6 +299,30 @@ impl PolyAttention {
         opt_alpha_g.set_amsgrad(true);
         opt_beta_g.set_amsgrad(true);
 
+        let mut opt_a = opt_a;
+        let mut opt_b = opt_b;
+        let mut opt_scale = opt_scale;
+        let mut opt_w_g = opt_w_g;
+        let mut opt_alpha_g = opt_alpha_g;
+        let mut opt_beta_g = opt_beta_g;
+        opt_a.set_amsgrad(true);
+        opt_b.set_amsgrad(true);
+        opt_scale.set_amsgrad(true);
+        opt_w_g.set_amsgrad(true);
+        opt_alpha_g.set_amsgrad(true);
+        opt_beta_g.set_amsgrad(true);
+
+        let adaptive_cfg = AdaptiveDegreeConfig {
+            enabled: true,
+            p_min: 1,
+            p_max: 7,
+            adjust_rate: 1.0,
+            increase_threshold: 0.5,
+            decrease_threshold: -0.5,
+            cooldown_epochs: 1,
+        };
+        let initial_p = if adaptive_cfg.enabled { 1 } else { p };
+
         Self {
             embed_dim,
             num_heads,
@@ -273,7 +330,7 @@ impl PolyAttention {
             heads,
             w_out,
             opt_w_out,
-            p,
+            p: initial_p,
             a,
             b,
             scale,
@@ -309,6 +366,64 @@ impl PolyAttention {
             last_causal: true,
             cached_soft_top_p_mask: None,
             param_info: None,
+            adaptive_cfg,
+            adaptive_state: AdaptiveDegreeState::default(),
+        }
+    }
+
+    pub fn set_adaptive_degree_config(&mut self, cfg: AdaptiveDegreeConfig) {
+        self.adaptive_cfg = cfg.clone();
+        if cfg.enabled {
+            self.p = 1;
+        }
+    }
+
+    pub fn adapt_degree(&mut self, m: &DegreeAdaptationMetrics) {
+        if !self.adaptive_cfg.enabled {
+            return;
+        }
+        if m.epoch_index < self.adaptive_state.last_change_epoch + self.adaptive_cfg.cooldown_epochs {
+            return;
+        }
+        let beta = 0.9f32;
+        self.adaptive_state.ema_loss_delta = if self.adaptive_state.ema_loss_delta == 0.0 {
+            m.loss_delta.abs()
+        } else {
+            beta * self.adaptive_state.ema_loss_delta + (1.0 - beta) * m.loss_delta.abs()
+        };
+        self.adaptive_state.ema_grad_norm = if self.adaptive_state.ema_grad_norm == 0.0 {
+            m.grad_norm
+        } else {
+            beta * self.adaptive_state.ema_grad_norm + (1.0 - beta) * m.grad_norm
+        };
+        self.adaptive_state.ema_epoch_ms = if self.adaptive_state.ema_epoch_ms == 0.0 {
+            m.epoch_ms
+        } else {
+            beta * self.adaptive_state.ema_epoch_ms + (1.0 - beta) * m.epoch_ms
+        };
+
+        let conv_signal = (1.0 - self.adaptive_state.ema_loss_delta).clamp(-1.0, 1.0);
+        let speed_signal = (self.adaptive_state.ema_epoch_ms / (m.epoch_ms.max(1e-3))).clamp(0.0, 2.0) - 1.0;
+        let grad_signal = (self.adaptive_state.ema_grad_norm / (m.grad_norm.max(1e-6))).clamp(0.0, 2.0) - 1.0;
+
+        let gating_penalty = m.pred_norm_rms.unwrap_or(0.0);
+        let tau_span = m.tau_range.map(|(tmin, tmax)| (tmax - tmin).abs()).unwrap_or(0.0);
+
+        let score = self.adaptive_cfg.adjust_rate
+            * (0.6 * conv_signal - 0.2 * speed_signal - 0.2 * grad_signal - 0.1 * gating_penalty - 0.1 * tau_span);
+
+        let mut new_p = self.p;
+        if score >= self.adaptive_cfg.increase_threshold {
+            new_p = (self.p + 2).min(self.adaptive_cfg.p_max | 1);
+        } else if score <= self.adaptive_cfg.decrease_threshold {
+            new_p = self.p.saturating_sub(2).max(self.adaptive_cfg.p_min | 1);
+        }
+
+        if new_p != self.p {
+            let old_p = self.p;
+            self.p = new_p;
+            self.adaptive_state.last_change_epoch = m.epoch_index;
+            tracing::info!(old_p, new_p, epoch = m.epoch_index, score, "PolyAttention degree adapted");
         }
     }
 
@@ -1032,19 +1147,25 @@ impl PolyAttention {
     ) -> crate::errors::Result<()> {
         let mut sanitized: Vec<Array2<f32>> = Vec::with_capacity(param_grads.len());
         let mut norm_sq: f32 = 0.0;
-        for g in param_grads {
-            let mut gg = g.clone();
-            gg.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
-            norm_sq += gg.iter().map(|&x| x * x).sum::<f32>();
-            sanitized.push(gg);
-        }
+        use rayon::prelude::*;
+        let pairs: Vec<(Array2<f32>, f32)> = param_grads
+            .par_iter()
+            .map(|g| {
+                let mut gg = g.clone();
+                gg.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+                let s = gg.iter().map(|&x| x * x).sum::<f32>();
+                (gg, s)
+            })
+            .collect();
+        norm_sq = pairs.iter().map(|(_, s)| *s).sum();
+        sanitized = pairs.into_iter().map(|(gg, _)| gg).collect();
         let nrm = norm_sq.sqrt();
         let clip = 5.0f32;
         if nrm.is_finite() && nrm > clip && nrm > 0.0 {
             let scale = clip / nrm;
-            for gg in &mut sanitized {
-                gg.mapv_inplace(|x| x * scale);
-            }
+            sanitized
+                .par_iter_mut()
+                .for_each(|gg| gg.mapv_inplace(|x| x * scale));
         }
         let param_grads = &sanitized;
 
@@ -1152,9 +1273,376 @@ impl PolyAttention {
             .cached_input
             .as_ref()
             .expect("forward must be called before backward");
-        let (input_grads, param_grads) = self.compute_gradients(input, grads);
+        let (input_grads, param_grads) = self.compute_gradients_parallel(input, grads);
         self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
+    }
+
+    pub fn compute_gradients_parallel(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before compute_gradients");
+        let (n, _d_model) = (input.nrows(), input.ncols());
+        let dk_scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let a = self.a[[0, 0]];
+        let b = self.b[[0, 0]];
+        let scale = self.scale[[0, 0]];
+        let p_i32 = self.p as i32;
+        let mut grad_input_total = output_grads.clone();
+        let n_gate_w = self.gate_poly.weights().len();
+        use rayon::prelude::*;
+
+        let head_results: Vec<(
+            Array2<f32>,
+            Array2<f32>,
+            Array2<f32>,
+            Array2<f32>,
+            Array2<f32>,
+            f32,
+            f32,
+            f32,
+            Array2<f32>,
+            f32,
+            f32,
+            Vec<f64>,
+            Option<Array2<f32>>, 
+            Array2<f32>,
+            bool
+        )> = (0..self.num_heads)
+            .into_par_iter()
+            .map(|h_idx| {
+                let head = &self.heads[h_idx];
+                let q: Array2<f32> = input.dot(&head.w_q);
+                let k: Array2<f32> = input.dot(&head.w_k);
+                let v: Array2<f32> = input.dot(&head.w_v);
+                let w_g_col = self.w_g.slice(s![.., h_idx..h_idx + 1]);
+                let xw_col = input.dot(&w_g_col);
+                let a_h = self.alpha_g[[0, h_idx]];
+                let b_h = self.beta_g[[0, h_idx]];
+                let mut z_col = xw_col.clone();
+                z_col.mapv_inplace(|vv| a_h * vv + b_h);
+                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
+                let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
+                let mut g_col = z_col.clone();
+                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+                let mut m_col = Array2::<f32>::ones((n, 1));
+                if self.head_selection_config.gating.use_learned_predictor
+                    && let Some(predictor) = &self.threshold_predictor
+                {
+                    let thresholds = predictor.forward(&input.view());
+                    m_col.assign(&thresholds);
+                } else if self.head_selection_config.gating.use_soft_top_p {
+                    if let Some(mask) = &self.cached_soft_top_p_mask {
+                        if mask.nrows() == n && mask.ncols() == self.num_heads {
+                            let mask_col = mask.slice(s![.., h_idx..h_idx + 1]);
+                            m_col.assign(&mask_col);
+                        }
+                    }
+                }
+
+                let start = h_idx * self.head_dim;
+                let end = start + self.head_dim;
+                let w_block = self.w_out.slice(s![start..end, ..]);
+                let w_block_t = w_block.t();
+                let mut grad_q: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_k: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_v: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
+                let mut grad_p_local: Array2<f32> =
+                    Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
+                let mut grad_w_out_block = Array2::<f32>::zeros((self.head_dim, self.embed_dim));
+                let mut grad_w_g_col = Array2::<f32>::zeros((self.embed_dim, 1));
+                let mut grad_alpha_val: f32 = 0.0;
+                let mut grad_beta_val: f32 = 0.0;
+                let mut grad_gate_poly_vec = vec![0.0f64; n_gate_w];
+                let mut grad_input_contrib = Array2::<f32>::zeros((n, self.embed_dim));
+                let mut grad_a_scalar_local: f32 = 0.0;
+                let mut grad_b_scalar_local: f32 = 0.0;
+                let mut grad_scale_scalar_local: f32 = 0.0;
+                let mut threshold_accum_local = if self.head_selection_config.gating.use_learned_predictor {
+                    Some(Array2::<f32>::zeros((n, 1)))
+                } else { None };
+                let mut anomaly = false;
+
+                for i in 0..n {
+                    let out_row = output_grads.slice(s![i..i + 1, ..]);
+                    let mut g_yh_gated_row = Array2::<f32>::zeros((1, self.head_dim));
+                    general_mat_mul(1.0, &out_row, &w_block_t, 0.0, &mut g_yh_gated_row);
+                    let mut y_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                    let j_start = match self.window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
+                    let j_end = if self.last_causal { i } else { n - 1 };
+                    let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
+                    let mut q_pe = vec![0.0f32; max_pos + 1];
+                    for pos in 0..=max_pos { q_pe[pos] = q.row(i).dot(&self.cope.pos_embeddings.row(pos)); }
+                    for j in j_start..=j_end {
+                        let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                        let mut s = base;
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() { s += q_pe[pos]; }
+                        let sp = match p_i32 { 1 => s, 2 => s * s, 3 => s * s * s, _ => s.powi(p_i32) };
+                        let phi = scale * (a * sp + b);
+                        for h in 0..self.head_dim { y_pre_row[[0, h]] += phi * v[[j, h]]; }
+                    }
+                    let eff_i = g_col[[i, 0]] * m_col[[i, 0]];
+                    let mut yh_gated_row = y_pre_row.clone();
+                    for h in 0..self.head_dim { yh_gated_row[[0, h]] *= eff_i; }
+                    general_mat_mul(1.0, &yh_gated_row.t(), &out_row, 1.0, &mut grad_w_out_block);
+                    let mut grad_eff_i = 0.0f32;
+                    for h in 0..self.head_dim { grad_eff_i += g_yh_gated_row[[0, h]] * y_pre_row[[0, h]]; }
+                    let d_g_i = grad_eff_i * m_col[[i, 0]];
+                    let z_i = a_h * xw_col[[i, 0]] + b_h;
+                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let grad_g_i = d_g_i * dphi_dz_i;
+                    let gws = gate_poly.grad_weights_scalar(z_i as f64, d_g_i as f64);
+                    for (wi, &gw) in gws.iter().enumerate() { grad_gate_poly_vec[wi] += gw; }
+                    for d in 0..self.embed_dim { grad_w_g_col[[d, 0]] += a_h * input[[i, d]] * grad_g_i; }
+                    grad_alpha_val += grad_g_i * xw_col[[i, 0]];
+                    grad_beta_val += grad_g_i;
+                    let wg_col_owned = self.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
+                    let wg_scaled_t = wg_col_owned.t();
+                    for d in 0..self.embed_dim { grad_input_contrib[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i; }
+
+                    let mut g_yh_pre_row = g_yh_gated_row.clone();
+                    for h in 0..self.head_dim { g_yh_pre_row[[0, h]] *= g_col[[i, 0]] * m_col[[i, 0]]; }
+                    for j in j_start..=j_end {
+                        let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                        let mut s = base;
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() { s += q_pe[pos]; }
+                        let s_clamped = s.clamp(-8.0, 8.0);
+                        let sp = if p_i32 <= 3 { match p_i32 { 1 => s_clamped, 2 => s_clamped * s_clamped, 3 => s_clamped * s_clamped * s_clamped, _ => unreachable!() } } else {
+                            let mut result = 1.0; let current = s_clamped; for _ in 0..p_i32 { result *= current; if !result.is_finite() { result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN }; break; } } result };
+                        let phi = scale * (a * sp + b);
+                        for h in 0..self.head_dim { grad_v[[j, h]] += phi * g_yh_pre_row[[0, h]]; }
+                        let dphi_ij = g_yh_pre_row.row(0).dot(&v.row(j));
+                        grad_scale_scalar_local += dphi_ij * (a * sp + b);
+                        grad_a_scalar_local += dphi_ij * scale * sp;
+                        grad_b_scalar_local += dphi_ij * scale;
+                        let spm1 = if p_i32 <= 3 { match p_i32 { 1 => 1.0, 2 => s_clamped, 3 => s_clamped * s_clamped, _ => unreachable!() } } else {
+                            let mut result = 1.0; let current = s_clamped; for _ in 0..(p_i32 - 1) { result *= current; if !result.is_finite() { result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN }; break; } } result };
+                        let d_s_ij = dphi_ij * scale * a * (self.p as f32) * spm1;
+                        if !d_s_ij.is_finite() { anomaly = true; }
+                        for h in 0..self.head_dim {
+                            let grad_q_val = d_s_ij * k[[j, h]] * dk_scale;
+                            let grad_k_val = d_s_ij * q[[i, h]] * dk_scale;
+                            if !grad_q_val.is_finite() || !grad_k_val.is_finite() { anomaly = true; }
+                            grad_q[[i, h]] += grad_q_val;
+                            grad_k[[j, h]] += grad_k_val;
+                        }
+                        let pos = i.saturating_sub(j);
+                        if pos < q_pe.len() { for h in 0..self.head_dim { grad_q[[i, h]] += d_s_ij * self.cope.pos_embeddings[[pos, h]]; grad_p_local[[pos, h]] += d_s_ij * q[[i, h]]; } }
+                    }
+
+                    if let Some(threshold_grad_accum) = threshold_accum_local.as_mut() {
+                        let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                        for j in j_start..=j_end {
+                            let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                            let mut s = base;
+                            let pos = i.saturating_sub(j);
+                            if pos < q_pe.len() { s += q_pe[pos]; }
+                            let s_clamped = s.clamp(-8.0, 8.0);
+                            let sp = if p_i32 <= 3 { match p_i32 { 1 => s_clamped, 2 => s_clamped * s_clamped, 3 => s_clamped * s_clamped * s_clamped, _ => unreachable!() } } else {
+                                let mut result = 1.0; let current = s_clamped; for _ in 0..p_i32 { result *= current; if !result.is_finite() { result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN }; break; } } result };
+                            let v_j = v.row(j);
+                            let dphi_contrib = (a * sp + b) * scale;
+                            for h in 0..self.head_dim { d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib; }
+                        }
+                        let g_i = g_col[[i, 0]];
+                        for h in 0..self.head_dim {
+                            let g_yh_gated_h = g_yh_gated_row[[0, h]];
+                            threshold_grad_accum[[i, 0]] += g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                        }
+                    }
+                }
+
+                let d_w_q = input.t().dot(&grad_q);
+                let d_w_k = input.t().dot(&grad_k);
+                let d_w_v = input.t().dot(&grad_v);
+                general_mat_mul(1.0, &grad_q, &head.w_q.t(), 1.0, &mut grad_input_contrib);
+                general_mat_mul(1.0, &grad_k, &head.w_k.t(), 1.0, &mut grad_input_contrib);
+                general_mat_mul(1.0, &grad_v, &head.w_v.t(), 1.0, &mut grad_input_contrib);
+                (
+                    d_w_q,
+                    d_w_k,
+                    d_w_v,
+                    grad_w_out_block,
+                    grad_input_contrib,
+                    grad_a_scalar_local,
+                    grad_b_scalar_local,
+                    grad_scale_scalar_local,
+                    grad_w_g_col,
+                    grad_alpha_val,
+                    grad_beta_val,
+                    grad_gate_poly_vec,
+                    threshold_accum_local,
+                    grad_p_local,
+                    anomaly,
+                )
+            })
+            .collect();
+
+        let mut all_param_grads: Vec<Array2<f32>> = Vec::new();
+        let mut grad_w_out = Array2::<f32>::zeros((self.embed_dim, self.embed_dim));
+        let mut grad_w_g = Array2::<f32>::zeros((self.embed_dim, self.num_heads));
+        let mut grad_alpha_g = Array2::<f32>::zeros((1, self.num_heads));
+        let mut grad_beta_g = Array2::<f32>::zeros((1, self.num_heads));
+        let mut grad_a_scalar: f32 = 0.0;
+        let mut grad_b_scalar: f32 = 0.0;
+        let mut grad_scale_scalar: f32 = 0.0;
+        let mut grad_gate_poly_vec_acc = vec![0.0f64; n_gate_w];
+        let mut grad_cope_pos = Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
+        let mut threshold_grad_accum = if self.head_selection_config.gating.use_learned_predictor { Some(Array2::<f32>::zeros((n, 1))) } else { None };
+        let mut gradient_anomaly_detected = false;
+
+        for (h_idx, (
+            d_w_q,
+            d_w_k,
+            d_w_v,
+            grad_w_out_block,
+            grad_input_contrib,
+            ga,
+            gb,
+            gs,
+            grad_w_g_col,
+            grad_alpha_val,
+            grad_beta_val,
+            grad_gate_poly_vec,
+            threshold_accum_local,
+            grad_p_local,
+            anomaly,
+        )) in head_results.into_iter().enumerate() {
+            all_param_grads.push(d_w_q);
+            all_param_grads.push(d_w_k);
+            all_param_grads.push(d_w_v);
+            let start = h_idx * self.head_dim;
+            let end = start + self.head_dim;
+            let mut gw_block = grad_w_out.slice_mut(s![start..end, ..]);
+            gw_block += &grad_w_out_block;
+            grad_input_total += &grad_input_contrib;
+            let mut col = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
+            col.assign(&grad_w_g_col);
+            grad_alpha_g[[0, h_idx]] += grad_alpha_val;
+            grad_beta_g[[0, h_idx]] += grad_beta_val;
+            for i in 0..n_gate_w { grad_gate_poly_vec_acc[i] += grad_gate_poly_vec[i]; }
+            if let (Some(acc), Some(local)) = (threshold_grad_accum.as_mut(), threshold_accum_local) { *acc += &local; }
+            grad_cope_pos += &grad_p_local;
+            if anomaly { gradient_anomaly_detected = true; }
+            grad_a_scalar += ga;
+            grad_b_scalar += gb;
+            grad_scale_scalar += gs;
+        }
+
+        if self.head_selection_config.gating.use_learned_predictor
+            && (self.head_selection_config.gating.complexity_loss_weight > 0.0
+                || self.head_selection_config.gating.load_balance_weight > 0.0
+                || self.head_selection_config.gating.sparsity_weight > 0.0)
+        {
+            let m_vec = if let Some(predictor) = &self.threshold_predictor { predictor.forward(&input.view()) } else { Array2::<f32>::ones((n, 1)) };
+            let mut g_mat = Array2::<f32>::zeros((n, self.num_heads));
+            let mut eff_mat = Array2::<f32>::zeros((n, self.num_heads));
+            let mut z_mat = Array2::<f32>::zeros((n, self.num_heads));
+            let mut max_abs_vec: Vec<f64> = vec![0.0; self.num_heads];
+            for h in 0..self.num_heads {
+                let w_g_col = self.w_g.slice(s![.., h..h + 1]);
+                let xw_col = input.dot(&w_g_col);
+                let a_h = self.alpha_g[[0, h]];
+                let b_h = self.beta_g[[0, h]];
+                let mut z_col = xw_col.clone();
+                z_col.mapv_inplace(|v| a_h * v + b_h);
+                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
+                max_abs_vec[h] = max_abs_z;
+                let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
+                let mut g_col = z_col.clone();
+                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+                for i in 0..n {
+                    z_mat[[i, h]] = z_col[[i, 0]];
+                    g_mat[[i, h]] = g_col[[i, 0]];
+                    eff_mat[[i, h]] = g_col[[i, 0]] * m_vec[[i, 0]];
+                }
+            }
+            let inv_n = 1.0f32 / (n as f32);
+            let inv_h = 1.0f32 / (self.num_heads as f32);
+            let target_heads = ((self.head_selection_config.min_heads + self.head_selection_config.max_heads) as f32) * 0.5;
+            for i in 0..n {
+                let m_i = m_vec[[i, 0]];
+                let mut s = 0.0f32;
+                for h in 0..self.num_heads { s += eff_mat[[i, h]]; }
+                let mean = s * inv_h;
+                let mut base_d = 0.0f32;
+                if self.head_selection_config.gating.complexity_loss_weight > 0.0 { base_d += self.head_selection_config.gating.complexity_loss_weight * (s - target_heads) * inv_n; }
+                base_d += self.head_selection_config.gating.sparsity_weight * inv_n * inv_h;
+                for h in 0..self.num_heads {
+                    let eff_h = eff_mat[[i, h]];
+                    let mut d_eff_h = base_d;
+                    if self.head_selection_config.gating.load_balance_weight > 0.0 { d_eff_h += 2.0 * self.head_selection_config.gating.load_balance_weight * inv_n * inv_h * (eff_h - mean); }
+                    let d_g_i = d_eff_h * m_i;
+                    let a_h = self.alpha_g[[0, h]];
+                    let z_i = z_mat[[i, h]];
+                    let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_vec[h]);
+                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let grad_g_i = d_g_i * dphi_dz_i;
+                    for d in 0..self.embed_dim { grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i; }
+                    let xw_val = if a_h.abs() > 1e-8 { (z_i - self.beta_g[[0, h]]) / a_h } else { 0.0 };
+                    grad_alpha_g[[0, h]] += grad_g_i * xw_val;
+                    grad_beta_g[[0, h]] += grad_g_i;
+                    for d in 0..self.embed_dim { grad_input_total[[i, d]] += a_h * self.w_g[[d, h]] * grad_g_i; }
+                }
+            }
+        }
+
+        let (grad_w_tau, grad_b_tau, grad_w2_tau, grad_b2_tau, grad_activation_tau): ThresholdPredictorGrads = if self.head_selection_config.gating.use_learned_predictor {
+            if let Some(predictor) = &self.threshold_predictor {
+                if let Some(threshold_grad_accum) = threshold_grad_accum.as_ref() {
+                    let (grad_w1, grad_b1_1d, grad_w2, grad_b2_1d, grad_activation) = predictor.compute_gradients(threshold_grad_accum);
+                    let grad_b1 = grad_b1_1d.clone().to_shape((grad_b1_1d.len(), 1)).unwrap().to_owned();
+                    let grad_b2 = grad_b2_1d.clone().to_shape((grad_b2_1d.len(), 1)).unwrap().to_owned();
+                    (Some(grad_w1), Some(grad_b1), Some(grad_w2), Some(grad_b2), Some(grad_activation))
+                } else {
+                    let hidden_dim = predictor.weights1.ncols();
+                    let num_outputs = predictor.weights2.ncols();
+                    (Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
+                     Some(Array2::<f32>::zeros((hidden_dim, 1))),
+                     Some(Array2::<f32>::zeros((hidden_dim, num_outputs))),
+                     Some(Array2::<f32>::zeros((num_outputs, 1))),
+                     Some(vec![0.0_f64; predictor.activation.scalar_weights_len()]))
+                }
+            } else { (None, None, None, None, None) }
+        } else { (None, None, None, None, None) };
+
+        let mut all_param_grads: Vec<Array2<f32>> = all_param_grads;
+        all_param_grads.push(grad_w_out);
+        let grad_a = Array2::<f32>::from_shape_vec((1, 1), vec![grad_a_scalar]).unwrap();
+        let grad_b = Array2::<f32>::from_shape_vec((1, 1), vec![grad_b_scalar]).unwrap();
+        let grad_scale = Array2::<f32>::from_shape_vec((1, 1), vec![grad_scale_scalar]).unwrap();
+        all_param_grads.push(grad_a);
+        all_param_grads.push(grad_b);
+        all_param_grads.push(grad_scale);
+        all_param_grads.push(grad_w_g);
+        all_param_grads.push(grad_alpha_g);
+        all_param_grads.push(grad_beta_g);
+        let grad_gate_poly = Array2::<f32>::from_shape_vec((1, n_gate_w), grad_gate_poly_vec_acc.into_iter().map(|v| v as f32).collect()).unwrap();
+        all_param_grads.push(grad_gate_poly);
+        if self.head_selection_config.gating.use_learned_predictor {
+            all_param_grads.push(grad_w_tau.unwrap());
+            all_param_grads.push(grad_b_tau.unwrap());
+            all_param_grads.push(grad_w2_tau.unwrap());
+            all_param_grads.push(grad_b2_tau.unwrap());
+            let grad_activation_tau_f32 = Array2::<f32>::from_shape_vec(
+                (1, grad_activation_tau.as_ref().unwrap().len()),
+                grad_activation_tau.unwrap().into_iter().map(|v| v as f32).collect(),
+            ).unwrap();
+            all_param_grads.push(grad_activation_tau_f32);
+        }
+        all_param_grads.push(grad_cope_pos);
+        if gradient_anomaly_detected {
+            for grad in &mut all_param_grads { grad.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 }); }
+            grad_input_total.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
+        }
+        (grad_input_total, all_param_grads)
     }
 
     /// Get parameter information for this PolyAttention layer
@@ -1310,6 +1798,96 @@ impl PolyAttention {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{AdaptiveDegreeConfig, DegreeAdaptationMetrics, PolyAttention};
+    use ndarray::{Array2};
+
+    #[test]
+    fn gradients_parallel_match_sequential_small() {
+        let mut pa = PolyAttention::new(16, 4, 3, 64, Some(4));
+        let n = 8;
+        let d = 16;
+        let mut input = Array2::<f32>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                input[[i, j]] = ((i * d + j) as f32 * 0.01).sin();
+            }
+        }
+        let _ = pa.forward_impl(&input, true);
+        let mut output_grads = Array2::<f32>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                output_grads[[i, j]] = (((i + j) as f32) * 0.001).cos();
+            }
+        }
+        let (gi_seq, pg_seq) = pa.compute_gradients(&input, &output_grads);
+        let (gi_par, pg_par) = pa.compute_gradients_parallel(&input, &output_grads);
+        assert_eq!(pg_seq.len(), pg_par.len());
+        let mut diff_input = 0.0f32;
+        for i in 0..n { for j in 0..d { diff_input += (gi_seq[[i,j]] - gi_par[[i,j]]).abs(); } }
+        assert!(diff_input < 1e-3);
+        for (a,b) in pg_seq.iter().zip(pg_par.iter()) {
+            assert_eq!(a.shape(), b.shape());
+            let mut diff = 0.0f32;
+            for (xa, xb) in a.iter().zip(b.iter()) { diff += (xa - xb).abs(); }
+            assert!(diff < 1e-2);
+        }
+    }
+
+    #[test]
+    fn adapt_increases_degree_on_slow_convergence() {
+        let mut pa = PolyAttention::new(64, 8, 3, 128, None);
+        pa.set_adaptive_degree_config(AdaptiveDegreeConfig {
+            enabled: true,
+            p_min: 1,
+            p_max: 5,
+            adjust_rate: 1.0,
+            increase_threshold: 0.1,
+            decrease_threshold: -0.5,
+            cooldown_epochs: 0,
+        });
+        let m = DegreeAdaptationMetrics {
+            epoch_index: 0,
+            loss_delta: 0.0,
+            grad_norm: 1.0,
+            epoch_ms: 10.0,
+            tokens_per_sec: 1000.0,
+            tau_range: None,
+            pred_norm_rms: Some(0.0),
+        };
+        let p0 = pa.p;
+        pa.adapt_degree(&m);
+        assert!(pa.p >= p0);
+    }
+
+    #[test]
+    fn adapt_decreases_degree_on_high_grad() {
+        let mut pa = PolyAttention::new(64, 8, 3, 128, None);
+        pa.set_adaptive_degree_config(AdaptiveDegreeConfig {
+            enabled: true,
+            p_min: 1,
+            p_max: 7,
+            adjust_rate: 1.0,
+            increase_threshold: 0.9,
+            decrease_threshold: -0.1,
+            cooldown_epochs: 0,
+        });
+        let m = DegreeAdaptationMetrics {
+            epoch_index: 0,
+            loss_delta: 1.0,
+            grad_norm: 1e6,
+            epoch_ms: 10.0,
+            tokens_per_sec: 1000.0,
+            tau_range: None,
+            pred_norm_rms: Some(1.0),
+        };
+        let p0 = pa.p;
+        pa.adapt_degree(&m);
+        assert!(pa.p <= p0);
+    }
+}
+
 impl Layer for PolyAttention {
     fn layer_type(&self) -> &str {
         "PolyAttention"
@@ -1325,7 +1903,7 @@ impl Layer for PolyAttention {
         _input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        PolyAttention::compute_gradients(self, _input, output_grads)
+        PolyAttention::compute_gradients_parallel(self, _input, output_grads)
     }
 
     fn apply_gradients(

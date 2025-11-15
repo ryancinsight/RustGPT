@@ -174,6 +174,35 @@ pub fn epsilon_mse_gradients(eps_pred: &Array2<f32>, eps_true: &Array2<f32>) -> 
     grad
 }
 
+/// Mean Squared Error loss for v-prediction parameterization in diffusion
+/// v = sqrt(alpha_bar) * epsilon − sqrt(1 − alpha_bar) * x0
+pub fn v_mse(v_pred: &Array2<f32>, v_true: &Array2<f32>) -> f32 {
+    assert_eq!(v_pred.shape(), v_true.shape(), "v_mse: shapes must match");
+    let n = (v_pred.nrows() * v_pred.ncols()) as f32;
+    if n == 0.0 {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    for (a, b) in v_pred.iter().zip(v_true.iter()) {
+        let d = *a - *b;
+        sum += d * d;
+    }
+    sum / n
+}
+
+/// Gradients of v MSE loss w.r.t v_pred
+/// d/d(v_pred) = 2/N * (v_pred − v_true)
+pub fn v_mse_gradients(v_pred: &Array2<f32>, v_true: &Array2<f32>) -> Array2<f32> {
+    assert_eq!(v_pred.shape(), v_true.shape(), "v_mse_gradients: shapes must match");
+    let n = (v_pred.nrows() * v_pred.ncols()) as f32;
+    let scale = if n > 0.0 { 2.0 / n } else { 0.0 };
+    let mut grad = Array2::<f32>::zeros(v_pred.raw_dim());
+    for ((g, &p), &t) in grad.iter_mut().zip(v_pred.iter()).zip(v_true.iter()) {
+        *g = scale * (p - t);
+    }
+    grad
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::array;

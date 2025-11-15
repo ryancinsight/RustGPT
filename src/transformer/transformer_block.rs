@@ -512,6 +512,7 @@ impl FeedForwardVariant {
     }
 }
 
+// performance tests are included in other modules or can be added under existing tests
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,5 @@
 use std::f32::consts::PI;
+use std::sync::RwLock;
 
 use ndarray::{Array1, Array2, s, Axis};
 use ndarray::Zip;
@@ -364,6 +365,9 @@ pub struct DiffusionBlockConfig {
     pub discrete_masked: bool,
     /// Mask token id for absorbing-state masking (required when discrete_masked)
     pub mask_token_id: Option<usize>,
+    /// Parameterization for model outputs (ε or v-prediction)
+    #[serde(default)]
+    pub prediction_target: DiffusionPredictionTarget,
 }
 
 impl From<TransformerBlockConfig> for DiffusionBlockConfig {
@@ -384,7 +388,23 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         }
+    }
+}
+
+/// Output parameterization options for diffusion models
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffusionPredictionTarget {
+    /// Predict ε directly (original DDPM objective)
+    Epsilon,
+    /// Predict v = √ᾱ ε − √(1-ᾱ) x₀ for improved stability (Imagen/LLADA)
+    VPrediction,
+}
+
+impl Default for DiffusionPredictionTarget {
+    fn default() -> Self {
+        DiffusionPredictionTarget::Epsilon
     }
 }
 
@@ -448,9 +468,33 @@ pub struct DiffusionBlock {
     pub ema_time_b1: Array2<f32>,
     pub ema_time_w2: Array2<f32>,
     pub ema_time_b2: Array2<f32>,
+    pub film_scale_gamma: f32,
+    pub film_scale_beta: f32,
     /// Optional dropout for training stability (disabled by default)
     pub enable_dropout: bool,
     pub dropout_rate: f32,
+    /// Cached gradient partition sizes for deterministic gradient routing
+    #[serde(skip_serializing, skip_deserializing)]
+    param_partitions: RwLock<Option<DiffusionParamPartitions>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiffusionParamPartitions {
+    attention: usize,
+    feedforward: usize,
+    pre_ffn_norm: usize,
+    pre_attn_norm: usize,
+    time_conditioner: usize,
+}
+
+impl DiffusionParamPartitions {
+    fn total(&self) -> usize {
+        self.attention
+            + self.feedforward
+            + self.pre_ffn_norm
+            + self.pre_attn_norm
+            + self.time_conditioner
+    }
 }
 
 /// Feedforward network variants (same as TransformerBlock)
@@ -462,7 +506,7 @@ pub enum FeedForwardVariant {
     MixtureOfExperts(Box<MixtureOfExperts>),
 }
 
-const DIFFUSION_ACTIVATION_CLIP: f32 = 50.0;
+const DIFFUSION_ACTIVATION_CLIP: f32 = 20.0;
 
 impl DiffusionBlock {
     /// Create a new diffusion transformer block
@@ -520,13 +564,13 @@ impl DiffusionBlock {
         let time_hidden = (config.time_embed_dim / 2).max(32);
         let mut rng = rand::rng();
         let w1 = Array2::from_shape_fn((config.time_embed_dim, time_hidden), |_| {
-            Normal::new(0.0, (2.0 / config.time_embed_dim as f32).sqrt())
+            Normal::new(0.0, (1.0 / config.time_embed_dim as f32).sqrt())
                 .unwrap()
                 .sample(&mut rng)
         });
         let b1 = Array2::zeros((time_hidden, 1));
         let w2 = Array2::from_shape_fn((time_hidden, config.embed_dim * 2), |_| {
-            Normal::new(0.0, (2.0 / time_hidden as f32).sqrt())
+            Normal::new(0.0, (1.0 / time_hidden as f32).sqrt())
                 .unwrap()
                 .sample(&mut rng)
         });
@@ -547,18 +591,21 @@ impl DiffusionBlock {
             time_b1: b1.clone(),
             time_w2: w2.clone(),
             time_b2: b2.clone(),
-            opt_time_w1: Some(crate::adam::Adam::new((config.time_embed_dim, time_hidden))),
-            opt_time_b1: Some(crate::adam::Adam::new((time_hidden, 1))),
-            opt_time_w2: Some(crate::adam::Adam::new((time_hidden, config.embed_dim * 2))),
-            opt_time_b2: Some(crate::adam::Adam::new((config.embed_dim * 2, 1))),
+            opt_time_w1: Some(crate::adam::Adam::new_adamw((config.time_embed_dim, time_hidden), 0.01)),
+            opt_time_b1: Some(crate::adam::Adam::new_adamw((time_hidden, 1), 0.01)),
+            opt_time_w2: Some(crate::adam::Adam::new_adamw((time_hidden, config.embed_dim * 2), 0.01)),
+            opt_time_b2: Some(crate::adam::Adam::new_adamw((config.embed_dim * 2, 1), 0.01)),
             ema_decay: 0.999,
             use_ema_for_sampling: false,
             ema_time_w1: w1.clone(),
             ema_time_b1: b1.clone(),
             ema_time_w2: w2.clone(),
             ema_time_b2: b2.clone(),
+            film_scale_gamma: 0.01,
+            film_scale_beta: 0.01,
             enable_dropout: false,
             dropout_rate: 0.0,
+            param_partitions: RwLock::new(None),
         }
     }
 
@@ -594,6 +641,7 @@ impl DiffusionBlock {
             causal_attention: false, // Diffusion models use bi-directional attention
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
 
         Self::new(block_config)
@@ -612,6 +660,10 @@ impl DiffusionBlock {
 
     pub fn set_use_ema_for_sampling(&mut self, on: bool) {
         self.use_ema_for_sampling = on;
+    }
+
+    pub fn set_causal_attention(&mut self, on: bool) {
+        self.config.causal_attention = on;
     }
 
     fn apply_film(
@@ -683,6 +735,63 @@ impl DiffusionBlock {
                 }
             }
         }
+    }
+
+    fn convert_prediction_to_epsilon(
+        &self,
+        x_t: &Array2<f32>,
+        raw_prediction: &Array2<f32>,
+        t: usize,
+    ) -> Array2<f32> {
+        match self.config.prediction_target {
+            DiffusionPredictionTarget::Epsilon => raw_prediction.clone(),
+            DiffusionPredictionTarget::VPrediction => {
+                let sqrt_alpha_bar = self.noise_scheduler.sqrt_alpha_cumprod(t);
+                let sqrt_one_minus_alpha_bar =
+                    self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
+                let v_term = raw_prediction * sqrt_alpha_bar;
+                let x_term = x_t * sqrt_one_minus_alpha_bar;
+                v_term + &x_term
+            }
+        }
+    }
+
+    /// Generate the supervised training target that matches the configured parameterization
+    pub fn training_target(
+        &self,
+        x_0: &Array2<f32>,
+        noise: &Array2<f32>,
+        t: usize,
+    ) -> Array2<f32> {
+        match self.config.prediction_target {
+            DiffusionPredictionTarget::Epsilon => noise.clone(),
+            DiffusionPredictionTarget::VPrediction => {
+                let sqrt_alpha_bar = self.noise_scheduler.sqrt_alpha_cumprod(t);
+                let sqrt_one_minus_alpha_bar =
+                    self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
+                let eps_term = noise * sqrt_alpha_bar;
+                let x_term = x_0 * sqrt_one_minus_alpha_bar;
+                eps_term - &x_term
+            }
+        }
+    }
+
+    /// Signal-to-noise ratio ᾱ/(1-ᾱ) for a timestep (useful for Min-SNR weighting)
+    pub fn snr(&self, t: usize) -> f32 {
+        let sqrt_alpha_bar = self.noise_scheduler.sqrt_alpha_cumprod(t);
+        let alpha_bar = sqrt_alpha_bar * sqrt_alpha_bar;
+        let beta_bar = (1.0 - alpha_bar).max(1e-6);
+        alpha_bar / beta_bar
+    }
+
+    /// Min-SNR weighting factor as described in LLADA / Imagen style training
+    pub fn min_snr_weight(&self, t: usize, gamma: f32) -> f32 {
+        let snr = self.snr(t);
+        if !snr.is_finite() || snr <= 0.0 {
+            return 1.0;
+        }
+        let cap = gamma.max(1e-6);
+        snr.min(cap) / snr
     }
 
     fn sanitize_tensor(label: &str, tensor: &mut Array2<f32>) {
@@ -761,20 +870,18 @@ impl DiffusionBlock {
             h.dot(w2) + b2.t().to_owned()
         };
         let embed = self.config.embed_dim;
-        let gamma_vec = Array1::<f32>::from_iter(
-            gamma_beta
-                .slice(s![.., 0..embed])
-                .row(0)
-                .iter()
-                .map(|&x| 1.0 + 0.1 * x),
-        );
-        let beta_vec = Array1::<f32>::from_iter(
-            gamma_beta
-                .slice(s![.., embed..2 * embed])
-                .row(0)
-                .iter()
-                .map(|&x| 0.1 * x),
-        );
+        let raw_gamma_row = gamma_beta.slice(s![.., 0..embed]).row(0).to_owned();
+        let raw_beta_row = gamma_beta.slice(s![.., embed..2 * embed]).row(0).to_owned();
+        let mut gamma_vec = Array1::<f32>::zeros(embed);
+        let mut beta_vec = Array1::<f32>::zeros(embed);
+        for d in 0..embed {
+            let g_raw = raw_gamma_row[d];
+            let b_raw = raw_beta_row[d];
+            let g_t = g_raw.tanh();
+            let b_t = b_raw.tanh();
+            gamma_vec[d] = 1.0 + self.film_scale_gamma * g_t;
+            beta_vec[d] = self.film_scale_beta * b_t;
+        }
 
         let mut norm1_out = self.pre_attention_norm.forward(x_t);
         Self::sanitize_tensor("norm1_out", &mut norm1_out);
@@ -816,7 +923,9 @@ impl DiffusionBlock {
             beta_vec,
         ));
 
-        output
+        let mut predicted_noise = self.convert_prediction_to_epsilon(x_t, &output, t);
+        Self::sanitize_tensor("predicted_noise", &mut predicted_noise);
+        predicted_noise
     }
 
     /// Sample from the reverse diffusion process (generative sampling)
@@ -872,6 +981,47 @@ impl DiffusionBlock {
         x_t
     }
 
+    pub fn sample_ddim(&mut self, shape: (usize, usize), steps: Option<usize>) -> Array2<f32> {
+        let total = self.noise_scheduler.num_timesteps().max(1);
+        let k = steps.unwrap_or(total).max(1);
+        let mut x_t = Array2::zeros(shape);
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        let mut rng = rand::rng();
+        if let Some(slice) = x_t.as_slice_mut() {
+            slice.par_iter_mut().for_each(|v| {
+                *v = normal.sample(&mut rand::rng()) as f32;
+            });
+        } else {
+            for v in x_t.iter_mut() {
+                *v = normal.sample(&mut rng) as f32;
+            }
+        }
+
+        let step_size = ((total - 1) / k).max(1);
+        let mut t = total - 1;
+        while t > 0 {
+            self.set_timestep(t);
+            let pred = self.forward_with_timestep(&x_t, t);
+            let t_idx = t.min(total - 1);
+            match self.config.prediction_target {
+                DiffusionPredictionTarget::Epsilon => {
+                    x_t = self.noise_scheduler.ddim_step(&x_t, t_idx, &pred);
+                }
+                DiffusionPredictionTarget::VPrediction => {
+                    let sa = self.noise_scheduler.sqrt_alpha_cumprod(t_idx).max(1e-6);
+                    let soa = self
+                        .noise_scheduler
+                        .sqrt_one_minus_alpha_cumprod(t_idx);
+                    let x0_hat = (&x_t * sa) - (&pred * soa);
+                    let eps_hat = (&pred + (&x0_hat * soa)) / sa;
+                    x_t = self.noise_scheduler.ddim_step(&x_t, t_idx, &eps_hat);
+                }
+            }
+            t = t.saturating_sub(step_size);
+        }
+        x_t
+    }
+
     pub fn set_noise_schedule(&mut self, schedule_type: NoiseSchedule, num_timesteps: Option<usize>) {
         let nt = num_timesteps.unwrap_or(self.config.num_timesteps);
         self.noise_scheduler = NoiseScheduler::new(schedule_type.clone(), nt);
@@ -880,6 +1030,10 @@ impl DiffusionBlock {
         if self.config.discrete_masked {
             self.discrete_scheduler = Some(crate::diffusion::discrete::DiscreteMaskScheduler::new(nt));
         }
+    }
+
+    pub fn prediction_target(&self) -> DiffusionPredictionTarget {
+        self.config.prediction_target
     }
 }
 
@@ -925,18 +1079,18 @@ impl Layer for DiffusionBlock {
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         if let Some((
-            _input_cache,
+            input_cache,
             time_embed,
             norm1_out,
             norm1_mod,
             _attn_out,
-            _residual1,
+            residual1,
             norm2_out,
-            _norm2_mod,
+            norm2_mod,
             _ffn_out,
             h_vec,
             gamma_vec,
-            _beta_vec,
+            beta_vec,
         )) = &self.cached_intermediates
         {
             let mut all_param_grads = Vec::new();
@@ -951,18 +1105,18 @@ impl Layer for DiffusionBlock {
             // Get feedforward gradients
             let (ffn_input_grad_mod, ffn_param_grads) = match &self.feedforward {
                 FeedForwardVariant::RichardsGlu(layer) => {
-                    layer.compute_gradients(norm2_out, &ffn_grads)
+                    layer.compute_gradients(norm2_mod, &ffn_grads)
                 }
                 FeedForwardVariant::MixtureOfExperts(layer) => {
-                    layer.compute_gradients(norm2_out, &ffn_grads)
+                    layer.compute_gradients(norm2_mod, &ffn_grads)
                 }
             };
 
-            let (residual1_from_ffn, mut grad_gamma, mut grad_beta) = Self::film_backward(
-                &ffn_input_grad_mod,
-                norm2_out,
-                &gamma_vec,
-            );
+            let (norm2_grad, mut grad_gamma, mut grad_beta) =
+                Self::film_backward(&ffn_input_grad_mod, norm2_out, &gamma_vec);
+
+            let (residual1_from_ffn, pre_ffn_param_grads) =
+                self.pre_ffn_norm.compute_gradients(residual1, &norm2_grad);
 
             // Combine residual gradients
             let residual1_total_grads = residual1_grads + residual1_from_ffn;
@@ -974,25 +1128,26 @@ impl Layer for DiffusionBlock {
             let (attn_input_grad_mod, attn_param_grads) =
                 self.attention.compute_gradients(norm1_mod, &attn_out_grads);
 
-            let (norm1_input_grad, grad_gamma_norm1, grad_beta_norm1) = Self::film_backward(
-                &attn_input_grad_mod,
-                norm1_out,
-                &gamma_vec,
-            );
+            let (norm1_grad, grad_gamma_norm1, grad_beta_norm1) =
+                Self::film_backward(&attn_input_grad_mod, norm1_out, &gamma_vec);
             grad_gamma += &grad_gamma_norm1;
             grad_beta += &grad_beta_norm1;
 
+            let (input_from_norm, pre_attn_param_grads) = self
+                .pre_attention_norm
+                .compute_gradients(input_cache, &norm1_grad);
+
             // The final input gradients are the gradients w.r.t. the transformer input
             // (combining gradients from residual and attention path)
-            let final_input_grads = &input_grads + &norm1_input_grad;
+            let final_input_grads = &input_grads + &input_from_norm;
+
+            let attn_grad_count = attn_param_grads.len();
+            let ffn_grad_count = ffn_param_grads.len();
+            let pre_ffn_grad_count = pre_ffn_param_grads.len();
+            let pre_attn_grad_count = pre_attn_param_grads.len();
 
             all_param_grads.extend(attn_param_grads);
             all_param_grads.extend(ffn_param_grads);
-
-            let (_ignored_ffn_norm_in, pre_ffn_param_grads) =
-                self.pre_ffn_norm.compute_gradients(_residual1, &ffn_input_grad_mod);
-            let (_ignored_attn_norm_in, pre_attn_param_grads) =
-                self.pre_attention_norm.compute_gradients(_input_cache, &attn_input_grad_mod);
             all_param_grads.extend(pre_ffn_param_grads);
             all_param_grads.extend(pre_attn_param_grads);
 
@@ -1001,24 +1156,22 @@ impl Layer for DiffusionBlock {
             let mut grad_b2 = Array2::<f32>::zeros((self.config.embed_dim * 2, 1));
             let mut grad_h = Array1::<f32>::zeros(time_hidden);
             for d in 0..self.config.embed_dim {
-                grad_b2[[d, 0]] = grad_gamma[d] * 0.1;
-                grad_b2[[self.config.embed_dim + d, 0]] = grad_beta[d] * 0.1;
+                let g_t = ((gamma_vec[d] - 1.0) / self.film_scale_gamma.max(1e-6)).clamp(-1.0, 1.0);
+                let b_t = (beta_vec[d] / self.film_scale_beta.max(1e-6)).clamp(-1.0, 1.0);
+                let d_g_raw = grad_gamma[d] * self.film_scale_gamma * (1.0 - g_t * g_t);
+                let d_b_raw = grad_beta[d] * self.film_scale_beta * (1.0 - b_t * b_t);
+                grad_b2[[d, 0]] = d_g_raw;
+                grad_b2[[self.config.embed_dim + d, 0]] = d_b_raw;
+                for k in 0..time_hidden {
+                    grad_w2[[k, d]] += d_g_raw * h_vec[k];
+                    grad_w2[[k, self.config.embed_dim + d]] += d_b_raw * h_vec[k];
+                }
+                for k in 0..time_hidden {
+                    grad_h[k] += d_g_raw * self.time_w2[[k, d]] + d_b_raw * self.time_w2[[k, self.config.embed_dim + d]];
+                }
             }
             for k in 0..time_hidden {
-                let mut acc = 0.0f32;
-                for d in 0..self.config.embed_dim {
-                    acc += 0.1 * grad_gamma[d] * self.time_w2[[k, d]];
-                    acc += 0.1 * grad_beta[d] * self.time_w2[[k, self.config.embed_dim + d]];
-                }
-                grad_h[k] = acc;
-            }
-            for k in 0..time_hidden {
-                let dh = grad_h[k] * (1.0 - h_vec[k] * h_vec[k]);
-                for d in 0..self.config.embed_dim {
-                    grad_w2[[k, d]] = 0.1 * grad_gamma[d] * h_vec[k];
-                    grad_w2[[k, self.config.embed_dim + d]] = 0.1 * grad_beta[d] * h_vec[k];
-                }
-                grad_h[k] = dh;
+                grad_h[k] = grad_h[k] * (1.0 - h_vec[k] * h_vec[k]);
             }
             let mut grad_w1 = Array2::<f32>::zeros((self.time_w1.nrows(), time_hidden));
             let mut grad_b1 = Array2::<f32>::zeros((time_hidden, 1));
@@ -1033,11 +1186,25 @@ impl Layer for DiffusionBlock {
             all_param_grads.push(grad_w1);
             all_param_grads.push(grad_b1);
 
+            let partitions = DiffusionParamPartitions {
+                attention: attn_grad_count,
+                feedforward: ffn_grad_count,
+                pre_ffn_norm: pre_ffn_grad_count,
+                pre_attn_norm: pre_attn_grad_count,
+                time_conditioner: 4,
+            };
+            if let Ok(mut guard) = self.param_partitions.write() {
+                *guard = Some(partitions);
+            }
+
             (final_input_grads, all_param_grads)
         } else {
             tracing::warn!(
                 "DiffusionBlock::compute_gradients called without cached intermediates. Call forward() first."
             );
+            if let Ok(mut guard) = self.param_partitions.write() {
+                *guard = None;
+            }
             (output_grads.clone(), Vec::new())
         }
     }
@@ -1056,7 +1223,7 @@ impl Layer for DiffusionBlock {
             norm_sq += gg.iter().map(|&x| x * x).sum::<f32>();
             sanitized.push(gg);
         }
-        let clip = 2.5f32;
+        let clip = 5.0f32;
         let nrm = norm_sq.sqrt();
         if nrm.is_finite() && nrm > clip && nrm > 0.0 {
             let scale = clip / nrm;
@@ -1065,32 +1232,50 @@ impl Layer for DiffusionBlock {
             }
         }
 
-        // Determine expected gradient array counts (not scalar parameter counts)
-        let mut attention_arrays = self.attention.num_heads * 3 + 1 + 3 + 3 + 1; // per-head Wq/Wk/Wv + w_out + a,b,scale + w_g,alpha,beta + gate_poly
-        if self
-            .attention
-            .head_selection_config
-            .gating
-            .use_learned_predictor
-        {
-            attention_arrays += 5;
-        } // w1,b1,w2,b2,activation
-        attention_arrays += 1; // CoPE
-        let feedforward_arrays = match &self.feedforward {
-            FeedForwardVariant::RichardsGlu(_) => 5, /* w1,w2,w_out, richards_activation,
-                                                       * gate_curve */
-            FeedForwardVariant::MixtureOfExperts(_layer) => {
-                // Fallback: estimate by requesting gradients via zero tensors and reading length
-                // would be heavy; assume provided vector matches layer expectations
-                // Use the remaining grads minus time conditioner as feedforward slice length if
-                // needed We will compute below by bounds
-                0
+        let cached_partitions = self
+            .param_partitions
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or(None);
+        let partitions = cached_partitions.unwrap_or_else(|| {
+            if !sanitized.is_empty() {
+                tracing::warn!(
+                    arrays = sanitized.len(),
+                    "DiffusionBlock::apply_gradients missing partition metadata; routing all gradients to attention as a safe fallback"
+                );
+                DiffusionParamPartitions {
+                    attention: sanitized.len(),
+                    feedforward: 0,
+                    pre_ffn_norm: 0,
+                    pre_attn_norm: 0,
+                    time_conditioner: 0,
+                }
+            } else {
+                DiffusionParamPartitions::default()
             }
-        };
+        });
 
         let mut idx0 = 0usize;
-        if sanitized.len() >= attention_arrays {
-            let attention_grads = &sanitized[idx0..idx0 + attention_arrays];
+        let mut next_range = |count: usize| {
+            let available = sanitized.len().saturating_sub(idx0);
+            let len = count.min(available);
+            let start = idx0;
+            idx0 += len;
+            start..idx0
+        };
+
+        if partitions.total() != 0 && partitions.total() != sanitized.len() {
+            tracing::warn!(
+                expected = partitions.total(),
+                actual = sanitized.len(),
+                "DiffusionBlock::apply_gradients gradient count mismatch"
+            );
+        }
+
+        // Attention gradients
+        let attn_range = next_range(partitions.attention);
+        if !attn_range.is_empty() {
+            let attention_grads = &sanitized[attn_range];
             let gnorm_attn: f32 = attention_grads
                 .iter()
                 .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
@@ -1099,7 +1284,7 @@ impl Layer for DiffusionBlock {
             let wnorm_attn = self.attention.weight_norm().max(1e-6);
             let scale_attn = (wnorm_attn / (gnorm_attn.max(1e-6))).clamp(0.5, 2.0);
             let scaled: Vec<Array2<f32>> = attention_grads
-                .iter()
+                .par_iter()
                 .map(|g| {
                     let mut gg = g.clone();
                     gg.mapv_inplace(|x| x * scale_attn);
@@ -1107,17 +1292,12 @@ impl Layer for DiffusionBlock {
                 })
                 .collect();
             self.attention.apply_gradients(&scaled, lr)?;
-            idx0 += attention_arrays;
         }
 
-        // Apply feedforward gradients
-        let mut ff_arrays = feedforward_arrays;
-        if ff_arrays == 0 {
-            // Derive remaining grads excluding time conditioner (4)
-            ff_arrays = sanitized.len().saturating_sub(idx0).saturating_sub(4);
-        }
-        if sanitized.len() >= idx0 + ff_arrays {
-            let feedforward_grads = &sanitized[idx0..idx0 + ff_arrays];
+        // Feedforward gradients
+        let ffn_range = next_range(partitions.feedforward);
+        if !ffn_range.is_empty() {
+            let feedforward_grads = &sanitized[ffn_range];
             let gnorm_ffn: f32 = feedforward_grads
                 .iter()
                 .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
@@ -1130,7 +1310,7 @@ impl Layer for DiffusionBlock {
             .max(1e-6);
             let scale_ffn = (wnorm_ffn / (gnorm_ffn.max(1e-6))).clamp(0.5, 2.0);
             let scaled: Vec<Array2<f32>> = feedforward_grads
-                .iter()
+                .par_iter()
                 .map(|g| {
                     let mut gg = g.clone();
                     gg.mapv_inplace(|x| x * scale_ffn);
@@ -1143,33 +1323,29 @@ impl Layer for DiffusionBlock {
                     layer.apply_gradients(&scaled, lr)?
                 }
             }
-            idx0 += ff_arrays;
         }
-        // Apply pre-FFN and pre-attention norm gradients if present
-        // Expect 7 arrays per RichardsNorm: 5 scalars + gamma + bias
-        // These were appended in compute_gradients immediately before time conditioner gradients
-        // Route them explicitly to avoid misinterpreting as time-grad arrays
-        let expected_norm_arrays = 7usize;
-        // Pre-FFN norm
-        if sanitized.len() >= idx0 + expected_norm_arrays {
-            let range = idx0..idx0 + expected_norm_arrays;
-            let pre_ffn_grads = &sanitized[range];
+
+        // Pre-FFN norm gradients
+        let pre_ffn_range = next_range(partitions.pre_ffn_norm);
+        if !pre_ffn_range.is_empty() {
+            let pre_ffn_grads = &sanitized[pre_ffn_range];
             self.pre_ffn_norm.apply_gradients(pre_ffn_grads, lr)?;
-            idx0 += expected_norm_arrays;
         }
-        // Pre-attention norm
-        if sanitized.len() >= idx0 + expected_norm_arrays {
-            let range = idx0..idx0 + expected_norm_arrays;
-            let pre_attn_grads = &sanitized[range];
+
+        // Pre-attention norm gradients
+        let pre_attn_range = next_range(partitions.pre_attn_norm);
+        if !pre_attn_range.is_empty() {
+            let pre_attn_grads = &sanitized[pre_attn_range];
             self.pre_attention_norm.apply_gradients(pre_attn_grads, lr)?;
-            idx0 += expected_norm_arrays;
         }
-        // Apply time-conditioner gradients (last 4 arrays)
-        if sanitized.len() >= idx0 + 4 {
-            let g_w2 = &sanitized[idx0];
-            let g_b2 = &sanitized[idx0 + 1];
-            let g_w1 = &sanitized[idx0 + 2];
-            let g_b1 = &sanitized[idx0 + 3];
+
+        // Time-conditioner gradients (expect 4 arrays)
+        let time_range = next_range(partitions.time_conditioner);
+        if time_range.len() == 4 {
+            let g_w2 = &sanitized[time_range.start];
+            let g_b2 = &sanitized[time_range.start + 1];
+            let g_w1 = &sanitized[time_range.start + 2];
+            let g_b1 = &sanitized[time_range.start + 3];
             let gnorm_time = [g_w2, g_b2, g_w1, g_b1]
                 .iter()
                 .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
@@ -1209,7 +1385,12 @@ impl Layer for DiffusionBlock {
                 .zip_mut_with(&self.time_w1, |e, &w| *e = d * *e + (1.0 - d) * w);
             self.ema_time_b1
                 .zip_mut_with(&self.time_b1, |e, &w| *e = d * *e + (1.0 - d) * w);
-            idx0 += 4;
+        } else if partitions.time_conditioner > 0 {
+            tracing::warn!("DiffusionBlock::apply_gradients missing time-conditioner gradients");
+        }
+
+        if let Ok(mut guard) = self.param_partitions.write() {
+            *guard = None;
         }
         Ok(())
     }
@@ -1311,6 +1492,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
 
         let block = DiffusionBlock::new(config);
@@ -1339,6 +1521,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
 
         let mut block = DiffusionBlock::new(config);
@@ -1367,6 +1550,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
 
         let mut block = DiffusionBlock::new(config);
@@ -1416,6 +1600,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
         let mut block = DiffusionBlock::new(config);
         let input = Array2::zeros((8, 32));
@@ -1447,6 +1632,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(500);
@@ -1529,6 +1715,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
         let mut block = DiffusionBlock::new(config);
         let embed_dim = block.config.embed_dim;
@@ -1649,6 +1836,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(10);
@@ -1684,6 +1872,7 @@ mod tests {
             causal_attention: false,
             discrete_masked: false,
             mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
         };
         let mut block = DiffusionBlock::new(config);
         block.set_timestep(10);
@@ -1706,5 +1895,84 @@ mod tests {
         }
         let rmse = (diff_sq / (seq_len * embed_dim) as f32).sqrt();
         assert!(rmse < 1e-3, "RMSE too large: {}", rmse);
+    }
+
+    #[test]
+    fn test_param_partitions_set_and_reset() {
+        let config = DiffusionBlockConfig {
+            embed_dim: 16,
+            hidden_dim: 32,
+            num_heads: 2,
+            poly_degree: 3,
+            max_pos: 15,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            time_embed_dim: 16,
+            num_timesteps: 100,
+            noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
+            causal_attention: false,
+            discrete_masked: false,
+            mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
+        };
+        let mut block = DiffusionBlock::new(config);
+        block.set_timestep(5);
+        let input = Array2::<f32>::zeros((4, 16));
+        let _out = block.forward(&input);
+        let grads = Array2::<f32>::ones((4, 16));
+        let (_in_grad, param_grads) = block.compute_gradients(&input, &grads);
+        {
+            let g = block.param_partitions.read().unwrap();
+            assert!(g.is_some());
+        }
+        let _ = block.apply_gradients(&param_grads, 1e-3);
+        {
+            let g = block.param_partitions.read().unwrap();
+            assert!(g.is_none());
+        }
+    }
+
+    #[test]
+    fn test_film_backward_shapes_and_finiteness() {
+        let activations = Array2::<f32>::ones((3, 8));
+        let gamma = Array1::<f32>::ones(8);
+        let (in_grad, grad_gamma, grad_beta) = DiffusionBlock::film_backward(&activations, &activations, &gamma);
+        assert_eq!(in_grad.shape(), activations.shape());
+        assert_eq!(grad_gamma.len(), 8);
+        assert_eq!(grad_beta.len(), 8);
+        assert!(in_grad.iter().all(|&x| x.is_finite()));
+        assert!(grad_gamma.iter().all(|&x| x.is_finite()));
+        assert!(grad_beta.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_min_snr_weighting_bounds() {
+        let config = DiffusionBlockConfig {
+            embed_dim: 8,
+            hidden_dim: 16,
+            num_heads: 2,
+            poly_degree: 3,
+            max_pos: 7,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            time_embed_dim: 8,
+            num_timesteps: 50,
+            noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
+            causal_attention: false,
+            discrete_masked: false,
+            mask_token_id: None,
+            prediction_target: DiffusionPredictionTarget::default(),
+        };
+        let block = DiffusionBlock::new(config);
+        for t in [0usize, 1, 10, 25, 49] {
+            let w = block.min_snr_weight(t, 3.0);
+            assert!(w.is_finite());
+            assert!(w > 0.0);
+            assert!(w <= 1.0);
+        }
     }
 }
