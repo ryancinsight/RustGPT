@@ -6,6 +6,7 @@ thread_local! {
     static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
     static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
+    static TLS_PHI:    RefCell<Option<ndarray::Array1<f32>>> = RefCell::new(None); // (w)
 }
 
 /// Get or create a thread-local scratch buffer for attention scores (N×N matrices)
@@ -56,5 +57,19 @@ pub fn with_tls_yh<R>(n: usize, d: usize, f: impl FnOnce(&mut Array2<f32>) -> R)
         }
         let mat = opt.as_mut().unwrap();
         f(mat)
+    })
+}
+
+#[inline]
+pub fn with_tls_phi<R>(len: usize, f: impl FnOnce(&mut ndarray::Array1<f32>) -> R) -> R {
+    TLS_PHI.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let need = match &*opt {
+            Some(a) => a.len() != len,
+            None => true,
+        };
+        if need { *opt = Some(ndarray::Array1::<f32>::zeros(len)); }
+        let vec = opt.as_mut().unwrap();
+        f(vec)
     })
 }

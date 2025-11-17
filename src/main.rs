@@ -2,14 +2,11 @@ use std::io::Write;
 
 use clap::{Parser, ValueEnum};
 use llm::{
-    build_network,
+    ArchitectureType, AttentionType, EMBEDDING_DIM, HIDDEN_DIM, LLM, MAX_SEQ_LEN, ModelConfig,
+    Vocab, WindowAdaptationStrategy, build_network,
     dataset_loader::{Dataset, DatasetType},
-    print_architecture_summary,
-    ArchitectureType, AttentionType, ModelConfig, Vocab, WindowAdaptationStrategy, LLM,
-    EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
-};
-use llm::{
     model_config::DiffusionTimestepStrategy,
+    print_architecture_summary,
     transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
 };
 
@@ -122,7 +119,6 @@ struct Args {
     #[arg(long, default_value_t = 0.10)]
     validation_ratio: f32,
 
-
     #[arg(long)]
     trm_recursions: Option<usize>,
 
@@ -131,6 +127,15 @@ struct Args {
 
     #[arg(long)]
     trm_inference_steps: Option<usize>,
+
+    #[arg(long)]
+    trm_latent_moh: Option<bool>,
+
+    #[arg(long, default_value_t = 0.6)]
+    trm_latent_moh_top_p_min: f32,
+
+    #[arg(long, default_value_t = 0.95)]
+    trm_latent_moh_top_p_max: f32,
 
     /// Number of epochs to run during pre-training (default 100)
     #[arg(long, default_value_t = 100)]
@@ -392,6 +397,9 @@ fn main() -> llm::Result<()> {
         config.trm_num_recursions = args.trm_recursions;
         config.trm_max_supervision_steps = args.trm_supervision_steps;
         config.trm_max_inference_steps = args.trm_inference_steps;
+        config.trm_latent_moh_enabled = args.trm_latent_moh;
+        config.trm_latent_moh_top_p_min = Some(args.trm_latent_moh_top_p_min);
+        config.trm_latent_moh_top_p_max = Some(args.trm_latent_moh_top_p_max);
     }
 
     // Apply modern LLM enhancements configuration
@@ -498,14 +506,22 @@ fn main() -> llm::Result<()> {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        llm.train_trm_complete(
-            pre_texts,
-            chat_texts,
-            args.pretrain_epochs,
-            args.instruction_epochs,
-            0.0005,
-            4,
-        )?;
+        llm.set_trm_training_mode();
+        if let Some(n) = args.trm_recursions { llm.set_trm_recursions(n); }
+        llm.set_trm_steps(args.trm_supervision_steps, args.trm_inference_steps);
+        println!(
+            "\n=== PRE-TRAINING LRM (CE) ===\nPre-training on {} examples for {} epochs",
+            pre_texts.len(),
+            args.pretrain_epochs
+        );
+        llm.train_with_warmup(pre_texts, args.pretrain_epochs, 0.0005, 4, 15)?;
+        println!(
+            "\n=== INSTRUCTION TUNING LRM (CE) ===\nInstruction tuning on {} examples for {} epochs",
+            chat_texts.len(),
+            args.instruction_epochs
+        );
+        llm.train_with_warmup(chat_texts, args.instruction_epochs, 0.0005, 4, 15)?;
+        llm.set_trm_inference_mode();
     } else if args.diffusion {
         let pre_texts: Vec<&str> = dataset
             .pretraining_data

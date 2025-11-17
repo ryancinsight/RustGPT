@@ -4,10 +4,7 @@ use llm::{
     mixtures::HeadSelectionStrategy,
     model_config::DiffusionTimestepStrategy,
     transformer::diffusion_block::{
-        DiffusionBlock,
-        DiffusionBlockConfig,
-        DiffusionPredictionTarget,
-        NoiseSchedule,
+        DiffusionBlock, DiffusionBlockConfig, DiffusionPredictionTarget, NoiseSchedule,
     },
 };
 use ndarray::Array2;

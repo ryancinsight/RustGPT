@@ -67,6 +67,8 @@ pub struct HeadSelectionConfig {
     pub min_heads: usize,
     /// Maximum number of heads to activate (efficiency constraint)
     pub max_heads: usize,
+    /// Modulation factor for thresholds (conditioning)
+    pub threshold_modulation: f32,
     /// Threshold predictor metrics: min threshold value seen
     pub metrics_tau_min: f32,
     /// Threshold predictor metrics: max threshold value seen
@@ -87,6 +89,7 @@ impl Default for HeadSelectionConfig {
             gating: GatingConfig::default(),
             min_heads: 1,
             max_heads: 8,
+            threshold_modulation: 1.0,
             metrics_tau_min: f32::INFINITY,
             metrics_tau_max: f32::NEG_INFINITY,
             metrics_tau_sum: 0.0,
@@ -110,6 +113,7 @@ impl HeadSelectionConfig {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1, // Default min, could be parameterized
                 max_heads: *num_active,
+                threshold_modulation: 1.0,
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,
@@ -124,6 +128,7 @@ impl HeadSelectionConfig {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1,         // Allow flexible selection with soft top-p
                 max_heads: num_heads, // All heads available for selection
+                threshold_modulation: 1.0,
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,
@@ -135,6 +140,7 @@ impl HeadSelectionConfig {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: *num_active,
                 max_heads: *num_active,
+                threshold_modulation: 1.0,
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,

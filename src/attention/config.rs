@@ -72,6 +72,7 @@ pub fn init_head_selection_config(num_heads: usize) -> HeadSelectionConfig {
         gating: crate::mixtures::gating::GatingConfig::default(),
         min_heads: 1,
         max_heads: num_heads,
+        threshold_modulation: 1.0,
         metrics_tau_min: f32::INFINITY,
         metrics_tau_max: f32::NEG_INFINITY,
         metrics_tau_sum: 0.0,
@@ -95,19 +96,22 @@ pub fn ensure_threshold_predictor_initialized(
     opt_b_tau: &mut Option<Adam>,
     opt_w2_tau: &mut Option<Adam>,
     opt_b2_tau: &mut Option<Adam>,
+    opt_cond_w_tau: &mut Option<Adam>,
 ) {
     if threshold_predictor.is_none() {
         let predictor_hidden_dim = 128.min(embed_dim / 2).max(32);
-        *threshold_predictor = Some(ThresholdPredictor::new(
+        *threshold_predictor = Some(ThresholdPredictor::new_with_cond(
             embed_dim,
             predictor_hidden_dim,
             num_heads,
+            embed_dim,
         ));
 
         *opt_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
         *opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
         *opt_w2_tau = Some(Adam::new((predictor_hidden_dim, num_heads)));
         *opt_b2_tau = Some(Adam::new((num_heads, 1)));
+        *opt_cond_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
     }
 }
 
@@ -121,6 +125,7 @@ pub fn configure_head_selection(
     opt_b_tau: &mut Option<Adam>,
     opt_w2_tau: &mut Option<Adam>,
     opt_b2_tau: &mut Option<Adam>,
+    opt_cond_w_tau: &mut Option<Adam>,
     strategy: &HeadSelectionStrategy,
 ) {
     *head_selection_config = HeadSelectionConfig::from_strategy(strategy, num_heads);
@@ -135,6 +140,7 @@ pub fn configure_head_selection(
             opt_b_tau,
             opt_w2_tau,
             opt_b2_tau,
+            opt_cond_w_tau,
         );
     }
 }

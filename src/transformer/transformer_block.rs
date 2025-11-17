@@ -1,6 +1,8 @@
+#![allow(dead_code)]
 use std::sync::RwLock;
 
 use ndarray::Array2;
+use ndarray::parallel::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,14 +13,12 @@ use crate::{
         HeadSelectionStrategy,
         moe::{ExpertRouterConfig, MixtureOfExperts},
     },
-    model_config::ModelConfig,
+    model_config::{ModelConfig, WindowAdaptationStrategy},
     richards::{RichardsGlu, RichardsNorm},
 };
 
 /// Type alias for cached transformer block intermediates to improve readability
 type CachedIntermediates = (
-    Array2<f32>,
-    Array2<f32>,
     Array2<f32>,
     Array2<f32>,
     Array2<f32>,
@@ -57,6 +57,9 @@ pub struct TransformerBlock {
     /// Cached gradient partition sizes so apply_gradients can route slices correctly
     #[serde(skip_serializing, skip_deserializing)]
     param_partitions: RwLock<Option<ParamPartitions>>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    window_entropy_ema: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -96,6 +99,17 @@ pub struct TransformerBlockConfig {
 
     /// Head selection strategy for attention
     pub head_selection: HeadSelectionStrategy,
+
+    /// Adaptive window sizing enabled
+    pub use_adaptive_window: bool,
+    /// Minimum window size
+    pub min_window_size: usize,
+    /// Maximum window size
+    pub max_window_size: usize,
+    /// Window adaptation strategy
+    pub window_adaptation_strategy: WindowAdaptationStrategy,
+    /// EMA alpha for entropy-based adaptation
+    pub entropy_ema_alpha: f32,
 }
 
 /// Feedforward network variants
@@ -162,6 +176,7 @@ impl TransformerBlock {
             config,
             cached_intermediates: None,
             param_partitions: RwLock::new(None),
+            window_entropy_ema: 0.0,
         }
     }
 
@@ -190,6 +205,11 @@ impl TransformerBlock {
                 .as_ref()
                 .map(|router| ExpertRouterConfig::from_router(router)),
             head_selection: config.head_selection.clone(),
+            use_adaptive_window: config.use_adaptive_window,
+            min_window_size: config.min_window_size,
+            max_window_size: config.max_window_size,
+            window_adaptation_strategy: config.window_adaptation_strategy,
+            entropy_ema_alpha: config.entropy_ema_alpha,
         };
 
         Self::new(block_config)
@@ -228,6 +248,44 @@ impl Layer for TransformerBlock {
         let norm1_out = self.pre_attention_norm.forward(input);
 
         // Attention with residual connection
+        let seq_len = input.nrows();
+        let base_w = self
+            .config
+            .window_size
+            .unwrap_or(self.config.max_pos.saturating_add(1));
+        let mut dynamic_w = base_w.min(seq_len.max(1));
+        if self.config.use_adaptive_window {
+            let min_w = self.config.min_window_size.max(1);
+            let max_w = self.config.max_window_size.max(min_w);
+            match self.config.window_adaptation_strategy {
+                WindowAdaptationStrategy::Fixed => {
+                    dynamic_w = base_w.min(seq_len.max(1));
+                }
+                WindowAdaptationStrategy::SequenceLengthBased => {
+                    let w = (seq_len / 2).max(min_w).min(max_w);
+                    dynamic_w = w;
+                }
+                WindowAdaptationStrategy::AttentionEntropy => {
+                    let alpha = self.config.entropy_ema_alpha.clamp(0.0, 1.0);
+                    let tau_span = if let Some((tmin, tmax)) = self.attention.last_tau_metrics {
+                        (tmax - tmin).abs().max(0.0)
+                    } else {
+                        0.0
+                    };
+                    let pred_rms = self.attention.last_pred_norm.unwrap_or(0.0).max(0.0);
+                    let signal = (0.7 * tau_span + 0.3 * pred_rms).clamp(0.0, 1.0);
+                    self.window_entropy_ema = alpha * signal + (1.0 - alpha) * self.window_entropy_ema;
+                    let w = min_w as f32 + self.window_entropy_ema * (max_w.saturating_sub(min_w) as f32);
+                    dynamic_w = w.round() as usize;
+                }
+                WindowAdaptationStrategy::PerplexityBased => {
+                    dynamic_w = base_w.min(seq_len.max(1));
+                }
+            }
+            dynamic_w = dynamic_w.min(seq_len.max(1));
+            dynamic_w = dynamic_w.clamp(min_w, max_w);
+        }
+        self.attention.set_window_size(Some(dynamic_w));
         let attn_out = self.attention.forward(&norm1_out);
         let residual1 = input + &attn_out; // Residual: x + attn(x)
 
@@ -238,19 +296,17 @@ impl Layer for TransformerBlock {
         let ffn_out = self.feedforward.forward(&norm2_out);
         let output = &residual1 + &ffn_out; // Residual: attn_out + ffn(attn_out)
 
-        // Cache intermediate states for gradient computation
         self.cached_intermediates = Some((
             input.clone(),
             norm1_out,
-            attn_out,
             residual1,
             norm2_out,
-            ffn_out,
         ));
 
         output
     }
 
+    #[allow(dead_code)]
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
         let _ = self.apply_gradients(&param_grads, lr);
@@ -258,11 +314,11 @@ impl Layer for TransformerBlock {
     }
 
     fn parameters(&self) -> usize {
-        self.parameter_count()
+        TransformerBlock::parameter_count(self)
     }
 
     fn weight_norm(&self) -> f32 {
-        self.weight_norm()
+        TransformerBlock::weight_norm(self)
     }
 
     /// Compute analytical gradients using cached forward intermediates
@@ -274,14 +330,14 @@ impl Layer for TransformerBlock {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let mut all_param_grads = Vec::new();
 
-        if let Some((input_cached, norm1_out, _attn_out, residual1, norm2_out, _ffn_out)) =
+        if let Some((input_cached, norm1_out, residual1, norm2_out)) =
             &self.cached_intermediates
         {
             // Compute gradients through the transformer block layers
 
             // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out
-            let ffn_grads = output_grads.clone();
-            let residual1_grads = output_grads.clone();
+            let ffn_grads = output_grads;
+            let residual1_grads = output_grads;
 
             // Get feedforward gradients
             let (ffn_input_grad, ffn_param_grads) = match &self.feedforward {
@@ -301,12 +357,11 @@ impl Layer for TransformerBlock {
             let residual1_total_grads = residual1_grads + residual1_from_ffn;
 
             // residual1 = input + attn_out: propagate full upstream gradient to both branches
-            let input_grads = residual1_total_grads.clone();
-            let attn_out_grads = residual1_total_grads.clone();
+            let input_grads_ref = &residual1_total_grads;
 
             // Get attention gradients
             let (attn_input_grad, attn_param_grads) =
-                self.attention.compute_gradients(norm1_out, &attn_out_grads);
+                self.attention.compute_gradients(norm1_out, &residual1_total_grads);
 
             let (norm1_input_grad, pre_attn_param_grads) = self
                 .pre_attention_norm
@@ -314,7 +369,7 @@ impl Layer for TransformerBlock {
 
             // The final input gradients are the gradients w.r.t. the transformer input
             // (combining gradients from residual and attention path)
-            let final_input_grads = &input_grads + &norm1_input_grad;
+            let final_input_grads = input_grads_ref + &norm1_input_grad;
 
             // Capture gradient partition sizes so apply_gradients can re-slice accurately later
             let partitions = ParamPartitions {
@@ -376,8 +431,12 @@ impl Layer for TransformerBlock {
         let mut norm_sq: f32 = 0.0;
         for g in param_grads {
             let mut gg = g.clone();
-            gg.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
-            norm_sq += gg.iter().map(|&x| x * x).sum::<f32>();
+            gg.par_iter_mut().for_each(|x| {
+                if !x.is_finite() {
+                    *x = 0.0;
+                }
+            });
+            norm_sq += gg.par_iter().map(|&x| x * x).sum::<f32>();
             sanitized.push(gg);
         }
         let clip = 5.0f32;
@@ -418,14 +477,10 @@ impl Layer for TransformerBlock {
                 .sqrt();
             let wnorm_attn = self.attention.weight_norm().max(1e-6);
             let scale_attn = (wnorm_attn / (gnorm_attn.max(1e-6))).clamp(0.5, 2.0);
-            let scaled: Vec<Array2<f32>> = attention_grads
-                .iter()
-                .map(|g| {
-                    let mut gg = g.clone();
-                    gg.mapv_inplace(|x| x * scale_attn);
-                    gg
-                })
-                .collect();
+            let mut scaled: Vec<Array2<f32>> = attention_grads.to_vec();
+            for gg in &mut scaled {
+                gg.par_iter_mut().for_each(|x| *x *= scale_attn);
+            }
             self.attention.apply_gradients(&scaled, lr)?;
         }
 
@@ -444,14 +499,10 @@ impl Layer for TransformerBlock {
             }
             .max(1e-6);
             let scale_ffn = (wnorm_ffn / (gnorm_ffn.max(1e-6))).clamp(0.5, 2.0);
-            let scaled: Vec<Array2<f32>> = feedforward_grads
-                .iter()
-                .map(|g| {
-                    let mut gg = g.clone();
-                    gg.mapv_inplace(|x| x * scale_ffn);
-                    gg
-                })
-                .collect();
+            let mut scaled: Vec<Array2<f32>> = feedforward_grads.to_vec();
+            for gg in &mut scaled {
+                gg.par_iter_mut().for_each(|x| *x *= scale_ffn);
+            }
             match &mut self.feedforward {
                 FeedForwardVariant::RichardsGlu(layer) => layer.apply_gradients(&scaled, lr)?,
                 FeedForwardVariant::MixtureOfExperts(layer) => {
@@ -471,12 +522,15 @@ impl Layer for TransformerBlock {
         let pre_attn_range = next_range(partitions.pre_attn_norm);
         let pre_attn_grads = &sanitized[pre_attn_range];
         if !pre_attn_grads.is_empty() {
-            self.pre_attention_norm.apply_gradients(pre_attn_grads, lr)?;
+            self.pre_attention_norm
+                .apply_gradients(pre_attn_grads, lr)?;
         }
 
         if let Ok(mut guard) = self.param_partitions.write() {
             *guard = None;
         }
+
+        self.cached_intermediates = None;
 
         Ok(())
     }
@@ -533,6 +587,11 @@ mod tests {
                 top_p: 0.9,
                 soft_top_p_alpha: 15.0,
             },
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
         };
 
         let block = TransformerBlock::new(config);
@@ -566,6 +625,11 @@ mod tests {
                 top_p: 0.9,
                 soft_top_p_alpha: 15.0,
             },
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
         };
 
         let mut block = TransformerBlock::new(config);
@@ -595,6 +659,11 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -620,6 +689,11 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -648,6 +722,11 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -683,6 +762,11 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
         };
 
         let mut block = TransformerBlock::new(config);
