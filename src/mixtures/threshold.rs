@@ -60,11 +60,14 @@ pub struct ThresholdPredictor {
     cached_activated: Option<ndarray::Array2<f32>>,
     #[serde(skip)]
     cached_output: Option<ndarray::Array2<f32>>,
+    #[serde(skip)]
+    cached_cond_input: Option<ndarray::Array2<f32>>, 
+    pub cond_w: ndarray::Array2<f32>,
 }
 
 impl ThresholdPredictor {
     /// Create a new threshold predictor with AutoDeco-inspired architecture
-    pub fn new(embed_dim: usize, hidden_dim: usize, num_outputs: usize) -> Self {
+    pub fn new_with_cond(embed_dim: usize, hidden_dim: usize, num_outputs: usize, cond_dim: usize) -> Self {
         use rand::Rng;
         let mut rng = rand::rng();
 
@@ -88,6 +91,9 @@ impl ThresholdPredictor {
         let sigmoid = crate::richards::RichardsCurve::sigmoid(false); // Non-learnable sigmoid
         let activation =
             crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation replacing ReLU
+        let cond_w = ndarray::Array2::from_shape_fn((cond_dim, hidden_dim), |_| {
+            rng.random_range(-(1.0 / (cond_dim as f32).sqrt())..(1.0 / (cond_dim as f32).sqrt()))
+        });
 
         Self {
             weights1,
@@ -103,19 +109,34 @@ impl ThresholdPredictor {
             cached_activation: None,
             cached_activated: None,
             cached_output: None,
+            cached_cond_input: None,
+            cond_w,
         }
+    }
+
+    pub fn new(embed_dim: usize, hidden_dim: usize, num_outputs: usize) -> Self {
+        Self::new_with_cond(embed_dim, hidden_dim, num_outputs, embed_dim)
     }
 
     /// Predict threshold values using AutoDeco-style architecture
     ///
     /// Returns sigmoid-activated values in [0, 1] range suitable for threshold prediction
     /// Caches intermediate activations for gradient computation
-    pub fn predict(&mut self, input: &ndarray::ArrayView2<f32>) -> ndarray::Array2<f32> {
-        // Cache input for gradient computation
+    pub fn predict_with_condition(
+        &mut self,
+        input: &ndarray::ArrayView2<f32>,
+        cond: Option<ndarray::ArrayView2<f32>>,
+    ) -> ndarray::Array2<f32> {
         self.cached_input = Some(input.to_owned());
-
-        // First layer: W1 * x + b1
-        let hidden = input.dot(&self.weights1) + &self.bias1;
+        let hidden_base = input.dot(&self.weights1);
+        let hidden = if let Some(c) = cond {
+            let c_owned = c.to_owned();
+            self.cached_cond_input = Some(c_owned.clone());
+            hidden_base + c_owned.dot(&self.cond_w) + &self.bias1
+        } else {
+            self.cached_cond_input = None;
+            hidden_base + &self.bias1
+        };
         self.cached_hidden = Some(hidden.clone());
 
         // Apply Richards normalization for adaptive behavior
@@ -170,6 +191,10 @@ impl ThresholdPredictor {
             .mapv(|x| x as f32)
     }
 
+    pub fn predict(&mut self, input: &ndarray::ArrayView2<f32>) -> ndarray::Array2<f32> {
+        self.predict_with_condition(input, None)
+    }
+
     /// Compute gradients for the two-layer threshold network
     ///
     /// Returns gradients for (weights1, bias1, weights2, bias2, activation_params)
@@ -181,6 +206,7 @@ impl ThresholdPredictor {
         ndarray::Array1<f32>,
         ndarray::Array2<f32>,
         ndarray::Array1<f32>,
+        Option<ndarray::Array2<f32>>, 
         Vec<f64>,
     ) {
         // Retrieve cached activations
@@ -236,6 +262,9 @@ impl ThresholdPredictor {
         // First layer gradients
         let grad_weights1: ndarray::Array2<f32> = cached_input.t().dot(&d_hidden);
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
+        let grad_cond_w = if let Some(cond_in) = &self.cached_cond_input {
+            Some(cond_in.t().dot(&d_hidden))
+        } else { None };
 
         // Activation parameter gradients (Richards curve parameters)
         let activation_grads = self
@@ -247,6 +276,7 @@ impl ThresholdPredictor {
             grad_bias1,
             grad_weights2,
             grad_bias2,
+            grad_cond_w,
             activation_grads,
         )
     }
@@ -340,7 +370,7 @@ mod tests {
 
         // Compute gradients
         let output_grads = Array2::<f32>::from_elem((2, 1), 1.0);
-        let (grad_w1, grad_b1, grad_w2, grad_b2, activation_grads) =
+        let (grad_w1, grad_b1, grad_w2, grad_b2, _grad_cond_w, activation_grads) =
             predictor.compute_gradients(&output_grads);
 
         // Check gradient shapes

@@ -1,7 +1,11 @@
-use llm::transformer::transformer_block::{TransformerBlock, TransformerBlockConfig};
-use llm::transformer::diffusion_block::{DiffusionBlock, DiffusionBlockConfig};
-use llm::mixtures::HeadSelectionStrategy;
-use llm::Layer;
+use llm::{
+    Layer,
+    mixtures::HeadSelectionStrategy,
+    transformer::{
+        diffusion_block::{DiffusionBlock, DiffusionBlockConfig},
+        transformer_block::{TransformerBlock, TransformerBlockConfig},
+    },
+};
 use ndarray::Array2;
 
 fn main() {
@@ -15,6 +19,11 @@ fn main() {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
+        use_adaptive_window: false,
+        min_window_size: 512,
+        max_window_size: 4096,
+        window_adaptation_strategy: llm::model_config::WindowAdaptationStrategy::SequenceLengthBased,
+        entropy_ema_alpha: 0.2,
     };
     let mut tblock = TransformerBlock::new(tcfg.clone());
 

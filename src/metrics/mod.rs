@@ -3,9 +3,14 @@
 //! This module contains metrics structures and utility functions commonly used
 //! in mixture models (MoE, MoH) and potentially other components.
 
+pub mod perf;
 pub mod text;
 pub mod topk;
 
+pub use perf::{
+    EstimateInput, FlopsEstimate, estimate_diffusion_block, estimate_transformer_block,
+    estimate_trm,
+};
 use serde::{Deserialize, Serialize};
 pub use text::{bleu_1_2, corpus_bleu_1_2};
 pub use topk::{compute_nim, compute_nim_from_normalized, select_top_k};

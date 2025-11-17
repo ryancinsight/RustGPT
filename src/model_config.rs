@@ -11,7 +11,7 @@ pub enum ArchitectureType {
     /// Standard Transformer with self-attention mechanism
     Transformer,
 
-    /// Tiny Recursive Model (TRM) - recursive reasoning with shared weights
+    /// Tiny Recursive Model (LRM) - recursive reasoning with shared weights
     TRM,
 
     /// Diffusion Transformer - generative model using denoising diffusion process
@@ -174,6 +174,9 @@ pub struct ModelConfig {
     pub trm_max_supervision_steps: Option<usize>,
     pub trm_max_inference_steps: Option<usize>,
     pub trm_latent_update_alpha: Option<f32>,
+    pub trm_latent_moh_enabled: Option<bool>,
+    pub trm_latent_moh_top_p_min: Option<f32>,
+    pub trm_latent_moh_top_p_max: Option<f32>,
 
     /// Target parameterization for diffusion blocks (ε vs v prediction)
     pub diffusion_prediction_target: DiffusionPredictionTarget,
@@ -228,6 +231,9 @@ impl ModelConfig {
             trm_max_supervision_steps: None,
             trm_max_inference_steps: None,
             trm_latent_update_alpha: None,
+            trm_latent_moh_enabled: Some(true),
+            trm_latent_moh_top_p_min: Some(0.6),
+            trm_latent_moh_top_p_max: Some(0.95),
             diffusion_prediction_target: DiffusionPredictionTarget::Epsilon,
             diffusion_min_snr_gamma: 3.0,
             diffusion_noise_schedule: NoiseSchedule::Cosine { s: 0.008 },

@@ -272,8 +272,8 @@ impl RichardsCurve {
         // learnable)
         let (output_gain_val, output_bias_val) = match variant {
             super::Variant::Sigmoid | super::Variant::Gompertz => (Some(1.0), Some(0.0)), /* [0, 1] range, fixed */
-            super::Variant::Tanh => (Some(1.0), Some(0.0)), /* [-1, 1] via 2σ(2x) - 1 transform,
-                                                              * fixed */
+            super::Variant::Tanh => (Some(1.0), Some(0.0)), // [-1, 1] via 2σ(2x) - 1 transform,
+            // fixed
             super::Variant::Adaptive | super::Variant::None | super::Variant::Polynomial => {
                 (None, None)
             } // Fully learnable including output_gain/output_bias
@@ -286,8 +286,8 @@ impl RichardsCurve {
             + if output_bias_val.is_none() { 1 } else { 0 };
 
         let (adaptive_initialized, momentum) = match variant {
-            super::Variant::Adaptive => (true, 0.01), /* Enable adaptive normalization with
-                                                        * default momentum */
+            super::Variant::Adaptive => (true, 0.01), // Enable adaptive normalization with
+            // default momentum
             _ => (false, 0.0), // Disable adaptive for other variants
         };
 

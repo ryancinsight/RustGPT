@@ -6,10 +6,9 @@ use crate::{
     output_projection::OutputProjection,
     richards::RichardsNorm,
     transformer::{
-        DiffusionBlock, TransformerBlock,
+        DiffusionBlock, TransformerBlock, LRM,
         diffusion_block::{DiffusionBlockConfig, NoiseSchedule},
     },
-    trm::TRM,
 };
 
 /// Build a network based on the provided configuration
@@ -52,11 +51,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         vocab.size(),
     )));
 
-    // Set TRM layers to inference mode by default for speed
+    // Set TRM/LRM layers to inference mode by default for speed
     for layer in &mut layers {
-        if let LayerEnum::TRM(trm) = layer {
-            trm.set_training_mode(false);
-        }
+        if let LayerEnum::LRM(lrm) = layer { lrm.set_training_mode(false); }
     }
 
     layers
@@ -149,8 +146,8 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 /// Creates a single TRM layer that handles recursive reasoning internally.
 /// TRM uses shared weights across recursive operations for efficient reasoning.
 fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    let trm = TRM::from_model_config(config);
-    layers.push(LayerEnum::TRM(Box::new(trm)));
+    let lrm = LRM::from_model_config(config);
+    layers.push(LayerEnum::LRM(Box::new(lrm)));
     layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(
         config.embedding_dim,
     )));
@@ -247,17 +244,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     println!("\n🧱 Layer Stack:");
     for (i, layer) in layers.iter().enumerate() {
-        let name = match layer {
-            crate::llm::LayerEnum::TRM(_) => {
-                if config.trm_use_diffusion {
-                    "TRM[Diffusion]"
-                } else {
-                    "TRM[Autoregressive]"
-                }
-            }
-            _ => layer.layer_type(),
-        };
-        println!("  {}: {}", i, name);
+        println!("  {}: {}", i, layer.layer_type());
     }
 
     // Parameter count summary
@@ -339,10 +326,7 @@ mod tests {
                     }
                     other => panic!("unexpected schedule: {:?}", other),
                 }
-                assert_eq!(
-                    block.timestep_strategy(),
-                    DiffusionTimestepStrategy::MinSnr
-                );
+                assert_eq!(block.timestep_strategy(), DiffusionTimestepStrategy::MinSnr);
                 found = true;
             }
         }
