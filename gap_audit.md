@@ -385,3 +385,42 @@ Implemented correct temporal gradient accumulation with proper scaling to preven
 **Evidence Gap**: Theorems claim mathematical properties but no empirical validation exists to support these claims.
 
 **Zero Tolerance Verification Incomplete**: Claims of mathematical correctness are not backed by empirical validation of the claimed mathematical properties.
+
+## DiffusionBlock Gap Analysis
+
+### Issue DIFF-001: Missing Speculative Sampling Support
+**Severity**: Major  
+**Category**: Performance Gap  
+**Status**: identified  
+**Description**: No speculative decoding/sampling for accelerated reverse diffusion. Literature ("Speculative Diffusion Sampling"): use small draft DiffusionBlock to propose multiple steps/samples, large verifies prefix/tree, accept/reject → 2-3x speedup.  
+**Evidence**: Research arXiv confirms viability for diffusion transformers.
+
+### Issue DIFF-002: Discrete Masked Diffusion Incomplete
+**Severity**: Medium  
+**Category**: Incomplete Implementation  
+**Status**: identified  
+**Description**: `discrete_scheduler: Option<DiscreteMaskScheduler>` stubbed, no integration in forward/sample/training_target.
+
+### Issue DIFF-003: No Formal Mathematical Theorems
+**Severity**: Minor  
+**Category**: Documentation Gap  
+**Status**: identified  
+**Description**: Lacks rustdoc theorems/invariants: SNR weighting correctness, v-prediction equivalence, schedule stability bounds, posterior variance derivation.
+
+### Issue DIFF-004: Property-Based Tests Missing
+**Severity**: Minor  
+**Category**: Testing Deficit  
+**Status**: identified  
+**Description**: No proptest for diffusion properties: q_sample roundtrip, DDIM deterministic, posterior_sample equiv.
+
+### Issue DIFF-005: EMA Equivalence Untested
+**Severity**: Minor  
+**Category**: Testing Deficit  
+**Status**: identified  
+**Description**: EMA weights for sampling, no test `use_ema=true == main weights post-update`.
+
+### Issue DIFF-006: Performance Optimizations Absent
+**Severity**: Minor  
+**Category**: Performance Gap  
+**Status**: identified  
+**Description**: No GPU (wgpu), limited rayon (inner only), no batch outer par.

@@ -113,6 +113,22 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DiffusionTimestepCli::Uniform)]
     diffusion_timestep_strategy: DiffusionTimestepCli,
 
+    /// Enable speculative diffusion sampling with a cheaper draft chain
+    #[arg(long)]
+    diffusion_speculative: bool,
+
+    /// Number of draft DDIM steps per speculative proposal
+    #[arg(long, default_value_t = 4)]
+    diffusion_speculative_gamma: usize,
+
+    /// Acceptance threshold on noise MSE between main and draft models
+    #[arg(long, default_value_t = 0.001)]
+    diffusion_speculative_tau: f32,
+
+    /// Number of diffusion blocks to use for the speculative draft pass
+    #[arg(long)]
+    diffusion_speculative_draft_layers: Option<usize>,
+
     #[arg(long)]
     ddim_steps: Option<usize>,
 
@@ -473,6 +489,20 @@ fn main() -> llm::Result<()> {
     } else {
         LLM::new(vocab, network)
     };
+
+    if args.diffusion_speculative {
+        let gamma = args.diffusion_speculative_gamma.max(1);
+        let tau = args.diffusion_speculative_tau.max(1e-6);
+        let draft_layers = args
+            .diffusion_speculative_draft_layers
+            .unwrap_or_else(|| config.num_layers.max(1))
+            .max(1);
+        println!(
+            "Enabling diffusion speculative sampling (gamma={}, tau={}, draft_layers={})",
+            gamma, tau, draft_layers
+        );
+        llm.enable_diffusion_speculative_sampling(gamma, tau, draft_layers);
+    }
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());

@@ -20,12 +20,16 @@
 pub mod diffusion_block;
 pub mod transformer_block;
 pub mod lrm;
+pub mod hrm;
+pub mod common;
 
 pub use diffusion_block::{
     DiffusionBlock, DiffusionBlockConfig, NoiseSchedule, NoiseScheduler, TimeEmbedding,
 };
 pub use transformer_block::{TransformerBlock, TransformerBlockConfig};
 pub use lrm::{LRM, LRMConfig};
+pub use hrm::{HRM, HRMConfig};
+pub use common::FeedForwardVariant;
 
 /// Re-export key types for convenience
 pub use crate::attention::poly_attention::PolyAttention;

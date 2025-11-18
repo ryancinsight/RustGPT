@@ -104,8 +104,9 @@ fn build_diffusion_layers(
             noise_schedule: config.diffusion_noise_schedule.clone(),
             causal_attention: false,
             discrete_masked: true,
+            use_adaptive_window: config.use_adaptive_window,
             mask_token_id: Some(mask_id),
-            prediction_target: config.diffusion_prediction_target,
+            prediction_target: config.diffusion_prediction_target.clone(),
             timestep_strategy: config.diffusion_timestep_strategy,
         };
 
