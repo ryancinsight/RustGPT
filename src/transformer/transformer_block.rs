@@ -15,10 +15,11 @@ use crate::{
     },
     model_config::{ModelConfig, WindowAdaptationStrategy},
     richards::{RichardsGlu, RichardsNorm},
+    transformer::common::FeedForwardVariant,
 };
 
 /// Type alias for cached transformer block intermediates to improve readability
-type CachedIntermediates = (
+pub type CachedIntermediates = (
     Array2<f32>,
     Array2<f32>,
     Array2<f32>,
@@ -52,7 +53,7 @@ pub struct TransformerBlock {
     /// Cached intermediate states from forward pass (for gradient computation)
     /// (input, norm1_out, attn_out, residual1, norm2_out, ffn_out)
     #[serde(skip_serializing, skip_deserializing)]
-    cached_intermediates: Option<CachedIntermediates>,
+    cached_intermediates: RwLock<Option<CachedIntermediates>>,
 
     /// Cached gradient partition sizes so apply_gradients can route slices correctly
     #[serde(skip_serializing, skip_deserializing)]
@@ -112,16 +113,6 @@ pub struct TransformerBlockConfig {
     pub entropy_ema_alpha: f32,
 }
 
-/// Feedforward network variants
-#[derive(Serialize, Deserialize, Debug)]
-pub enum FeedForwardVariant {
-    /// Standard RichardsGlu feedforward
-    RichardsGlu(Box<RichardsGlu>),
-
-    /// Mixture-of-Experts feedforward
-    MixtureOfExperts(Box<MixtureOfExperts>),
-}
-
 impl TransformerBlock {
     /// Analytical gradient invariants:
     /// - Residual splits: output = residual1 + ffn_out → d_residual1 and d_ffn_out both receive
@@ -174,7 +165,7 @@ impl TransformerBlock {
             pre_ffn_norm,
             feedforward,
             config,
-            cached_intermediates: None,
+            cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
             window_entropy_ema: 0.0,
         }
@@ -213,6 +204,16 @@ impl TransformerBlock {
         };
 
         Self::new(block_config)
+    }
+
+    /// Get the cached intermediates
+    pub fn get_cache(&self) -> Option<CachedIntermediates> {
+        self.cached_intermediates.read().unwrap().clone()
+    }
+
+    /// Set the cached intermediates
+    pub fn set_cache(&self, cache: Option<CachedIntermediates>) {
+        *self.cached_intermediates.write().unwrap() = cache;
     }
 
     /// Get the total number of parameters in this transformer block
@@ -296,7 +297,7 @@ impl Layer for TransformerBlock {
         let ffn_out = self.feedforward.forward(&norm2_out);
         let output = &residual1 + &ffn_out; // Residual: attn_out + ffn(attn_out)
 
-        self.cached_intermediates = Some((
+        *self.cached_intermediates.write().unwrap() = Some((
             input.clone(),
             norm1_out,
             residual1,
@@ -331,7 +332,7 @@ impl Layer for TransformerBlock {
         let mut all_param_grads = Vec::new();
 
         if let Some((input_cached, norm1_out, residual1, norm2_out)) =
-            &self.cached_intermediates
+            &self.cached_intermediates.read().unwrap().clone()
         {
             // Compute gradients through the transformer block layers
 
@@ -530,39 +531,9 @@ impl Layer for TransformerBlock {
             *guard = None;
         }
 
-        self.cached_intermediates = None;
+        *self.cached_intermediates.write().unwrap() = None;
 
         Ok(())
-    }
-}
-
-impl FeedForwardVariant {
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.forward(input),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward(input),
-        }
-    }
-
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.backward(grads, lr),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.backward(grads, lr),
-        }
-    }
-
-    fn parameters(&self) -> usize {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.parameters(),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.parameters(),
-        }
-    }
-
-    fn weight_norm(&self) -> f32 {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.weight_norm(),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.weight_norm(),
-        }
     }
 }
 

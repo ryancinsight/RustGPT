@@ -18,6 +18,13 @@ use crate::{
     transformer::{TransformerBlock, LRM},
 };
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct SpeculativeSamplingConfig {
+    pub gamma: usize,
+    pub tau: f32,
+    pub draft_layers: usize,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LayerEnum {
     TokenEmbeddings(TokenEmbeddings),
@@ -268,6 +275,8 @@ pub struct LLM {
     decoder: DecoderType,
     // EMA of median per-layer gradient norm to stabilize adaptive LR balance
     median_grad_ema: Option<f32>,
+    #[serde(default)]
+    diffusion_speculative: Option<SpeculativeSamplingConfig>,
 }
 
 impl std::fmt::Debug for LLM {
@@ -294,6 +303,7 @@ impl Default for LLM {
             network,
             decoder,
             median_grad_ema: None,
+            diffusion_speculative: None,
         }
     }
 }
@@ -307,6 +317,7 @@ impl LLM {
             network,
             decoder,
             median_grad_ema: None,
+            diffusion_speculative: None,
         }
     }
 
@@ -318,6 +329,7 @@ impl LLM {
             network,
             decoder,
             median_grad_ema: None,
+            diffusion_speculative: None,
         }
     }
 
@@ -326,9 +338,63 @@ impl LLM {
         let decoder = DecoderType::Greedy(GreedyDecoder::new());
         self.decoder = decoder;
     }
+
+    pub fn enable_diffusion_speculative_sampling(
+        &mut self,
+        gamma: usize,
+        tau: f32,
+        draft_layers: usize,
+    ) {
+        if gamma == 0 || draft_layers == 0 {
+            warn!(
+                "Speculative sampling requested with invalid gamma={} or draft_layers={}",
+                gamma, draft_layers
+            );
+            self.diffusion_speculative = None;
+            return;
+        }
+        let cfg = SpeculativeSamplingConfig {
+            gamma,
+            tau: tau.max(1e-6),
+            draft_layers,
+        };
+        self.diffusion_speculative = Some(cfg);
+    }
 }
 
 impl LLM {
+    fn forward_diffusion_stack(
+        &mut self,
+        block_indices: &[usize],
+        input: &Array2<f32>,
+        t_idx: usize,
+    ) -> Array2<f32> {
+        let mut hidden = input.clone();
+        for &idx in block_indices {
+            if let LayerEnum::DiffusionBlock(block) = &mut self.network[idx] {
+                block.set_timestep(t_idx);
+                hidden = block.forward_with_timestep(&hidden, t_idx);
+            }
+        }
+        hidden
+    }
+
+    fn apply_ddim_step(
+        &self,
+        scheduler_block_idx: usize,
+        current: &Array2<f32>,
+        t_idx: usize,
+        predicted_noise: &Array2<f32>,
+    ) -> Array2<f32> {
+        if let LayerEnum::DiffusionBlock(block) = &self.network[scheduler_block_idx] {
+            block
+                .noise_scheduler
+                .ddim_step(current, t_idx, predicted_noise)
+        } else {
+            current.clone()
+        }
+    }
+
     pub fn network_description(&self) -> String {
         let network_layers = self.network.iter().map(|layer| layer.layer_type()).fold(
             String::new(),
@@ -697,7 +763,7 @@ impl LLM {
                     }
                 }
                 if let LayerEnum::LRM(lrm) = layer {
-                    if let Some((min_tau, max_tau)) = lrm.transformer.attention.take_tau_metrics() {
+                    if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
                         tau_available = true;
                         if min_tau < tau_min_epoch {
                             tau_min_epoch = min_tau;
@@ -706,11 +772,11 @@ impl LLM {
                             tau_max_epoch = max_tau;
                         }
                     }
-                    if let Some(rms_g) = lrm.transformer.attention.take_pred_norm() {
+                    if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
                         pred_norm_sum += rms_g;
                         pred_norm_count += 1;
                     }
-                    let per_head = lrm.transformer.attention.get_head_metrics_and_reset();
+                    let per_head = lrm.attention_mut().get_head_metrics_and_reset();
                     if !per_head.is_empty() {
                         let layer_avg_active_heads =
                             per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
@@ -1015,16 +1081,16 @@ impl LLM {
             let mut heads_layers_count = 0usize;
             for layer in &mut self.network {
                 if let LayerEnum::LRM(lrm) = layer {
-                    if let Some((min_tau, max_tau)) = lrm.transformer.attention.take_tau_metrics() {
+                    if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
                         tau_available = true;
                         if min_tau < tau_min_epoch { tau_min_epoch = min_tau; }
                         if max_tau > tau_max_epoch { tau_max_epoch = max_tau; }
                     }
-                    if let Some(rms_g) = lrm.transformer.attention.take_pred_norm() {
+                    if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
                         pred_norm_sum += rms_g;
                         pred_norm_count += 1;
                     }
-                    let per_head = lrm.transformer.attention.get_head_metrics_and_reset();
+                    let per_head = lrm.attention_mut().get_head_metrics_and_reset();
                     if !per_head.is_empty() {
                         let layer_avg_active_heads = per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
                         avg_heads_per_token_sum += layer_avg_active_heads;
@@ -1046,9 +1112,9 @@ impl LLM {
             let mut rec_tau_max = f32::NAN;
             for layer in &self.network {
                 if let LayerEnum::LRM(lrm) = layer {
-                    lb_loss = lrm.transformer.attention.head_selection_config.compute_load_balance_loss();
-                    cx_loss = lrm.transformer.attention.head_selection_config.compute_complexity_loss(lrm.transformer.attention.moh_num_active() as f32);
-                    sp_loss = lrm.transformer.attention.head_selection_config.compute_sparsity_loss();
+                    lb_loss = lrm.attention().head_selection_config.compute_load_balance_loss();
+                    cx_loss = lrm.attention().head_selection_config.compute_complexity_loss(lrm.attention().moh_num_active() as f32);
+                    sp_loss = lrm.attention().head_selection_config.compute_sparsity_loss();
                     if !lrm.recursion_metrics.is_empty() {
                         let mut hsum = 0.0f32;
                         let mut c = 0usize;
@@ -1088,11 +1154,11 @@ impl LLM {
 
             for layer in &mut self.network {
                 if let LayerEnum::LRM(lrm) = layer {
-                    let heads = lrm.transformer.attention.num_heads() as f32;
+                    let heads = lrm.attention().num_heads() as f32;
                     let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 { (avg_active_heads / heads).clamp(0.1, 1.0) } else { 0.5 };
                     lrm.set_latent_update_alpha(0.03 + 0.05 * (1.0 - h_ratio));
-                    let ent = lrm.transformer.attention.head_selection_config.gating.get_gating_entropy();
-                    let g = &mut lrm.transformer.attention.head_selection_config.gating;
+                    let ent = lrm.attention().head_selection_config.gating.get_gating_entropy();
+                    let g = &mut lrm.attention_mut().head_selection_config.gating;
                     if ent < 0.2 { g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2); }
                     if avg_active_heads.is_finite() {
                         if avg_active_heads > heads * 0.5 { g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2); }
@@ -1199,8 +1265,8 @@ impl LLM {
             let loss_norm = sce / (target_ids.len().max(1) as f32);
             batch_loss += loss_norm;
 
-            let target_avg = match &self.network[t_idx] { LayerEnum::LRM(l) => l.transformer.attention.moh_num_active() as f32, _ => 0.0 };
-            let moh_penalty = match &self.network[t_idx] { LayerEnum::LRM(l) => l.transformer.attention.compute_moh_aux_weighted_total(target_avg), _ => 0.0 };
+            let target_avg = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().moh_num_active() as f32, _ => 0.0 };
+            let moh_penalty = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg), _ => 0.0 };
             batch_loss += moh_penalty;
 
             let grads_logits = crate::loss::symmetric_cross_entropy_gradients(&probs, target_ids, sce_cfg.alpha, sce_cfg.beta, sce_cfg.epsilon);
@@ -2132,6 +2198,7 @@ impl LLM {
                                     // x0 = sqrt(alpha_bar) * x_t − sqrt(1 − alpha_bar) * v
                                     (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
                                 }
+                                crate::transformer::diffusion_block::DiffusionPredictionTarget::Sample => pred.clone(),
                             }
                         } else {
                             pred.clone()
@@ -2255,6 +2322,7 @@ impl LLM {
                                 let coeff = -sqrt_one_minus_a;
                                 grad_hidden.mapv(|x| x * coeff)
                             }
+                            crate::transformer::diffusion_block::DiffusionPredictionTarget::Sample => grad_hidden.clone(),
                         };
                         let mut grad_total = grad_ce.mapv(|x| x * lambda_ce);
                         if let Some(target) = denoise_target.as_ref() {
@@ -2428,8 +2496,8 @@ impl LLM {
                     pred_norm_rms = db.attention.take_pred_norm();
                 }
                 if let LayerEnum::LRM(lrm) = layer {
-                    tau_range = lrm.transformer.attention.take_tau_metrics();
-                    pred_norm_rms = lrm.transformer.attention.take_pred_norm();
+                    tau_range = lrm.attention_mut().take_tau_metrics();
+                    pred_norm_rms = lrm.attention_mut().take_pred_norm();
                 }
             }
             let metrics = crate::attention::poly_attention::DegreeAdaptationMetrics {
@@ -2449,7 +2517,7 @@ impl LLM {
                     db.attention.adapt_degree(&metrics);
                 }
                 if let LayerEnum::LRM(lrm) = layer {
-                    lrm.transformer.attention.adapt_degree(&metrics);
+                    lrm.attention_mut().adapt_degree(&metrics);
                 }
             }
             // Validation split (last 10% examples)
@@ -2559,6 +2627,7 @@ impl LLM {
                             crate::transformer::diffusion_block::DiffusionPredictionTarget::VPrediction => {
                                 (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
                             }
+                            crate::transformer::diffusion_block::DiffusionPredictionTarget::Sample => pred.clone(),
                         }
                     } else {
                         pred.clone()
@@ -2840,27 +2909,84 @@ impl LLM {
                     b.set_use_ema_for_sampling(true);
                 }
             }
-            for t in (1..=steps).rev() {
-                let t_idx = t - 1;
-                for &idx in &diffusion_blocks_idx {
-                    if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                        b.set_timestep(t_idx);
+            let scheduler_idx = diffusion_blocks_idx[0];
+            let mut used_speculative = false;
+            if let Some(cfg) = self.diffusion_speculative {
+                let draft_len = cfg.draft_layers.min(diffusion_blocks_idx.len());
+                if draft_len > 0 {
+                    let draft_indices = diffusion_blocks_idx[..draft_len].to_vec();
+                    let mut t = steps;
+                    used_speculative = true;
+                    while t > 0 {
+                        let t_idx = t - 1;
+                        let main_pred = self.forward_diffusion_stack(
+                            &diffusion_blocks_idx,
+                            &current_sample,
+                            t_idx,
+                        );
+                        let draft_pred =
+                            self.forward_diffusion_stack(&draft_indices, &current_sample, t_idx);
+                        let mse = main_pred
+                            .iter()
+                            .zip(draft_pred.iter())
+                            .map(|(a, b)| {
+                                let diff = a - b;
+                                diff * diff
+                            })
+                            .sum::<f32>()
+                            / main_pred.len().max(1) as f32;
+
+                        if mse > cfg.tau {
+                            current_sample = self.apply_ddim_step(
+                                scheduler_idx,
+                                &current_sample,
+                                t_idx,
+                                &main_pred,
+                            );
+                            t -= 1;
+                            continue;
+                        }
+
+                        current_sample = self.apply_ddim_step(
+                            scheduler_idx,
+                            &current_sample,
+                            t_idx,
+                            &draft_pred,
+                        );
+                        t -= 1;
+
+                        let mut accepted = 1usize;
+                        while accepted < cfg.gamma && t > 0 {
+                            let next_t_idx = t - 1;
+                            let draft_pred = self.forward_diffusion_stack(
+                                &draft_indices,
+                                &current_sample,
+                                next_t_idx,
+                            );
+                            current_sample = self.apply_ddim_step(
+                                scheduler_idx,
+                                &current_sample,
+                                next_t_idx,
+                                &draft_pred,
+                            );
+                            accepted += 1;
+                            t -= 1;
+                        }
                     }
                 }
-                let mut predicted_noise = current_sample.clone();
-                for &idx in &diffusion_blocks_idx {
-                    if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                        predicted_noise = b.forward_with_timestep(&predicted_noise, t_idx);
-                    }
+            }
+            if !used_speculative {
+                for t in (1..=steps).rev() {
+                    let t_idx = t - 1;
+                    let predicted_noise = self
+                        .forward_diffusion_stack(&diffusion_blocks_idx, &current_sample, t_idx);
+                    current_sample = self.apply_ddim_step(
+                        scheduler_idx,
+                        &current_sample,
+                        t_idx,
+                        &predicted_noise,
+                    );
                 }
-                let noise_scheduler =
-                    if let LayerEnum::DiffusionBlock(b0) = &self.network[diffusion_blocks_idx[0]] {
-                        &b0.noise_scheduler
-                    } else {
-                        unreachable!()
-                    };
-                current_sample =
-                    noise_scheduler.ddim_step(&current_sample, t_idx, &predicted_noise);
             }
             for &idx in &diffusion_blocks_idx {
                 if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
