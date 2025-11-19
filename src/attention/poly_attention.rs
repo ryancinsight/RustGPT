@@ -1032,7 +1032,7 @@ impl PolyAttention {
                         let g_i = g_col[[i, 0]];
                         for h in 0..self.head_dim {
                             let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                            threshold_grad_accum[[i, h_idx]] +=
+                            threshold_grad_accum[[i, h]] +=
                                 g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
                         }
                     }
@@ -1156,8 +1156,8 @@ impl PolyAttention {
                         grad_input_total[[i, d]] += a_h * self.w_g[[d, h]] * grad_g_i;
                     }
 
-                    if let Some(th_acc) = threshold_grad_accum.as_mut() {
-                        th_acc[[i, h]] += d_eff_h * g_mat[[i, h]];
+                    if let Some(threshold_grad_accum) = threshold_grad_accum.as_mut() {
+                        threshold_grad_accum[[i, h]] += d_eff_h * g_mat[[i, h]];
                     }
                 }
             }
@@ -1538,6 +1538,7 @@ impl PolyAttention {
                     for h in 0..self.head_dim {
                         g_yh_pre_row[[0, h]] *= g_col[[i, 0]] * m_col[[i, 0]];
                     }
+
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
@@ -1658,6 +1659,7 @@ impl PolyAttention {
                     }
                 }
 
+                // Backprop through linear projections for this head
                 let d_w_q = input.t().dot(&grad_q);
                 let d_w_k = input.t().dot(&grad_k);
                 let d_w_v = input.t().dot(&grad_v);
@@ -2019,6 +2021,18 @@ impl PolyAttention {
     pub fn compute_moh_aux_weighted_total(&self, target_avg_components: f32) -> f32 {
         let (lb, cx, sp) = self.compute_moh_aux_losses(target_avg_components);
         let g = &self.head_selection_config.gating;
+        
+        // Debug logging for high loss investigation
+        if lb * g.load_balance_weight + cx * g.complexity_loss_weight + sp * g.sparsity_weight > 1.0 {
+            tracing::info!(
+                "High MoH Aux Loss: Total={}, LB={} (w={}), CX={} (w={}), SP={} (w={})",
+                lb * g.load_balance_weight + cx * g.complexity_loss_weight + sp * g.sparsity_weight,
+                lb, g.load_balance_weight,
+                cx, g.complexity_loss_weight,
+                sp, g.sparsity_weight
+            );
+        }
+
         (lb * g.load_balance_weight)
             + (cx * g.complexity_loss_weight)
             + (sp * g.sparsity_weight)

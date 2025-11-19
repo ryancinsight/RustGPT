@@ -113,21 +113,21 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DiffusionTimestepCli::Uniform)]
     diffusion_timestep_strategy: DiffusionTimestepCli,
 
-    /// Enable speculative diffusion sampling with a cheaper draft chain
+    /// Enable speculative sampling (diffusion or transformer) with a cheaper draft chain
     #[arg(long)]
-    diffusion_speculative: bool,
+    speculative: bool,
 
-    /// Number of draft DDIM steps per speculative proposal
+    /// Number of draft steps per speculative proposal
     #[arg(long, default_value_t = 4)]
-    diffusion_speculative_gamma: usize,
+    speculative_gamma: usize,
 
-    /// Acceptance threshold on noise MSE between main and draft models
+    /// Acceptance threshold (tau) for speculative verification
     #[arg(long, default_value_t = 0.001)]
-    diffusion_speculative_tau: f32,
+    speculative_tau: f32,
 
-    /// Number of diffusion blocks to use for the speculative draft pass
+    /// Number of layers to use for the speculative draft pass
     #[arg(long)]
-    diffusion_speculative_draft_layers: Option<usize>,
+    speculative_draft_layers: Option<usize>,
 
     #[arg(long)]
     ddim_steps: Option<usize>,
@@ -490,18 +490,18 @@ fn main() -> llm::Result<()> {
         LLM::new(vocab, network)
     };
 
-    if args.diffusion_speculative {
-        let gamma = args.diffusion_speculative_gamma.max(1);
-        let tau = args.diffusion_speculative_tau.max(1e-6);
+    if args.speculative {
+        let gamma = args.speculative_gamma.max(1);
+        let tau = args.speculative_tau.max(1e-6);
         let draft_layers = args
-            .diffusion_speculative_draft_layers
+            .speculative_draft_layers
             .unwrap_or_else(|| config.num_layers.max(1))
             .max(1);
         println!(
-            "Enabling diffusion speculative sampling (gamma={}, tau={}, draft_layers={})",
+            "Enabling speculative sampling (gamma={}, tau={}, draft_layers={})",
             gamma, tau, draft_layers
         );
-        llm.enable_diffusion_speculative_sampling(gamma, tau, draft_layers);
+        llm.enable_speculative_sampling(gamma, tau, draft_layers);
     }
 
     println!("\n=== MODEL INFORMATION ===");
