@@ -12,7 +12,8 @@ fn main() {
     println!("  Weights: {:?}", curve.weights());
 
     // Simulate multiple training steps with consistent gradients
-    let gradients = vec![0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]; // 8 gradients for 8 parameters
+    let param_count = curve.weights().len();
+    let gradients = vec![0.1; param_count];
     let learning_rate = 0.1;
 
     for epoch in 0..5 {

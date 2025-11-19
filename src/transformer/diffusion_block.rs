@@ -1065,11 +1065,12 @@ impl Layer for DiffusionBlock {
     }
 
     fn weight_norm(&self) -> f32 {
-        self.pre_attention_norm.weight_norm()
-            + self.attention.weight_norm()
-            + self.pre_ffn_norm.weight_norm()
-            + self.feedforward.weight_norm()
-            + self.time_conditioner.weight_norm()
+        (self.pre_attention_norm.weight_norm().powi(2)
+            + self.attention.weight_norm().powi(2)
+            + self.pre_ffn_norm.weight_norm().powi(2)
+            + self.feedforward.weight_norm().powi(2)
+            + self.time_conditioner.weight_norm().powi(2))
+        .sqrt()
     }
 
     /// Compute analytical gradients using cached forward intermediates
@@ -1300,7 +1301,7 @@ impl Layer for DiffusionBlock {
                 .sum::<f32>()
                 .sqrt();
             let wnorm_attn = self.attention.weight_norm().max(1e-6);
-            let scale_attn = (wnorm_attn / (gnorm_attn.max(1e-6))).clamp(0.5, 2.0);
+            let scale_attn = (wnorm_attn / (gnorm_attn.max(1e-6))).clamp(0.01, 5.0);
             let scaled: Vec<Array2<f32>> = attention_grads
                 .par_iter()
                 .map(|g| {
@@ -1326,7 +1327,7 @@ impl Layer for DiffusionBlock {
                 FeedForwardVariant::MixtureOfExperts(l) => l.weight_norm(),
             }
             .max(1e-6);
-            let scale_ffn = (wnorm_ffn / (gnorm_ffn.max(1e-6))).clamp(0.5, 2.0);
+            let scale_ffn = (wnorm_ffn / (gnorm_ffn.max(1e-6))).clamp(0.01, 5.0);
             let scaled: Vec<Array2<f32>> = feedforward_grads
                 .par_iter()
                 .map(|g| {
