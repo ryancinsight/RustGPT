@@ -15,15 +15,9 @@ use crate::{
     metrics::text::corpus_bleu_1_2,
     model_config::DiffusionTimestepStrategy,
     output_projection::OutputProjection,
-    transformer::{TransformerBlock, LRM},
-};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub struct SpeculativeSamplingConfig {
-    pub gamma: usize,
-    pub tau: f32,
-    pub draft_layers: usize,
-}
+    transformer::{TransformerBlock, LRM, speculative::SpeculativeSamplingConfig},
+};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LayerEnum {

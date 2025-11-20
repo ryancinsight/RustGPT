@@ -9,7 +9,6 @@ use crate::{
     llm::Layer,
     model_config::ModelConfig,
     transformer::{
-        common::FeedForwardVariant,
         diffusion_block::{DiffusionBlock, DiffusionBlockConfig, DiffusionCachedIntermediates},
         transformer_block::{TransformerBlock, TransformerBlockConfig, CachedIntermediates as TransformerCachedIntermediates},
     },

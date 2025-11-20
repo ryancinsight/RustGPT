@@ -2,7 +2,7 @@
 use std::sync::RwLock;
 
 use ndarray::Array2;
-use ndarray::parallel::prelude::*;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,11 +11,14 @@ use crate::{
     llm::Layer,
     mixtures::{
         HeadSelectionStrategy,
-        moe::{ExpertRouterConfig, MixtureOfExperts},
+        moe::ExpertRouterConfig,
     },
     model_config::{ModelConfig, WindowAdaptationStrategy},
-    richards::{RichardsGlu, RichardsNorm},
-    transformer::common::FeedForwardVariant,
+    richards::RichardsNorm,
+    transformer::common::{
+        FeedForwardVariant, CommonLayerConfig, CommonLayers, 
+        sanitize_and_clip_gradients, apply_adaptive_gradients
+    },
 };
 
 /// Type alias for cached transformer block intermediates to improve readability
@@ -113,6 +116,22 @@ pub struct TransformerBlockConfig {
     pub entropy_ema_alpha: f32,
 }
 
+impl From<&TransformerBlockConfig> for CommonLayerConfig {
+    fn from(config: &TransformerBlockConfig) -> Self {
+        Self {
+            embed_dim: config.embed_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.num_heads,
+            poly_degree: config.poly_degree,
+            max_pos: config.max_pos,
+            window_size: config.window_size,
+            use_moe: config.use_moe,
+            moe_config: config.moe_config.clone(),
+            head_selection: config.head_selection.clone(),
+        }
+    }
+}
+
 impl TransformerBlock {
     /// Analytical gradient invariants:
     /// - Residual splits: output = residual1 + ffn_out → d_residual1 and d_ffn_out both receive
@@ -124,46 +143,14 @@ impl TransformerBlock {
     /// - Final input grads: d_input = d_input_direct + pre_attention_norm.backward(d_norm1_out)
     /// Create a new transformer block with the given configuration
     pub fn new(config: TransformerBlockConfig) -> Self {
-        // Create pre-attention normalization
-        let pre_attention_norm = RichardsNorm::new(config.embed_dim);
-
-        // Create attention layer
-        let mut attention = PolyAttention::new(
-            config.embed_dim,
-            config.num_heads,
-            config.poly_degree,
-            config.max_pos,
-            config.window_size,
-        );
-        attention.set_head_selection_config(&config.head_selection);
-
-        // Create pre-FFN normalization
-        let pre_ffn_norm = RichardsNorm::new(config.embed_dim);
-
-        // Create feedforward layer
-        let feedforward = if config.use_moe {
-            if let Some(moe_config) = &config.moe_config {
-                let moe_layer = MixtureOfExperts::new(
-                    config.embed_dim,
-                    (config.embed_dim / 4).max(32), // Router hidden dim
-                    moe_config.clone(),
-                );
-                FeedForwardVariant::MixtureOfExperts(Box::new(moe_layer))
-            } else {
-                // Fallback to RichardsGlu if MoE config is missing
-                let richards_glu = RichardsGlu::new(config.embed_dim, config.hidden_dim);
-                FeedForwardVariant::RichardsGlu(Box::new(richards_glu))
-            }
-        } else {
-            let richards_glu = RichardsGlu::new(config.embed_dim, config.hidden_dim);
-            FeedForwardVariant::RichardsGlu(Box::new(richards_glu))
-        };
+        let common_config = CommonLayerConfig::from(&config);
+        let layers = CommonLayers::new(&common_config);
 
         Self {
-            pre_attention_norm,
-            attention,
-            pre_ffn_norm,
-            feedforward,
+            pre_attention_norm: layers.pre_attention_norm,
+            attention: layers.attention,
+            pre_ffn_norm: layers.pre_ffn_norm,
+            feedforward: layers.feedforward,
             config,
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
@@ -429,26 +416,7 @@ impl Layer for TransformerBlock {
             });
 
         // Sanitize and globally clip gradients
-        let mut sanitized: Vec<Array2<f32>> = Vec::with_capacity(param_grads.len());
-        let mut norm_sq: f32 = 0.0;
-        for g in param_grads {
-            let mut gg = g.clone();
-            gg.par_iter_mut().for_each(|x| {
-                if !x.is_finite() {
-                    *x = 0.0;
-                }
-            });
-            norm_sq += gg.par_iter().map(|&x| x * x).sum::<f32>();
-            sanitized.push(gg);
-        }
-        let clip = 5.0f32;
-        let nrm = norm_sq.sqrt();
-        if nrm.is_finite() && nrm > clip && nrm > 0.0 {
-            let scale = clip / nrm;
-            for gg in &mut sanitized {
-                gg.mapv_inplace(|x| x * scale);
-            }
-        }
+        let sanitized = sanitize_and_clip_gradients(param_grads, 5.0);
 
         let mut idx = 0usize;
         let total_expected = partitions.total();
@@ -472,45 +440,24 @@ impl Layer for TransformerBlock {
         let attn_range = next_range(partitions.attention);
         let attention_grads = &sanitized[attn_range];
         if !attention_grads.is_empty() {
-            let gnorm_attn: f32 = attention_grads
-                .iter()
-                .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
-                .sum::<f32>()
-                .sqrt();
-            let wnorm_attn = self.attention.weight_norm().max(1e-6);
-            let scale_attn = (wnorm_attn / (gnorm_attn.max(1e-6))).clamp(0.01, 5.0);
-            let mut scaled: Vec<Array2<f32>> = attention_grads.to_vec();
-            for gg in &mut scaled {
-                gg.par_iter_mut().for_each(|x| *x *= scale_attn);
-            }
-            self.attention.apply_gradients(&scaled, lr)?;
+            apply_adaptive_gradients(
+                attention_grads,
+                self.attention.weight_norm(),
+                lr,
+                |grads, lr| self.attention.apply_gradients(grads, lr)
+            )?;
         }
 
         // Apply feedforward gradients with adaptive scaling
         let ffn_range = next_range(partitions.feedforward);
         let feedforward_grads = &sanitized[ffn_range];
         if !feedforward_grads.is_empty() {
-            let gnorm_ffn: f32 = feedforward_grads
-                .iter()
-                .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
-                .sum::<f32>()
-                .sqrt();
-            let wnorm_ffn = match &self.feedforward {
-                FeedForwardVariant::RichardsGlu(l) => l.weight_norm(),
-                FeedForwardVariant::MixtureOfExperts(l) => l.weight_norm(),
-            }
-            .max(1e-6);
-            let scale_ffn = (wnorm_ffn / (gnorm_ffn.max(1e-6))).clamp(0.01, 5.0);
-            let mut scaled: Vec<Array2<f32>> = feedforward_grads.to_vec();
-            for gg in &mut scaled {
-                gg.par_iter_mut().for_each(|x| *x *= scale_ffn);
-            }
-            match &mut self.feedforward {
-                FeedForwardVariant::RichardsGlu(layer) => layer.apply_gradients(&scaled, lr)?,
-                FeedForwardVariant::MixtureOfExperts(layer) => {
-                    layer.apply_gradients(&scaled, lr)?
-                }
-            }
+             apply_adaptive_gradients(
+                feedforward_grads,
+                self.feedforward.weight_norm(),
+                lr,
+                |grads, lr| self.feedforward.apply_gradients(grads, lr)
+            )?;
         }
 
         // Apply pre-FFN norm gradients

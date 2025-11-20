@@ -1,0 +1,54 @@
+#[cfg(test)]
+mod tests {
+    use crate::transformer::speculative::SpeculativeSamplingConfig;
+    use crate::transformer::diffusion_block::{DiffusionBlock, DiffusionBlockConfig, NoiseSchedule, DiffusionPredictionTarget};
+    use crate::model_config::DiffusionTimestepStrategy;
+    use crate::mixtures::HeadSelectionStrategy;
+    use ndarray::Array2;
+
+    fn create_dummy_block() -> DiffusionBlock {
+        let config = DiffusionBlockConfig {
+            embed_dim: 16,
+            hidden_dim: 32,
+            num_heads: 2,
+            num_timesteps: 10,
+            noise_schedule: NoiseSchedule::Linear { beta_min: 0.0001, beta_max: 0.02 },
+            prediction_target: DiffusionPredictionTarget::Epsilon,
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
+            causal_attention: false,
+            window_size: None,
+            use_adaptive_window: false,
+            discrete_masked: false,
+            poly_degree: 1,
+            max_pos: 10,
+            use_moe: false,
+            moe_config: None,
+            head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            time_embed_dim: 16,
+            mask_token_id: None,
+        };
+        DiffusionBlock::new(config)
+    }
+
+    #[test]
+    fn test_speculative_sampling_runs() {
+        let mut target_model = create_dummy_block();
+        let mut draft_model = create_dummy_block();
+        
+        let config = SpeculativeSamplingConfig {
+            gamma: 2,
+            tau: 0.1,
+            draft_layers: 1,
+        };
+        
+        let shape = (1, 16);
+        let sample = target_model.speculative_sample(
+            &mut draft_model,
+            shape,
+            Some(5),
+            &config
+        );
+        
+        assert_eq!(sample.shape(), &[1, 16]);
+    }
+}
