@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use ndarray::{Array2, Axis, s};
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 

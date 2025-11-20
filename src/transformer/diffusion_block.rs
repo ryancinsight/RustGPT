@@ -11,11 +11,17 @@ use crate::{
     llm::Layer,
     mixtures::{
         HeadSelectionStrategy,
-        moe::{ExpertRouterConfig, MixtureOfExperts},
+        moe::ExpertRouterConfig,
     },
     model_config::{DiffusionTimestepStrategy, ModelConfig},
-    richards::{RichardsGlu, RichardsNorm},
-    transformer::{common::FeedForwardVariant, transformer_block::TransformerBlockConfig},
+    richards::RichardsNorm,
+    transformer::{
+        common::{
+            FeedForwardVariant, CommonLayerConfig, CommonLayers,
+            sanitize_and_clip_gradients, apply_adaptive_gradients
+        },
+        transformer_block::TransformerBlockConfig
+    },
 };
 
 /// Noise schedule types for diffusion models
@@ -561,34 +567,18 @@ pub struct DiffusionBlock {
 
 impl DiffusionBlock {
     pub fn new(config: DiffusionBlockConfig) -> Self {
-        let pre_attention_norm = RichardsNorm::new(config.embed_dim);
-        let mut attention = PolyAttention::new(
-            config.embed_dim,
-            config.num_heads,
-            config.poly_degree,
-            config.max_pos,
-            config.window_size,
-        );
-        attention.set_head_selection_config(&config.head_selection);
-        
-        let pre_ffn_norm = RichardsNorm::new(config.embed_dim);
-        
-        let feedforward = if config.use_moe {
-            if let Some(moe_config) = &config.moe_config {
-                let moe_layer = MixtureOfExperts::new(
-                    config.embed_dim,
-                    (config.embed_dim / 4).max(32),
-                    moe_config.clone(),
-                );
-                FeedForwardVariant::MixtureOfExperts(Box::new(moe_layer))
-            } else {
-                let richards_glu = RichardsGlu::new(config.embed_dim, config.hidden_dim);
-                FeedForwardVariant::RichardsGlu(Box::new(richards_glu))
-            }
-        } else {
-            let richards_glu = RichardsGlu::new(config.embed_dim, config.hidden_dim);
-            FeedForwardVariant::RichardsGlu(Box::new(richards_glu))
+        let common_config = CommonLayerConfig {
+            embed_dim: config.embed_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.num_heads,
+            poly_degree: config.poly_degree,
+            max_pos: config.max_pos,
+            window_size: config.window_size,
+            use_moe: config.use_moe,
+            moe_config: config.moe_config.clone(),
+            head_selection: config.head_selection.clone(),
         };
+        let layers = CommonLayers::new(&common_config);
 
         let time_embedding = TimeEmbedding::new(config.time_embed_dim);
         // Output dim of time conditioner = 4 * embed_dim (gamma_attn, beta_attn, gamma_ffn, beta_ffn)
@@ -607,10 +597,10 @@ impl DiffusionBlock {
 
         Self {
             config: config.clone(),
-            attention,
-            feedforward,
-            pre_attention_norm,
-            pre_ffn_norm,
+            attention: layers.attention,
+            feedforward: layers.feedforward,
+            pre_attention_norm: layers.pre_attention_norm,
+            pre_ffn_norm: layers.pre_ffn_norm,
             time_embedding,
             time_conditioner,
             noise_scheduler,
@@ -974,10 +964,12 @@ impl DiffusionBlock {
         draft: &mut DiffusionBlock,
         shape: (usize, usize),
         steps: Option<usize>,
-        gamma: usize,
-        tau: f32,
+        config: &crate::transformer::speculative::SpeculativeSamplingConfig,
     ) -> Array2<f32> {
         let total = self.noise_scheduler.num_timesteps().max(1);
+        let gamma = config.gamma;
+        let tau = config.tau;
+        
         let mut steps_left = steps.unwrap_or(total).max(gamma.max(1));
         let mut x_t = Array2::zeros(shape);
         let normal = Normal::new(0.0, 1.0).unwrap();
@@ -1233,26 +1225,7 @@ impl Layer for DiffusionBlock {
         }
 
         // Sanitize and globally clip gradients for stability
-        use rayon::prelude::*;
-        let pairs: Vec<(Array2<f32>, f32)> = param_grads
-            .par_iter()
-            .map(|g| {
-                let mut gg = g.clone();
-                gg.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
-                let s = gg.iter().map(|&x| x * x).sum::<f32>();
-                (gg, s)
-            })
-            .collect();
-        let mut sanitized: Vec<Array2<f32>> = pairs.iter().map(|(gg, _)| gg.clone()).collect();
-        let norm_sq: f32 = pairs.iter().map(|(_, s)| *s).sum();
-        let clip = 5.0f32;
-        let nrm = norm_sq.sqrt();
-        if nrm.is_finite() && nrm > clip && nrm > 0.0 {
-            let scale = clip / nrm;
-            for gg in &mut sanitized {
-                gg.mapv_inplace(|x| x * scale);
-            }
-        }
+        let sanitized = sanitize_and_clip_gradients(param_grads, 5.0);
 
         let cached_partitions = self
             .param_partitions
@@ -1295,53 +1268,24 @@ impl Layer for DiffusionBlock {
         let attn_range = next_range(partitions.attention);
         if !attn_range.is_empty() {
             let attention_grads = &sanitized[attn_range];
-            let gnorm_attn: f32 = attention_grads
-                .iter()
-                .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
-                .sum::<f32>()
-                .sqrt();
-            let wnorm_attn = self.attention.weight_norm().max(1e-6);
-            let scale_attn = (wnorm_attn / (gnorm_attn.max(1e-6))).clamp(0.01, 5.0);
-            let scaled: Vec<Array2<f32>> = attention_grads
-                .par_iter()
-                .map(|g| {
-                    let mut gg = g.clone();
-                    gg.mapv_inplace(|x| x * scale_attn);
-                    gg
-                })
-                .collect();
-            self.attention.apply_gradients(&scaled, lr)?;
+            apply_adaptive_gradients(
+                attention_grads,
+                self.attention.weight_norm(),
+                lr,
+                |grads, lr| self.attention.apply_gradients(grads, lr)
+            )?;
         }
 
         // Feedforward gradients
         let ffn_range = next_range(partitions.feedforward);
         if !ffn_range.is_empty() {
             let feedforward_grads = &sanitized[ffn_range];
-            let gnorm_ffn: f32 = feedforward_grads
-                .iter()
-                .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
-                .sum::<f32>()
-                .sqrt();
-            let wnorm_ffn = match &self.feedforward {
-                FeedForwardVariant::RichardsGlu(l) => l.weight_norm(),
-                FeedForwardVariant::MixtureOfExperts(l) => l.weight_norm(),
-            }
-            .max(1e-6);
-            let scale_ffn = (wnorm_ffn / (gnorm_ffn.max(1e-6))).clamp(0.01, 5.0);
-            let scaled: Vec<Array2<f32>> = feedforward_grads
-                .par_iter()
-                .map(|g| {
-                    let mut gg = g.clone();
-                    gg.mapv_inplace(|x| x * scale_ffn);
-                    gg
-                })
-                .collect();
-            match &mut self.feedforward {
-                FeedForwardVariant::RichardsGlu(layer) => layer.apply_gradients(&scaled, lr)?,
-                FeedForwardVariant::MixtureOfExperts(layer) => {
-                    layer.apply_gradients(&scaled, lr)?
-                }
-            }
+            apply_adaptive_gradients(
+                feedforward_grads,
+                self.feedforward.weight_norm(),
+                lr,
+                |grads, lr| self.feedforward.apply_gradients(grads, lr)
+            )?;
         }
 
         // Pre-FFN norm gradients

@@ -22,6 +22,9 @@ pub mod transformer_block;
 pub mod lrm;
 pub mod hrm;
 pub mod common;
+pub mod speculative;
+#[cfg(test)]
+mod speculative_tests;
 
 pub use diffusion_block::{
     DiffusionBlock, DiffusionBlockConfig, NoiseSchedule, NoiseScheduler, TimeEmbedding,
