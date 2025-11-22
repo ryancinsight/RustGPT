@@ -6,7 +6,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::{
     attention::poly_attention::PolyAttention,
     errors::Result,
-    llm::Layer,
+    network::Layer,
     model_config::ModelConfig,
     transformer::{
         diffusion_block::{DiffusionBlock, DiffusionBlockConfig, DiffusionCachedIntermediates},
@@ -629,6 +629,11 @@ impl Layer for LRM {
             0.0
         };
         (base_sq + latent_sq).sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // LRM doesn't maintain internal gradient state beyond the block
+        // The underlying TransformerBlock handles its own gradient state
     }
 }
 

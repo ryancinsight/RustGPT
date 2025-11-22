@@ -1,6 +1,15 @@
 pub mod adam;
 pub mod attention;
+pub mod cli;
+pub mod config_builder;
 pub mod diffusion;
+pub mod evaluator;
+pub mod inference;
+pub mod interactive;
+pub mod network;
+pub mod persistence;
+pub mod training;
+pub mod trainer;
 pub mod transformer;
 // TRM module removed
 
@@ -45,7 +54,6 @@ pub use encoding::{SimpleTokenizer, Vocab};
 pub use errors::{ModelError, Result};
 // removed head_router re-exports
 // pub use head_router::{RouterType, FullyAdaptiveHeadRouter};
-pub use llm::{LLM, Layer, LayerEnum};
 // Also re-export mixture types for convenience
 pub use mixtures::{
     ExpertRouter, ExpertRouterConfig, HeadSelectionConfig, HeadSelectionStrategy, MixtureOfExperts,
@@ -58,5 +66,13 @@ pub use richards::RichardsGlu;
 // Also re-export RichardsNorm as DynamicTanhNorm for compatibility
 pub use richards::RichardsNorm as DynamicTanhNorm;
 // TRM removed; use LRM via transformer::lrm
+
+// Re-export core LLM functionality
+pub use evaluator::Evaluator;
+pub use inference::InferenceEngine;
+pub use llm::LLM;
+pub use network::{Layer, LayerEnum};
+pub use persistence::ModelPersistence;
+pub use trainer::Trainer;
 
 // TRM tests removed

@@ -10,169 +10,18 @@ use tracing::{info, instrument, warn};
 use crate::{
     MAX_SEQ_LEN, Vocab,
     decoding::GreedyDecoder,
-    embeddings::TokenEmbeddings,
     errors::{ModelError, Result},
     metrics::text::corpus_bleu_1_2,
     model_config::DiffusionTimestepStrategy,
-    output_projection::OutputProjection,
-
-    transformer::{TransformerBlock, LRM, speculative::SpeculativeSamplingConfig},
+    network::{Layer, LayerEnum},
+    transformer::speculative::SpeculativeSamplingConfig,
 };
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum LayerEnum {
-    TokenEmbeddings(TokenEmbeddings),
-    // Removed SelfAttention variant
-    // Removed FeedForward variant; RichardsGlu is the only FFN
-    RichardsGlu(Box<crate::richards::RichardsGlu>),
-    MixtureOfExperts(Box<crate::mixtures::moe::MixtureOfExperts>),
-
-    DynamicTanhNorm(crate::richards::RichardsNorm),
-    OutputProjection(OutputProjection),
-
-    // Removed TRMBlock variant
-    PolyAttention(Box<crate::attention::poly_attention::PolyAttention>),
-    TransformerBlock(Box<TransformerBlock>),
-    DiffusionBlock(Box<crate::transformer::diffusion_block::DiffusionBlock>),
-    LRM(Box<LRM>),
-}
 
 impl LayerEnum {
     // Removed downcast helpers for SelfAttention/TRM to simplify to PolyAttention-only
 }
 
-impl Layer for LayerEnum {
-    fn layer_type(&self) -> &str {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.layer_type(),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.layer_type(),
-            LayerEnum::MixtureOfExperts(layer) => layer.layer_type(),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.layer_type(),
-            LayerEnum::OutputProjection(layer) => layer.layer_type(),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.layer_type(),
-            LayerEnum::TransformerBlock(layer) => layer.layer_type(),
-            LayerEnum::DiffusionBlock(layer) => layer.layer_type(),
-            LayerEnum::LRM(layer) => layer.layer_type(),
-        }
-    }
-
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.forward(input),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.forward(input),
-            LayerEnum::MixtureOfExperts(layer) => layer.forward(input),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.forward(input),
-            LayerEnum::OutputProjection(layer) => layer.forward(input),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.forward(input),
-            LayerEnum::TransformerBlock(layer) => layer.forward(input),
-            LayerEnum::DiffusionBlock(layer) => layer.forward(input),
-            LayerEnum::LRM(layer) => layer.forward(input),
-        }
-    }
-
-    fn compute_gradients(
-        &self,
-        input: &Array2<f32>,
-        output_grads: &Array2<f32>,
-    ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.compute_gradients(input, output_grads),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::MixtureOfExperts(layer) => layer.compute_gradients(input, output_grads),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::TransformerBlock(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::DiffusionBlock(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::LRM(layer) => layer.compute_gradients(input, output_grads),
-        }
-    }
-
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.apply_gradients(param_grads, lr),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::MixtureOfExperts(layer) => layer.apply_gradients(param_grads, lr),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::OutputProjection(layer) => layer.apply_gradients(param_grads, lr),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::TransformerBlock(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::DiffusionBlock(layer) => layer.apply_gradients(param_grads, lr),
-            LayerEnum::LRM(layer) => layer.apply_gradients(param_grads, lr),
-        }
-    }
-
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.backward(grads, lr),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.backward(grads, lr),
-            LayerEnum::MixtureOfExperts(layer) => layer.backward(grads, lr),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.backward(grads, lr),
-            LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.backward(grads, lr),
-            LayerEnum::TransformerBlock(layer) => layer.backward(grads, lr),
-            LayerEnum::DiffusionBlock(layer) => layer.backward(grads, lr),
-            LayerEnum::LRM(layer) => layer.backward(grads, lr),
-        }
-    }
-
-    fn parameters(&self) -> usize {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.parameters(),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.parameters(),
-            LayerEnum::MixtureOfExperts(layer) => layer.parameters(),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.parameters(),
-            LayerEnum::OutputProjection(layer) => layer.parameters(),
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.parameters(),
-            LayerEnum::TransformerBlock(layer) => layer.parameters(),
-            LayerEnum::DiffusionBlock(layer) => layer.parameters(),
-            LayerEnum::LRM(layer) => layer.parameters(),
-        }
-    }
-
-    fn weight_norm(&self) -> f32 {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.weight_norm(),
-            LayerEnum::RichardsGlu(layer) => layer.weight_norm(),
-            LayerEnum::MixtureOfExperts(layer) => layer.weight_norm(),
-            LayerEnum::DynamicTanhNorm(layer) => layer.weight_norm(),
-            LayerEnum::OutputProjection(layer) => layer.weight_norm(),
-            LayerEnum::PolyAttention(layer) => layer.weight_norm(),
-            LayerEnum::TransformerBlock(layer) => layer.weight_norm(),
-            LayerEnum::DiffusionBlock(layer) => layer.weight_norm(),
-            LayerEnum::LRM(layer) => layer.weight_norm(),
-        }
-    }
-}
 
 fn response_span_from_tokens(vocab: &Vocab, tokens: &[usize]) -> Option<(usize, usize)> {
     if tokens.is_empty() {
@@ -218,29 +67,6 @@ fn response_span_from_tokens(vocab: &Vocab, tokens: &[usize]) -> Option<(usize, 
     None
 }
 
-pub trait Layer {
-    fn layer_type(&self) -> &str;
-
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32>;
-
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
-
-    fn parameters(&self) -> usize;
-
-    /// Frobenius norm of all learnable weights in the layer
-    /// Used by LARS trust-ratio to balance update magnitude
-    fn weight_norm(&self) -> f32;
-
-    fn compute_gradients(
-        &self,
-        input: &Array2<f32>,
-        output_grads: &Array2<f32>,
-    ) -> (Array2<f32>, Vec<Array2<f32>>);
-
-    /// Apply gradients to layer parameters
-    /// Returns GradientError if param_grads has incorrect length
-    fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()>;
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum DecoderType {

@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{EMBEDDING_DIM, Vocab, adam::Adam, llm::Layer};
+use crate::{EMBEDDING_DIM, Vocab, adam::Adam, network::Layer};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TokenEmbeddings {
@@ -120,6 +120,11 @@ impl Layer for TokenEmbeddings {
         self.token_optimizer
             .step(&mut self.token_embeddings, &grad, lr);
         Ok(())
+    }
+
+    fn zero_gradients(&mut self) {
+        // TokenEmbeddings doesn't maintain internal gradients state
+        // Gradients are computed on-demand in compute_gradients
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {

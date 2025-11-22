@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, llm::Layer};
+use crate::{adam::Adam, network::Layer};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OutputProjection {
@@ -91,5 +91,10 @@ impl Layer for OutputProjection {
     fn weight_norm(&self) -> f32 {
         let sumsq = self.w_out.iter().map(|&w| w * w).sum::<f32>();
         sumsq.sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // OutputProjection doesn't maintain internal gradient state
+        // Gradients are computed on-demand
     }
 }

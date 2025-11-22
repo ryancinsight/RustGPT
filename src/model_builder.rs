@@ -1,7 +1,7 @@
 use crate::{
     embeddings::TokenEmbeddings,
     encoding::Vocab,
-    llm::{Layer, LayerEnum},
+    network::{Layer, LayerEnum},
     model_config::{ArchitectureType, ModelConfig},
     output_projection::OutputProjection,
     richards::RichardsNorm,
@@ -335,68 +335,3 @@ mod tests {
     }
 }
 
-#[cfg(any())]
-pub fn build_network(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
-    match config.architecture {
-        ArchitectureType::Transformer => build_transformer_layers(config, vocab_size),
-    }
-}
-
-#[cfg(any())]
-fn build_transformer_layers(config: &ModelConfig, vocab_size: usize) -> Vec<LayerEnum> {
-    let mut layers: Vec<LayerEnum> = Vec::new();
-    layers.push(LayerEnum::Embeddings(Embeddings::new(
-        vocab_size,
-        config.embedding_dim,
-    )));
-
-    // CoPE is integrated within attention modules as needed
-
-    // Build attention + FFN blocks
-    for _ in 0..config.num_layers {
-        match config.attention {
-            AttentionType::SelfAttention => {
-                layers.push(LayerEnum::SelfAttention(SelfAttention::new(
-                    config.get_num_heads(),
-                    config.embedding_dim,
-                    config.num_kv_heads,
-                    config.window_size,
-                    config.use_adaptive_window,
-                    config.min_window_size,
-                    config.max_window_size,
-                    config.window_adaptation_strategy,
-                    config.entropy_ema_alpha,
-                    &config.head_selection,
-                )));
-            }
-            AttentionType::PolyAttention { degree_p } => {
-                layers.push(LayerEnum::PolyAttention(PolyAttention::new(
-                    config.embedding_dim,
-                    config.get_num_heads(),
-                    degree_p,
-                    config.cope_max_pos,
-                    config.window_size,
-                )));
-            }
-        }
-
-        if config.use_dynamic_tanh_norm {
-            layers.push(LayerEnum::DynamicTanhNorm(DynamicTanhNorm::new(
-                config.embedding_dim,
-            )));
-        }
-
-        layers.push(LayerEnum::RichardsGlu(RichardsGlu::new(
-            config.embedding_dim,
-            config.hidden_dim,
-        )));
-    }
-
-    // Output projection to vocab size
-    layers.push(LayerEnum::OutputProjection(OutputProjection::new(
-        config.embedding_dim,
-        vocab_size,
-    )));
-
-    layers
-}

@@ -275,7 +275,7 @@ impl LLM {
         let has_poly_attention = self
             .network
             .iter()
-            .any(|l| matches!(l, crate::llm::LayerEnum::PolyAttention(_)));
+            .any(|l| matches!(l, crate::LayerEnum::PolyAttention(_)));
 
         if has_poly_attention {
             "Transformer".to_string()
@@ -288,7 +288,7 @@ impl LLM {
     fn get_embedding_dim(&self) -> usize {
         // Extract from first embeddings layer
         for layer in &self.network {
-            if let crate::llm::LayerEnum::TokenEmbeddings(emb) = layer {
+            if let crate::LayerEnum::TokenEmbeddings(emb) = layer {
                 // Get embedding dimension from token_embeddings shape
                 return emb.token_embeddings.shape()[1];
             }

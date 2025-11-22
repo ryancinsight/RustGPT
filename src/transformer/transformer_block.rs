@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     attention::poly_attention::PolyAttention,
     errors::Result,
-    llm::Layer,
+    network::Layer,
     mixtures::{
         HeadSelectionStrategy,
         moe::ExpertRouterConfig,
@@ -482,6 +482,14 @@ impl Layer for TransformerBlock {
         *self.cached_intermediates.write().unwrap() = None;
 
         Ok(())
+    }
+
+    fn zero_gradients(&mut self) {
+        // TransformerBlock doesn't maintain internal gradient state beyond cached intermediates
+        // Reset cached intermediates to free memory
+        if let Ok(mut guard) = self.cached_intermediates.write() {
+            *guard = None;
+        }
     }
 }
 

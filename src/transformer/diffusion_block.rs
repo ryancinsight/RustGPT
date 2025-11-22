@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     attention::poly_attention::PolyAttention,
     errors::Result,
-    llm::Layer,
+    network::Layer,
     mixtures::{
         HeadSelectionStrategy,
         moe::ExpertRouterConfig,
@@ -1314,6 +1314,17 @@ impl Layer for DiffusionBlock {
             *guard = None;
         }
         Ok(())
+    }
+
+    fn zero_gradients(&mut self) {
+        // DiffusionBlock doesn't maintain internal gradient state beyond cached intermediates
+        // Reset cached intermediates and partitions to free memory
+        if let Ok(mut guard) = self.cached_intermediates.write() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.param_partitions.write() {
+            *guard = None;
+        }
     }
 }
 
