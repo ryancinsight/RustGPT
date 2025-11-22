@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, errors::Result, llm::Layer, richards::{RichardsActivation, RichardsCurve, Variant}};
+use crate::{adam::Adam, errors::Result, network::Layer, richards::{RichardsActivation, RichardsCurve, Variant}};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RichardsGlu {
@@ -281,5 +281,10 @@ impl Layer for RichardsGlu {
             .map(|&w| (w as f32) * (w as f32))
             .sum::<f32>();
         sumsq.sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // RichardsGlu doesn't maintain internal gradient state
+        // Gradients are computed on-demand
     }
 }

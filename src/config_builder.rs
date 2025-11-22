@@ -1,0 +1,67 @@
+use crate::{
+    cli::Args,
+    model_config::{ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy},
+    MAX_SEQ_LEN, EMBEDDING_DIM, HIDDEN_DIM,
+};
+
+/// Build a complete model configuration from CLI arguments
+pub fn build_model_config(args: &Args) -> ModelConfig {
+    // Choose architecture based on CLI flags
+    let architecture = if args.trm {
+        ArchitectureType::TRM
+    } else if args.diffusion {
+        ArchitectureType::Diffusion
+    } else {
+        ArchitectureType::Transformer
+    };
+
+    let use_dynamic_tanh_norm = true;
+    let num_kv_heads: Option<usize> = Some(4); // GQA with 4 KV heads
+    let window_size: Option<usize> = Some(4096); // Mistral-style sliding window
+    let use_adaptive_window: bool = true;
+    let min_window_size: usize = 512;
+    let max_window_size: usize = 4096;
+    let window_adaptation_strategy = WindowAdaptationStrategy::AttentionEntropy;
+
+    // Create base configuration
+    let mut config = ModelConfig::transformer(
+        EMBEDDING_DIM,
+        HIDDEN_DIM,
+        1,
+        MAX_SEQ_LEN,
+        None,
+        Some(8)
+    );
+
+    // Apply architecture-specific settings
+    config.architecture = architecture;
+    config.diffusion_prediction_target = args.diffusion_prediction_target.into();
+    config.diffusion_min_snr_gamma = args.diffusion_min_snr_gamma.max(1e-6);
+    config.diffusion_noise_schedule = args.diffusion_noise_schedule.into();
+    config.diffusion_timestep_strategy = args.diffusion_timestep_strategy.into();
+
+    // Apply TRM-specific settings
+    if args.trm {
+        config.trm_use_diffusion = args.diffusion;
+        config.trm_num_recursions = args.trm_recursions;
+        config.trm_max_supervision_steps = args.trm_supervision_steps;
+        config.trm_max_inference_steps = args.trm_inference_steps;
+        config.trm_latent_moh_enabled = args.trm_latent_moh;
+        config.trm_latent_moh_top_p_min = Some(args.trm_latent_moh_top_p_min);
+        config.trm_latent_moh_top_p_max = Some(args.trm_latent_moh_top_p_max);
+    }
+
+    // Apply modern LLM enhancements
+    config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
+    config.num_kv_heads = num_kv_heads;
+    config.window_size = window_size;
+    config.use_adaptive_window = use_adaptive_window;
+    config.min_window_size = min_window_size;
+    config.max_window_size = max_window_size;
+    config.window_adaptation_strategy = window_adaptation_strategy;
+
+    // Set attention mechanism to PolyAttention
+    config.attention = AttentionType::PolyAttention { degree_p: 3 };
+
+    config
+}

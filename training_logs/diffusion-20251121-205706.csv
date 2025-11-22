@@ -1,0 +1,1 @@
+epoch,loss,sce,mse,lambda_ce,lr,grad_norm,val_loss,val_sce,val_mse

@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::Layer;
+use crate::network::Layer;
 
 /// Enhanced threshold predictor inspired by AutoDeco
 ///

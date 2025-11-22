@@ -6,7 +6,7 @@ use crate::{
         HeadSelectionStrategy,
         moe::{MixtureOfExperts, ExpertRouterConfig},
     },
-    llm::Layer,
+    network::Layer,
     attention::poly_attention::PolyAttention,
 };
 

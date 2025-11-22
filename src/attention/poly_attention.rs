@@ -13,7 +13,7 @@ use crate::{
         params::PolyAttentionParamInfo,
         position::cope::CoPE,
     },
-    llm::Layer,
+    network::Layer,
     mixtures::{
         moh::{HeadSelectionConfig, HeadSelectionStrategy},
         threshold::ThresholdPredictor,
@@ -2358,5 +2358,10 @@ impl Layer for PolyAttention {
         }
 
         sumsq.sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // PolyAttention doesn't maintain internal gradient state
+        // Gradients are computed on-demand and applied immediately
     }
 }

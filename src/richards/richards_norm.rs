@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::llm::Layer;
+use crate::network::Layer;
 use super::{RichardsCurve, Variant};
 
 // EMA smoothing factor for gradient norm tracking inside RichardsNorm
@@ -324,5 +324,10 @@ impl Layer for RichardsNorm {
             .map(|&w| (w as f32) * (w as f32))
             .sum::<f32>();
         sumsq.sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // RichardsNorm doesn't maintain internal gradient state
+        // Gradients are computed on-demand
     }
 }

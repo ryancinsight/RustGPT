@@ -5,7 +5,7 @@ use std::sync::RwLock;
 
 use crate::{
     errors::Result,
-    llm::Layer,
+    network::Layer,
     model_config::ModelConfig,
     transformer::transformer_block::{TransformerBlock, TransformerBlockConfig},
 };
@@ -446,8 +446,17 @@ impl Layer for HRM {
 
     fn weight_norm(&self) -> f32 {
         self.bottom_block.weight_norm() + self.top_block.weight_norm() +
-        (self.downsample_w.iter().map(|x| x*x).sum::<f32>() + 
+        (self.downsample_w.iter().map(|x| x*x).sum::<f32>() +
          self.upsample_w.iter().map(|x| x*x).sum::<f32>()).sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // HRM doesn't maintain internal gradient state beyond cached intermediates
+        // Reset cached intermediates to free memory
+        self.cached_intermediates = None;
+        if let Ok(mut guard) = self.param_partitions.write() {
+            *guard = None;
+        }
     }
 }
 

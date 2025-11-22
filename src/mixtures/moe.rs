@@ -27,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    llm::Layer,
+    network::Layer,
     mixtures::{
         gating::{GatingConfig, GatingStrategy},
         routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm},
@@ -773,6 +773,11 @@ impl Layer for RichardsExpert {
     fn weight_norm(&self) -> f32 {
         self.glu.weight_norm()
     }
+
+    fn zero_gradients(&mut self) {
+        // RichardsExpert delegates to underlying GLU layer
+        // GLU layer handles its own gradient state
+    }
 }
 
 /// Parameter information for the MoE layer
@@ -1222,6 +1227,13 @@ impl Layer for MixtureOfExperts {
         let expert_norm = self.experts.iter().map(|e| e.weight_norm()).sum::<f32>();
 
         router_norm + expert_norm
+    }
+
+    fn zero_gradients(&mut self) {
+        // MixtureOfExperts doesn't maintain internal gradient state beyond cached routing
+        // Reset cached routing decisions and expert outputs
+        self.cached_routing_probs = None;
+        self.cached_expert_outputs = None;
     }
 }
 
