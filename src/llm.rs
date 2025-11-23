@@ -677,8 +677,8 @@ impl LLM {
             let mut richards_training_status: Vec<bool> = Vec::new();
             for layer in &self.network {
                 if let LayerEnum::RichardsGlu(richards_glu) = layer {
-                    current_richards_glu_weights.push(richards_glu.gate_curve.weights());
-                    richards_training_status.push(richards_glu.gate_curve.has_trained_parameters());
+                    current_richards_glu_weights.push(richards_glu.gate.weights());
+                    richards_training_status.push(richards_glu.gate.has_trained_parameters());
                 }
             }
 

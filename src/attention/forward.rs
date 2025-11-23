@@ -5,7 +5,7 @@ use crate::{
     attention::{head::PolyHead, position::cope::CoPE},
     attention::memory::with_tls_phi,
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
-    richards::RichardsCurve,
+    richards::{RichardsCurve, RichardsGate},
 };
 
 /// Context structure containing all data needed for forward computation
@@ -17,7 +17,7 @@ pub struct ForwardContext<'a> {
     pub w_g: &'a Array2<f32>,
     pub alpha_g: &'a Array2<f32>,
     pub beta_g: &'a Array2<f32>,
-    pub gate_poly: &'a mut RichardsCurve,
+    pub gate: &'a mut RichardsGate,
     pub cope: &'a mut CoPE,
     pub head_selection_config: &'a mut HeadSelectionConfig,
     pub threshold_predictor: &'a mut Option<ThresholdPredictor>,
@@ -107,8 +107,10 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
 
-            let gate_poly = ctx.gate_poly.update_scaling_from_max_abs(max_abs_z);
-            let g_col = xw_col.mapv(|xw| gate_poly.forward_scalar((a_h * xw + b_h) as f64) as f32);
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
+            let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
+            let g_col_data: Vec<f32> = gate_input.iter().map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32).collect();
+            let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
 
             all_gates.push(g_col);
         }
@@ -186,9 +188,11 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
 
-            let gate_poly = ctx.gate_poly.update_scaling_from_max_abs(max_abs_z);
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
 
-            let g_col = xw_col.mapv(|xw| gate_poly.forward_scalar((a_h * xw + b_h) as f64) as f32);
+            let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
+            let g_col_data: Vec<f32> = gate_input.iter().map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32).collect();
+            let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
 
             // RMS tracking for gating predictor
             let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
@@ -435,8 +439,10 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
                 .iter()
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
-            let gate_poly = ctx.gate_poly.update_scaling_from_max_abs(max_abs_z);
-            let g_col = xw_col.mapv(|xw| gate_poly.forward_scalar((a_h * xw + b_h) as f64) as f32);
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
+            let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
+            let g_col_data: Vec<f32> = gate_input.iter().map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32).collect();
+            let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
             let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
             let g_count = n;
             let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);

@@ -18,7 +18,7 @@ use crate::{
         moh::{HeadSelectionConfig, HeadSelectionStrategy},
         threshold::ThresholdPredictor,
     },
-    richards::RichardsCurve,
+    richards::{RichardsCurve, RichardsGate},
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -223,7 +223,7 @@ pub struct PolyAttention {
     opt_beta_g: Adam,
 
     // Learnable Richards curve for gating
-    pub gate_poly: RichardsCurve,
+    pub gate: RichardsGate,
 
     // ===== Mixture of Heads (MoH) components =====
     /// Head selection configuration and metrics
@@ -298,7 +298,7 @@ impl PolyAttention {
         let (w_g, alpha_g, beta_g, opt_w_g, opt_alpha_g, opt_beta_g) =
             init_gating_params(embed_dim, num_heads);
         let cope = init_cope(max_pos, head_dim);
-        let gate_poly = init_gate_polynomial();
+        let gate = RichardsGate::new();
 
         let mut opt_a = opt_a;
         let mut opt_b = opt_b;
@@ -344,7 +344,7 @@ impl PolyAttention {
             opt_w_g,
             opt_alpha_g,
             opt_beta_g,
-            gate_poly,
+            gate,
             head_selection_config: HeadSelectionConfig {
                 gating: crate::mixtures::gating::GatingConfig::default(),
                 min_heads: 1,
@@ -491,7 +491,7 @@ impl PolyAttention {
             w_g: &self.w_g,
             alpha_g: &self.alpha_g,
             beta_g: &self.beta_g,
-            gate_poly: &mut self.gate_poly,
+            gate: &mut self.gate,
             cope: &mut self.cope,
             head_selection_config: &mut self.head_selection_config,
             threshold_predictor: &mut self.threshold_predictor,
@@ -536,7 +536,7 @@ impl PolyAttention {
             w_g: &self.w_g,
             alpha_g: &self.alpha_g,
             beta_g: &self.beta_g,
-            gate_poly: &mut self.gate_poly,
+            gate: &mut self.gate,
             cope: &mut self.cope,
             head_selection_config: &mut self.head_selection_config,
             threshold_predictor: &mut self.threshold_predictor,
@@ -594,7 +594,7 @@ impl PolyAttention {
         let mut grad_alpha_g = Array2::<f32>::zeros((1, self.num_heads));
         let mut grad_beta_g = Array2::<f32>::zeros((1, self.num_heads));
         // Gate polynomial coefficient gradient accumulator (shared across heads)
-        let n_gate_w = self.gate_poly.weights().len();
+        let n_gate_w = self.gate.parameters();
         let mut grad_gate_poly_vec = vec![0.0_f64; n_gate_w];
 
         // Threshold predictor gradient accumulator (shared across heads)
@@ -663,9 +663,8 @@ impl PolyAttention {
             let mut z_col = xw_col.clone();
             z_col.mapv_inplace(|v| a_h * v + b_h);
             let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-            let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
-            let mut g_col = z_col.clone();
-            g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+            let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+            let g_col = self.gate.forward_const(&z_col);
 
             // Threshold path forward
             let mut m_col = Array2::<f32>::ones((n, 1));
@@ -759,10 +758,10 @@ impl PolyAttention {
 
                     // Gate Richards path
                     let z_i = a_h * xw_col[[i, 0]] + b_h;
-                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let dphi_dz_i = self.gate.backward_scalar(z_i as f64) as f32;
                     let grad_g_i = d_g_i * dphi_dz_i;
                     // Parameter grads for Richards curve
-                    let gws = gate_poly.grad_weights_scalar(z_i as f64, d_g_i as f64);
+                    let gws = self.gate.grad_weights_scalar(z_i as f64, d_g_i as f64);
                     for (wi, &gw) in gws.iter().enumerate() {
                         grad_gate_poly_vec[wi] += gw;
                     }
@@ -1085,9 +1084,8 @@ impl PolyAttention {
                 z_col.mapv_inplace(|v| a_h * v + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
                 max_abs_vec[h] = max_abs_z;
-                let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
-                let mut g_col = z_col.clone();
-                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+                let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+                let g_col = self.gate.forward_const(&z_col);
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
                     g_mat[[i, h]] = g_col[[i, 0]];
@@ -1136,7 +1134,7 @@ impl PolyAttention {
                     let d_g_i = d_eff_h * m_mat[[i, h]];
                     let a_h = self.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
-                    let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_vec[h]);
+                    let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_vec[h]);
                     let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
                     let grad_g_i = d_g_i * dphi_dz_i;
 
@@ -1308,8 +1306,7 @@ impl PolyAttention {
         // Option 3: Meta-learning - Richards learns across multiple attention layers
         {
             let grad_gate_poly = &param_grads[idx];
-            let grad_gate_vec: Vec<f64> = grad_gate_poly.iter().map(|&x| x as f64).collect();
-            self.gate_poly.step(&grad_gate_vec, lr as f64);
+            let _ = self.gate.apply_gradients(&[grad_gate_poly.clone()]);
         }
         idx += 1;
 
@@ -1394,7 +1391,7 @@ impl PolyAttention {
         let scale = self.scale[[0, 0]];
         let p_i32 = self.p as i32;
         let mut grad_input_total = output_grads.clone();
-        let n_gate_w = self.gate_poly.weights().len();
+        let n_gate_w = self.gate.parameters();
         use rayon::prelude::*;
 
         let head_results: Vec<(
@@ -1427,9 +1424,8 @@ impl PolyAttention {
                 let mut z_col = xw_col.clone();
                 z_col.mapv_inplace(|vv| a_h * vv + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-                let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
-                let mut g_col = z_col.clone();
-                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+                let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+                let g_col = self.gate.forward_const(&z_col);
                 let mut m_col = Array2::<f32>::ones((n, 1));
                 if self.head_selection_config.gating.use_learned_predictor
                     && let Some(predictor) = &self.threshold_predictor
@@ -1776,9 +1772,8 @@ impl PolyAttention {
                 z_col.mapv_inplace(|v| a_h * v + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
                 max_abs_vec[h] = max_abs_z;
-                let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_z);
-                let mut g_col = z_col.clone();
-                g_col.mapv_inplace(|z| gate_poly.forward_scalar(z as f64) as f32);
+                let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+                let g_col = self.gate.forward_const(&z_col);
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
                     g_mat[[i, h]] = g_col[[i, 0]];
@@ -1816,7 +1811,7 @@ impl PolyAttention {
                     let d_g_i = d_eff_h * m_mat[[i, h]];
                     let a_h = self.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
-                    let gate_poly = self.gate_poly.update_scaling_from_max_abs(max_abs_vec[h]);
+                    let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_vec[h]);
                     let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
                     let grad_g_i = d_g_i * dphi_dz_i;
                     for d in 0..self.embed_dim {
@@ -1922,7 +1917,7 @@ impl PolyAttention {
                 .map(|h| h.w_q.len() + h.w_k.len() + h.w_v.len())
                 .unwrap_or(0);
 
-            let gate_poly_params = self.gate_poly.weights().len();
+            let gate_poly_params = self.gate.parameters();
 
             let threshold_predictor_params =
                 if self.head_selection_config.gating.use_learned_predictor {
@@ -1976,7 +1971,7 @@ impl PolyAttention {
                 + self.w_g.len()
                 + self.alpha_g.len()
                 + self.beta_g.len()
-                + self.gate_poly.weights().len();
+                + self.gate.parameters();
             total += self.cope.parameters();
             if self.head_selection_config.gating.use_learned_predictor {
                 if let Some(predictor) = &self.threshold_predictor {
@@ -2337,12 +2332,7 @@ impl Layer for PolyAttention {
         sumsq += self.beta_g.iter().map(|&w| w * w).sum::<f32>();
 
         // Learnable Richards gate parameters
-        sumsq += self
-            .gate_poly
-            .weights()
-            .iter()
-            .map(|&w| (w as f32) * (w as f32))
-            .sum::<f32>();
+        sumsq += self.gate.weight_norm().powi(2);
 
         // CoPE positional embeddings
         sumsq += self.cope.weight_norm().powi(2);
