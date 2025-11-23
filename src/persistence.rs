@@ -47,3 +47,4 @@ impl ModelPersistence {
         LLM::load_versioned(path)
     }
 }
+

@@ -355,7 +355,7 @@ pub struct ExpertSelector {
     /// Richards sigmoid for stable activation
     pub sigmoid: crate::richards::RichardsCurve,
     /// Learned Richards activation replacing ReLU
-    pub activation: crate::richards::RichardsCurve,
+    pub activation: crate::richards::RichardsGate,
     /// Softmax layer for probability normalization
     pub softmax: crate::softmax::Softmax,
 
@@ -404,8 +404,7 @@ impl ExpertSelector {
 
         let norm = crate::richards::RichardsNorm::new(router_hidden_dim);
         let sigmoid = crate::richards::RichardsCurve::sigmoid(false); // Non-learnable sigmoid
-        let activation =
-            crate::richards::RichardsCurve::new_learnable(crate::richards::Variant::None); // Learnable activation replacing ReLU
+        let activation = crate::richards::RichardsGate::new(); // Learned Richards gating replacing ReLU
 
         Self {
             weights1,
@@ -443,11 +442,8 @@ impl ExpertSelector {
         let normalized = self.norm.forward(&hidden);
         self.cached_normalized = Some(normalized.clone());
 
-        // Learned Richards activation replacing ReLU (avoid double conversion)
-        let activation_output = self
-            .activation
-            .forward_matrix(&normalized.mapv(|x| x as f64))
-            .mapv(|x| x as f32);
+        // Learned Richards gating replacing ReLU
+        let activation_output = self.activation.forward(&normalized);
         self.cached_activation = Some(activation_output.clone());
 
         // Second layer: W2 * activated + b2
@@ -620,7 +616,7 @@ impl ExpertSelector {
             let bias_shapes = vec![self.bias1.len(), self.bias2.len()];
 
             let norm_params = self.norm.parameters();
-            let activation_params = self.activation.weights().len();
+            let activation_params = self.activation.parameters();
             let sigmoid_params = self.sigmoid.weights().len();
 
             let total_params = self.parameters().map(|p| p.len()).sum::<usize>()
@@ -706,7 +702,7 @@ impl RichardsExpert {
             ];
 
             let richards_activation_params = self.glu.richards_activation.weights().len();
-            let richards_gate_params = self.glu.gate_curve.weights().len();
+            let richards_gate_params = self.glu.gate.parameters();
 
             let total_params = self.glu.parameters();
 
@@ -976,7 +972,7 @@ impl Layer for MixtureOfExperts {
             total += self.router.weights1.len() + self.router.weights2.len();
             total += self.router.bias1.len() + self.router.bias2.len();
             total += self.router.norm.parameters();
-            total += self.router.activation.weights().len();
+            total += self.router.activation.parameters();
 
             total += self
                 .experts
@@ -1196,13 +1192,7 @@ impl Layer for MixtureOfExperts {
                 .scaled_add(-lr, &param_grads[grad_idx + 3].row(0));
 
             // Apply activation parameter gradients
-            let activation_grads_f64: Vec<f64> = param_grads[grad_idx + 4]
-                .iter()
-                .map(|&x| x as f64)
-                .collect();
-            self.router
-                .activation
-                .step(&activation_grads_f64, lr as f64);
+            let _ = self.router.activation.apply_gradients(&[param_grads[grad_idx + 4].clone()]);
         }
 
         Ok(())
@@ -1222,7 +1212,8 @@ impl Layer for MixtureOfExperts {
                 .iter()
                 .map(|&w| w * w)
                 .sum::<f32>()
-                .sqrt();
+                .sqrt()
+            + self.router.activation.weight_norm();
 
         let expert_norm = self.experts.iter().map(|e| e.weight_norm()).sum::<f32>();
 
@@ -1393,7 +1384,7 @@ mod tests {
 
         // Verify that router gradients are included (5 matrices: weights1, bias1, weights2, bias2,
         // activation) Expert gradients come first, then router gradients
-        let expected_router_grad_start = moe.experts.len() * 5; // 5 parameters per expert (w1, w2, w_out, richards_activation, gate_curve)
+        let expected_router_grad_start = moe.experts.len() * 5; // 5 parameter groups per expert (w1, w2, w_out, richards_activation, gate_parameters)
         assert!(
             param_grads.len() >= expected_router_grad_start + 5,
             "Should have gradients for all experts plus 5 router matrices"

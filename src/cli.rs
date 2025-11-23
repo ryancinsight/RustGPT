@@ -159,3 +159,4 @@ impl From<DiffusionTimestepCli> for DiffusionTimestepStrategy {
         }
     }
 }
+

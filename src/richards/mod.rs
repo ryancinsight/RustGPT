@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod richards_act;
 pub mod richards_curve;
+pub mod richards_gate;
 pub mod richards_glu;
 pub mod richards_norm;
 
@@ -10,6 +11,7 @@ pub use crate::pade::*;
 
 pub use self::richards_act::*;
 pub use self::richards_curve::{RichardsCurve, WeightsIter};
+pub use self::richards_gate::*;
 pub use self::richards_glu::*;
 pub use self::richards_norm::*;
 

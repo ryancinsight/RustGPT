@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, errors::Result, network::Layer, richards::{RichardsActivation, RichardsCurve, Variant}};
+use crate::{adam::Adam, errors::Result, network::Layer, richards::{RichardsActivation, RichardsGate, Variant}};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RichardsGlu {
@@ -19,8 +19,8 @@ pub struct RichardsGlu {
     pub cached_gated: Option<Array2<f32>>,
     // [MOD] Learnable RichardsActivation for value function
     pub richards_activation: RichardsActivation,
-    // [MOD] Learnable RichardsCurve for gate (sigmoid)
-    pub gate_curve: RichardsCurve,
+    // [MOD] Learned RichardsGate for gating (ensures [0,1] output range)
+    pub gate: RichardsGate,
 }
 
 impl RichardsGlu {
@@ -48,7 +48,7 @@ impl RichardsGlu {
             cached_swish: None,
             cached_gated: None,
             richards_activation: RichardsActivation::new_learnable(Variant::None),
-            gate_curve: RichardsCurve::new_learnable(Variant::Sigmoid),
+            gate: RichardsGate::new(),
         }
     }
 
@@ -69,11 +69,11 @@ impl Layer for RichardsGlu {
 
         // Apply Richards functions to entire matrices at once
         let value_f64 = self.richards_activation.forward_matrix(&x1_f64);
-        let gate_f64 = self.gate_curve.forward_matrix(&x2_f64);
-
         // Convert back to f32
         let value = value_f64.mapv(|x| x as f32);
-        let gate_sigma = gate_f64.mapv(|x| x as f32);
+
+        // Compute gate values using RichardsGate
+        let gate_sigma = self.gate.forward(&x2);
 
         let gated = &value * &gate_sigma;
         let output = gated.dot(&self.w_out) + input;
@@ -99,7 +99,7 @@ impl Layer for RichardsGlu {
 
     fn parameters(&self) -> usize {
         let base = self.w1.len() + self.w2.len() + self.w_out.len();
-        base + self.richards_activation.weights().len() + self.gate_curve.weights().len()
+        base + self.richards_activation.weights().len() + self.gate.parameters()
     }
 
     fn compute_gradients(
@@ -133,36 +133,22 @@ impl Layer for RichardsGlu {
                 }
                 result
             });
+        // Compute gate values
+        let gate_sigma = self.gate.forward_const(&x2);
+
         let gated = self
             .cached_gated
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| {
-                // Recompute gate if not cached
-                let mut gate_sigma = Array2::<f32>::zeros(x2.raw_dim());
-                for (i, x2_row) in x2.outer_iter().enumerate() {
-                    let x2_f64: Array1<f64> = x2_row.mapv(|x| x as f64);
-                    let gate_f64 = self.gate_curve.forward(&x2_f64);
-                    for (j, &g) in gate_f64.iter().enumerate() {
-                        gate_sigma[[i, j]] = g as f32;
-                    }
-                }
-                &value * &gate_sigma
-            });
+            .unwrap_or_else(|| &value * &gate_sigma);
 
         // Gradients wrt parameters
         let grad_w_out = gated.t().dot(output_grads);
         let grad_gated = output_grads.dot(&self.w_out.t());
 
         // Compute gate_sigma for gradient computation
-        let mut gate_sigma = Array2::<f32>::zeros(x2.raw_dim());
-        for (i, x2_row) in x2.outer_iter().enumerate() {
-            let x2_f64: Array1<f64> = x2_row.mapv(|x| x as f64);
-            let gate_f64 = self.gate_curve.forward(&x2_f64);
-            for (j, &g) in gate_f64.iter().enumerate() {
-                gate_sigma[[i, j]] = g as f32;
-            }
-        }
+        // Compute gate values
+        let gate_sigma = self.gate.forward_const(&x2);
         
         let grad_value = &grad_gated * &gate_sigma;
         let grad_gate_sigma = &grad_gated * &value;
@@ -174,10 +160,16 @@ impl Layer for RichardsGlu {
         for (i, (x1_row, x2_row)) in x1.outer_iter().zip(x2.outer_iter()).enumerate() {
             let x1_f64: Array1<f64> = x1_row.mapv(|x| x as f64);
             let x2_f64: Array1<f64> = x2_row.mapv(|x| x as f64);
-            
+
             let value_deriv = self.richards_activation.derivative(&x1_f64);
-            let gate_deriv = self.gate_curve.derivative(&x2_f64);
-            
+
+            // For RichardsGate, compute derivative through temperature scaling
+            // RichardsGate applies temperature scaling: x_temp = x / T
+            // Derivative: d/dx[g(x/T)] = g'(x/T) * (1/T)
+            let scaled_x = x2_f64.mapv(|x| x / self.gate.temperature as f64);
+            let curve_deriv = self.gate.curve.derivative(&scaled_x);
+            let gate_deriv = curve_deriv.mapv(|d| d / self.gate.temperature as f64);
+
             for j in 0..x1_row.len() {
                 grad_x1[[i, j]] = (value_deriv[j] * grad_value[[i, j]] as f64) as f32;
             }
@@ -198,11 +190,8 @@ impl Layer for RichardsGlu {
         // Parameter gradients vector
         let mut param_grads = vec![grad_w1, grad_w2, grad_w_out];
 
-        // Compute RichardsActivation/RichardsCurve gradients
-        // For Richards layers, we need to accumulate gradients across all input elements
+        // Compute RichardsActivation gradients (value function)
         let mut value_grads_sum = Array2::<f32>::zeros((1, self.richards_activation.weights().len()));
-        let mut gate_grads_sum = Array2::<f32>::zeros((1, self.gate_curve.weights().len()));
-
 
         // Accumulate gradients for richards_activation (value function)
         for (i, x1_row) in x1.outer_iter().enumerate() {
@@ -217,31 +206,21 @@ impl Layer for RichardsGlu {
             }
         }
 
-        // Accumulate gradients for gate_curve (sigmoid)
-        for (i, x2_row) in x2.outer_iter().enumerate() {
-            for (j, &x2_val) in x2_row.iter().enumerate() {
-                let grad_output = grad_gate_sigma[[i, j]] as f64;
-                if grad_output != 0.0 {
-                    let gate_grads = self.gate_curve.grad_weights_scalar(x2_val as f64, grad_output);
-                    for (k, &grad) in gate_grads.iter().enumerate() {
-                        gate_grads_sum[[0, k]] += grad as f32;
-                    }
-                }
-            }
-        }
-        
+        // Compute RichardsGate gradients using the gate's own gradient computation
+        let (_, gate_param_grads) = self.gate.compute_gradients(&x2, &grad_gate_sigma);
+
         param_grads.push(value_grads_sum);
-        param_grads.push(gate_grads_sum);
+        param_grads.extend(gate_param_grads);
 
         (grad_input, param_grads)
     }
 
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        // Expect gradients in order: W1, W2, W_out, richards_activation, gate_curve
-        if param_grads.len() != 5 {
+        // Expect gradients in order: W1, W2, W_out, richards_activation, gate_parameters...
+        if param_grads.len() < 4 {
             return Err(crate::errors::ModelError::GradientError {
                 message: format!(
-                    "RichardsGlu expects 5 gradient blocks, got {}",
+                    "RichardsGlu expects at least 4 gradient blocks, got {}",
                     param_grads.len()
                 ),
             });
@@ -256,9 +235,11 @@ impl Layer for RichardsGlu {
         let grad_value_vec: Vec<f64> = param_grads[3].iter().map(|&x| x as f64).collect();
         self.richards_activation.step(&grad_value_vec, lr as f64);
 
-        // Update RichardsCurve weights
-        let grad_gate_vec: Vec<f64> = param_grads[4].iter().map(|&x| x as f64).collect();
-        self.gate_curve.step(&grad_gate_vec, lr as f64);
+        // Update RichardsGate parameters (parameters 4 onwards)
+        if param_grads.len() > 4 {
+            let gate_grads = &param_grads[4..];
+            self.gate.apply_gradients(gate_grads)?;
+        }
         
         Ok(())
     }
@@ -274,12 +255,7 @@ impl Layer for RichardsGlu {
             .iter()
             .map(|&w| (w as f32) * (w as f32))
             .sum::<f32>();
-        sumsq += self
-            .gate_curve
-            .weights()
-            .iter()
-            .map(|&w| (w as f32) * (w as f32))
-            .sum::<f32>();
+        sumsq += self.gate.weight_norm();
         sumsq.sqrt()
     }
 
