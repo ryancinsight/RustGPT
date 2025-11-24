@@ -238,7 +238,7 @@ impl Layer for RichardsGlu {
         // Update RichardsGate parameters (parameters 4 onwards)
         if param_grads.len() > 4 {
             let gate_grads = &param_grads[4..];
-            self.gate.apply_gradients(gate_grads)?;
+            self.gate.apply_gradients(gate_grads, lr)?;
         }
         
         Ok(())

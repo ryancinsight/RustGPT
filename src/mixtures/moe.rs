@@ -1192,7 +1192,7 @@ impl Layer for MixtureOfExperts {
                 .scaled_add(-lr, &param_grads[grad_idx + 3].row(0));
 
             // Apply activation parameter gradients
-            let _ = self.router.activation.apply_gradients(&[param_grads[grad_idx + 4].clone()]);
+            let _ = self.router.activation.apply_gradients(&[param_grads[grad_idx + 4].clone()], lr);
         }
 
         Ok(())

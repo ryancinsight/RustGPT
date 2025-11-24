@@ -285,7 +285,7 @@ impl RichardsGate {
     }
 
     /// Apply gradients to parameters
-    pub fn apply_gradients(&mut self, gradients: &[Array2<f32>]) -> Result<(), crate::errors::ModelError> {
+    pub fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<(), crate::errors::ModelError> {
         if gradients.len() != 4 {  // nu, k, m, temperature
             return Err(crate::errors::ModelError::GradientError {
                 message: format!("RichardsGate expected 4 gradients, got {}", gradients.len()),
@@ -297,11 +297,11 @@ impl RichardsGate {
         let k_grad = gradients[1][[0, 0]] as f64;
         let m_grad = gradients[2][[0, 0]] as f64;
         let curve_grads = vec![nu_grad, k_grad, m_grad];
-        self.curve.step(&curve_grads, 1.0); // Learning rate handled internally
+        self.curve.step(&curve_grads, learning_rate as f64);
 
         // Apply temperature gradient
         let temp_grad = gradients[3][[0, 0]];
-        self.temperature_optimizer.step(&mut Array2::from_elem((1, 1), self.temperature), &Array2::from_elem((1, 1), temp_grad), 1.0);
+        self.temperature_optimizer.step(&mut Array2::from_elem((1, 1), self.temperature), &Array2::from_elem((1, 1), temp_grad), learning_rate);
         self.temperature = self.temperature.max(0.1).min(10.0);
 
         Ok(())
@@ -388,7 +388,7 @@ impl Layer for RichardsGate {
         // For RichardsGate, backward pass computes gradients and applies them
         let dummy_input = Array2::zeros(grads.raw_dim());
         let (_, param_grads) = self.compute_gradients(&dummy_input, grads);
-        let _ = self.apply_gradients(&param_grads);
+        let _ = self.apply_gradients(&param_grads, lr);
         // Return input gradients (simplified - would need proper computation)
         Array2::zeros(grads.raw_dim())
     }
@@ -405,9 +405,8 @@ impl Layer for RichardsGate {
         self.compute_gradients(input, output_grads)
     }
 
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], _learning_rate: f32) -> crate::errors::Result<()> {
-        // Note: RichardsGate handles its own learning rate scaling internally
-        self.apply_gradients(gradients)
+    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> crate::errors::Result<()> {
+        self.apply_gradients(gradients, learning_rate)
     }
 
     fn zero_gradients(&mut self) {
@@ -453,7 +452,7 @@ mod tests {
         assert!(!param_grads.is_empty());
 
         // Apply gradients (should not panic)
-        gate.apply_gradients(&param_grads).unwrap();
+        gate.apply_gradients(&param_grads, 0.1).unwrap();
     }
 
     #[test]
@@ -573,7 +572,7 @@ mod tests {
             Array2::zeros((1, 1)), // k grad
             Array2::zeros((1, 1)), // m grad
             Array2::zeros((1, 1)), // temperature grad
-        ]);
+        ], 0.1);
 
         // Should be clamped to reasonable range
         assert!(gate.temperature >= 0.1 && gate.temperature <= 10.0,
@@ -629,7 +628,7 @@ mod tests {
                 }
             }
 
-            let _ = gate.apply_gradients(&param_grads);
+            let _ = gate.apply_gradients(&param_grads, 0.1);
 
             // Compute loss
             let loss: f32 = error.iter().map(|&x| x * x).sum::<f32>() / error.len() as f32;

@@ -56,6 +56,10 @@ pub struct Args {
     #[arg(long)]
     pub speculative: bool,
 
+    /// Speculative sampling mode: "diffusion" or "transformer"
+    #[arg(long, default_value = "diffusion")]
+    pub speculative_mode: String,
+
     /// Number of draft steps per speculative proposal
     #[arg(long, default_value_t = 4)]
     pub speculative_gamma: usize,
