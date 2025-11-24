@@ -11,6 +11,21 @@ pub struct SpeculativeSamplingConfig {
     pub draft_layers: usize,
 }
 
+/// Speculative sampling mode - determines which type of model uses speculative sampling
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum SpeculativeMode {
+    /// Speculative sampling for diffusion models (existing implementation)
+    Diffusion,
+    /// Speculative sampling for transformer models (new implementation)
+    Transformer,
+}
+
+impl Default for SpeculativeMode {
+    fn default() -> Self {
+        SpeculativeMode::Diffusion
+    }
+}
+
 impl Default for SpeculativeSamplingConfig {
     fn default() -> Self {
         Self {

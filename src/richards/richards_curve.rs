@@ -893,7 +893,7 @@ impl RichardsCurve {
 
     /// Vectorized backward pass: df/dx at x (analytical gradient), writing to output slice.
     pub fn derivative_into(&self, x: &[f64], out: &mut [f64]) {
-        let (nu, k, m, _, _, output_gain, _, scale, shift) = self.get_all_params();
+        let (nu, k, m, beta, _, output_gain, _, scale, shift) = self.get_all_params();
         let (input_scale, outer_scale) = self.get_variant_scales();
 
         // Ensure output size matches input
@@ -911,7 +911,13 @@ impl RichardsCurve {
                     1.0 / (1.0 + u)
                 };
 
-                let dsig_dinput = if nu <= 0.0 { k * sigma * (1.0 - sigma) } else { (k / nu) * sigma * (1.0 - sigma) };
+                let exp_term = PadeExp::exp(exponent);
+                let base = 1.0 + beta * exp_term;
+                let dsig_dinput = if nu <= 0.0 {
+                    k * sigma * (1.0 - sigma)  // Standard logistic for nu <= 0
+                } else {
+                    (sigma * k * beta * exp_term) / (nu * base)  // Correct Richards derivative
+                };
                 *o = output_gain * dsig_dinput * input_scale * outer_scale * scale;
             });
     }
@@ -949,69 +955,78 @@ impl RichardsCurve {
         };
         let gate = match self.variant { super::Variant::Tanh => 2.0 * sigma - 1.0, _ => sigma };
 
-        let denom = if nu <= 0.0 { 1.0 } else { nu.max(1e-6) };
-        let dsigma_dinput = (k / denom) * sigma * (1.0 - sigma);
+        let denom = nu.max(1e-6);
+        let dsigma_dinput = (k * beta * exp_term * sigma) / (denom * base);
         let pref = grad_output * output_gain * outer_scale;
 
         let mut pos = 0usize;
         if self.nu_learnable {
+            // Correct logarithmic differentiation: ∂σ/∂ν = σ * ln(base) / ν²
             if nu <= 0.0 {
                 out[pos] = 0.0;
             } else {
-                let d_sigma_d_nu = sigma * (1.0 - sigma) * (exponent / (denom * denom));
+                let d_sigma_d_nu = sigma * base.ln() / (nu * nu);
                 out[pos] = pref * d_sigma_d_nu;
             }
             pos += 1;
         }
+        // Compute k gradient (needed for both k and m gradients)
+        let d_sigma_d_k = if self.k_learnable || self.m_learnable {
+            // Theorem 8: ∂σ/∂k = σ * (1-σ) * (x-m) * [1 + (1-β)e^(-k(x-m))/(β + (1-β)e^(-k(x-m)))]
+            // Let exp_term = e^(-k(x-m)), base = 1 + β*exp_term
+            // Expression: [1 + (1-β)*exp_term/base]
+            let exp_term_ratio = (1.0 - beta) * exp_term / base;
+            let bracket_term = 1.0 + exp_term_ratio;
+            sigma * (1.0 - sigma) * (input - m) * bracket_term
+        } else {
+            0.0
+        };
+
         if self.k_learnable {
-            let d_sigma_d_k = sigma * (1.0 - sigma) * ((input - m) / denom);
+            // Correct chain rule: ∂σ/∂k = (σ / ν) * β * (input - m) * exp_term / base
+            let d_sigma_d_k = (sigma / nu.max(1e-6)) * beta * (input - m) * exp_term / base;
             out[pos] = pref * d_sigma_d_k;
             pos += 1;
         }
         if self.m_learnable {
-            let d_sigma_d_m = -(k / denom) * sigma * (1.0 - sigma);
+            // Correct chain rule: ∂σ/∂m = - (σ / ν) * β * exp_term * k / base
+            let d_sigma_d_m = - (sigma / nu.max(1e-6)) * beta * exp_term * k / base;
             out[pos] = pref * d_sigma_d_m;
             pos += 1;
         }
         if self.beta_learnable {
-            // New formula: Richards(y) = [1 + β * exp(-k*(y-m))]^(-1/ν)
-            // Let D = 1 + β * exp(-k*(y-m))
-            // dD/dβ = exp(-k*(y-m))
-            let exp_term = PadeExp::exp(exponent);
-            let base = 1.0 + beta * exp_term;
-            let d_base_d_beta = exp_term;
-
-            let d_richards_d_base = if nu <= 0.0 {
-                // Richards = 1/D, dRichards/dD = -1/D²
-                -1.0 / (base * base)
-            } else {
-                // Richards = D^(-1/ν), dRichards/dD = (-1/ν) * D^(-1/ν - 1)
-                (-1.0 / nu) * base.powf(-1.0 / nu - 1.0)
-            };
-
-            out[pos] = pref * d_richards_d_base * d_base_d_beta;
+            // Correct chain rule: ∂σ/∂β = - (σ / ν) * exp_term / base
+            let d_sigma_d_beta = - (sigma / nu.max(1e-6)) * exp_term / base;
+            out[pos] = pref * d_sigma_d_beta;
             pos += 1;
         }
 
         if self.temperature_learnable {
-            // Temperature affects input scaling
-            let d_input_d_temp = input_scale * scale * (-temp_scaled / temp);
+            // Temperature gradient: ∂σ/∂T through input transformation chain
+            // temp_scaled = adaptive_normalized / T
+            // ∂temp_scaled/∂T = -adaptive_normalized / T² = -temp_scaled / T
+            // input = input_scale * (scale * temp_scaled + shift)
+            // ∂input/∂T = input_scale * scale * ∂temp_scaled/∂T
+            // ∂σ/∂input = ∂σ/∂k * k + ∂σ/∂m * (-k) + ∂σ/∂β * β * exp_term + ∂σ/∂ν * (-1/ν) * ln(base)
+            // But simpler: ∂σ/∂input = σ * (1-σ) * ∂(base)/∂input / base * (-1/ν)
+            // Since ∂base/∂input = β * exp_term * ∂exponent/∂input = β * exp_term * (-k)
+            // So ∂σ/∂input = σ * (1-σ) * [β * exp_term * (-k) / base] * (-1/ν)
+            // = σ * (1-σ) * (k/ν) * (β * exp_term / base) * (-1)
+            // Wait, let me use the chain rule properly
 
-            // New formula: D = 1 + β * exp(-k*(input-m))
-            // dD/dinput = β * exp(-k*(input-m)) * (-k) = -k * β * exp_term
-            let exp_term = PadeExp::exp(exponent);
-            let base = 1.0 + beta * exp_term;
-            let d_base_d_input = -k * beta * exp_term;
-            
-            let d_richards_d_input = if nu <= 0.0 {
-                // Richards = 1/D, dRichards/dinput = -1/D² * dD/dinput
-                -(1.0 / (base * base)) * d_base_d_input
-            } else {
-                // Richards = D^(-1/ν), dRichards/dinput = (-1/ν) * D^(-1/ν-1) * dD/dinput
-                (-1.0 / nu) * base.powf(-1.0 / nu - 1.0) * d_base_d_input
-            };
+            // ∂σ/∂input = d_sigma_d_k * ∂k/∂input + d_sigma_d_m * ∂m/∂input + ...
+            // But since k, m, beta, nu are independent of input, only the exponent depends on input
+            // Actually, ∂σ/∂input = ∂σ/∂(exponent) * ∂exponent/∂input
+            // ∂exponent/∂input = -k
+            // ∂σ/∂exponent = ∂σ/∂base * ∂base/∂exponent = (∂σ/∂base) * (β * exp_term)
+            // ∂σ/∂base = σ * (1-σ) * (-1/ν) / base   (from d/db σ = -σ/ν * 1/base)
+            // So ∂σ/∂input = [σ * (1-σ) * (-1/ν) / base] * (β * exp_term) * (-k)
+            // = σ * (1-σ) * (k/ν) * (β * exp_term / base)
 
-            out[pos] = pref * d_richards_d_input * d_input_d_temp;
+            let d_sigma_d_input = (sigma * k * beta * exp_term) / (nu.max(1e-6) * base);
+            let d_temp_scaled_d_temp = -temp_scaled / temp;  // ∂(adaptive_normalized/T)/∂T = -adaptive_normalized/T² = -temp_scaled/T
+            let d_input_d_temp = input_scale * scale * d_temp_scaled_d_temp;
+            out[pos] = pref * d_sigma_d_input * d_input_d_temp;
             pos += 1;
         }
         if self.output_gain_learnable {
@@ -1057,7 +1072,7 @@ impl RichardsCurve {
 
     /// Derivative for a single scalar x (backward compatibility)
     pub fn backward_scalar(&self, x: f64) -> f64 {
-        let (nu_raw, k, m, _, _, output_gain, _, scale, shift) = self.get_all_params();
+        let (nu_raw, k, m, beta, _, output_gain, _, scale, shift) = self.get_all_params();
         let nu = nu_raw.max(1e-6);
         let (input_scale, outer_scale) = self.get_variant_scales();
         let cx = scale * x + shift;
@@ -1068,10 +1083,12 @@ impl RichardsCurve {
         let sigma = 1.0 / (1.0 + u);
 
         // Derivative of Richards sigmoid w.r.t. input
+        let exp_term = PadeExp::exp(exponent);
+        let base = 1.0 + beta * exp_term;
         let dsig_dinput = if nu <= 0.0 {
-            k * sigma * (1.0 - sigma)
+            k * sigma * (1.0 - sigma)  // Standard logistic for nu <= 0
         } else {
-            (k / nu) * sigma * (1.0 - sigma)
+            (sigma * k * beta * exp_term) / (nu * base)  // Correct Richards derivative
         };
 
         // Chain rule: d/dx [variant_transform(richards(input_scale * (scale*x + shift)))]
@@ -1195,6 +1212,49 @@ impl RichardsCurve {
             optimizer.reset();
         }
         self.grad_norm_history.clear();
+    }
+
+    /// Set learnable parameter values from a vector (for testing)
+    pub fn set_weights_from_vec(&mut self, weights: &[f64]) {
+        let mut idx = 0;
+        
+        if self.nu_learnable && idx < weights.len() {
+            self.learned_nu = Some(weights[idx].clamp(1e-6, 10.0));
+            idx += 1;
+        }
+        if self.k_learnable && idx < weights.len() {
+            self.learned_k = Some(weights[idx].clamp(1e-6, 100.0));
+            idx += 1;
+        }
+        if self.m_learnable && idx < weights.len() {
+            self.learned_m = Some(weights[idx].clamp(-10.0, 10.0));
+            idx += 1;
+        }
+        if self.beta_learnable && idx < weights.len() {
+            self.learned_beta = Some(weights[idx].clamp(1e-6, 10.0));
+            idx += 1;
+        }
+        if self.temperature_learnable && idx < weights.len() {
+            self.learned_temperature = Some(weights[idx].clamp(0.1, 10.0));
+            idx += 1;
+        }
+        if self.output_gain_learnable && idx < weights.len() {
+            self.learned_output_gain = Some(weights[idx].clamp(-10.0, 10.0));
+            idx += 1;
+        }
+        if self.output_bias_learnable && idx < weights.len() {
+            self.learned_output_bias = Some(weights[idx].clamp(-10.0, 10.0));
+            idx += 1;
+        }
+        if self.scale_learnable && idx < weights.len() {
+            self.learned_scale = Some(weights[idx].clamp(-10.0, 10.0));
+            idx += 1;
+        }
+        if self.shift_learnable && idx < weights.len() {
+            self.learned_shift = Some(weights[idx].clamp(-5.0, 5.0));
+            idx += 1;
+        }
+        // Note: gamma and bias not supported in set_weights_from_vec (would need matrix dims)
     }
 
     /// Return current learnable parameter values as a vector (only learnable parameters)
@@ -1503,7 +1563,7 @@ mod tests {
             let mut vector_out = vec![0.0];
             curve.forward_into(&[x_val], &mut vector_out);
             
-            // forward_scalar should match forward_into since both use standard Richards
+            // forward_scalar should match forward_into since both use extended Richards with same params
             assert!((scalar_out - vector_out[0]).abs() < 1e-10, 
                 "Mismatch at x={}: scalar={}, vector={}", x_val, scalar_out, vector_out[0]);
         }
@@ -1520,6 +1580,149 @@ mod tests {
         for (i, &val) in x_val.iter().enumerate() {
             let scalar = curve.forward_scalar(val);
             assert!((out[i] - scalar).abs() < 1e-6, "Zero-copy output mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_gradient_numerical_check() {
+        // Numerical gradient checking using finite differences
+        let mut curve = RichardsCurve::new_learnable(super::super::Variant::Sigmoid);
+        
+        // Initialize with standard Richards parameters (beta=1, temp=1)
+        curve.learned_nu = Some(1.5);
+        curve.learned_k = Some(2.0);
+        curve.learned_m = Some(0.5);
+        curve.learned_beta = Some(1.0);  // Standard Richards
+        curve.learned_temperature = Some(1.0);  // No temperature scaling
+        
+        let x = 0.3;
+        let grad_output = 1.0;
+        let epsilon = 1e-5;
+        
+        // Compute analytical gradients
+        let analytical_grads = curve.grad_weights_scalar(x, grad_output);
+        
+        // Compute numerical gradients for each parameter
+        let params = curve.weights();
+        let mut numerical_grads = vec![0.0; params.len()];
+        
+        for i in 0..params.len() {
+            // Perturb parameter +epsilon
+            let mut params_plus = params.clone();
+            params_plus[i] += epsilon;
+            let mut curve_plus = curve.clone();
+            curve_plus.set_weights_from_vec(&params_plus);
+            let f_plus = curve_plus.forward_scalar(x);
+            
+            // Perturb parameter -epsilon
+            let mut params_minus = params.clone();
+            params_minus[i] -= epsilon;
+            let mut curve_minus = curve.clone();
+            curve_minus.set_weights_from_vec(&params_minus);
+            let f_minus = curve_minus.forward_scalar(x);
+            
+            // Numerical gradient
+            numerical_grads[i] = (f_plus - f_minus) / (2.0 * epsilon) * grad_output;
+        }
+        
+        // Compare analytical vs numerical
+        let param_names = ["nu", "k", "m", "beta", "temp", "output_gain", "output_bias", "scale", "shift"];
+
+        println!("\\nGradient comparison:");
+        println!("Params: nu={}, k={}, m={}, beta={}, temp={}",
+            curve.get_param(curve.nu, curve.learned_nu, 1.0),
+            curve.get_param(curve.k, curve.learned_k, 1.0),
+            curve.get_param(curve.m, curve.learned_m, 0.0),
+            curve.get_param(curve.beta, curve.learned_beta, 1.0),
+            curve.get_param(curve.temperature, curve.learned_temperature, 1.0));
+
+        let mut max_rel_error: f64 = 0.0;
+        for i in 0..analytical_grads.len() {
+            let diff = (analytical_grads[i] - numerical_grads[i]).abs();
+            let rel_error = if numerical_grads[i].abs() > 1e-8 {
+                diff / numerical_grads[i].abs()
+            } else {
+                diff
+            };
+
+            let param_name = param_names.get(i).unwrap_or(&"unknown");
+
+            println!("{}[{}]: analytical={:.6}, numerical={:.6}, diff={:.6}, rel_err={:.6}",
+                param_name, i, analytical_grads[i], numerical_grads[i], diff, rel_error);
+
+            max_rel_error = max_rel_error.max(rel_error);
+        }
+
+        // Assert that all gradients are accurate within 1% relative error
+        assert!(max_rel_error < 0.01, "Maximum relative error {:.6} exceeds 1% threshold", max_rel_error);
+    }
+
+    #[test]
+    fn test_beta_parameter_behavior() {
+        // Test that beta=1.0 gives standard Richards
+        let mut curve = RichardsCurve::new_default();
+        curve.learned_beta = Some(1.0);
+        curve.learned_nu = Some(1.0);
+        curve.learned_k = Some(1.0);
+        curve.learned_m = Some(0.0);
+        curve.learned_temperature = Some(1.0);
+        
+        let x_vals = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
+        
+        for &x in &x_vals {
+            let output = curve.forward_scalar(x);
+            // Standard logistic: σ(x) = 1 / (1 + e^(-x))
+            let expected = 1.0 / (1.0 + (-x).exp());
+            assert!((output - expected).abs() < 1e-6, 
+                "Beta=1.0 should give standard logistic at x={}: got {}, expected {}", 
+                x, output, expected);
+        }
+    }
+
+    #[test]
+    fn test_temperature_scaling() {
+        // Create non-adaptive curve to test temperature without interference
+        let mut curve = RichardsCurve::sigmoid(true); // Learnable sigmoid
+        curve.learned_nu = Some(1.0);
+        curve.learned_k = Some(1.0);
+        curve.learned_m = Some(0.0);
+        curve.learned_beta = Some(1.0);
+        curve.learned_scale = Some(1.0);
+        curve.learned_shift = Some(0.0);
+        curve.learned_output_gain = Some(1.0);
+        curve.learned_output_bias = Some(0.0);
+        
+        // Test at a point well above the midpoint
+        let test_x = 1.0;
+        
+        curve.learned_temperature = Some(0.5); // Sharper (lower temp scales input up)
+        let sharp_output = curve.forward_scalar(test_x);
+        
+        curve.learned_temperature = Some(2.0); // Softer (higher temp scales input down)
+        let soft_output = curve.forward_scalar(test_x);
+        
+        // At x=1.0 (positive), lower temperature (0.5) amplifies input: x/0.5=2.0
+        // Higher temperature (2.0) reduces input: x/2.0=0.5
+        // So sharp should have higher sigmoid output than soft
+        assert!(sharp_output > soft_output,
+            "Lower temperature should amplify transitions: sharp={}, soft={}", 
+            sharp_output, soft_output);
+    }
+
+    #[test]
+    fn test_no_nan_inf_in_gradients() {
+        let curve = RichardsCurve::new_learnable(super::super::Variant::Sigmoid);
+        
+        // Test with extreme inputs
+        let extreme_inputs = vec![-100.0, -10.0, 0.0, 10.0, 100.0];
+        
+        for &x in &extreme_inputs {
+            let grads = curve.grad_weights_scalar(x, 1.0);
+            
+            for (i, &g) in grads.iter().enumerate() {
+                assert!(g.is_finite(), 
+                    "Gradient {} is not finite for input x={}: grad={}", i, x, g);
+            }
         }
     }
 }

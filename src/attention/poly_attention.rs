@@ -1306,7 +1306,7 @@ impl PolyAttention {
         // Option 3: Meta-learning - Richards learns across multiple attention layers
         {
             let grad_gate_poly = &param_grads[idx];
-            let _ = self.gate.apply_gradients(&[grad_gate_poly.clone()]);
+            let _ = self.gate.apply_gradients(&[grad_gate_poly.clone()], lr);
         }
         idx += 1;
 

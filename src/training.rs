@@ -1,3 +1,4 @@
+use tracing::warn;
 use crate::{
     cli::Args,
     dataset_loader::Dataset,
@@ -21,11 +22,21 @@ pub fn run_training_pipeline(
             .speculative_draft_layers
             .unwrap_or_else(|| config.num_layers.max(1))
             .max(1);
+
+        let mode = match args.speculative_mode.as_str() {
+            "transformer" => crate::transformer::speculative::SpeculativeMode::Transformer,
+            "diffusion" => crate::transformer::speculative::SpeculativeMode::Diffusion,
+            _ => {
+                warn!("Unknown speculative mode '{}', defaulting to diffusion", args.speculative_mode);
+                crate::transformer::speculative::SpeculativeMode::Diffusion
+            }
+        };
+
         println!(
-            "Enabling speculative sampling (gamma={}, tau={}, draft_layers={})",
-            gamma, tau, draft_layers
+            "Enabling speculative sampling (mode={:?}, gamma={}, tau={}, draft_layers={})",
+            mode, gamma, tau, draft_layers
         );
-        llm.enable_speculative_sampling(gamma, tau, draft_layers);
+        llm.enable_speculative_sampling(gamma, tau, draft_layers, mode);
     }
 
     // Determine training mode and run appropriate training

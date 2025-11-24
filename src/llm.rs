@@ -14,7 +14,7 @@ use crate::{
     metrics::text::corpus_bleu_1_2,
     model_config::DiffusionTimestepStrategy,
     network::{Layer, LayerEnum},
-    transformer::speculative::SpeculativeSamplingConfig,
+    transformer::speculative::{SpeculativeSamplingConfig, SpeculativeMode},
 };
 
 
@@ -97,6 +97,8 @@ pub struct LLM {
     median_grad_ema: Option<f32>,
     #[serde(default)]
     speculative_config: Option<SpeculativeSamplingConfig>,
+    #[serde(default)]
+    speculative_mode: SpeculativeMode,
 }
 
 impl std::fmt::Debug for LLM {
@@ -124,6 +126,7 @@ impl Default for LLM {
             decoder,
             median_grad_ema: None,
             speculative_config: None,
+            speculative_mode: SpeculativeMode::Diffusion, // Default to diffusion mode for backward compatibility
         }
     }
 }
@@ -138,6 +141,7 @@ impl LLM {
             decoder,
             median_grad_ema: None,
             speculative_config: None,
+            speculative_mode: SpeculativeMode::Diffusion, // Default to diffusion mode for backward compatibility
         }
     }
 
@@ -150,6 +154,7 @@ impl LLM {
             decoder,
             median_grad_ema: None,
             speculative_config: None,
+            speculative_mode: SpeculativeMode::Diffusion, // Default to diffusion mode for backward compatibility
         }
     }
 
@@ -164,6 +169,7 @@ impl LLM {
         gamma: usize,
         tau: f32,
         draft_layers: usize,
+        mode: SpeculativeMode,
     ) {
         if gamma == 0 || draft_layers == 0 {
             warn!(
@@ -179,6 +185,132 @@ impl LLM {
             draft_layers,
         };
         self.speculative_config = Some(cfg);
+        self.speculative_mode = mode;
+    }
+
+    /// Generate next token using speculative sampling for transformers
+    /// Uses early layers of the main model as draft model for fast candidate generation
+    pub fn generate_speculative_transformer(
+        &mut self,
+        current_tokens: &[usize],
+        gamma: usize,
+        tau: f32,
+        draft_layers: usize,
+    ) -> usize {
+        use ndarray::Array2;
+
+        // Ensure we have tokens to work with
+        if current_tokens.is_empty() {
+            return self.vocab.encode("</s>").unwrap_or(0);
+        }
+
+        // Convert tokens to embeddings (convert to f32)
+        let token_ids_f32 = Array2::from_shape_vec((1, current_tokens.len()),
+            current_tokens.iter().map(|&x| x as f32).collect())
+            .expect("Failed to create token array");
+
+        // Forward pass through embeddings
+        let mut hidden = self.network[0].forward(&token_ids_f32); // TokenEmbeddings
+
+        // Forward through draft layers (early layers of main model)
+        let draft_end_idx = draft_layers.min(self.network.len().saturating_sub(2)); // Leave room for output projection
+
+        for i in 1..=draft_end_idx {
+            hidden = self.network[i].forward(&hidden);
+        }
+
+        // Get draft logits (using output projection if available)
+        let draft_logits = if let Some(layer) = self.network.iter_mut().find(|l| matches!(l, LayerEnum::OutputProjection(_))) {
+            if let LayerEnum::OutputProjection(op) = layer {
+                op.forward(&hidden)
+            } else {
+                hidden.clone()
+            }
+        } else {
+            hidden.clone()
+        };
+
+        // Get top-gamma candidates from draft model
+        let draft_probs = crate::softmax::Softmax::new().forward_immutable(&draft_logits.row(draft_logits.shape()[0] - 1).insert_axis(Axis(0)).view());
+        let draft_tokens = self.get_top_k_tokens(&draft_probs, gamma);
+
+        // Now verify all candidates with full model
+        // We need to score: [original_sequence + candidate] for each candidate
+        let mut candidate_scores = Vec::new();
+
+        // Score the original sequence (without any new token)
+        let original_sequence = current_tokens.to_vec();
+        let original_logit = self.get_sequence_logit(&original_sequence);
+
+        for &candidate_token in &draft_tokens {
+            let candidate_sequence = [original_sequence.as_slice(), &[candidate_token]].concat();
+            let candidate_logit = self.get_sequence_logit(&candidate_sequence);
+
+            // Compute acceptance probability ratio
+            let q_draft = draft_probs[[0, candidate_token]]; // Draft model probability
+            let q_target = crate::softmax::Softmax::new().forward_immutable(&candidate_logit.view())[[0, candidate_token]]; // Target model probability
+
+            let ratio = if q_draft > 0.0 { q_target / q_draft } else { 0.0 };
+            candidate_scores.push((candidate_token, ratio));
+        }
+
+        // Accept tokens based on tau threshold
+        for (token, ratio) in candidate_scores {
+            if ratio >= tau {
+                return token;
+            }
+        }
+
+        // If no candidates accepted, fall back to greedy decoding from draft model
+        draft_tokens[0]
+    }
+
+    /// Get logit for the last position of a sequence
+    fn get_sequence_logit(&mut self, tokens: &[usize]) -> Array2<f32> {
+        use ndarray::Array2;
+
+        if tokens.is_empty() {
+            return Array2::zeros((1, self.vocab.size()));
+        }
+
+        // Convert tokens to embeddings (convert to f32)
+        let token_ids = Array2::from_shape_vec((1, tokens.len()),
+            tokens.iter().map(|&x| x as f32).collect())
+            .expect("Failed to create token array");
+
+        // Forward through embeddings
+        let mut hidden = self.network[0].forward(&token_ids);
+
+        // Forward through all layers except output projection
+        let network_len = self.network.len();
+        for i in 1..network_len {
+            match &mut self.network[i] {
+                LayerEnum::OutputProjection(_) => break, // Stop before output projection
+                layer => hidden = layer.forward(&hidden),
+            }
+        }
+
+        // Apply output projection if it exists
+        let logits = if let Some(LayerEnum::OutputProjection(op)) = self.network.last_mut() {
+            op.forward(&hidden)
+        } else {
+            hidden
+        };
+
+        // Return logits for the last position
+        logits.row(logits.shape()[0] - 1).to_owned().insert_axis(Axis(0))
+    }
+
+    /// Get top-k tokens from probability distribution
+    fn get_top_k_tokens(&self, probs: &Array2<f32>, k: usize) -> Vec<usize> {
+        let mut token_probs: Vec<(usize, f32)> = probs.iter()
+            .enumerate()
+            .map(|(i, &p)| (i, p))
+            .collect();
+
+        token_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        token_probs.truncate(k);
+        token_probs.into_iter().map(|(i, _)| i).collect()
     }
 }
 
@@ -358,13 +490,19 @@ impl LLM {
             // Get hidden states for the last position
             let _last_hidden = hidden_states.row(hidden_states.shape()[0] - 1).to_owned();
 
-            let next_token = match &mut self.decoder {
-                DecoderType::Greedy(decoder) => {
-                    // Simple greedy decoding
-                    let probs =
-                        crate::softmax::Softmax::new().forward_immutable(&last_logit.view());
-                    let tokens = decoder.decode(&probs);
-                    tokens[0]
+            let next_token = if let (Some(cfg), SpeculativeMode::Transformer) = (self.speculative_config, self.speculative_mode) {
+                // Use speculative sampling for transformers
+                self.generate_speculative_transformer(&tokenized, cfg.gamma, cfg.tau, cfg.draft_layers)
+            } else {
+                // Use regular decoding
+                match &mut self.decoder {
+                    DecoderType::Greedy(decoder) => {
+                        // Simple greedy decoding
+                        let probs =
+                            crate::softmax::Softmax::new().forward_immutable(&last_logit.view());
+                        let tokens = decoder.decode(&probs);
+                        tokens[0]
+                    }
                 }
             };
 
@@ -3074,6 +3212,29 @@ mod tests {
         // Switch to Greedy (should remain Greedy)
         llm.enable_greedy();
         assert_eq!(llm.decoder.layer_type(), "GreedyDecoder");
+    }
+
+    #[test]
+    fn test_transformer_speculative_sampling_configuration() {
+        let vocab = Vocab::default();
+        let network = Vec::new();
+        let mut llm = LLM::new(vocab, network);
+
+        // Check initial state
+        assert_eq!(llm.speculative_mode, SpeculativeMode::Diffusion);
+        assert!(llm.speculative_config.is_none());
+
+        // Enable transformer speculative sampling
+        llm.enable_speculative_sampling(4, 0.1, 2, SpeculativeMode::Transformer);
+
+        // Verify configuration
+        assert_eq!(llm.speculative_mode, SpeculativeMode::Transformer);
+        assert!(llm.speculative_config.is_some());
+
+        let config = llm.speculative_config.as_ref().unwrap();
+        assert_eq!(config.gamma, 4);
+        assert_eq!(config.tau, 0.1);
+        assert_eq!(config.draft_layers, 2);
     }
 
     #[test]

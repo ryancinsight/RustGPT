@@ -8,3 +8,4 @@ models/*.h5
 models/*.pb
 models/*.onnx
 *.bin
+*.csv
