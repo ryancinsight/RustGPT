@@ -28,16 +28,18 @@ use rayon::prelude::*;
 /// **Theorem 2 (Extended Richards with Asymmetry)**: The extended Richards curve
 /// introduces asymmetry control via parameter β:
 ///
-/// σ_β(x; ν, k, m, β) = [β + (1-β) * e^(-k(x-m))]^(-1/ν)
+/// σ_β(x; ν, k, m, β) = [1 + β * e^(-k(x-m))]^(-1/ν)
 ///
 /// **Asymmetry Properties:**
-/// - β = 1.0: Standard Richards curve (symmetric)
-/// - β = 0.0: Gompertz curve σ(x) = e^(-e^(-k(x-m)))
-/// - 0 < β < 1: Asymmetric Richards curve with controlled skewness
-/// - β < 0 or β > 1: Extended asymmetry range
+/// - β = 1.0: Standard Richards curve σ(x) = [1 + e^(-k(x-m))]^(-1/ν)
+/// - β = 0.0: Constant function σ(x) = 1.0 (degenerate case)
+/// - 0 < β < 1: Softer sigmoid transitions
+/// - β > 1: Sharper sigmoid transitions
+/// - β < 0: Inverted sigmoid behavior
 ///
-/// **Gompertz Limit (ν → 0⁺):** The Gompertz curve emerges as:
-/// lim_{ν→0⁺} σ_β(x; ν, k, m, β) = e^(-e^(-k(x-m))) * β^0 + (1-β) * e^(-e^(-k(x-m)))
+/// **Mathematical Interpretation:**
+/// The β parameter scales the exponential term, controlling the steepness and asymmetry
+/// of the sigmoid transition without degenerating into a constant.
 ///
 /// ## Temperature Scaling Transformation
 ///
@@ -622,82 +624,126 @@ impl RichardsCurve {
         }
     }
 
-    /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise), single-pass.
-    pub fn forward(&self, x: &Array1<f64>) -> Array1<f64> {
+    /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise), writing to output slice.
+    /// Optimized for zero-copy usage. Uses extended Richards with beta and temperature parameters.
+    pub fn forward_into(&self, x: &[f64], out: &mut [f64]) {
         let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = self.get_all_params();
         let (input_scale, _) = self.get_variant_scales();
         let (adaptive_scale, adaptive_shift) = self.get_adaptive_scaling();
 
-        let mut out = Array1::zeros(x.len());
-        let xs = x.as_slice().unwrap();
-        let os = out.as_slice_mut().unwrap();
+        // Ensure output size matches input
+        assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
-        xs.par_iter()
-            .zip(os.par_iter_mut())
+        x.par_iter()
+            .zip(out.par_iter_mut())
             .for_each(|(&xi, o)| {
-                // Apply adaptive normalization first (x - mean) / std for Adaptive variant
+                // Apply adaptive normalization (for Adaptive variant)
                 let adaptive_normalized = adaptive_scale * xi + adaptive_shift;
+                
                 // Apply temperature scaling: sharper when temp < 1, softer when temp > 1
                 let temp_scaled = adaptive_normalized / temp;
+                
+                // Apply input transformation
                 let input = input_scale * (scale * temp_scaled + shift);
-        let exponent: f64 = -k * (input - m);
-        // Clamp exponent to prevent overflow: exp(exponent) should not exceed 1e10
-        let clamped_exponent = exponent.clamp(-23.0, 23.0); // exp(±23) ≈ 1e±10
-        // Extended Richards with beta asymmetry factor
-        // y = (beta + (1-beta) * exp(-k*(x-m))) ^ (-1/ν)
-        let beta_term = beta + (1.0 - beta) * PadeExp::exp(clamped_exponent);
-                let extended_richards = if nu <= 0.0 {
-                    1.0 / beta_term
+                
+                let exponent: f64 = -k * (input - m);
+                // Clamp exponent to prevent overflow
+                let clamped_exponent = exponent.clamp(-23.0, 23.0);
+                
+                // Extended Richards formula: σ(x) = [1 + β * e^(-k(x-m))]^(-1/ν)
+                // When β=1: standard Richards [1 + e^(-k(x-m))]^(-1/ν)
+                // When β=0: constant 1.0 (degenerate)
+                let exp_term = PadeExp::exp(clamped_exponent);
+                let base = 1.0 + beta * exp_term;
+                
+                let sigma = if nu <= 0.0 {
+                    // Limit case: standard logistic
+                    1.0 / base
                 } else {
-                    beta_term.powf(-1.0 / nu)
+                    // General Richards curve
+                    base.powf(-1.0 / nu)
                 };
-                let gate = match self.variant { super::Variant::Tanh => 2.0 * extended_richards - 1.0, _ => extended_richards };
+                
+                // Apply variant-specific transformation
+                let gate = match self.variant { 
+                    super::Variant::Tanh => 2.0 * sigma - 1.0, 
+                    _ => sigma 
+                };
+                
                 let output = output_gain * gate + output_bias;
                 // Numerical stability: clamp extreme values to prevent NaN/inf propagation
                 *o = output.clamp(-1e6, 1e6);
             });
+    }
 
+    /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise), single-pass.
+    pub fn forward(&self, x: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(x.len());
+        self.forward_into(x.as_slice().unwrap(), out.as_slice_mut().unwrap());
         out
     }
 
-    /// Vectorized forward pass for matrix input
-    pub fn forward_matrix(&self, x: &Array2<f64>) -> Array2<f64> {
-        let mut output = x.mapv(|val| self.forward_scalar(val));
+    /// Vectorized forward pass for matrix input, writing to output array
+    pub fn forward_matrix_into(&self, x: &Array2<f64>, out: &mut Array2<f64>) {
+        // First compute the scalar Richards function for all elements
+        // We can treat the matrix as a flat slice for this part to reuse forward_into logic
+        // if the memory layout allows (standard layout)
+        if let (Some(x_slice), Some(out_slice)) = (x.as_slice(), out.as_slice_mut()) {
+            self.forward_into(x_slice, out_slice);
+        } else {
+            // Fallback for non-contiguous arrays
+            x.outer_iter().zip(out.outer_iter_mut()).for_each(|(row_in, mut row_out)| {
+                self.forward_into(row_in.as_slice().unwrap(), row_out.as_slice_mut().unwrap());
+            });
+        }
 
         // Apply per-feature transformations if enabled
         if let (Some(gamma), Some(bias)) = (&self.gamma, &self.bias) {
             // Broadcast gamma and bias across all samples for each feature
-            ndarray::Zip::indexed(&mut output)
+            // This part needs to be aware of the matrix structure (batch_size, embedding_dim)
+            ndarray::Zip::indexed(out)
                 .and_broadcast(gamma)
                 .and_broadcast(bias)
-                .for_each(|(_, _j), o, &g, &b| {
+                .par_for_each(|(_, _j), o, &g, &b| {
                     *o = (*o as f32 * g + b) as f64;
                 });
         }
+    }
 
+    /// Vectorized forward pass for matrix input
+    pub fn forward_matrix(&self, x: &Array2<f64>) -> Array2<f64> {
+        let mut output = Array2::zeros(x.dim());
+        self.forward_matrix_into(x, &mut output);
         output
     }
 
-    /// Forward for a single scalar x (backward compatibility)
+    /// Forward for a single scalar x
     pub fn forward_scalar(&self, x: f64) -> f64 {
-        let (nu, k, m, _, _, output_gain, output_bias, scale, shift) = self.get_all_params();
+        let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = self.get_all_params();
         let (input_scale, _) = self.get_variant_scales();
-        let temp_scaled = x;  // Backward compatibility: no temperature scaling
+        let (adaptive_scale, adaptive_shift) = self.get_adaptive_scaling();
+
+        // Apply adaptive normalization
+        let adaptive_normalized = adaptive_scale * x + adaptive_shift;
+        // Apply temperature scaling
+        let temp_scaled = adaptive_normalized / temp;
         let input = input_scale * (scale * temp_scaled + shift);
 
         let exponent = -k * (input - m);
-        // Clamp exponent to prevent overflow
         let clamped_exponent = exponent.clamp(-23.0, 23.0);
+        
+        // Extended Richards formula: σ(x) = [1 + β * e^(-k(x-m))]^(-1/ν)
+        let exp_term = PadeExp::exp(clamped_exponent);
+        let base = 1.0 + beta * exp_term;
+        
         let sigma = if nu <= 0.0 {
-            1.0 / (1.0 + PadeExp::exp(clamped_exponent))
+            1.0 / base
         } else {
-            let u = PadeExp::exp(clamped_exponent).powf(1.0 / nu);
-            1.0 / (1.0 + u)
+            base.powf(-1.0 / nu)
         };
 
         let gate = match self.variant { super::Variant::Tanh => 2.0 * sigma - 1.0, _ => sigma };
         let output = output_gain * gate + output_bias;
-        // Numerical stability: clamp extreme values to prevent NaN/inf propagation
         output.clamp(-1e6, 1e6)
     }
 
@@ -718,103 +764,143 @@ impl RichardsCurve {
     }
 
     /// Matrix gradient computation for all learnable parameters
+    /// Optimized with parallel reduction to avoid O(N*D) sequential accumulation
     pub fn grad_weights_matrix(&self, x: &Array2<f64>, output_grads: &Array2<f64>) -> Vec<f64> {
-        let mut grads_accum = vec![0.0f64; self.weights_len()];
         let (batch_size, embedding_dim) = x.dim();
 
         // Bounds checking: ensure dimensions are compatible
         if x.dim() != output_grads.dim() {
-            return grads_accum;
+            return vec![0.0f64; self.weights_len()];
         }
 
-        // First, accumulate scalar parameter gradients (same as before)
         let scalar_param_count = self.scalar_weights_len();
+        let total_elements = (batch_size * embedding_dim) as f64;
 
-        for sample_idx in 0..batch_size {
-            for feature_idx in 0..embedding_dim {
-                let xi = x[[sample_idx, feature_idx]];
-                let dy = output_grads[[sample_idx, feature_idx]];
+        // Parallel accumulation of scalar parameter gradients
+        // We iterate over the underlying slices if possible for max speed
+        let x_slice = x.as_slice().unwrap();
+        let grad_slice = output_grads.as_slice().unwrap();
 
-                // Compute scalar parameter gradients for this element
-                let param_grads = self.grad_weights_scalar(xi, dy);
-
-                // Accumulate only scalar parameters
-                for i in 0..scalar_param_count {
-                    grads_accum[i] += param_grads[i];
+        // Use fold/reduce to accumulate gradients in parallel
+        let mut grads_accum = x_slice.par_iter()
+            .zip(grad_slice.par_iter())
+            .fold(
+                || vec![0.0f64; scalar_param_count],
+                |mut acc, (&xi, &dy)| {
+                    let param_grads = self.grad_weights_scalar(xi, dy);
+                    for i in 0..scalar_param_count {
+                        acc[i] += param_grads[i];
+                    }
+                    acc
                 }
+            )
+            .reduce(
+                || vec![0.0f64; scalar_param_count],
+                |mut a, b| {
+                    for i in 0..scalar_param_count {
+                        a[i] += b[i];
+                    }
+                    a
+                }
+            );
+
+        // Average scalar parameters across batch and features
+        for i in 0..scalar_param_count {
+            grads_accum[i] /= total_elements;
+            // Safety: replace NaN/Inf with 0.0
+            if !grads_accum[i].is_finite() {
+                grads_accum[i] = 0.0;
             }
         }
 
-        // Average scalar parameters across batch and features
-        let total_elements = (batch_size * embedding_dim) as f64;
-        for i in 0..scalar_param_count {
-            grads_accum[i] /= total_elements;
-        }
-
         // Now compute gamma/bias gradients (matrix-specific)
-        let mut pos = scalar_param_count;
+        // These are per-feature, so we average over batch_size
+        
+        // Extend accumulator for gamma/bias
+        let extra_params_len = self.weights_len() - scalar_param_count;
+        if extra_params_len > 0 {
+            grads_accum.reserve(extra_params_len);
+        }
 
         if self.gamma_learnable {
             if let Some(ref gamma) = self.gamma {
                 let gamma_size = gamma.len();
-                // Compute Richards outputs before gamma/bias application
-                let richards_output = self.forward_matrix(x);
-
-                // Bounds checking: ensure gamma_size matches embedding_dim
-                if gamma_size != embedding_dim {
-                    eprintln!("RichardsCurve::grad_weights_matrix: gamma size mismatch - gamma_size: {}, embedding_dim: {}", gamma_size, embedding_dim);
-                    return grads_accum;
-                }
-
-                // For each gamma parameter (one per feature)
-                for feature_idx in 0..gamma_size {
-                    let mut gamma_grad = 0.0;
-                    for sample_idx in 0..batch_size {
-                        // d(output)/d(gamma_feature) = richards_output for that feature
-                        gamma_grad += richards_output[[sample_idx, feature_idx]] * output_grads[[sample_idx, feature_idx]];
+                if gamma_size == embedding_dim {
+                    // Compute Richards outputs before gamma/bias application
+                    // We need the pre-gamma output to compute d(output)/d(gamma)
+                    // output = richards_output * gamma + bias
+                    // d(loss)/d(gamma) = d(loss)/d(output) * richards_output
+                    
+                    // We can't easily use the pre-computed forward pass here without passing it in.
+                    // So we recompute. To optimize, we could pass it in, but that changes API.
+                    // For now, we recompute efficiently.
+                    let richards_output = self.forward_matrix(x); // This includes gamma/bias! Wait.
+                    // Actually forward_matrix applies gamma/bias. 
+                    // We need the raw richards output.
+                    // Let's use forward_into on a temp buffer without gamma/bias application
+                    // But forward_matrix_into applies gamma/bias too.
+                    // We need just the scalar forward part.
+                    
+                    // Let's compute raw richards output (without gamma/bias)
+                    let mut raw_output = Array2::zeros(x.dim());
+                    if let (Some(x_s), Some(out_s)) = (x.as_slice(), raw_output.as_slice_mut()) {
+                        self.forward_into(x_s, out_s);
                     }
-                    grads_accum[pos + feature_idx] = gamma_grad / (batch_size as f64);
+                    
+                    // Now compute gamma grads: sum_over_batch(raw_output * output_grad) / batch_size
+                    // We can parallelize over features
+                    let mut gamma_grads = vec![0.0; gamma_size];
+                    
+                    gamma_grads.par_iter_mut().enumerate().for_each(|(feature_idx, g_grad)| {
+                        let mut sum = 0.0;
+                        for sample_idx in 0..batch_size {
+                            sum += raw_output[[sample_idx, feature_idx]] * output_grads[[sample_idx, feature_idx]];
+                        }
+                        let grad_val = sum / (batch_size as f64);
+                        *g_grad = if grad_val.is_finite() { grad_val } else { 0.0 };
+                    });
+                    
+                    grads_accum.extend(gamma_grads);
                 }
-                pos += gamma_size;
             }
         }
 
         if self.bias_learnable {
             if let Some(ref bias) = self.bias {
                 let bias_size = bias.len();
-                // Bounds checking: ensure bias_size matches embedding_dim
-                if bias_size != embedding_dim {
-                    eprintln!("RichardsCurve::grad_weights_matrix: bias size mismatch - bias_size: {}, embedding_dim: {}", bias_size, embedding_dim);
-                    return grads_accum;
+                if bias_size == embedding_dim {
+                    // d(loss)/d(bias) = d(loss)/d(output) * 1
+                    // sum_over_batch(output_grad) / batch_size
+                    
+                    let mut bias_grads = vec![0.0; bias_size];
+                    
+                    bias_grads.par_iter_mut().enumerate().for_each(|(feature_idx, b_grad)| {
+                        let mut sum = 0.0;
+                        for sample_idx in 0..batch_size {
+                            sum += output_grads[[sample_idx, feature_idx]];
+                        }
+                        let grad_val = sum / (batch_size as f64);
+                        *b_grad = if grad_val.is_finite() { grad_val } else { 0.0 };
+                    });
+                    
+                    grads_accum.extend(bias_grads);
                 }
-
-                // For each bias parameter (one per feature)
-                for feature_idx in 0..bias_size {
-                    let mut bias_grad = 0.0;
-                    for sample_idx in 0..batch_size {
-                        // d(output)/d(bias_feature) = output_grad for that feature
-                        bias_grad += output_grads[[sample_idx, feature_idx]];
-                    }
-                    grads_accum[pos + feature_idx] = bias_grad / (batch_size as f64);
-                }
-                pos += bias_size;
             }
         }
 
         grads_accum
     }
 
-    /// Vectorized backward pass: df/dx at x (analytical gradient), single-pass.
-    pub fn derivative(&self, x: &Array1<f64>) -> Array1<f64> {
+    /// Vectorized backward pass: df/dx at x (analytical gradient), writing to output slice.
+    pub fn derivative_into(&self, x: &[f64], out: &mut [f64]) {
         let (nu, k, m, _, _, output_gain, _, scale, shift) = self.get_all_params();
         let (input_scale, outer_scale) = self.get_variant_scales();
 
-        let mut out = Array1::zeros(x.len());
-        let xs = x.as_slice().unwrap();
-        let os = out.as_slice_mut().unwrap();
+        // Ensure output size matches input
+        assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
-        xs.par_iter()
-            .zip(os.par_iter_mut())
+        x.par_iter()
+            .zip(out.par_iter_mut())
             .for_each(|(&xi, o)| {
                 let input = input_scale * (scale * xi + shift);
                 let exponent: f64 = -k * (input - m);
@@ -828,7 +914,12 @@ impl RichardsCurve {
                 let dsig_dinput = if nu <= 0.0 { k * sigma * (1.0 - sigma) } else { (k / nu) * sigma * (1.0 - sigma) };
                 *o = output_gain * dsig_dinput * input_scale * outer_scale * scale;
             });
+    }
 
+    /// Vectorized backward pass: df/dx at x (analytical gradient), single-pass.
+    pub fn derivative(&self, x: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(x.len());
+        self.derivative_into(x.as_slice().unwrap(), out.as_slice_mut().unwrap());
         out
     }
 
@@ -848,11 +939,13 @@ impl RichardsCurve {
         let input = input_scale * (scale * temp_scaled + shift);
 
         let exponent = -k * (input - m);
+        let exp_term = PadeExp::exp(exponent);
+        let base = 1.0 + beta * exp_term;
+        
         let sigma = if nu <= 0.0 {
-            1.0 / (1.0 + PadeExp::exp(exponent))
+            1.0 / base
         } else {
-            let u = PadeExp::exp(exponent).powf(1.0 / nu);
-            1.0 / (1.0 + u)
+            base.powf(-1.0 / nu)
         };
         let gate = match self.variant { super::Variant::Tanh => 2.0 * sigma - 1.0, _ => sigma };
 
@@ -881,45 +974,41 @@ impl RichardsCurve {
             pos += 1;
         }
         if self.beta_learnable {
-            // Richards(y) = [β + (1-β) * exp(-k*(y-m))] ^ (-1/ν)
-            // Let D = β + (1-β) * exp(-k*(y-m))
-            // Let Richards(y) = D^(-1/ν)
-            // dRichards/dβ = dRichards/dD * dD/dβ
-            // dD/dβ = 1 - exp(-k*(y-m))
+            // New formula: Richards(y) = [1 + β * exp(-k*(y-m))]^(-1/ν)
+            // Let D = 1 + β * exp(-k*(y-m))
+            // dD/dβ = exp(-k*(y-m))
             let exp_term = PadeExp::exp(exponent);
-            let d = beta + (1.0 - beta) * exp_term;
-            let d_d_beta = 1.0 - exp_term;
+            let base = 1.0 + beta * exp_term;
+            let d_base_d_beta = exp_term;
 
-            let d_richards_d_d = if nu <= 0.0 {
-                // Richards = 1/D, so dRichards/dD = -1/D² = -Richards²
-                -gate * gate
+            let d_richards_d_base = if nu <= 0.0 {
+                // Richards = 1/D, dRichards/dD = -1/D²
+                -1.0 / (base * base)
             } else {
                 // Richards = D^(-1/ν), dRichards/dD = (-1/ν) * D^(-1/ν - 1)
-                (-1.0 / nu) * d.powf(-1.0 / nu - 1.0)
+                (-1.0 / nu) * base.powf(-1.0 / nu - 1.0)
             };
 
-            out[pos] = pref * d_richards_d_d * d_d_beta;
+            out[pos] = pref * d_richards_d_base * d_base_d_beta;
             pos += 1;
         }
 
         if self.temperature_learnable {
-            // Temperature affects input scaling: temp_scaled = adaptive_normalized / temp
-            // input = input_scale * (scale * temp_scaled + shift)
-            // dinput/dtemp = input_scale * scale * d(temp_scaled)/dtemp
-            // d(temp_scaled)/dtemp = d(adaptive_normalized/temp)/dtemp = -adaptive_normalized/temp²
-            // = -temp_scaled / temp
+            // Temperature affects input scaling
             let d_input_d_temp = input_scale * scale * (-temp_scaled / temp);
 
+            // New formula: D = 1 + β * exp(-k*(input-m))
+            // dD/dinput = β * exp(-k*(input-m)) * (-k) = -k * β * exp_term
+            let exp_term = PadeExp::exp(exponent);
+            let base = 1.0 + beta * exp_term;
+            let d_base_d_input = -k * beta * exp_term;
+            
             let d_richards_d_input = if nu <= 0.0 {
-                // Richards = 1/D, dRichards/dinput = d(1/D)/dinput = -1/D² * dD/dinput
-                let exp_term = PadeExp::exp(exponent);
-                let d = beta + (1.0 - beta) * exp_term;
-                - (1.0 / (d * d)) * (-k * exp_term * (1.0 - beta))
+                // Richards = 1/D, dRichards/dinput = -1/D² * dD/dinput
+                -(1.0 / (base * base)) * d_base_d_input
             } else {
                 // Richards = D^(-1/ν), dRichards/dinput = (-1/ν) * D^(-1/ν-1) * dD/dinput
-                let exp_term = PadeExp::exp(exponent);
-                let d = beta + (1.0 - beta) * exp_term;
-                (-1.0 / nu) * d.powf(-1.0 / nu - 1.0) * (-k * exp_term * (1.0 - beta))
+                (-1.0 / nu) * base.powf(-1.0 / nu - 1.0) * d_base_d_input
             };
 
             out[pos] = pref * d_richards_d_input * d_input_d_temp;
@@ -1391,6 +1480,46 @@ impl<'a> Iterator for WeightsIter<'a> {
                 }
                 _ => return None,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array1;
+
+    #[test]
+    fn test_richards_scalar_vector_consistency() {
+        // Test that forward_scalar and forward_into produce consistent results
+        // Note: forward() uses extended Richards with beta/temperature, so we test the simpler methods
+        let curve = RichardsCurve::new_default();
+        let x_vals = vec![0.5, -0.5, 1.0, -1.0, 0.0];
+        
+        for &x_val in &x_vals {
+            let scalar_out = curve.forward_scalar(x_val);
+            
+            // Test forward_into
+            let mut vector_out = vec![0.0];
+            curve.forward_into(&[x_val], &mut vector_out);
+            
+            // forward_scalar should match forward_into since both use standard Richards
+            assert!((scalar_out - vector_out[0]).abs() < 1e-10, 
+                "Mismatch at x={}: scalar={}, vector={}", x_val, scalar_out, vector_out[0]);
+        }
+    }
+
+    #[test]
+    fn test_richards_zero_copy() {
+        let curve = RichardsCurve::new_default();
+        let x_val = vec![0.5, -0.5, 1.0];
+        let mut out = vec![0.0; 3];
+        
+        curve.forward_into(&x_val, &mut out);
+        
+        for (i, &val) in x_val.iter().enumerate() {
+            let scalar = curve.forward_scalar(val);
+            assert!((out[i] - scalar).abs() < 1e-6, "Zero-copy output mismatch at index {}", i);
         }
     }
 }
