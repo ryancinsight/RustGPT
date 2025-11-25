@@ -8,6 +8,7 @@ pub mod inference;
 pub mod interactive;
 pub mod network;
 pub mod persistence;
+pub mod rng;
 pub mod training;
 pub mod trainer;
 pub mod transformer;
@@ -73,6 +74,7 @@ pub use inference::InferenceEngine;
 pub use llm::LLM;
 pub use network::{Layer, LayerEnum};
 pub use persistence::ModelPersistence;
+pub use rng::{get_rng, set_seed, is_seeded, get_seed};
 pub use trainer::Trainer;
 
 // TRM tests removed

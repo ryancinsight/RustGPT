@@ -10,6 +10,7 @@ use crate::{
         threshold::ThresholdPredictor,
     },
     richards::{RichardsCurve, Variant},
+    rng::get_rng,
 };
 
 /// Configuration utilities for PolyAttention initialization and setup
@@ -30,7 +31,7 @@ pub fn init_polynomial_params() -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam,
 
 /// Initialize output projection parameters
 pub fn init_output_projection(embed_dim: usize) -> (Array2<f32>, Adam) {
-    let mut rng = rand::rng();
+    let mut rng = get_rng();
     let std_out = (2.0f32 / (embed_dim as f32 + embed_dim as f32)).sqrt();
     let normal_out = Normal::new(0.0, std_out).unwrap();
 
@@ -46,7 +47,7 @@ pub fn init_gating_params(
     embed_dim: usize,
     num_heads: usize,
 ) -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
-    let mut rng = rand::rng();
+    let mut rng = get_rng();
     let std_g = (2.0f32 / embed_dim as f32).sqrt();
     let normal_g = Normal::new(0.0, std_g).unwrap();
 

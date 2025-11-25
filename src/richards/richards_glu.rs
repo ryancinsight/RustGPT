@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, errors::Result, network::Layer, richards::{RichardsActivation, RichardsGate, Variant}};
+use crate::{adam::Adam, errors::Result, network::Layer, richards::{RichardsActivation, RichardsGate, Variant}, rng::get_rng};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RichardsGlu {
@@ -26,7 +26,7 @@ pub struct RichardsGlu {
 impl RichardsGlu {
     pub fn new(embedding_dim: usize, hidden_dim: usize) -> Self {
         // Xavier/Glorot initialization via Normal(0, sqrt(2/fan_in))
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let std_w1 = (2.0 / embedding_dim as f32).sqrt();
         let std_w2 = (2.0 / embedding_dim as f32).sqrt();
         let std_w3 = (2.0 / hidden_dim as f32).sqrt();

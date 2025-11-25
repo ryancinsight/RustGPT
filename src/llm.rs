@@ -14,6 +14,7 @@ use crate::{
     metrics::text::corpus_bleu_1_2,
     model_config::DiffusionTimestepStrategy,
     network::{Layer, LayerEnum},
+    rng::get_rng,
     transformer::speculative::{SpeculativeSamplingConfig, SpeculativeMode},
 };
 
@@ -179,17 +180,48 @@ impl LLM {
             self.speculative_config = None;
             return;
         }
-        let cfg = SpeculativeSamplingConfig {
-            gamma,
-            tau: tau.max(1e-6),
-            draft_layers,
-        };
+        // Use the new constructor which handles clamping
+        let cfg = SpeculativeSamplingConfig::new(gamma, tau, draft_layers);
         self.speculative_config = Some(cfg);
         self.speculative_mode = mode;
+        info!(
+            "Enabled speculative sampling: mode={}, {}",
+            mode, cfg.description()
+        );
+    }
+
+    /// Disable speculative sampling, revert to greedy decoding
+    pub fn disable_speculative_sampling(&mut self) {
+        self.speculative_config = None;
+        info!("Disabled speculative sampling, using greedy decoding");
+    }
+
+    /// Check if speculative sampling is enabled
+    pub fn is_speculative_enabled(&self) -> bool {
+        self.speculative_config.is_some()
+    }
+
+    /// Get the current speculative sampling configuration (if enabled)
+    pub fn speculative_config(&self) -> Option<&SpeculativeSamplingConfig> {
+        self.speculative_config.as_ref()
+    }
+
+    /// Get the current speculative mode
+    pub fn speculative_mode(&self) -> SpeculativeMode {
+        self.speculative_mode
     }
 
     /// Generate next token using speculative sampling for transformers
-    /// Uses early layers of the main model as draft model for fast candidate generation
+    /// 
+    /// This implements speculative decoding where a lightweight draft model (early layers)
+    /// proposes candidate tokens, and the full model verifies them.
+    /// 
+    /// Algorithm:
+    /// 1. Draft phase: Generate γ candidate tokens using only draft_layers of the model
+    /// 2. Verify phase: Score candidates with full model
+    /// 3. Accept/reject: Use probability ratio threshold τ for rejection sampling
+    /// 
+    /// Reference: "Fast Inference from Transformers via Speculative Decoding" (Leviathan et al., 2022)
     pub fn generate_speculative_transformer(
         &mut self,
         current_tokens: &[usize],
@@ -204,65 +236,112 @@ impl LLM {
             return self.vocab.encode("</s>").unwrap_or(0);
         }
 
+        let vocab_size = self.vocab.size();
+        
         // Convert tokens to embeddings (convert to f32)
         let token_ids_f32 = Array2::from_shape_vec((1, current_tokens.len()),
             current_tokens.iter().map(|&x| x as f32).collect())
             .expect("Failed to create token array");
 
         // Forward pass through embeddings
-        let mut hidden = self.network[0].forward(&token_ids_f32); // TokenEmbeddings
+        let mut draft_hidden = self.network[0].forward(&token_ids_f32); // TokenEmbeddings
 
         // Forward through draft layers (early layers of main model)
-        let draft_end_idx = draft_layers.min(self.network.len().saturating_sub(2)); // Leave room for output projection
+        // Use fewer layers for faster draft generation
+        let draft_end_idx = draft_layers.min(self.network.len().saturating_sub(2));
 
         for i in 1..=draft_end_idx {
-            hidden = self.network[i].forward(&hidden);
+            draft_hidden = self.network[i].forward(&draft_hidden);
         }
 
-        // Get draft logits (using output projection if available)
-        let draft_logits = if let Some(layer) = self.network.iter_mut().find(|l| matches!(l, LayerEnum::OutputProjection(_))) {
-            if let LayerEnum::OutputProjection(op) = layer {
-                op.forward(&hidden)
-            } else {
-                hidden.clone()
-            }
+        // Get draft logits (using output projection)
+        let draft_logits = if let Some(LayerEnum::OutputProjection(op)) = self.network.last_mut() {
+            op.forward(&draft_hidden)
         } else {
-            hidden.clone()
+            draft_hidden.clone()
         };
 
-        // Get top-gamma candidates from draft model
-        let draft_probs = crate::softmax::Softmax::new().forward_immutable(&draft_logits.row(draft_logits.shape()[0] - 1).insert_axis(Axis(0)).view());
-        let draft_tokens = self.get_top_k_tokens(&draft_probs, gamma);
-
-        // Now verify all candidates with full model
-        // We need to score: [original_sequence + candidate] for each candidate
-        let mut candidate_scores = Vec::new();
-
-        // Score the original sequence (without any new token)
-        let original_sequence = current_tokens.to_vec();
-        let original_logit = self.get_sequence_logit(&original_sequence);
-
-        for &candidate_token in &draft_tokens {
-            let candidate_sequence = [original_sequence.as_slice(), &[candidate_token]].concat();
-            let candidate_logit = self.get_sequence_logit(&candidate_sequence);
-
-            // Compute acceptance probability ratio
-            let q_draft = draft_probs[[0, candidate_token]]; // Draft model probability
-            let q_target = crate::softmax::Softmax::new().forward_immutable(&candidate_logit.view())[[0, candidate_token]]; // Target model probability
-
-            let ratio = if q_draft > 0.0 { q_target / q_draft } else { 0.0 };
-            candidate_scores.push((candidate_token, ratio));
+        // Get probabilities for last position from draft model
+        let last_row = draft_logits.row(draft_logits.shape()[0] - 1);
+        let draft_probs = crate::softmax::Softmax::new().forward_immutable(
+            &last_row.to_owned().insert_axis(Axis(0)).view()
+        );
+        
+        // Get top-γ candidates from draft model
+        let candidates = self.get_top_k_tokens(&draft_probs, gamma);
+        
+        if candidates.is_empty() {
+            // Fallback to greedy from draft
+            return draft_probs.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
         }
 
-        // Accept tokens based on tau threshold
-        for (token, ratio) in candidate_scores {
-            if ratio >= tau {
-                return token;
+        // Get full model probabilities for verification
+        // Run through all layers (full model)
+        let full_logits = self.get_sequence_logit(current_tokens);
+        let target_probs = crate::softmax::Softmax::new().forward_immutable(&full_logits.view());
+
+        // Speculative decoding acceptance with rejection sampling
+        // Accept token i with probability min(1, p_target(i) / p_draft(i))
+        let mut rng = get_rng();
+        
+        for &candidate_token in &candidates {
+            if candidate_token >= vocab_size {
+                continue; // Skip invalid tokens
+            }
+            
+            let q_draft = draft_probs[[0, candidate_token]].max(1e-10);
+            let q_target = target_probs[[0, candidate_token]].max(1e-10);
+            
+            // Rejection sampling: accept with probability min(1, q_target/q_draft)
+            let acceptance_prob = (q_target / q_draft).min(1.0);
+            
+            // For tau threshold mode: accept if ratio exceeds tau
+            // For probabilistic mode: accept with probability = acceptance_prob
+            if acceptance_prob >= tau {
+                // Additional probabilistic rejection for better distribution matching
+                let r: f32 = rng.random();
+                if r < acceptance_prob {
+                    return candidate_token;
+                }
             }
         }
 
-        // If no candidates accepted, fall back to greedy decoding from draft model
-        draft_tokens[0]
+        // No candidates accepted - sample from adjusted distribution
+        // p_adjusted = max(0, p_target - p_draft) normalized
+        // This ensures we sample from the "residual" of the target distribution
+        let mut adjusted_probs = Vec::with_capacity(vocab_size);
+        let mut sum = 0.0f32;
+        
+        for i in 0..vocab_size {
+            let p_target = if i < target_probs.len() { target_probs[[0, i]] } else { 0.0 };
+            let p_draft = if i < draft_probs.len() { draft_probs[[0, i]] } else { 0.0 };
+            let p_adj = (p_target - p_draft).max(0.0);
+            adjusted_probs.push(p_adj);
+            sum += p_adj;
+        }
+        
+        if sum > 1e-10 {
+            // Sample from adjusted distribution
+            let r: f32 = rng.random::<f32>() * sum;
+            let mut cumsum = 0.0f32;
+            for (i, &p) in adjusted_probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= r {
+                    return i;
+                }
+            }
+        }
+        
+        // Ultimate fallback: greedy from target
+        target_probs.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(candidates[0])
     }
 
     /// Get logit for the last position of a sequence
@@ -360,7 +439,33 @@ impl LLM {
         );
 
         // Include decoder type in the description
-        format!("{}, {}", network_layers, self.decoder.layer_type())
+        // Show speculative decoder when enabled, otherwise show base decoder type
+        let decoder_desc = match (&self.speculative_config, self.speculative_mode) {
+            (Some(cfg), SpeculativeMode::Transformer) => {
+                format!("SpeculativeDecoder(γ={}, τ={:.4}, layers={})", 
+                    cfg.gamma, cfg.tau, cfg.draft_layers)
+            }
+            (Some(cfg), SpeculativeMode::Diffusion) => {
+                format!("SpeculativeDiffusion(γ={}, τ={:.4}, layers={})", 
+                    cfg.gamma, cfg.tau, cfg.draft_layers)
+            }
+            (None, _) => self.decoder.layer_type().to_string(),
+        };
+        
+        format!("{}, {}", network_layers, decoder_desc)
+    }
+
+    /// Get a detailed decoder description including speculative mode info
+    pub fn decoder_description(&self) -> String {
+        match (&self.speculative_config, self.speculative_mode) {
+            (Some(cfg), mode) => {
+                format!(
+                    "Speculative {} (γ={}, τ={:.4}, draft_layers={}, temp={:.2}, top_p={:.2})",
+                    mode, cfg.gamma, cfg.tau, cfg.draft_layers, cfg.temperature, cfg.top_p
+                )
+            }
+            (None, _) => format!("Greedy (deterministic argmax)"),
+        }
     }
 
     pub fn total_parameters(&self) -> usize {
@@ -1945,7 +2050,7 @@ impl LLM {
             DiffusionTimestepStrategy::Uniform
         };
         let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let min_snr_gamma = min_snr_gamma.max(1e-6);
         let sampling_cdf = if matches!(timestep_strategy, DiffusionTimestepStrategy::MinSnr) {
             if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
@@ -2072,7 +2177,7 @@ impl LLM {
                     let mut noise = Array2::<f32>::zeros(x0.raw_dim());
                     if let Some(slice) = noise.as_slice_mut() {
                         slice.par_iter_mut().for_each(|v| {
-                            *v = normal.sample(&mut rand::rng()) as f32;
+                            *v = normal.sample(&mut get_rng()) as f32;
                         });
                     } else {
                         for v in noise.iter_mut() {
@@ -2536,7 +2641,7 @@ impl LLM {
                 let mut noise = Array2::<f32>::zeros(x0.raw_dim());
                 if let Some(slice) = noise.as_slice_mut() {
                     slice.par_iter_mut().for_each(|v| {
-                        *v = normal.sample(&mut rand::rng()) as f32;
+                        *v = normal.sample(&mut get_rng()) as f32;
                     });
                 } else {
                     for v in noise.iter_mut() {
@@ -2742,7 +2847,7 @@ impl LLM {
         steps: Option<usize>,
     ) -> String {
         let steps = steps.unwrap_or(100);
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
 
         // Tokenize the prompt if provided
         let prompt_tokens = if !prompt.is_empty() {
@@ -3155,7 +3260,7 @@ impl LLM {
             embeddings.token_embeddings.row(token_id).to_owned()
         } else {
             // Fallback: return random embedding if no embeddings layer found
-            let mut rng = rand::rng();
+            let mut rng = get_rng();
             Array1::from_vec(
                 (0..embedding_dim)
                     .map(|_| rng.random::<f32>() * 2.0 - 1.0)

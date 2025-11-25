@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::adam::Adam;
+use crate::{adam::Adam, rng::get_rng};
 
 /// Contextual Position Embeddings (CoPE) for attention mechanisms.
 /// CoPE provides position-aware attention by adding learnable positional
@@ -20,7 +20,7 @@ pub struct CoPE {
 impl CoPE {
     /// Create a new CoPE instance
     pub fn new(max_pos: usize, embed_dim: usize) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let normal_pe = Normal::new(0.0, 0.02).unwrap();
         let pe =
             Array2::<f32>::from_shape_fn((max_pos + 1, embed_dim), |_| normal_pe.sample(&mut rng));

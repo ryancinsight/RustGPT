@@ -15,6 +15,7 @@ use crate::{
     },
     model_config::{DiffusionTimestepStrategy, ModelConfig},
     richards::RichardsNorm,
+    rng::get_rng,
     transformer::{
         common::{
             FeedForwardVariant, CommonLayerConfig, CommonLayers,
@@ -385,7 +386,7 @@ pub struct TimeConditioner {
 
 impl TimeConditioner {
     pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let w1 = Array2::from_shape_fn((input_dim, hidden_dim), |_| {
             Normal::new(0.0, (1.0 / input_dim as f32).sqrt())
                 .unwrap()
@@ -701,7 +702,7 @@ impl DiffusionBlock {
     }
 
     fn apply_dropout_inplace(input: &mut Array2<f32>, rate: f32) {
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let scale = 1.0 / (1.0 - rate);
         input.mapv_inplace(|x| {
             if rand::random::<f32>() > rate {
@@ -833,10 +834,10 @@ impl DiffusionBlock {
         // Start from pure noise: x_T ~ N(0, I)
         let mut x_t = Array2::zeros(shape);
         let normal = Normal::new(0.0, 1.0).unwrap();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         if let Some(slice) = x_t.as_slice_mut() {
             slice.par_iter_mut().for_each(|v| {
-                *v = normal.sample(&mut rand::rng()) as f32;
+                *v = normal.sample(&mut get_rng()) as f32;
             });
         } else {
             for v in x_t.iter_mut() {
@@ -861,7 +862,7 @@ impl DiffusionBlock {
                 let mut noise = Array2::zeros(shape);
                 if let Some(slice) = noise.as_slice_mut() {
                     slice.par_iter_mut().for_each(|v| {
-                        *v = normal.sample(&mut rand::rng()) as f32;
+                        *v = normal.sample(&mut get_rng()) as f32;
                     });
                 } else {
                     for v in noise.iter_mut() {
@@ -884,10 +885,10 @@ impl DiffusionBlock {
         let k = steps.unwrap_or(total).max(1);
         let mut x_t = Array2::zeros(shape);
         let normal = Normal::new(0.0, 1.0).unwrap();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         if let Some(slice) = x_t.as_slice_mut() {
             slice.par_iter_mut().for_each(|v| {
-                *v = normal.sample(&mut rand::rng()) as f32;
+                *v = normal.sample(&mut get_rng()) as f32;
             });
         } else {
             for v in x_t.iter_mut() {
@@ -973,7 +974,7 @@ impl DiffusionBlock {
         let mut steps_left = steps.unwrap_or(total).max(gamma.max(1));
         let mut x_t = Array2::zeros(shape);
         let normal = Normal::new(0.0, 1.0).unwrap();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         x_t.mapv_inplace(|_| normal.sample(&mut rng) as f32);
         let mut t = total.saturating_sub(1);
         while t > 0 && steps_left > 0 {

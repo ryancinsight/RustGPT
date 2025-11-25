@@ -35,11 +35,8 @@ mod tests {
         let mut target_model = create_dummy_block();
         let mut draft_model = create_dummy_block();
         
-        let config = SpeculativeSamplingConfig {
-            gamma: 2,
-            tau: 0.1,
-            draft_layers: 1,
-        };
+        // Use new constructor instead of struct literal
+        let config = SpeculativeSamplingConfig::new(2, 0.1, 1);
         
         let shape = (1, 16);
         let sample = target_model.speculative_sample(

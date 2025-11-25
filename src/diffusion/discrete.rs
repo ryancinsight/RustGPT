@@ -3,6 +3,8 @@ use rand::Rng;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
+use crate::rng::get_rng;
+
 fn mix64(seed: u64, idx: u64) -> u64 {
     let mut z = seed ^ idx;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -49,7 +51,7 @@ impl DiscreteMaskScheduler {
     pub fn mask_sequence(&self, ids: &Array2<f32>, mask_token_id: usize) -> (Array2<f32>, f32) {
         let seq_len = ids.ncols();
         let uniform = Uniform::new(0.0f32, 1.0f32).expect("uniform[0,1]");
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let t_ratio = uniform.sample(&mut rng);
         let k = ((t_ratio * seq_len as f32).round() as usize).min(seq_len);
         let mut indices: Vec<usize> = (0..seq_len).collect();
@@ -77,7 +79,7 @@ impl DiscreteMaskScheduler {
         };
         let k = ((ratio * seq_len as f32).round() as usize).min(seq_len);
         let mut indices: Vec<usize> = (0..seq_len).collect();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let random_salt = rng.random::<u64>();
         indices.sort_by_key(|&i| mix64_with_t(self.seed ^ random_salt, t as u64, i as u64));
         let mut masked = ids.clone();
@@ -132,7 +134,7 @@ impl DiscreteMaskScheduler {
             .collect();
         masked_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut out = ids.clone();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         for k in 0..need.min(masked_positions.len()) {
             let pos = masked_positions[k].0;
             let row = probs.row(pos);
@@ -214,7 +216,7 @@ impl DiscreteMaskScheduler {
             return ids.clone();
         }
         let mut indices: Vec<usize> = (span_start..span_end).collect();
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let random_salt = rng.random::<u64>();
         indices.sort_by_key(|&i| mix64_with_t(self.seed ^ random_salt, t as u64, i as u64));
         let mut masked = ids.clone();
