@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{EMBEDDING_DIM, Vocab, adam::Adam, network::Layer};
+use crate::{EMBEDDING_DIM, Vocab, adam::Adam, network::Layer, rng::get_rng};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TokenEmbeddings {
@@ -27,7 +27,7 @@ impl TokenEmbeddings {
     }
 
     fn init_embeddings(vocab_size: usize, embedding_dim: usize) -> Array2<f32> {
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         // Proper embedding initialization: std = 1 / sqrt(embedding_dim)
         // Reference: "Attention is All You Need" (Vaswani et al., 2017)
         // This prevents gradient explosion in early layers

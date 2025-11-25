@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, network::Layer};
+use crate::{adam::Adam, network::Layer, rng::get_rng};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OutputProjection {
@@ -14,7 +14,7 @@ pub struct OutputProjection {
 impl OutputProjection {
     /// Initialize output layer with random weights (no bias - modern LLM practice)
     pub fn new(embedding_dim: usize, vocab_size: usize) -> Self {
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         // Xavier/He initialization: std = sqrt(2 / fan_in)
         let std = (2.0 / embedding_dim as f32).sqrt();
         let normal = Normal::new(0.0, std).unwrap();

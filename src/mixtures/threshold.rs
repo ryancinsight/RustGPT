@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::network::Layer;
+use crate::{network::Layer, rng::get_rng};
 
 /// Enhanced threshold predictor inspired by AutoDeco
 ///
@@ -69,7 +69,7 @@ impl ThresholdPredictor {
     /// Create a new threshold predictor with AutoDeco-inspired architecture
     pub fn new_with_cond(embed_dim: usize, hidden_dim: usize, num_outputs: usize, cond_dim: usize) -> Self {
         use rand::Rng;
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
 
         // Xavier initialization: weights ~ N(0, 1/sqrt(fan_in))
         let scale1 = 1.0 / (embed_dim as f32).sqrt();

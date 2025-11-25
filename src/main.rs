@@ -8,11 +8,17 @@ use llm::{
     interactive::run_interactive_mode,
     llm::LLM,
     model_builder::{build_network, print_architecture_summary},
+    rng::set_seed,
     training::run_training_pipeline,
 };
 
 fn main() -> crate::Result<()> {
     let args = Args::parse();
+
+    // Set random seed for reproducibility if provided
+    if let Some(seed) = args.seed {
+        set_seed(seed);
+    }
 
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
@@ -52,6 +58,7 @@ fn main() -> crate::Result<()> {
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
+    println!("Decoder: {}", llm.decoder_description());
     println!("Total parameters: {}", llm.total_parameters());
 
     // Test prediction before training

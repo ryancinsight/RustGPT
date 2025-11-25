@@ -33,6 +33,7 @@ use crate::{
         routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm},
         threshold::ThresholdPredictor,
     },
+    rng::get_rng,
 };
 
 /// Strategy for selecting which experts to activate
@@ -384,7 +385,7 @@ impl ExpertSelector {
     /// Create a new expert selector with AutoDeco-inspired architecture
     pub fn new(embed_dim: usize, router_hidden_dim: usize, num_experts: usize) -> Self {
         use rand::Rng;
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
 
         // Xavier initialization: weights ~ N(0, 1/sqrt(fan_in))
         let scale1 = 1.0 / (embed_dim as f32).sqrt();

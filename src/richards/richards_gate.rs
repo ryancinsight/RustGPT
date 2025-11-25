@@ -6,6 +6,7 @@ use crate::{
     adam::Adam,
     network::Layer,
     richards::RichardsCurve,
+    rng::get_rng,
 };
 
 /// # Richards Gate: Complete Mathematical Framework and Implementation
@@ -122,7 +123,7 @@ pub struct RichardsGate {
 impl RichardsGate {
     /// Create a new Richards gate with learned parameters
     pub fn new() -> Self {
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
 
         // Create a minimal Richards curve optimized for gating
         // Only learn nu, k, m parameters for stable gating behavior

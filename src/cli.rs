@@ -13,6 +13,12 @@ pub struct Args {
     #[arg(short)]
     pub interactive: bool,
 
+    /// Random seed for reproducible training.
+    /// When set, all random operations use deterministic sequences.
+    /// Use the same seed to get identical results across runs.
+    #[arg(long)]
+    pub seed: Option<u64>,
+
     /// Use hard head selection (top-k) instead of soft gating for MoH
     /// Hard mode: Only compute attention for selected heads (saves computation)
     /// Soft mode (default): Compute all heads and apply soft gating weights
@@ -57,8 +63,11 @@ pub struct Args {
     pub speculative: bool,
 
     /// Speculative sampling mode: "diffusion" or "transformer"
-    #[arg(long, default_value = "diffusion")]
-    pub speculative_mode: String,
+    /// If not specified, auto-detected from model type:
+    /// - With --diffusion: uses diffusion speculation
+    /// - Without --diffusion: uses transformer speculation
+    #[arg(long)]
+    pub speculative_mode: Option<String>,
 
     /// Number of draft steps per speculative proposal
     #[arg(long, default_value_t = 4)]

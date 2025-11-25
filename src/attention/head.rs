@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::adam::Adam;
+use crate::{adam::Adam, rng::get_rng};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyHead {
@@ -20,7 +20,7 @@ impl PolyHead {
         let std_qk = (2.0f32 / (embed_dim as f32 + head_dim as f32)).sqrt();
         let std_v = (2.0f32 / (embed_dim as f32 + head_dim as f32)).sqrt();
 
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         let normal_qk = Normal::new(0.0, std_qk).unwrap();
         let normal_v = Normal::new(0.0, std_v).unwrap();
 

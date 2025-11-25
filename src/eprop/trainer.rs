@@ -14,6 +14,7 @@ use crate::eprop::{
     adaptive_softmax::AdaptiveSoftmax,
     EPropError, Result,
 };
+use crate::rng::get_rng;
 
 /// Training statistics and monitoring
 #[derive(Debug, Clone, Default)]
@@ -115,7 +116,7 @@ impl EPropTrainer {
         use rand::Rng;
         use rand_distr::{Distribution, Normal};
         
-        let mut rng = rand::rng();
+        let mut rng = get_rng();
         
         // Xavier initialization for weights
         let fan_in_rec = config.num_neurons as f32;

@@ -23,12 +23,35 @@ pub fn run_training_pipeline(
             .unwrap_or_else(|| config.num_layers.max(1))
             .max(1);
 
-        let mode = match args.speculative_mode.as_str() {
-            "transformer" => crate::transformer::speculative::SpeculativeMode::Transformer,
-            "diffusion" => crate::transformer::speculative::SpeculativeMode::Diffusion,
-            _ => {
-                warn!("Unknown speculative mode '{}', defaulting to diffusion", args.speculative_mode);
+        // Auto-detect speculative mode from model type if not explicitly specified
+        // --diffusion flag → diffusion speculation
+        // otherwise (transformer/TRM) → transformer speculation
+        let mode = if let Some(ref mode_str) = args.speculative_mode {
+            // User explicitly specified a mode
+            match mode_str.to_lowercase().as_str() {
+                "transformer" | "trans" | "t" => {
+                    crate::transformer::speculative::SpeculativeMode::Transformer
+                }
+                "diffusion" | "diff" | "d" => {
+                    crate::transformer::speculative::SpeculativeMode::Diffusion
+                }
+                _ => {
+                    warn!("Unknown speculative mode '{}', auto-detecting from model type", mode_str);
+                    if args.diffusion {
+                        crate::transformer::speculative::SpeculativeMode::Diffusion
+                    } else {
+                        crate::transformer::speculative::SpeculativeMode::Transformer
+                    }
+                }
+            }
+        } else {
+            // Auto-detect from model type
+            if args.diffusion {
+                println!("Auto-detected speculative mode: Diffusion (based on --diffusion flag)");
                 crate::transformer::speculative::SpeculativeMode::Diffusion
+            } else {
+                println!("Auto-detected speculative mode: Transformer (default model type)");
+                crate::transformer::speculative::SpeculativeMode::Transformer
             }
         };
 
