@@ -1774,7 +1774,7 @@ impl LLM {
 
         // EMA-smooth the median to reduce step-to-step volatility
         const EMA_BETA: f32 = 0.9; // 90% memory, gentle smoothing
-        let median_smoothed = if let Some(prev) = self.median_grad_ema {
+        let _median_smoothed = if let Some(prev) = self.median_grad_ema {
             let sm = EMA_BETA * prev + (1.0 - EMA_BETA) * median_grad_norm;
             self.median_grad_ema = Some(sm);
             sm
@@ -2122,8 +2122,8 @@ impl LLM {
             };
             let effective_lr = base_lr * lr_scale;
             let mut total_loss = 0.0f32;
-            let mut total_mse = 0.0f32;
-            let mut mse_examples = 0usize;
+            let mut _total_mse = 0.0f32;
+            let _mse_examples = 0usize;
             let mut total_ce = 0.0f32;
             let mut total_lambda_ce = 0.0f32;
             let mut count = 0usize;
@@ -2550,8 +2550,8 @@ impl LLM {
             } else {
                 0.0
             };
-            let avg_mse = if mse_examples > 0 {
-                total_mse / mse_examples as f32
+            let avg_mse = if _mse_examples > 0 {
+                _total_mse / _mse_examples as f32
             } else {
                 0.0
             };

@@ -5,7 +5,7 @@ use crate::{
     adam::Adam,
     attention::{
         config::{
-            init_attention_heads, init_cope, init_gate_polynomial, init_gating_params,
+            init_attention_heads, init_cope, init_gating_params,
             init_output_projection, init_polynomial_params,
         },
         forward::{ForwardContext, compute_poly_attention_forward},
@@ -18,7 +18,7 @@ use crate::{
         moh::{HeadSelectionConfig, HeadSelectionStrategy},
         threshold::ThresholdPredictor,
     },
-    richards::{RichardsCurve, RichardsGate},
+    richards::RichardsGate,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -663,7 +663,7 @@ impl PolyAttention {
             let mut z_col = xw_col.clone();
             z_col.mapv_inplace(|v| a_h * v + b_h);
             let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-            let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+            let _gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
             let g_col = self.gate.forward_const(&z_col);
 
             // Threshold path forward
@@ -1084,7 +1084,7 @@ impl PolyAttention {
                 z_col.mapv_inplace(|v| a_h * v + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
                 max_abs_vec[h] = max_abs_z;
-                let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+                let _gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
                 let g_col = self.gate.forward_const(&z_col);
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
@@ -1772,7 +1772,7 @@ impl PolyAttention {
                 z_col.mapv_inplace(|v| a_h * v + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
                 max_abs_vec[h] = max_abs_z;
-                let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
+                let _gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
                 let g_col = self.gate.forward_const(&z_col);
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];

@@ -1,4 +1,4 @@
-use llm::{RichardsGlu, llm::Layer};
+use llm::{network::Layer, RichardsGlu};
 use ndarray::Array2;
 
 fn main() {

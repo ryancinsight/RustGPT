@@ -251,6 +251,7 @@ pub struct RichardsCurve {
     pub grad_norm_history: Vec<f64>,
 }
 
+#[allow(dead_code)]
 impl RichardsCurve {
     /// Constructor with learnable params based on variant.
     pub fn new_learnable(variant: super::Variant) -> Self {
@@ -834,7 +835,7 @@ impl RichardsCurve {
                     // We can't easily use the pre-computed forward pass here without passing it in.
                     // So we recompute. To optimize, we could pass it in, but that changes API.
                     // For now, we recompute efficiently.
-                    let richards_output = self.forward_matrix(x); // This includes gamma/bias! Wait.
+                    let _richards_output = self.forward_matrix(x); // This includes gamma/bias! Wait.
                     // Actually forward_matrix applies gamma/bias. 
                     // We need the raw richards output.
                     // Let's use forward_into on a temp buffer without gamma/bias application
@@ -971,7 +972,7 @@ impl RichardsCurve {
             pos += 1;
         }
         // Compute k gradient (needed for both k and m gradients)
-        let d_sigma_d_k = if self.k_learnable || self.m_learnable {
+        let _d_sigma_d_k = if self.k_learnable || self.m_learnable {
             // Theorem 8: ∂σ/∂k = σ * (1-σ) * (x-m) * [1 + (1-β)e^(-k(x-m))/(β + (1-β)e^(-k(x-m)))]
             // Let exp_term = e^(-k(x-m)), base = 1 + β*exp_term
             // Expression: [1 + (1-β)*exp_term/base]
@@ -1216,43 +1217,43 @@ impl RichardsCurve {
 
     /// Set learnable parameter values from a vector (for testing)
     pub fn set_weights_from_vec(&mut self, weights: &[f64]) {
-        let mut idx = 0;
+        let mut _idx = 0;
         
-        if self.nu_learnable && idx < weights.len() {
-            self.learned_nu = Some(weights[idx].clamp(1e-6, 10.0));
-            idx += 1;
+        if self.nu_learnable && _idx < weights.len() {
+            self.learned_nu = Some(weights[_idx].clamp(1e-6, 10.0));
+            _idx += 1;
         }
-        if self.k_learnable && idx < weights.len() {
-            self.learned_k = Some(weights[idx].clamp(1e-6, 100.0));
-            idx += 1;
+        if self.k_learnable && _idx < weights.len() {
+            self.learned_k = Some(weights[_idx].clamp(1e-6, 100.0));
+            _idx += 1;
         }
-        if self.m_learnable && idx < weights.len() {
-            self.learned_m = Some(weights[idx].clamp(-10.0, 10.0));
-            idx += 1;
+        if self.m_learnable && _idx < weights.len() {
+            self.learned_m = Some(weights[_idx].clamp(-10.0, 10.0));
+            _idx += 1;
         }
-        if self.beta_learnable && idx < weights.len() {
-            self.learned_beta = Some(weights[idx].clamp(1e-6, 10.0));
-            idx += 1;
+        if self.beta_learnable && _idx < weights.len() {
+            self.learned_beta = Some(weights[_idx].clamp(1e-6, 10.0));
+            _idx += 1;
         }
-        if self.temperature_learnable && idx < weights.len() {
-            self.learned_temperature = Some(weights[idx].clamp(0.1, 10.0));
-            idx += 1;
+        if self.temperature_learnable && _idx < weights.len() {
+            self.learned_temperature = Some(weights[_idx].clamp(0.1, 10.0));
+            _idx += 1;
         }
-        if self.output_gain_learnable && idx < weights.len() {
-            self.learned_output_gain = Some(weights[idx].clamp(-10.0, 10.0));
-            idx += 1;
+        if self.output_gain_learnable && _idx < weights.len() {
+            self.learned_output_gain = Some(weights[_idx].clamp(-10.0, 10.0));
+            _idx += 1;
         }
-        if self.output_bias_learnable && idx < weights.len() {
-            self.learned_output_bias = Some(weights[idx].clamp(-10.0, 10.0));
-            idx += 1;
+        if self.output_bias_learnable && _idx < weights.len() {
+            self.learned_output_bias = Some(weights[_idx].clamp(-10.0, 10.0));
+            _idx += 1;
         }
-        if self.scale_learnable && idx < weights.len() {
-            self.learned_scale = Some(weights[idx].clamp(-10.0, 10.0));
-            idx += 1;
+        if self.scale_learnable && _idx < weights.len() {
+            self.learned_scale = Some(weights[_idx].clamp(-10.0, 10.0));
+            _idx += 1;
         }
-        if self.shift_learnable && idx < weights.len() {
-            self.learned_shift = Some(weights[idx].clamp(-5.0, 5.0));
-            idx += 1;
+        if self.shift_learnable && _idx < weights.len() {
+            self.learned_shift = Some(weights[_idx].clamp(-5.0, 5.0));
+            _idx += 1;
         }
         // Note: gamma and bias not supported in set_weights_from_vec (would need matrix dims)
     }
