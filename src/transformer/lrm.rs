@@ -283,13 +283,13 @@ impl LRM {
         Self::new(c)
     }
 
-    pub fn attention(&self) -> PolyAttentionReadGuard {
+    pub fn attention(&self) -> PolyAttentionReadGuard<'_> {
         PolyAttentionReadGuard {
             guard: self.block.read().unwrap(),
         }
     }
 
-    pub fn attention_mut(&self) -> PolyAttentionWriteGuard {
+    pub fn attention_mut(&self) -> PolyAttentionWriteGuard<'_> {
         PolyAttentionWriteGuard {
             guard: self.block.write().unwrap(),
         }
@@ -539,11 +539,11 @@ impl LRM {
         
         let parts = self.param_partitions.read().unwrap().clone().unwrap_or_default();
         
-        let mut idx = 0;
+        let mut _idx = 0;
         let mut next_slice = |count: usize| {
-            let end = idx + count;
-            let slice = &param_grads[idx..end];
-            idx = end;
+            let end = _idx + count;
+            let slice = &param_grads[_idx..end];
+            _idx = end;
             slice
         };
         
@@ -552,13 +552,13 @@ impl LRM {
         
         if let Some(li) = &mut self.latent_init {
             if parts.latent_w > 0 {
-                let gw = &param_grads[idx];
-                idx += 1;
+                let gw = &param_grads[_idx];
+                _idx += 1;
                 li.w = &li.w - &(gw * lr);
             }
             if parts.latent_b > 0 {
-                let gb = &param_grads[idx];
-                idx += 1;
+                let gb = &param_grads[_idx];
+                _idx += 1;
                 li.b = &li.b - &(gb * lr);
             }
         }

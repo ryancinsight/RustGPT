@@ -67,9 +67,9 @@ impl HRM {
         
         let dim = config.embed_dim;
         // Initialize identity-like projections
-        let mut downsample_w = Array2::eye(dim);
+        let downsample_w = Array2::eye(dim);
         let downsample_b = Array2::<f32>::zeros((1, dim));
-        let mut upsample_w = Array2::eye(dim);
+        let upsample_w = Array2::eye(dim);
         let upsample_b = Array2::<f32>::zeros((1, dim));
         
         // Add small noise to break symmetry if needed, but identity is a good start for residual-like behavior
@@ -89,7 +89,7 @@ impl HRM {
 
     pub fn from_model_config(config: &ModelConfig) -> Self {
         let stride = 2; // Default stride
-        let mut bottom_cfg = TransformerBlockConfig {
+        let bottom_cfg = TransformerBlockConfig {
             embed_dim: config.embedding_dim,
             hidden_dim: config.hidden_dim,
             num_heads: config.get_num_heads(),
@@ -210,7 +210,7 @@ impl HRM {
         (grad_input, grad_w, grad_b)
     }
 
-    fn upsample_backward(&self, grad_output: &Array2<f32>, projected: &Array2<f32>, coarse_len: usize) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+    fn upsample_backward(&self, grad_output: &Array2<f32>, _projected: &Array2<f32>, coarse_len: usize) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
         // grad_output: (target_len, dim)
         // projected: (coarse_len, dim) (input to upsample repeat)
         

@@ -5,7 +5,7 @@ use crate::{
     attention::{head::PolyHead, position::cope::CoPE},
     attention::memory::with_tls_phi,
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
-    richards::{RichardsCurve, RichardsGate},
+    richards::RichardsGate,
 };
 
 /// Context structure containing all data needed for forward computation
@@ -107,7 +107,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
 
-            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
+            let _gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
             let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
             let g_col_data: Vec<f32> = gate_input.iter().map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32).collect();
             let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
@@ -188,7 +188,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
 
-            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
+            let _gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
 
             let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
             let g_col_data: Vec<f32> = gate_input.iter().map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32).collect();
@@ -439,7 +439,7 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
                 .iter()
                 .map(|&v| (a_h * v + b_h) as f64)
                 .fold(0.0_f64, |m, z| m.max(z.abs()));
-            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
+            let _gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
             let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
             let g_col_data: Vec<f32> = gate_input.iter().map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32).collect();
             let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();

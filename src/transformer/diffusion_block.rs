@@ -13,7 +13,7 @@ use crate::{
         HeadSelectionStrategy,
         moe::ExpertRouterConfig,
     },
-    model_config::{DiffusionTimestepStrategy, ModelConfig},
+    model_config::{DiffusionTimestepStrategy},
     richards::RichardsNorm,
     rng::get_rng,
     transformer::{
@@ -702,7 +702,7 @@ impl DiffusionBlock {
     }
 
     fn apply_dropout_inplace(input: &mut Array2<f32>, rate: f32) {
-        let mut rng = get_rng();
+        let _rng = get_rng();
         let scale = 1.0 / (1.0 - rate);
         input.mapv_inplace(|x| {
             if rand::random::<f32>() > rate {

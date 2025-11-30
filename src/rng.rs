@@ -4,7 +4,7 @@
 //! When a seed is set, all random operations use a deterministic sequence.
 //! When no seed is set, the default thread-local RNG is used.
 
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng};
 use rand::rngs::StdRng;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
