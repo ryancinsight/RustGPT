@@ -21,3 +21,11 @@ Phase 3: Verify/docs
 - [ ] Benchmarks vs baseline (training logs)
 - [ ] Update rustdoc/theorems
 - [ ] Close sprint, new task
+
+## TransformerBlock Audit/Enhancement Sprint
+- [x] Audit complete, gaps to gap_audit (TB-001..006)
+- [ ] Integrate TransformerWorkspace (TB-001 Major perf)
+- [ ] Prop/unit tests theorems/adaptive/MoE (TB-002/3/4)
+- [ ] Extract WindowAdapter/GradPartitioner traits (TB-005)
+- [ ] Par forward/RwLock→low-contention (TB-006)
+- [ ] Bench validate + docs sync

@@ -50,6 +50,7 @@ impl Default for LRMConfig {
                 max_window_size: 4096,
                 window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::SequenceLengthBased,
                 entropy_ema_alpha: 0.2,
+                use_advanced_adaptive_residuals: true,
             }),
             embed_dim: 64,
             num_recursions: 1,
@@ -268,6 +269,7 @@ impl LRM {
             max_window_size: config.max_window_size,
             window_adaptation_strategy: config.window_adaptation_strategy,
             entropy_ema_alpha: config.entropy_ema_alpha,
+            use_advanced_adaptive_residuals: true,
         });
 
         let c = LRMConfig {

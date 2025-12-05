@@ -104,6 +104,7 @@ impl HRM {
             max_window_size: config.max_window_size,
             window_adaptation_strategy: config.window_adaptation_strategy,
             entropy_ema_alpha: config.entropy_ema_alpha,
+            use_advanced_adaptive_residuals: true,
         };
         
         // Top block might have larger effective window or different capacity
@@ -484,6 +485,7 @@ mod tests {
             max_window_size: 32,
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.1,
+            use_advanced_adaptive_residuals: false,
         };
         let top_cfg = bottom_cfg.clone();
         
@@ -520,6 +522,7 @@ mod tests {
             max_window_size: 16,
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.1,
+            use_advanced_adaptive_residuals: false,
         };
         let top_cfg = bottom_cfg.clone();
         

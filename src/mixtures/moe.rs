@@ -1129,23 +1129,17 @@ impl Layer for MixtureOfExperts {
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
 
         // Activation parameter gradients
-        let activation_grads = self
-            .router
-            .activation
-            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
+        let normalized_f32 = normalized_f64.mapv(|x| x as f32);
+        let d_activated_f32 = d_activated_f64.mapv(|x| x as f32);
+        let (_, activation_param_grads) = self.router.activation.compute_gradients(&normalized_f32, &d_activated_f32);
 
-        // Convert to the format expected by apply_gradients (Vec<Array2<f32>>)
-        let router_grads = vec![
+        let mut router_grads = vec![
             grad_weights1,
             grad_bias1.insert_axis(ndarray::Axis(0)),
             grad_weights2,
             grad_bias2.insert_axis(ndarray::Axis(0)),
-            ndarray::Array2::from_shape_vec(
-                (1, activation_grads.len()),
-                activation_grads.into_iter().map(|x| x as f32).collect(),
-            )
-            .unwrap(),
         ];
+        router_grads.extend(activation_param_grads);
         all_param_grads.extend(router_grads);
 
         (grad_input, all_param_grads)
@@ -1160,8 +1154,8 @@ impl Layer for MixtureOfExperts {
 
         // Apply gradients to each expert
         for expert in &mut self.experts {
-            // RichardsGlu always has 5 parameters
-            let num_expert_params = 5;
+            // RichardsGlu always has 8 parameters: w1, w2, w_out, richards_activation, gate (4 params)
+            let num_expert_params = 8;
 
             if grad_idx + num_expert_params > param_grads.len() {
                 return Err(crate::errors::ModelError::GradientError {
@@ -1179,7 +1173,7 @@ impl Layer for MixtureOfExperts {
         }
 
         // Apply router gradients (weights1, bias1, weights2, bias2, activation_params)
-        let router_grad_count = 5; // weights1, bias1, weights2, bias2, activation
+        let router_grad_count = 8; // weights1, bias1, weights2, bias2, activation (4 params)
         if grad_idx + router_grad_count <= param_grads.len() {
             self.router.weights1.scaled_add(-lr, &param_grads[grad_idx]);
             self.router
@@ -1192,8 +1186,9 @@ impl Layer for MixtureOfExperts {
                 .bias2
                 .scaled_add(-lr, &param_grads[grad_idx + 3].row(0));
 
-            // Apply activation parameter gradients
-            let _ = self.router.activation.apply_gradients(&[param_grads[grad_idx + 4].clone()], lr);
+            // Apply activation parameter gradients (4 separate arrays: nu, k, m, temperature)
+            let activation_grads = &param_grads[grad_idx + 4..grad_idx + 8];
+            let _ = self.router.activation.apply_gradients(activation_grads, lr);
         }
 
         Ok(())
@@ -1383,12 +1378,14 @@ mod tests {
         // Check that input gradients have correct shape
         assert_eq!(grad_input.shape(), input.shape());
 
-        // Verify that router gradients are included (5 matrices: weights1, bias1, weights2, bias2,
-        // activation) Expert gradients come first, then router gradients
+        // Verify that router gradients are included (8 matrices: weights1, bias1, weights2, bias2,
+        // activation_nu, activation_k, activation_m, activation_temperature)
+        // Expert gradients come first, then router gradients
         let expected_router_grad_start = moe.experts.len() * 5; // 5 parameter groups per expert (w1, w2, w_out, richards_activation, gate_parameters)
         assert!(
-            param_grads.len() >= expected_router_grad_start + 5,
-            "Should have gradients for all experts plus 5 router matrices"
+            param_grads.len() >= expected_router_grad_start + 8,
+            "Should have gradients for all experts plus 8 router matrices, got {}",
+            param_grads.len()
         );
     }
 

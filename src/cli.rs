@@ -112,6 +112,12 @@ pub struct Args {
     /// Number of epochs to run during instruction tuning (default 100)
     #[arg(long, default_value_t = 100)]
     pub instruction_epochs: usize,
+
+    /// Enable Mixture-of-Experts (MoE) for feedforward layers
+    /// When enabled, replaces standard feedforward layers with sparse MoE layers
+    /// Each MoE layer contains multiple expert networks with learned routing
+    #[arg(long)]
+    pub moe: bool,
 }
 
 /// CLI representation of diffusion prediction targets

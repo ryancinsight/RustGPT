@@ -77,6 +77,13 @@ impl RichardsActivation {
         x * &richards_output
     }
 
+    /// Optimized forward pass that avoids intermediate allocation
+    pub fn forward_into(&self, x: &Array1<f64>, out: &mut Array1<f64>) {
+        let mut richards_output = Array1::zeros(x.len());
+        self.richards_curve.forward_into(x.as_slice().unwrap(), richards_output.as_slice_mut().unwrap());
+        *out = x * &richards_output;
+    }
+
     /// Backward pass: derivative of x * Richards(x)
     /// d/dx[x * Richards(x)] = Richards(x) + x * Richards'(x)
     pub fn derivative(&self, x: &Array1<f64>) -> Array1<f64> {

@@ -63,6 +63,18 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     // Set attention mechanism to PolyAttention
     config.attention = AttentionType::PolyAttention { degree_p: 3 };
 
+    // Enable MoE if requested
+    if args.moe {
+        config.moe_router = Some(crate::mixtures::moe::ExpertRouter::LearnedMoE {
+            num_experts: 4,
+            num_active_experts: 2,
+            expert_hidden_dim: HIDDEN_DIM / 2,
+            load_balance_weight: 0.01,
+            sparsity_weight: 0.001,
+            diversity_weight: 0.005,
+        });
+    }
+
     config
 }
 
