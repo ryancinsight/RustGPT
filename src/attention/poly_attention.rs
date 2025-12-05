@@ -385,6 +385,10 @@ impl PolyAttention {
         self.window_size = ws;
     }
 
+    pub fn window_size(&self) -> Option<usize> {
+        self.window_size
+    }
+
     pub fn adapt_degree_from_forward_metrics(
         &mut self,
         tau_metrics: Option<(f32, f32)>,

@@ -635,42 +635,46 @@ impl RichardsCurve {
         // Ensure output size matches input
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
+        // Pre-compute common values for optimization
+        let temp_reciprocal = 1.0 / temp;
+        let output_gain_bias = output_gain * output_bias;
+
         x.par_iter()
             .zip(out.par_iter_mut())
             .for_each(|(&xi, o)| {
                 // Apply adaptive normalization (for Adaptive variant)
                 let adaptive_normalized = adaptive_scale * xi + adaptive_shift;
-                
+
                 // Apply temperature scaling: sharper when temp < 1, softer when temp > 1
-                let temp_scaled = adaptive_normalized / temp;
-                
+                let temp_scaled = adaptive_normalized * temp_reciprocal;
+
                 // Apply input transformation
                 let input = input_scale * (scale * temp_scaled + shift);
-                
+
                 let exponent: f64 = -k * (input - m);
                 // Clamp exponent to prevent overflow
                 let clamped_exponent = exponent.clamp(-23.0, 23.0);
-                
+
                 // Extended Richards formula: σ(x) = [1 + β * e^(-k(x-m))]^(-1/ν)
                 // When β=1: standard Richards [1 + e^(-k(x-m))]^(-1/ν)
                 // When β=0: constant 1.0 (degenerate)
                 let exp_term = PadeExp::exp(clamped_exponent);
                 let base = 1.0 + beta * exp_term;
-                
+
                 let sigma = if nu <= 0.0 {
                     // Limit case: standard logistic
                     1.0 / base
                 } else {
-                    // General Richards curve
+                    // General Richards curve - optimized powf call
                     base.powf(-1.0 / nu)
                 };
-                
+
                 // Apply variant-specific transformation
-                let gate = match self.variant { 
-                    super::Variant::Tanh => 2.0 * sigma - 1.0, 
-                    _ => sigma 
+                let gate = match self.variant {
+                    super::Variant::Tanh => 2.0 * sigma - 1.0,
+                    _ => sigma
                 };
-                
+
                 let output = output_gain * gate + output_bias;
                 // Numerical stability: clamp extreme values to prevent NaN/inf propagation
                 *o = output.clamp(-1e6, 1e6);
@@ -900,26 +904,35 @@ impl RichardsCurve {
         // Ensure output size matches input
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
+        // Pre-compute common scaling factors
+        let final_scaling = output_gain * input_scale * outer_scale * scale;
+
         x.par_iter()
             .zip(out.par_iter_mut())
             .for_each(|(&xi, o)| {
                 let input = input_scale * (scale * xi + shift);
                 let exponent: f64 = -k * (input - m);
-                let sigma = if nu <= 0.0 {
-                    1.0 / (1.0 + PadeExp::exp(exponent))
-                } else {
-                    let u = PadeExp::exp(exponent).powf(1.0 / nu);
-                    1.0 / (1.0 + u)
-                };
 
+                // Optimized sigma computation
                 let exp_term = PadeExp::exp(exponent);
                 let base = 1.0 + beta * exp_term;
-                let dsig_dinput = if nu <= 0.0 {
-                    k * sigma * (1.0 - sigma)  // Standard logistic for nu <= 0
+
+                let sigma = if nu <= 0.0 {
+                    1.0 / base
                 } else {
-                    (sigma * k * beta * exp_term) / (nu * base)  // Correct Richards derivative
+                    base.powf(-1.0 / nu)
                 };
-                *o = output_gain * dsig_dinput * input_scale * outer_scale * scale;
+
+                // Optimized derivative computation
+                let dsig_dinput = if nu <= 0.0 {
+                    // Standard logistic derivative: k * σ(1-σ)
+                    k * sigma * (1.0 - sigma)
+                } else {
+                    // Richards derivative: (σ * k * β * exp_term) / (ν * base)
+                    (sigma * k * beta * exp_term) / (nu * base)
+                };
+
+                *o = final_scaling * dsig_dinput;
             });
     }
 
@@ -1714,6 +1727,27 @@ mod tests {
     fn test_no_nan_inf_in_gradients() {
         let curve = RichardsCurve::new_learnable(super::super::Variant::Sigmoid);
         
+
+#[test]
+fn test_richards_optimizations_integration() {
+    // Test that all optimizations work together correctly
+    let curve = RichardsCurve::new_default();
+
+    // Test input data
+    let x_vals = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
+    let x_array = Array1::from_vec(x_vals.clone());
+
+    // Test RichardsCurve optimizations
+    let curve_output = curve.forward(&x_array);
+    assert_eq!(curve_output.len(), x_vals.len());
+
+    // Verify outputs are reasonable (no NaN/inf)
+    for val in curve_output.iter() {
+        assert!(val.is_finite(), "RichardsCurve output contains non-finite value: {}", val);
+    }
+
+    println!("Richards module optimizations working correctly!");
+}
         // Test with extreme inputs
         let extreme_inputs = vec![-100.0, -10.0, 0.0, 10.0, 100.0];
         

@@ -174,7 +174,10 @@ impl RichardsNorm {
         temp_richards.beta = adjusted_beta;
 
         // Apply Richards curve with per-feature transformations
-        temp_richards.forward_matrix(&input.mapv(|x| x as f64)).mapv(|x| x as f32)
+        // Use forward_matrix_into to avoid intermediate allocation
+        let mut output_f64 = Array2::zeros(input.dim());
+        temp_richards.forward_matrix_into(&input.mapv(|x| x as f64), &mut output_f64);
+        output_f64.mapv(|x| x as f32)
     }
 }
 

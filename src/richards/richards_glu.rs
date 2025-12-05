@@ -65,7 +65,6 @@ impl Layer for RichardsGlu {
 
         // Vectorized processing: convert entire matrices to f64, apply Richards functions, convert back
         let x1_f64 = x1.mapv(|x| x as f64);
-        let _x2_f64 = x2.mapv(|x| x as f64);
 
         // Apply Richards functions to entire matrices at once
         let value_f64 = self.richards_activation.forward_matrix(&x1_f64);
