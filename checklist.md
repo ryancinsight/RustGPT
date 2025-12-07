@@ -29,3 +29,11 @@ Phase 3: Verify/docs
 - [ ] Extract WindowAdapter/GradPartitioner traits (TB-005)
 - [ ] Par forward/RwLock→low-contention (TB-006)
 - [ ] Bench validate + docs sync
+
+## Diffusion Training Gradient NaN Fix
+- [x] Analyze gradient NaN error in diffusion training
+- [x] Identify root cause (numerical instability in V-prediction gradient scaling)
+- [x] Check gradient computation and sanitization
+- [x] Implement fixes for numerical stability (bounds checking, input validation, post-scaling sanitization)
+- [x] Test compilation fixes
+- [x] Update gap audit with findings
