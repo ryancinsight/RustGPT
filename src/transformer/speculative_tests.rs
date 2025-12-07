@@ -26,6 +26,7 @@ mod tests {
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
             time_embed_dim: 16,
             mask_token_id: None,
+            use_advanced_adaptive_residuals: false, // Disable for testing
         };
         DiffusionBlock::new(config)
     }
