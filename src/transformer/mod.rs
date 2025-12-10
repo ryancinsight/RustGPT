@@ -17,6 +17,7 @@
 //!   - Forward/reverse diffusion processes
 //!   - Denoising objective for generative modeling
 
+pub mod adaptive_residuals;
 pub mod diffusion_block;
 pub mod transformer_block;
 pub mod lrm;
@@ -30,6 +31,7 @@ pub use diffusion_block::{
     DiffusionBlock, DiffusionBlockConfig, NoiseSchedule, NoiseScheduler, TimeEmbedding,
 };
 pub use transformer_block::{TransformerBlock, TransformerBlockConfig};
+pub use adaptive_residuals::{AdaptiveResidualStrategy, UnifiedAdaptiveResiduals};
 pub use lrm::{LRM, LRMConfig};
 pub use hrm::{HRM, HRMConfig};
 pub use common::FeedForwardVariant;
