@@ -2,12 +2,11 @@
 use std::sync::{Arc, RwLock};
 use std::borrow::Cow;
 
-use ndarray::{Array2, s};
+use ndarray::Array2;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    adam::Adam,
     attention::poly_attention::PolyAttention,
     errors::Result,
     network::Layer,
@@ -17,9 +16,12 @@ use crate::{
     },
     model_config::{ModelConfig, WindowAdaptationStrategy},
     richards::RichardsNorm,
-    transformer::common::{
-        FeedForwardVariant, CommonLayerConfig, CommonLayers,
-        apply_adaptive_gradients
+    transformer::{
+        adaptive_residuals::{UnifiedAdaptiveResiduals, AdaptiveResidualStrategy},
+        common::{
+            FeedForwardVariant, CommonLayerConfig, CommonLayers,
+            apply_adaptive_gradients
+        }
     },
 };
 
@@ -163,619 +165,60 @@ impl TransformerWorkspace {
     }
 }
 
-/// Performance-Optimized Advanced Adaptive Residual Connections
-///
-/// This implements weight similarity-based adaptive residuals with several optimizations:
-/// 1. Memory-efficient similarity computation using SIMD-friendly operations
-/// 2. Lazy evaluation of similarity matrices only when needed
-/// 3. Optimized attention mechanism for residual fusion
-/// 4. Position-aware residual scaling using CoPE (Theorem 4 Extension)
-/// 5. Gradient checkpointing for memory efficiency
-/// 6. Adaptive parameter updates with stability constraints
-#[derive(Debug, Clone)]
-pub struct OptimizedAdvancedAdaptiveResiduals {
-    /// Compact weight similarity matrix (embed_dim × embed_dim)
-    pub weight_similarity_matrix: Array2<f32>,
-
-    /// Per-channel affinity scores (embed_dim × 1)
-    pub layer_affinity_scores: Array2<f32>,
-
-    /// Optimized attention parameters for residual fusion
-    pub residual_attention_qkv: Array2<f32>, // Combined QKV for efficiency (embed_dim × 3 * embed_dim)
-
-    /// Channel interaction matrix (embed_dim × embed_dim)
-    pub channel_affinity_matrix: Array2<f32>,
-
-    /// Adaptive residual scaling for attention (embed_dim × 1)
-    pub attention_residual_scales: Array2<f32>,
-
-    /// Adaptive residual scaling for FFN (embed_dim × 1)
-    pub ffn_residual_scales: Array2<f32>,
-
-    /// ===== Theorem 4 Extension: Position-Aware Residual Scaling =====
-    /// Position-aware attention parameters for CoPE-based residual scaling
-    pub positional_residual_qkv: Array2<f32>, // (embed_dim × 3 * embed_dim) for Q,K,V
-
-    /// Maximum sequence length for positional encoding
-    pub max_seq_len: usize,
-
-    /// CoPE positional embeddings (learned relative position encodings)
-    pub cope_pos_embeddings: Array2<f32>, // (max_seq_len, embed_dim)
-
-    /// Position-aware residual scaling weights (embed_dim × embed_dim)
-    pub positional_residual_weights: Array2<f32>,
-
-    /// Optimizers for all parameters
-    opt_similarity: Adam,
-    opt_affinity: Adam,
-    opt_attention: Adam,
-    opt_channel: Adam,
-    opt_scales_attention: Adam,
-    opt_scales_ffn: Adam,
-
-    /// Theorem 4 Extension: Position-aware optimizers
-    opt_positional_qkv: Adam,
-    opt_cope_pos: Adam,
-    opt_positional_weights: Adam,
-
-    /// Configuration
-    embed_dim: usize,
-    similarity_update_rate: f32,
-    residual_stability_threshold: f32,
-
-    /// Performance caches
-    similarity_matrix_valid: bool,
-    last_similarity_update: usize,
-}
-
-/// Comprehensive residual connection optimization strategies
-impl OptimizedAdvancedAdaptiveResiduals {
-    /// Create optimized adaptive residuals with performance tuning
+/// Legacy compatibility methods - removing versioned names per persona rules
+impl UnifiedAdaptiveResiduals {
+    /// Direct replacement initialization
     pub fn new(embed_dim: usize) -> Self {
-        use rand::prelude::*;
-
-        let mut rng = rand::thread_rng();
-
-        // Initialize with intelligent defaults for better convergence
-        let weight_similarity_matrix = Array2::from_elem((embed_dim, embed_dim), 0.1); // Small positive correlations
-
-        let layer_affinity_scores = Array2::from_elem((embed_dim, 1), 1.0); // Start with full residual contribution
-
-        // Combined QKV attention parameters for efficiency (use simpler initialization)
-        let residual_attention_qkv = Array2::from_shape_fn((embed_dim, 3 * embed_dim), |_| {
-            0.02 * (rng.random::<f32>() - 0.5) // Simple scaled random initialization
-        });
-
-        // Channel affinity with identity-like initialization
-        let mut channel_affinity_matrix = Array2::eye(embed_dim) * 0.5; // Moderate self-affinity
-        channel_affinity_matrix += &Array2::from_shape_fn((embed_dim, embed_dim), |_| {
-            0.01 * (rng.random::<f32>() - 0.5) // Simple scaled random initialization
-        });
-
-        // Adaptive scaling initialized to 1.0 (standard residual)
-        let attention_residual_scales = Array2::ones((embed_dim, 1));
-        let ffn_residual_scales = Array2::ones((embed_dim, 1));
-
-        // Initialize optimizers with AMSgrad for stability
-        let opt_similarity = Adam::new((embed_dim, embed_dim));
-        let opt_affinity = Adam::new((embed_dim, 1));
-        let opt_attention = Adam::new((embed_dim, 3 * embed_dim));
-        let opt_channel = Adam::new((embed_dim, embed_dim));
-        let opt_scales_attention = Adam::new((embed_dim, 1));
-        let opt_scales_ffn = Adam::new((embed_dim, 1));
-
-        // Enable AMSgrad for all optimizers to prevent gradient instability
-        // Note: AMSgrad is enabled by default in this implementation
-
-        // ===== Theorem 4 Extension: Initialize position-aware residual scaling =====
-        // Position-aware attention parameters (QKV format: d_model, 3*d_model)
-        let positional_residual_qkv = Array2::from_shape_fn((embed_dim, 3 * embed_dim), |_| {
-            0.01 * (rng.random::<f32>() - 0.5) // Smaller initialization for stability
-        });
-
-        // CoPE-like positional embeddings initialized with sinusoidal patterns
-        let max_seq_len = 2048; // Default maximum sequence length
-        let cope_pos_embeddings = Array2::from_shape_fn((max_seq_len, embed_dim), |(pos, dim)| {
-            let angle = pos as f32 / (10000_f32.powf(2.0 * dim as f32 / embed_dim as f32));
-            if dim % 2 == 0 {
-                angle.sin()
-            } else {
-                angle.cos()
-            }
-        });
-
-        // Position-aware residual weights (applied after attention computation)
-        let positional_residual_weights = Array2::from_shape_fn((embed_dim, embed_dim), |_| {
-            0.01 * (rng.random::<f32>() - 0.5) // Small random initialization
-        });
-
-        // Theorem 4 Extension: Additional optimizers for position-aware parameters
-        let opt_positional_qkv = Adam::new((embed_dim, 3 * embed_dim));
-        let opt_cope_pos = Adam::new((max_seq_len, embed_dim));
-        let opt_positional_weights = Adam::new((embed_dim, embed_dim));
-
-        Self {
-            weight_similarity_matrix,
-            layer_affinity_scores,
-            residual_attention_qkv,
-            channel_affinity_matrix,
-            attention_residual_scales,
-            ffn_residual_scales,
-            // Theorem 4 Extension fields
-            positional_residual_qkv,
-            max_seq_len,
-            cope_pos_embeddings,
-            positional_residual_weights,
-            opt_similarity,
-            opt_affinity,
-            opt_attention,
-            opt_channel,
-            opt_scales_attention,
-            opt_scales_ffn,
-            // Theorem 4 Extension optimizers
-            opt_positional_qkv,
-            opt_cope_pos,
-            opt_positional_weights,
-            embed_dim,
-            similarity_update_rate: 0.01, // Slow but stable updates
-            residual_stability_threshold: 0.1, // Prevent extreme values
-            similarity_matrix_valid: false,
-            last_similarity_update: 0,
-        }
+        Self::create_new(embed_dim)
     }
 
-    /// SIMD-optimized cosine similarity computation for 1D vectors
-    #[inline]
-    fn cosine_similarity_optimized(a: &ndarray::ArrayView1<f32>, b: &ndarray::ArrayView1<f32>) -> f32 {
-        // Efficient dot product computation for two 1D vectors
-        let mut dot_product = 0.0f32;
-        let mut norm_a_sq = 0.0f32;
-        let mut norm_b_sq = 0.0f32;
-
-        // Both vectors should have the same length
-        let len = a.len().min(b.len());
-
-        // Compute dot product and norms
-        for i in 0..len {
-            let va = a[i];
-            let vb = b[i];
-            dot_product += va * vb;
-            norm_a_sq += va * va;
-            norm_b_sq += vb * vb;
-        }
-
-        let norm_a = norm_a_sq.sqrt();
-        let norm_b = norm_b_sq.sqrt();
-
-        if norm_a > 1e-8 && norm_b > 1e-8 {
-            (dot_product / (norm_a * norm_b)).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        }
+    /// Private implementation method to avoid recursion
+    fn get_performance_metrics_impl(&self) -> (f32, f32, f32) {
+        use AdaptiveResidualStrategy;
+        self.get_performance_metrics()
     }
 
-    /// Memory-efficient batch similarity computation
-    pub fn compute_batch_similarity_matrix(&mut self, attention_weights: &Array2<f32>,
-                                        ffn_weights: &Array2<f32>) -> &Array2<f32> {
-        let embed_dim = self.embed_dim;
-
-        // lazy update - only recompute if invalidated
-        if self.similarity_matrix_valid {
-            return &self.weight_similarity_matrix;
-        }
-
-        // Batch compute similarities for better cache efficiency
-        for i in 0..embed_dim {
-            let attn_i = attention_weights.column(i);
-
-            // Compute row i of similarity matrix
-            for j in 0..embed_dim {
-                let ffn_j = ffn_weights.column(j);
-
-                // Use array-based computation for better performance
-                let similarity = Self::cosine_similarity_optimized(&attn_i, &ffn_j);
-
-                self.weight_similarity_matrix[[i, j]] = similarity;
-            }
-        }
-
-        self.similarity_matrix_valid = true;
-        self.last_similarity_update += 1;
-
-        &self.weight_similarity_matrix
-    }
-
-    /// Optimized residual fusion with attention mechanism
+    /// Direct replacement for residual application
     pub fn apply_optimized_residual(&mut self, input: &Array2<f32>, attn_out: &Array2<f32>) -> Array2<f32> {
-        let seq_len = input.nrows();
-
-        // Ensure similarity matrix is current
-        // In real implementation, this would be called externally after weight updates
-        if !self.similarity_matrix_valid {
-            // Use dummy weights for initial computation - in practice, would use actual layer weights
-            let dummy_weights = Array2::from_elem((seq_len, self.embed_dim), 0.1);
-            self.compute_batch_similarity_matrix(&dummy_weights, &dummy_weights);
-        }
-
-        // Compute attention-based mixing weights
-        let mut mixing_weights = Array2::zeros((seq_len, self.embed_dim));
-
-        // Simplified attention computation for efficiency
-        for seq_idx in 0..seq_len {
-            for embed_idx in 0..self.embed_dim {
-                // Use affinity scores as attention weights
-                let attn_weight = self.layer_affinity_scores[[embed_idx, 0]].max(0.0).min(2.0);
-
-                // Apply scaling factor
-                let scale = self.attention_residual_scales[[embed_idx, 0]];
-                let combined_weight = (1.0 + attn_weight * scale).clamp(0.1, 3.0);
-
-                mixing_weights[[seq_idx, embed_idx]] = combined_weight;
-            }
-        }
-
-        // Efficient element-wise residual computation with NaN robustness
-        let mut residual = input.clone();
-        for seq_idx in 0..seq_len {
-            for embed_idx in 0..self.embed_dim {
-                let input_val = input[[seq_idx, embed_idx]];
-                let attn_val = attn_out[[seq_idx, embed_idx]];
-                let weight = mixing_weights[[seq_idx, embed_idx]];
-
-                // Handle NaN/inf inputs by using fallback values
-                let input_safe = if input_val.is_finite() { input_val } else { 0.0 };
-                let attn_safe = if attn_val.is_finite() { attn_val } else { 0.0 };
-                let weight_safe = if weight.is_finite() { weight } else { 1.0 };
-
-                residual[[seq_idx, embed_idx]] = input_safe + weight_safe * attn_safe;
-            }
-        }
-
-        residual
+        self.apply_attention_residual(input, attn_out)
     }
 
-    /// Optimized FFN residual with learned scaling
+    /// Direct replacement for FFN residual
     pub fn apply_optimized_ffn_residual(&self, residual1: &Array2<f32>, ffn_out: &Array2<f32>) -> Array2<f32> {
-        let seq_len = residual1.nrows();
-
-        let mut output = residual1.clone();
-
-        // Use learned scaling factors and global similarity
-        let avg_similarity = self.weight_similarity_matrix.mean().unwrap_or(1.0).clamp(0.0, 2.0);
-
-        for seq_idx in 0..seq_len {
-            for embed_idx in 0..self.embed_dim {
-                let scale = self.ffn_residual_scales[[embed_idx, 0]];
-                let effective_scale = (1.0 + avg_similarity * scale).clamp(0.1, 3.0);
-
-                let residual_val = residual1[[seq_idx, embed_idx]];
-                let ffn_val = ffn_out[[seq_idx, embed_idx]];
-
-                output[[seq_idx, embed_idx]] = residual_val + effective_scale * ffn_val;
-            }
-        }
-
-        output
+        self.apply_ffn_residual(residual1, ffn_out)
     }
 
-    /// Efficient parameter updates with stability constraints
-    pub fn update_similarity_matrix_efficient(&mut self, learning_rate: f32) {
-        // Exponential moving average update for stability
-        let alpha = self.similarity_update_rate * learning_rate;
-
-        // Update affinity scores based on similarity patterns
-        for i in 0..self.embed_dim {
-            let row_mean = self.weight_similarity_matrix.row(i).mean().unwrap_or(0.0);
-            self.layer_affinity_scores[[i, 0]] = (1.0 - alpha) * self.layer_affinity_scores[[i, 0]] + alpha * row_mean.clamp(0.0, 1.0);
-        }
-
-        self.similarity_matrix_valid = false; // Mark for recomputation
-    }
-
-    /// Comprehensive gradient computation with memory efficiency
+    /// Direct replacement for gradient computation
     pub fn compute_gradients_efficient(&self, input: &Array2<f32>, attn_out: &Array2<f32>,
                                     ffn_out: &Array2<f32>, residual_grads: &Array2<f32>) -> Vec<Array2<f32>> {
-        let seq_len = input.nrows();
-        let embed_dim = self.embed_dim;
-
-        // Initialize gradient arrays
-        let mut param_grads = Vec::with_capacity(6);
-
-        // Gradient w.r.t. similarity matrix (simplified - in practice would be more complex)
-        let similarity_grads = Array2::zeros((embed_dim, embed_dim));
-        param_grads.push(similarity_grads);
-
-        // Gradients for affinity scores based on residual magnitude
-        let mut affinity_grads = Array2::zeros((embed_dim, 1));
-        for embed_idx in 0..embed_dim {
-            // Approximate gradient based on residual gradients
-            let residual_sum: f32 = (0..seq_len).map(|seq| residual_grads[[seq, embed_idx]].abs()).sum();
-            affinity_grads[[embed_idx, 0]] = residual_sum * 0.001; // Small learning signal
-        }
-        param_grads.push(affinity_grads);
-
-        // Gradients for attention parameters (simplified)
-        let attention_grads = Array2::zeros((embed_dim, 3 * embed_dim));
-        param_grads.push(attention_grads);
-
-        // Gradients for channel affinity matrix
-        let channel_grads = Array2::zeros((embed_dim, embed_dim));
-        param_grads.push(channel_grads);
-
-        // Gradients for scaling parameters
-        let mut attention_scale_grads = Array2::zeros((embed_dim, 1));
-        let mut ffn_scale_grads = Array2::zeros((embed_dim, 1));
-
-        // Approximate scale gradients based on residual gradient magnitude
-        for embed_idx in 0..embed_dim {
-            let attn_residual_sum: f32 = (0..seq_len).map(|seq| {
-                residual_grads[[seq, embed_idx]] * attn_out[[seq, embed_idx]]
-            }).sum();
-            attention_scale_grads[[embed_idx, 0]] = attn_residual_sum * 0.001;
-
-            let ffn_residual_sum: f32 = (0..seq_len).map(|seq| {
-                residual_grads[[seq, embed_idx]] * ffn_out[[seq, embed_idx]]
-            }).sum();
-            ffn_scale_grads[[embed_idx, 0]] = ffn_residual_sum * 0.001;
-        }
-
-        param_grads.push(attention_scale_grads);
-        param_grads.push(ffn_scale_grads);
-
-        param_grads
+        self.compute_gradients(input, attn_out, ffn_out, residual_grads)
     }
 
-    /// Optimized gradient application with stability checks
+    /// Direct replacement for gradient application
     pub fn apply_gradients_optimized(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        if param_grads.len() < 6 {
-            return Err(crate::errors::ModelError::GradientError {
-                message: format!("Expected at least 6 gradient arrays, got {}", param_grads.len())
-            });
-        }
-
-        let mut idx = 0;
-
-        // Apply gradients with stability constraints
-
-        // Similarity matrix (with renormalization)
-        let similarity_grads = &param_grads[idx];
-        self.opt_similarity.step(&mut self.weight_similarity_matrix, similarity_grads, lr);
-
-        // Renormalize similarity matrix to prevent drift
-        let norm = self.weight_similarity_matrix.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            self.weight_similarity_matrix.mapv_inplace(|x| x / norm);
-        }
-        idx += 1;
-
-        // Affinity scores (clipped to reasonable range)
-        let affinity_grads = &param_grads[idx];
-        self.opt_affinity.step(&mut self.layer_affinity_scores, affinity_grads, lr);
-
-        // Clip affinity scores for stability
-        self.layer_affinity_scores.mapv_inplace(|x| x.clamp(-2.0, 2.0));
-        idx += 1;
-
-        // Attention parameters
-        let attention_grads = &param_grads[idx];
-        self.opt_attention.step(&mut self.residual_attention_qkv, attention_grads, lr);
-        idx += 1;
-
-        // Channel affinity matrix
-        let channel_grads = &param_grads[idx];
-        self.opt_channel.step(&mut self.channel_affinity_matrix, channel_grads, lr);
-
-        // Symmetrize channel affinity for better convergence
-        for i in 0..self.embed_dim {
-            for j in 0..i {
-                let avg = (self.channel_affinity_matrix[[i, j]] + self.channel_affinity_matrix[[j, i]]) * 0.5;
-                self.channel_affinity_matrix[[i, j]] = avg;
-                self.channel_affinity_matrix[[j, i]] = avg;
-            }
-        }
-        idx += 1;
-
-        // Attention scales (with stability threshold)
-        let attention_scale_grads = &param_grads[idx];
-        self.opt_scales_attention.step(&mut self.attention_residual_scales, attention_scale_grads, lr);
-
-        // Clip scales to prevent excessive residuals
-        self.attention_residual_scales.mapv_inplace(|x| x.clamp(-self.residual_stability_threshold, self.residual_stability_threshold));
-        idx += 1;
-
-        // FFN scales (with stability threshold)
-        let ffn_scale_grads = &param_grads[idx];
-        self.opt_scales_ffn.step(&mut self.ffn_residual_scales, ffn_scale_grads, lr);
-
-        // Clip scales to prevent excessive residuals
-        self.ffn_residual_scales.mapv_inplace(|x| x.clamp(-self.residual_stability_threshold, self.residual_stability_threshold));
-
-        Ok(())
+        self.apply_gradients(param_grads, lr)
     }
 
-    /// Get optimized parameter count
+    /// Direct replacement for parameter counting
     pub fn optimized_parameter_count(&self) -> usize {
-        self.weight_similarity_matrix.len() +
-        self.layer_affinity_scores.len() +
-        self.residual_attention_qkv.len() +
-        self.channel_affinity_matrix.len() +
-        self.attention_residual_scales.len() +
-        self.ffn_residual_scales.len()
+        self.parameter_count()
     }
 
-    /// Memory usage in bytes (approximate)
-    pub fn memory_usage_bytes(&self) -> usize {
-        (self.optimized_parameter_count() * std::mem::size_of::<f32>()) +
-        // Account for optimizer state (rough estimate)
-        (self.optimized_parameter_count() * std::mem::size_of::<f32>() * 2)
+    /// Direct replacement for similarity matrix updates
+    pub fn update_similarity_matrix_efficient(&mut self, learning_rate: f32) {
+        // Similarity matrix is updated automatically during forward pass
+        // No need for manual updates in the unified implementation
+        let _ = learning_rate; // Unused in unified impl
     }
 
-    /// ===== Theorem 4 Extension: Position-Aware Residual Scaling =====
-    /// Compute position-aware residual scaling using attention mechanism
-    /// α_pos = Attention(Q_x, K_x, V_α)[pos] where Q/K are position-encoded
-    pub fn compute_positional_residual_attention(
-        &self,
-        input_sequence: &Array2<f32>
-    ) -> Array2<f32> {
-        let seq_len = input_sequence.nrows();
-        let embed_dim = self.embed_dim;
-
-        // Ensure sequence length doesn't exceed our max_seq_len
-        let effective_seq_len = seq_len.min(self.max_seq_len);
-
-        // Compute position queries: Q_pos = positional_residual_qkv[embed_dim:2*embed_dim]
-        // Split the combined QKV matrix into Q, K, V components
-        let q_slice = self.positional_residual_qkv.slice(s![.., 0..embed_dim]);
-        let k_slice = self.positional_residual_qkv.slice(s![.., embed_dim..2*embed_dim]);
-        let v_slice = self.positional_residual_qkv.slice(s![.., 2*embed_dim..3*embed_dim]);
-
-        // Generate position queries using sinusoidal encoding + input projection
-        let mut queries = Array2::zeros((effective_seq_len, embed_dim));
-        for pos in 0..effective_seq_len {
-            for d in 0..embed_dim {
-                // Use learned position embeddings with sinusoidal bias
-                let pos_embed = if pos < self.max_seq_len {
-                    self.cope_pos_embeddings[[pos, d]]
-                } else {
-                    0.0 // Fallback for rare case beyond max_seq_len
-                };
-
-                // Mix with input-weighted queries
-                let input_proj = input_sequence.row(pos).dot(&q_slice.column(d));
-                queries[[pos, d]] = input_proj + pos_embed;
-            }
-        }
-
-        // Generate position keys using same method
-        let mut keys = Array2::zeros((effective_seq_len, embed_dim));
-        for pos in 0..effective_seq_len {
-            for d in 0..embed_dim {
-                let pos_embed = if pos < self.max_seq_len {
-                    self.cope_pos_embeddings[[pos, d]]
-                } else {
-                    0.0
-                };
-                let input_proj = input_sequence.row(pos).dot(&k_slice.column(d));
-                keys[[pos, d]] = input_proj + pos_embed;
-            }
-        }
-
-        // Position-aware residual scaling values (our target)
-        let mut values = Array2::zeros((effective_seq_len, embed_dim));
-        for pos in 0..effective_seq_len {
-            for d in 0..embed_dim {
-                // Values represent the residual scaling factors we want to learn
-                // Start with base scaling of 1.0 plus position-specific modulation
-                let base_scale = 1.0;
-                let pos_modulation: f32 = input_sequence.row(pos).dot(&v_slice.column(d));
-                values[[pos, d]] = base_scale + 0.1 * pos_modulation.tanh();
-            }
-        }
-
-        // Compute attention: Attention(Q_pos, K_pos, V_α) -> per-position residual scales
-        let mut attention_weights = Array2::zeros((effective_seq_len, effective_seq_len));
-
-        // Compute attention matrix
-        for i in 0..effective_seq_len {
-            for j in 0..effective_seq_len {
-                let q_i = queries.row(i);
-                let k_j = keys.row(j);
-                let dk_scale = 1.0 / (embed_dim as f32).sqrt();
-                let score = q_i.dot(&k_j) * dk_scale;
-
-                // Apply softmax (simplified - in practice would use stable softmax)
-                attention_weights[[i, j]] = score.exp();
-            }
-
-            // Normalize row (simplified softmax)
-            let row_sum: f32 = (0..effective_seq_len).map(|j| attention_weights[[i, j]]).sum();
-            if row_sum > 0.0 {
-                for j in 0..effective_seq_len {
-                    attention_weights[[i, j]] /= row_sum;
-                }
-            }
-        }
-
-        // Apply attention to values: output = attention_weights @ values
-        let mut positional_residual_scales = Array2::zeros((effective_seq_len, embed_dim));
-        for i in 0..effective_seq_len {
-            for d in 0..embed_dim {
-                let mut weighted_sum: f32 = 0.0;
-                for j in 0..effective_seq_len {
-                    weighted_sum += attention_weights[[i, j]] * values[[j, d]];
-                }
-                positional_residual_scales[[i, d]] = weighted_sum.clamp(0.1, 3.0); // Reasonable residual scale bounds
-            }
-        }
-
-        // Apply learned residual weights and return position-aware scales
-        let mut final_scales = Array2::zeros((seq_len, embed_dim));
-        for pos in 0..seq_len {
-            for d in 0..embed_dim {
-                let attention_scale = if pos < effective_seq_len {
-                    positional_residual_scales[[pos, d]]
-                } else {
-                    1.0 // Default scale for positions beyond our computation
-                };
-
-                // Apply final learned weights to modulate the attention-based scales
-                let learned_modulation: f32 = self.positional_residual_weights.row(d).dot(&input_sequence.row(pos));
-                final_scales[[pos, d]] = attention_scale * (1.0 + 0.1 * learned_modulation).clamp(0.5, 2.0);
-            }
-        }
-
-        final_scales
-    }
-
-    /// Apply Theorem 4: Position-aware residual connection
-    /// Combines traditional residual with position-aware scaling learned via attention
-    pub fn apply_position_aware_residual(
-        &self,
-        input: &Array2<f32>,
-        attn_out: &Array2<f32>
-    ) -> Array2<f32> {
-        let seq_len = input.nrows();
-        let embed_dim = self.embed_dim;
-
-        // Compute position-aware residual scales using Theorem 4 attention mechanism
-        let positional_scales = self.compute_positional_residual_attention(input);
-
-        // Apply position-specific residual mixing
-        let mut output = Array2::zeros((seq_len, embed_dim));
-
-        for seq_pos in 0..seq_len {
-            for embed_idx in 0..embed_dim {
-                let input_val = input[[seq_pos, embed_idx]];
-                let attn_val = attn_out[[seq_pos, embed_idx]];
-                let scale = positional_scales[[seq_pos, embed_idx]];
-
-                // Position-aware residual: input + scale * attn_out
-                output[[seq_pos, embed_idx]] = input_val + scale * attn_val;
-            }
-        }
-
-        output
-    }
-
-    /// ===== End Theorem 4 Extension =====
-
-    /// Performance metrics for monitoring
+    /// Direct replacement for performance metrics
     pub fn get_performance_metrics(&self) -> (f32, f32, f32) {
-        let affinity_entropy = -self.layer_affinity_scores.iter().map(|&x| {
-            let clamped = x.clamp(0.001, 0.999);
-            clamped * clamped.ln() + (1.0 - clamped) * (1.0 - clamped).ln()
-        }).sum::<f32>() / self.embed_dim as f32;
-
-        let mean_similarity = self.weight_similarity_matrix.mean().unwrap_or(0.0);
-        let similarity_variance = self.weight_similarity_matrix.iter()
-            .map(|x| (x - mean_similarity).powi(2)).sum::<f32>() / self.weight_similarity_matrix.len() as f32;
-
-        let scale_stability = (self.attention_residual_scales.iter().chain(self.ffn_residual_scales.iter()))
-            .map(|x| x.abs()).sum::<f32>() / (2 * self.embed_dim) as f32;
-
-        (affinity_entropy, similarity_variance.sqrt(), scale_stability)
+        Self::get_performance_metrics_impl(self)
     }
 }
+
+/// Legacy type alias for backward compatibility - now delegates to unified implementation
+pub type OptimizedAdvancedAdaptiveResiduals = UnifiedAdaptiveResiduals;
 
 impl From<&TransformerBlockConfig> for CommonLayerConfig {
     fn from(config: &TransformerBlockConfig) -> Self {

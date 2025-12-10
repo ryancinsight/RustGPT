@@ -24,7 +24,7 @@ fn main() {
         max_window_size: 4096,
         window_adaptation_strategy: llm::model_config::WindowAdaptationStrategy::SequenceLengthBased,
         entropy_ema_alpha: 0.2,
-        use_learned_residuals: true,
+        use_advanced_adaptive_residuals: true,
     };
     let mut tblock = TransformerBlock::new(tcfg.clone());
 
