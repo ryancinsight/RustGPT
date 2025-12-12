@@ -173,11 +173,10 @@ impl RichardsNorm {
         temp_richards.m = adjusted_m;
         temp_richards.beta = adjusted_beta;
 
-        // Apply Richards curve with per-feature transformations
-        // Use forward_matrix_into to avoid intermediate allocation
-        let mut output_f64 = Array2::zeros(input.dim());
-        temp_richards.forward_matrix_into(&input.mapv(|x| x as f64), &mut output_f64);
-        output_f64.mapv(|x| x as f32)
+        // Apply Richards curve with per-feature transformations without materializing f64 matrices.
+        let mut out = Array2::<f32>::zeros(input.dim());
+        temp_richards.forward_matrix_f32_into(input, &mut out);
+        out
     }
 }
 
