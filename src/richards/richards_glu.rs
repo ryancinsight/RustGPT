@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -63,13 +63,8 @@ impl Layer for RichardsGlu {
         let x1 = input.dot(&self.w1);
         let x2 = input.dot(&self.w2);
 
-        // Vectorized processing: convert entire matrices to f64, apply Richards functions, convert back
-        let x1_f64 = x1.mapv(|x| x as f64);
-
-        // Apply Richards functions to entire matrices at once
-        let value_f64 = self.richards_activation.forward_matrix(&x1_f64);
-        // Convert back to f32
-        let value = value_f64.mapv(|x| x as f32);
+        // Apply Richards activation directly on f32 without materializing f64 matrices.
+        let value = self.richards_activation.forward_matrix_f32(&x1);
 
         // Compute gate values using RichardsGate
         let gate_sigma = self.gate.forward(&x2);
@@ -121,16 +116,7 @@ impl Layer for RichardsGlu {
             .as_ref()
             .cloned()
             .unwrap_or_else(|| {
-                // Recompute value if not cached
-                let mut result = Array2::<f32>::zeros(x1.raw_dim());
-                for (i, x1_row) in x1.outer_iter().enumerate() {
-                    let x1_f64: Array1<f64> = x1_row.mapv(|x| x as f64);
-                    let value_f64 = self.richards_activation.forward(&x1_f64);
-                    for (j, &v) in value_f64.iter().enumerate() {
-                        result[[i, j]] = v as f32;
-                    }
-                }
-                result
+                self.richards_activation.forward_matrix_f32(&x1)
             });
         // Compute gate values
         let gate_sigma = self.gate.forward_const(&x2);
@@ -152,28 +138,47 @@ impl Layer for RichardsGlu {
         let grad_value = &grad_gated * &gate_sigma;
         let grad_gate_sigma = &grad_gated * &value;
 
-        // Compute gradients through RichardsActivation (row by row)
+        // Compute gradients through RichardsActivation / RichardsGate (row by row)
         let mut grad_x1 = Array2::<f32>::zeros(x1.raw_dim());
         let mut grad_x2 = Array2::<f32>::zeros(x2.raw_dim());
+
+        // Scratch buffers to avoid per-row allocations
+        let mut value_deriv_row: Vec<f32> = Vec::new();
+        let mut value_deriv_tmp: Vec<f32> = Vec::new();
+        let mut gate_scaled_row: Vec<f32> = Vec::new();
+        let mut gate_curve_deriv_row: Vec<f32> = Vec::new();
+        let gate_temp_reciprocal = 1.0 / self.gate.temperature;
         
         for (i, (x1_row, x2_row)) in x1.outer_iter().zip(x2.outer_iter()).enumerate() {
-            let x1_f64: Array1<f64> = x1_row.mapv(|x| x as f64);
-            let x2_f64: Array1<f64> = x2_row.mapv(|x| x as f64);
+            let x1_slice = x1_row.as_slice().unwrap();
+            let x2_slice = x2_row.as_slice().unwrap();
 
-            let value_deriv = self.richards_activation.derivative(&x1_f64);
+            if value_deriv_row.len() != x1_slice.len() {
+                value_deriv_row.resize(x1_slice.len(), 0.0);
+                value_deriv_tmp.resize(x1_slice.len(), 0.0);
+            }
+            if gate_scaled_row.len() != x2_slice.len() {
+                gate_scaled_row.resize(x2_slice.len(), 0.0);
+                gate_curve_deriv_row.resize(x2_slice.len(), 0.0);
+            }
 
-            // For RichardsGate, compute derivative through temperature scaling
-            // RichardsGate applies temperature scaling: x_temp = x / T
-            // Derivative: d/dx[g(x/T)] = g'(x/T) * (1/T)
-            let scaled_x = x2_f64.mapv(|x| x / self.gate.temperature as f64);
-            let curve_deriv = self.gate.curve.derivative(&scaled_x);
-            let gate_deriv = curve_deriv.mapv(|d| d / self.gate.temperature as f64);
+            // value_deriv_row = d/dx[x * Richards(x)]
+            self.richards_activation
+                .derivative_into_f32_with_scratch(x1_slice, &mut value_deriv_row, &mut value_deriv_tmp);
+
+            // Gate derivative with temperature scaling:
+            // g(x) = curve(x/T) => dg/dx = curve'(x/T) * (1/T)
+            for j in 0..x2_slice.len() {
+                gate_scaled_row[j] = x2_slice[j] * gate_temp_reciprocal;
+            }
+            self.gate.curve.derivative_into_f32(&gate_scaled_row, &mut gate_curve_deriv_row);
 
             for j in 0..x1_row.len() {
-                grad_x1[[i, j]] = (value_deriv[j] * grad_value[[i, j]] as f64) as f32;
+                grad_x1[[i, j]] = value_deriv_row[j] * grad_value[[i, j]];
             }
             for j in 0..x2_row.len() {
-                grad_x2[[i, j]] = (gate_deriv[j] * grad_gate_sigma[[i, j]] as f64) as f32;
+                let gate_deriv = gate_curve_deriv_row[j] * gate_temp_reciprocal;
+                grad_x2[[i, j]] = gate_deriv * grad_gate_sigma[[i, j]];
             }
         }
 

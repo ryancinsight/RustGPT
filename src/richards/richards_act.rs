@@ -77,11 +77,40 @@ impl RichardsActivation {
         x * &richards_output
     }
 
+    /// Vectorized forward pass for f32 matrix input (avoids f64 materialization).
+    pub fn forward_matrix_f32(&self, x: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
+        let mut out = ndarray::Array2::<f32>::zeros(x.raw_dim());
+        self.forward_matrix_f32_into(x, &mut out);
+        out
+    }
+
+    /// Vectorized forward pass for f32 matrix input into a caller-provided output buffer.
+    pub fn forward_matrix_f32_into(&self, x: &ndarray::Array2<f32>, out: &mut ndarray::Array2<f32>) {
+        // Compute Richards(x) into out, then multiply by x elementwise.
+        self.richards_curve.forward_matrix_f32_into(x, out);
+        ndarray::Zip::from(out)
+            .and(x)
+            .for_each(|o, &xi| {
+                *o *= xi;
+            });
+    }
+
     /// Optimized forward pass that avoids intermediate allocation
     pub fn forward_into(&self, x: &Array1<f64>, out: &mut Array1<f64>) {
-        let mut richards_output = Array1::zeros(x.len());
-        self.richards_curve.forward_into(x.as_slice().unwrap(), richards_output.as_slice_mut().unwrap());
-        *out = x * &richards_output;
+        let x_slice = x.as_slice().unwrap();
+        let out_slice = out.as_slice_mut().unwrap();
+        self.richards_curve.forward_into(x_slice, out_slice);
+        for (xi, o) in x_slice.iter().copied().zip(out_slice.iter_mut()) {
+            *o *= xi;
+        }
+    }
+
+    /// f32-friendly forward into a caller-provided slice (no allocations).
+    pub fn forward_into_f32(&self, x: &[f32], out: &mut [f32]) {
+        self.richards_curve.forward_into_f32(x, out);
+        for (xi, o) in x.iter().copied().zip(out.iter_mut()) {
+            *o *= xi;
+        }
     }
 
     /// Backward pass: derivative of x * Richards(x)
@@ -90,6 +119,20 @@ impl RichardsActivation {
         let richards_output = self.richards_curve.forward(x);
         let richards_derivative = self.richards_curve.derivative(x);
         &richards_output + x * &richards_derivative
+    }
+
+    /// f32-friendly derivative into a caller-provided buffer with scratch.
+    /// Computes: Richards(x) + x * Richards'(x)
+    pub fn derivative_into_f32_with_scratch(&self, x: &[f32], out: &mut [f32], scratch: &mut [f32]) {
+        debug_assert_eq!(x.len(), out.len());
+        debug_assert_eq!(x.len(), scratch.len());
+        // out = Richards(x)
+        self.richards_curve.forward_into_f32(x, out);
+        // scratch = Richards'(x)
+        self.richards_curve.derivative_into_f32(x, scratch);
+        for i in 0..x.len() {
+            out[i] = out[i] + x[i] * scratch[i];
+        }
     }
 
     /// Backward pass for a single scalar
@@ -124,7 +167,7 @@ impl RichardsActivation {
 
     /// Update scaling based on input statistics
     pub fn update_scaling_from_max_abs(&mut self, max_abs_x: f64) {
-        self.richards_curve.update_scaling_from_max_abs(max_abs_x);
+        self.richards_curve.update_scaling_from_max_abs_inplace(max_abs_x);
     }
 
     /// Get scaling parameters

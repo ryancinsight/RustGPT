@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -163,20 +163,27 @@ impl RichardsGate {
     /// Forward pass: compute gating values (const version for immutable access)
     pub fn forward_const(&self, input: &Array2<f32>) -> Array2<f32> {
         let mut output = Array2::zeros(input.raw_dim());
-        let temp_reciprocal = 1.0 / self.temperature as f64;
+        let temp_reciprocal = 1.0 / self.temperature;
 
-        // Process each sample
+        // Reuse a per-row scratch buffer to avoid allocating Array1/Array2<f64>.
+        let mut scratch_in: Vec<f32> = Vec::new();
+        let mut scratch_out: Vec<f32> = Vec::new();
+
         for (i, row) in input.outer_iter().enumerate() {
-            let input_f64: Array1<f64> = row.mapv(|x| x as f64);
-            // Scale input by temperature using pre-computed reciprocal
-            let scaled_input = input_f64.mapv(|x| x * temp_reciprocal);
+            let n = row.len();
+            if scratch_in.len() != n {
+                scratch_in.resize(n, 0.0);
+                scratch_out.resize(n, 0.0);
+            }
 
-            // Apply Richards curve
-            let gate_values = self.curve.forward(&scaled_input);
+            for (j, &x) in row.iter().enumerate() {
+                scratch_in[j] = x * temp_reciprocal;
+            }
 
-            // Ensure output is in [0, 1] range (gating constraint)
-            for (j, &val) in gate_values.iter().enumerate() {
-                output[[i, j]] = val.max(0.0).min(1.0) as f32;
+            self.curve.forward_into_f32(&scratch_in, &mut scratch_out);
+
+            for (j, &val) in scratch_out.iter().enumerate() {
+                output[[i, j]] = val.max(0.0).min(1.0);
             }
         }
 
@@ -244,7 +251,7 @@ impl RichardsGate {
                 let x_scaled = x / temp;
 
                 // Get derivative of Richards curve w.r.t. its input
-                let curve_deriv = self.curve.derivative(&Array1::from_elem(1, x_scaled))[0];
+                let curve_deriv = self.curve.derivative_scalar(x_scaled);
 
                 // Chain rule: ∂g/∂x = curve'(x/T) * ∂(x/T)/∂x = curve'(x/T) * (1/T)
                 let input_grad = curve_deriv * grad_out / temp;
@@ -272,7 +279,7 @@ impl RichardsGate {
                     let x_scaled = x_f64 / temp;
 
                     // Get derivative of Richards curve w.r.t. its scaled input
-                    let curve_deriv = self.curve.derivative(&Array1::from_elem(1, x_scaled))[0];
+                    let curve_deriv = self.curve.derivative_scalar(x_scaled);
 
                     // Chain rule: ∂g/∂T = curve'(x/T) * ∂(x/T)/∂T = curve'(x/T) * (-x/T²)
                     let d_input_d_temp = -x_f64 / (temp * temp);
