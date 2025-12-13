@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 use ndarray::Array2;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     adam::Adam,
@@ -117,7 +116,7 @@ fn smooth_clip_tanh(x: f32, limit: f32) -> f32 {
 
 impl UnifiedAdaptiveResiduals {
     /// Create new unified adaptive residuals with performance tuning
-    pub fn create_new(embed_dim: usize) -> Self {
+    pub fn new(embed_dim: usize) -> Self {
         use rand::prelude::*;
         let mut rng = rand::thread_rng();
 
@@ -291,25 +290,25 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
             self.compute_batch_similarity_matrix(&dummy_weights, &dummy_weights);
         }
 
-        // Similarity-based residual fusion (map passed through as per-token similarity signal).
-        // We compute a per-token cosine similarity between input and attention output,
-        // then use it to modulate the learned per-channel affinity/scale.
-        //
-        // This keeps the residual near-identity when similarity ~ 0 (common at init),
-        // while allowing learned amplification/attenuation as similarity becomes informative.
+        // Similarity-based residual fusion.
+        // Signed gating: positive similarity increases contribution; negative similarity
+        // suppresses and can invert the residual contribution if strong enough.
         let beta_clamp = 10.0;
         let sim_beta = 1.5;
+        let gate_limit = 2.0;
 
         let mut residual = input.clone();
         for seq_idx in 0..seq_len {
-            let sim = Self::cosine_similarity_rows(input, attn_out, seq_idx);
+            let sim_raw = Self::cosine_similarity_rows(input, attn_out, seq_idx);
+            let sim = smooth_clamp(sim_raw, -1.0, 1.0, beta_clamp);
             let sim_centered = (sim_beta * sim).tanh();
 
             for embed_idx in 0..self.embed_dim {
                 let affinity = smooth_clamp(self.layer_affinity_scores[[embed_idx, 0]], 0.0, 2.0, beta_clamp);
                 let scale = self.attention_residual_scales[[embed_idx, 0]];
-                let weight = 1.0 + sim_centered * affinity * scale;
-                let weight = smooth_clamp(weight, 0.1, 3.0, beta_clamp);
+                let gate = sim_centered * affinity * scale;
+                let gate = smooth_clamp(gate, -gate_limit, gate_limit, beta_clamp);
+                let weight = 1.0 + gate;
 
                 let input_val = input[[seq_idx, embed_idx]];
                 let attn_val = attn_out[[seq_idx, embed_idx]];
@@ -329,21 +328,28 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
         let mut output = residual1.clone();
         let beta_clamp = 10.0;
         let sim_beta = 1.5;
-        let avg_similarity = smooth_clamp(self.weight_similarity_matrix.mean().unwrap_or(1.0), 0.0, 2.0, beta_clamp);
+        let gate_limit = 2.0;
+        let avg_similarity = smooth_clamp(self.weight_similarity_matrix.mean().unwrap_or(0.0), -1.0, 1.0, beta_clamp);
 
         for seq_idx in 0..seq_len {
-            let sim = Self::cosine_similarity_rows(residual1, ffn_out, seq_idx);
+            let sim_raw = Self::cosine_similarity_rows(residual1, ffn_out, seq_idx);
+            let sim = smooth_clamp(sim_raw, -1.0, 1.0, beta_clamp);
             let sim_centered = (sim_beta * sim).tanh();
 
             for embed_idx in 0..self.embed_dim {
                 let scale = self.ffn_residual_scales[[embed_idx, 0]];
-                let effective_scale = 1.0 + sim_centered * avg_similarity * scale;
-                let effective_scale = smooth_clamp(effective_scale, 0.1, 3.0, beta_clamp);
+                let gate = sim_centered * avg_similarity * scale;
+                let gate = smooth_clamp(gate, -gate_limit, gate_limit, beta_clamp);
+                let effective_scale = 1.0 + gate;
 
                 let residual_val = residual1[[seq_idx, embed_idx]];
                 let ffn_val = ffn_out[[seq_idx, embed_idx]];
 
-                output[[seq_idx, embed_idx]] = residual_val + effective_scale * ffn_val;
+                let residual_safe = if residual_val.is_finite() { residual_val } else { 0.0 };
+                let ffn_safe = if ffn_val.is_finite() { ffn_val } else { 0.0 };
+                let scale_safe = if effective_scale.is_finite() { effective_scale } else { 1.0 };
+
+                output[[seq_idx, embed_idx]] = residual_safe + scale_safe * ffn_safe;
             }
         }
 
@@ -507,93 +513,6 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
     }
 }
 
-/// Diffusion-specific extension for unified adaptive residuals
-#[derive(Debug)]
-pub struct DiffusionAdaptiveResiduals {
-    base: UnifiedAdaptiveResiduals,
-    num_timesteps: usize,
-}
-
-impl DiffusionAdaptiveResiduals {
-    /// Backward-compatible constructor name used by some older call sites/tests.
-    pub fn new_with_diffusion_params(embed_dim: usize, num_timesteps: usize) -> Self {
-        Self::new(embed_dim, num_timesteps)
-    }
-
-    pub fn new(embed_dim: usize, num_timesteps: usize) -> Self {
-        let mut base = UnifiedAdaptiveResiduals::new(embed_dim);
-        base.max_seq_len = num_timesteps.min(2048);
-        Self { base, num_timesteps }
-    }
-
-    pub fn embed_dim(&self) -> usize {
-        self.base.embed_dim
-    }
-
-    pub fn max_seq_len(&self) -> usize {
-        self.base.max_seq_len
-    }
-
-    pub fn num_timesteps(&self) -> usize {
-        self.num_timesteps
-    }
-
-    pub fn apply_diffusion_adaptive_residual(
-        &mut self,
-        input: &Array2<f32>,
-        attn_out: &Array2<f32>,
-        timestep: usize,
-        total_timesteps: usize
-    ) -> Array2<f32> {
-        let diffusion_progress = timestep as f32 / total_timesteps as f32;
-        let adaptive_lr_scale = 1.0 + diffusion_progress * 0.5;
-
-        let original_rate = self.base.similarity_update_rate;
-        self.base.similarity_update_rate *= adaptive_lr_scale;
-
-        let result = self.base.apply_attention_residual(input, attn_out);
-
-        self.base.similarity_update_rate = original_rate;
-        result
-    }
-
-    /// Backward-compatible name for the main residual application.
-    /// This maps to the attention residual path.
-    pub fn apply_optimized_residual(&mut self, input: &Array2<f32>, attn_out: &Array2<f32>) -> Array2<f32> {
-        self.base.apply_attention_residual(input, attn_out)
-    }
-
-    pub fn update_with_diffusion_progress(&mut self, learning_rate: f32, timestep: usize, total_timesteps: usize) {
-        let progress_ratio = timestep as f32 / total_timesteps as f32;
-        let progressive_rate = learning_rate * (1.0 + progress_ratio);
-        self.base.similarity_update_rate *= 1.0 + progress_ratio * 0.5;
-    }
-
-    pub fn apply_snr_weighted_residuals(
-        &self,
-        input: &Array2<f32>,
-        attn_out: &Array2<f32>,
-        snr_weight: f32
-    ) -> Array2<f32> {
-        let snr_weight = smooth_clamp(snr_weight, 0.1, 10.0, 10.0);
-        let snr_scaled_attention_scales = &self.base.attention_residual_scales * snr_weight;
-        let seq_len = input.nrows();
-        let mut residual_output = Array2::zeros((seq_len, self.base.embed_dim));
-
-        for seq_idx in 0..seq_len {
-            for embed_idx in 0..self.base.embed_dim {
-                let input_val = input[[seq_idx, embed_idx]];
-                let attn_val = attn_out[[seq_idx, embed_idx]];
-                let attn_weight = smooth_clamp(snr_scaled_attention_scales[[embed_idx, 0]], 0.1, 3.0, 10.0);
-
-                residual_output[[seq_idx, embed_idx]] = input_val + attn_weight * attn_val;
-            }
-        }
-
-        residual_output
-    }
-}
-
 impl UnifiedAdaptiveResiduals {
     pub fn residual_stability_threshold(&self) -> f32 {
         self.residual_stability_threshold
@@ -601,36 +520,6 @@ impl UnifiedAdaptiveResiduals {
 
     pub fn invalidate_similarity_cache(&mut self) {
         self.similarity_matrix_valid = false;
-    }
-}
-
-impl AdaptiveResidualStrategy for DiffusionAdaptiveResiduals {
-    fn apply_attention_residual(&mut self, input: &Array2<f32>, attn_out: &Array2<f32>) -> Array2<f32> {
-        self.base.apply_attention_residual(input, attn_out)
-    }
-
-    fn apply_ffn_residual(&self, residual1: &Array2<f32>, ffn_out: &Array2<f32>) -> Array2<f32> {
-        self.base.apply_ffn_residual(residual1, ffn_out)
-    }
-
-    fn compute_gradients(&self, input: &Array2<f32>, attn_out: &Array2<f32>, ffn_out: &Array2<f32>, residual_grads: &Array2<f32>) -> Vec<Array2<f32>> {
-        self.base.compute_gradients(input, attn_out, ffn_out, residual_grads)
-    }
-
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<()> {
-        self.base.apply_gradients(gradients, learning_rate)
-    }
-
-    fn parameter_count(&self) -> usize {
-        self.base.parameter_count()
-    }
-
-    fn memory_usage_bytes(&self) -> usize {
-        self.base.memory_usage_bytes()
-    }
-
-    fn get_performance_metrics(&self) -> (f32, f32, f32) {
-        self.base.get_performance_metrics()
     }
 }
 
@@ -666,51 +555,6 @@ mod tests {
 
         assert_eq!(result.shape(), [seq_len, embed_dim]);
         assert!(result.iter().all(|&x| x.is_finite()));
-    }
-
-    #[test]
-    fn test_diffusion_adaptive_residuals() {
-        let embed_dim = 16;
-        let seq_len = 4;
-        let num_timesteps = 100;
-
-        let mut residuals = DiffusionAdaptiveResiduals::new(embed_dim, num_timesteps);
-
-        let input = Array2::from_elem((seq_len, embed_dim), 0.1);
-        let attn_out = Array2::from_elem((seq_len, embed_dim), 0.2);
-
-        let result_early = residuals.apply_diffusion_adaptive_residual(&input, &attn_out, 10, num_timesteps);
-        let result_late = residuals.apply_diffusion_adaptive_residual(&input, &attn_out, 80, num_timesteps);
-
-        assert_eq!(result_early.shape(), [seq_len, embed_dim]);
-        assert_eq!(result_late.shape(), [seq_len, embed_dim]);
-
-        // Both should produce finite, reasonable values
-        assert!(result_early.iter().all(|&x| x.is_finite()));
-        assert!(result_late.iter().all(|&x| x.is_finite()));
-    }
-
-    #[test]
-    fn test_snr_weighted_residuals() {
-        let embed_dim = 8;
-        let seq_len = 2;
-
-        let residuals = DiffusionAdaptiveResiduals::new(embed_dim, 100);
-
-        let input = Array2::from_elem((seq_len, embed_dim), 1.0);
-        let attn_out = Array2::from_elem((seq_len, embed_dim), 0.5);
-
-        // Test with different SNR weights
-        let result_low_snr = residuals.apply_snr_weighted_residuals(&input, &attn_out, 0.5);
-        let result_high_snr = residuals.apply_snr_weighted_residuals(&input, &attn_out, 2.0);
-
-        assert_eq!(result_low_snr.shape(), [seq_len, embed_dim]);
-        assert_eq!(result_high_snr.shape(), [seq_len, embed_dim]);
-
-        // High SNR should amplify residuals more than low SNR
-        let mean_low = result_low_snr.mean().unwrap_or(0.0);
-        let mean_high = result_high_snr.mean().unwrap_or(0.0);
-        assert!(mean_high > mean_low, "High SNR should produce stronger residuals");
     }
 
     #[test]
@@ -772,7 +616,7 @@ mod tests {
 
         // Recompute should allocate new matrix
         residuals.compute_batch_similarity_matrix(&weights, &weights);
-        let matrix3_ptr = residuals.weight_similarity_matrix.as_ptr();
+        let _matrix3_ptr = residuals.weight_similarity_matrix.as_ptr();
 
         // Test consistency by checking values are the same
         let mut original = UnifiedAdaptiveResiduals::new(embed_dim);

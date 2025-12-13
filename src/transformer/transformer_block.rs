@@ -17,7 +17,6 @@ use crate::{
     model_config::{ModelConfig, WindowAdaptationStrategy},
     richards::RichardsNorm,
     transformer::{
-        adaptive_residuals::{UnifiedAdaptiveResiduals, AdaptiveResidualStrategy},
         common::{
             FeedForwardVariant, CommonLayerConfig, CommonLayers,
             apply_adaptive_gradients
@@ -164,60 +163,6 @@ impl TransformerWorkspace {
         self.ffn_scratch.as_mut().unwrap()
     }
 }
-
-/// Legacy compatibility methods - removing versioned names per persona rules
-impl UnifiedAdaptiveResiduals {
-    /// Direct replacement initialization
-    pub fn new(embed_dim: usize) -> Self {
-        Self::create_new(embed_dim)
-    }
-
-    /// Private implementation method to avoid recursion
-    fn get_performance_metrics_impl(&self) -> (f32, f32, f32) {
-        <Self as AdaptiveResidualStrategy>::get_performance_metrics(self)
-    }
-
-    /// Direct replacement for residual application
-    pub fn apply_optimized_residual(&mut self, input: &Array2<f32>, attn_out: &Array2<f32>) -> Array2<f32> {
-        self.apply_attention_residual(input, attn_out)
-    }
-
-    /// Direct replacement for FFN residual
-    pub fn apply_optimized_ffn_residual(&self, residual1: &Array2<f32>, ffn_out: &Array2<f32>) -> Array2<f32> {
-        self.apply_ffn_residual(residual1, ffn_out)
-    }
-
-    /// Direct replacement for gradient computation
-    pub fn compute_gradients_efficient(&self, input: &Array2<f32>, attn_out: &Array2<f32>,
-                                    ffn_out: &Array2<f32>, residual_grads: &Array2<f32>) -> Vec<Array2<f32>> {
-        self.compute_gradients(input, attn_out, ffn_out, residual_grads)
-    }
-
-    /// Direct replacement for gradient application
-    pub fn apply_gradients_optimized(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        self.apply_gradients(param_grads, lr)
-    }
-
-    /// Direct replacement for parameter counting
-    pub fn optimized_parameter_count(&self) -> usize {
-        self.parameter_count()
-    }
-
-    /// Direct replacement for similarity matrix updates
-    pub fn update_similarity_matrix_efficient(&mut self, learning_rate: f32) {
-        // Similarity matrix is updated automatically during forward pass
-        // No need for manual updates in the unified implementation
-        let _ = learning_rate; // Unused in unified impl
-    }
-
-    /// Direct replacement for performance metrics
-    pub fn get_performance_metrics(&self) -> (f32, f32, f32) {
-        Self::get_performance_metrics_impl(self)
-    }
-}
-
-/// Legacy type alias for backward compatibility - now delegates to unified implementation
-pub type OptimizedAdvancedAdaptiveResiduals = UnifiedAdaptiveResiduals;
 
 impl From<&TransformerBlockConfig> for CommonLayerConfig {
     fn from(config: &TransformerBlockConfig) -> Self {
@@ -648,6 +593,7 @@ impl Layer for TransformerBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transformer::adaptive_residuals::{AdaptiveResidualStrategy, UnifiedAdaptiveResiduals};
     use crate::model_config::ModelConfig;
 
     #[test]
@@ -867,10 +813,10 @@ mod tests {
     #[test]
     fn test_optimized_adaptive_residuals_creation() {
         let embed_dim = 64;
-        let residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         // Check parameter counts
-        let param_count = residuals.optimized_parameter_count();
+        let param_count = residuals.parameter_count();
         let expected = (embed_dim * embed_dim) + embed_dim + (embed_dim * 3 * embed_dim) +
                        (embed_dim * embed_dim) + embed_dim + embed_dim +
                        (embed_dim * 3 * embed_dim) + 2048 * embed_dim + (embed_dim * embed_dim);
@@ -890,12 +836,12 @@ mod tests {
         let embed_dim = 32;
         let seq_len = 8;
 
-        let mut residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.5);
 
-        let result = residuals.apply_optimized_residual(&input, &attn_out);
+        let result = residuals.apply_attention_residual(&input, &attn_out);
 
         // Check shape
         assert_eq!(result.shape(), [seq_len, embed_dim]);
@@ -911,12 +857,12 @@ mod tests {
         let embed_dim = 16;
         let seq_len = 4;
 
-        let residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         let residual1 = Array2::from_elem((seq_len, embed_dim), 1.0);
         let ffn_out = Array2::<f32>::zeros((seq_len, embed_dim));
 
-        let result = residuals.apply_optimized_ffn_residual(&residual1, &ffn_out);
+        let result = residuals.apply_ffn_residual(&residual1, &ffn_out);
 
         // Should be approximately equal to residual1 since ffn_out is zeros
         let diff = (&result - &residual1).mapv(|x| x.abs()).sum();
@@ -928,7 +874,7 @@ mod tests {
         let embed_dim = 16;
         let seq_len = 8;
 
-        let mut residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         let attention_weights = Array2::from_shape_fn((seq_len, embed_dim), |(i, j)| (i * embed_dim + j) as f32 * 0.1);
         let ffn_weights = Array2::from_shape_fn((seq_len, embed_dim), |(i, j)| (i * embed_dim + j) as f32 * 0.05);
@@ -950,14 +896,14 @@ mod tests {
         let embed_dim = 8;
         let seq_len = 4;
 
-        let residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         let input = Array2::from_elem((seq_len, embed_dim), 0.1);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.2);
         let ffn_out = Array2::from_elem((seq_len, embed_dim), 0.1);
         let residual_grads = Array2::from_elem((seq_len, embed_dim), 1.0);
 
-        let param_grads = residuals.compute_gradients_efficient(&input, &attn_out, &ffn_out, &residual_grads);
+        let param_grads = residuals.compute_gradients(&input, &attn_out, &ffn_out, &residual_grads);
 
         // Unified adaptive residuals include Theorem 4 extension gradients.
         assert_eq!(param_grads.len(), 9);
@@ -974,7 +920,7 @@ mod tests {
     fn test_gradient_application() {
         let embed_dim = 8;
 
-        let mut residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         // Create dummy gradients
         let param_grads = vec![
@@ -990,7 +936,7 @@ mod tests {
         ];
 
         let lr = 0.001;
-        let result = residuals.apply_gradients_optimized(&param_grads, lr);
+        let result = residuals.apply_gradients(&param_grads, lr);
         assert!(result.is_ok());
 
         // Check that scales are still within reasonable bounds
@@ -1006,7 +952,7 @@ mod tests {
     fn test_performance_metrics() {
         let embed_dim = 16;
 
-        let residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
         let (affinity_entropy, similarity_std, scale_stability) = residuals.get_performance_metrics();
 
         // Check that metrics are finite and reasonable
@@ -1025,11 +971,11 @@ mod tests {
     fn test_memory_usage_reporting() {
         let embed_dim = 16;
 
-        let residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
         let memory_bytes = residuals.memory_usage_bytes();
 
         // Check that memory usage is reasonable and non-zero
-        let param_count = residuals.optimized_parameter_count();
+        let param_count = residuals.parameter_count();
         assert!(memory_bytes >= param_count * 4); // At least 4 bytes per f32 param
         assert!(memory_bytes >= param_count * 8); // At least 8 bytes with optimizer state
     }
@@ -1070,8 +1016,8 @@ mod tests {
         traditional_residual_2_0 += &(2.0f32 * &attn_output);
 
         // Method 4: Adaptive Residual Learning
-        let mut adaptive_residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
-        let mut adaptive_output = adaptive_residuals.apply_optimized_residual(&input, &attn_output);
+        let mut adaptive_residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut adaptive_output = adaptive_residuals.apply_attention_residual(&input, &attn_output);
 
         // Training loop: Update adaptive residuals to match target pattern
         let mut adaptive_losses = Vec::new();
@@ -1096,10 +1042,10 @@ mod tests {
                 // Compute gradients w.r.t. the adaptive residual output
                 let grads = compute_adaptive_loss_gradients(&adaptive_output, &target_residual_pattern,
                                                           &input, &attn_output, &adaptive_residuals);
-                let _ = adaptive_residuals.apply_gradients_optimized(&grads, learning_rate);
+                let _ = adaptive_residuals.apply_gradients(&grads, learning_rate);
 
                 // Recompute adaptive output with updated parameters
-                adaptive_output = adaptive_residuals.apply_optimized_residual(&input, &attn_output);
+                adaptive_output = adaptive_residuals.apply_attention_residual(&input, &attn_output);
             }
         }
 
@@ -1153,7 +1099,7 @@ mod tests {
     /// Helper function to compute gradients for adaptive residual learning
     fn compute_adaptive_loss_gradients(output: &Array2<f32>, target: &Array2<f32>,
                                      input: &Array2<f32>, attn_out: &Array2<f32>,
-                                     residuals: &OptimizedAdvancedAdaptiveResiduals) -> Vec<Array2<f32>> {
+                                     residuals: &UnifiedAdaptiveResiduals) -> Vec<Array2<f32>> {
         let seq_len = output.nrows();
         let embed_dim = output.ncols();
 
@@ -1170,7 +1116,7 @@ mod tests {
         }
 
         // Use the adaptive residuals' gradient computation method
-        residuals.compute_gradients_efficient(input, attn_out, &Array2::zeros((seq_len, embed_dim)), &output_grads)
+        residuals.compute_gradients(input, attn_out, &Array2::zeros((seq_len, embed_dim)), &output_grads)
     }
 
     /// Stability and robustness test for adaptive residuals under various conditions
@@ -1179,20 +1125,20 @@ mod tests {
         let embed_dim = 16;
         let seq_len = 8;
 
-        let mut residuals = OptimizedAdvancedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         // Test 1: Zero input stability
         let zero_input = Array2::zeros((seq_len, embed_dim));
         let zero_attn = Array2::zeros((seq_len, embed_dim));
         residuals.invalidate_similarity_cache(); // Force recomputation
-        let zero_result = residuals.apply_optimized_residual(&zero_input, &zero_attn);
+        let zero_result = residuals.apply_attention_residual(&zero_input, &zero_attn);
         assert!(zero_result.iter().all(|&x| x.is_finite()), "Zero input should produce finite outputs");
 
         // Test 2: Large input robustness
         let large_input = Array2::from_elem((seq_len, embed_dim), 100.0);
         let large_attn = Array2::from_elem((seq_len, embed_dim), 50.0);
         residuals.invalidate_similarity_cache();
-        let large_result = residuals.apply_optimized_residual(&large_input, &large_attn);
+        let large_result = residuals.apply_attention_residual(&large_input, &large_attn);
         assert!(large_result.iter().all(|&x| x.is_finite() && x.abs() < 1000.0), "Large inputs should be handled robustly");
 
         // Test 3: NaN/Inf robustness
@@ -1200,7 +1146,7 @@ mod tests {
         nan_input[[0, 0]] = f32::NAN;
         let normal_attn = Array2::from_elem((seq_len, embed_dim), 0.5);
         residuals.invalidate_similarity_cache();
-        let nan_result = residuals.apply_optimized_residual(&nan_input, &normal_attn);
+        let nan_result = residuals.apply_attention_residual(&nan_input, &normal_attn);
         assert!(nan_result.iter().all(|&x| x.is_finite()), "NaN inputs should not propagate");
 
         // Test 4: Gradient stability over multiple steps
@@ -1210,11 +1156,11 @@ mod tests {
 
         let mut gradient_norms = Vec::new();
         for _ in 0..20 {
-            let output = residuals.apply_optimized_residual(&normal_input, &normal_attn);
+            let output = residuals.apply_attention_residual(&normal_input, &normal_attn);
             let grads = compute_adaptive_loss_gradients(&output, &target, &normal_input, &normal_attn, &residuals);
             let grad_norm_sq: f32 = grads.iter().flat_map(|g| g.iter()).map(|x| x * x).sum();
             gradient_norms.push(grad_norm_sq.sqrt());
-            let _ = residuals.apply_gradients_optimized(&grads, 0.001);
+            let _ = residuals.apply_gradients(&grads, 0.001);
         }
 
         // Gradients should remain stable (not explode or vanish)
