@@ -383,15 +383,15 @@ impl PadeExp {
         (-std::f64::consts::LN_2, 0.5), // exp(-ln(2)) = 0.5
     ];
 
-    /// Optimized lookup for common exponential values using iterator chains
-    /// Reduces computation by ~25 operations for frequent values
+    /// Optimized lookup for common exponential values.
+    ///
+    /// Note: these are exact IEEE-754 representable inputs/outputs, so we intentionally use
+    /// exact equality (no tolerance) to avoid introducing discontinuities near the listed values.
     #[inline]
     fn lookup_common_exp(x: f64) -> Option<f64> {
-        // Zero-copy iterator-based lookup with early termination
-        const TOLERANCE: f64 = 1e-15;
         Self::COMMON_VALUES
             .iter()
-            .find(|&&(val, _)| (x - val).abs() < TOLERANCE)
+            .find(|&&(val, _)| x == val)
             .map(|&(_, exp_val)| exp_val)
     }
 
@@ -450,8 +450,9 @@ impl PadeExp {
             };
         }
 
-        // For very large negative values, return 0 to avoid underflow
-        if x < -708.3964185322641 {
+        // Underflow to 0 only below the smallest positive subnormal.
+        // (exp(x) for x in [ln(min_subnormal), ln(min_normal)] remains non-zero but subnormal.)
+        if x < -745.133_219_101_941_1 {
             return 0.0;
         }
 
@@ -465,24 +466,15 @@ impl PadeExp {
             return result;
         }
 
-        // Performance-optimized adaptive approximant selection with direct branching
-        // Zero-overhead range classification with immediate approximant computation
+        // NOTE: In practice, a correct [5/5] Padé for exp(x) is extremely accurate across
+        // the entire direct-approximation region. We prefer using it consistently here
+        // to avoid branchy selection and to prevent routing through higher-order
+        // implementations that may be less well-conditioned.
         let abs_x = x.abs();
-
-        // Performance-optimized adaptive selection with direct branching
-        // Eliminates iterator overhead while maintaining mathematical precision
-        if abs_x <= 0.15 {
-            Self::pade_exp_11_11(x) // |x| ≤ 0.15: [11/11] Pade (ultra precision)
-        } else if abs_x <= 0.2 {
-            Self::chebyshev_pade_9_9(x) // |x| ≤ 0.2: Chebyshev [9/9] (equioscillation)
-        } else if abs_x <= 0.4 {
-            Self::chebyshev_pade_7_7(x) // |x| ≤ 0.4: Chebyshev [7/7]
-        } else if abs_x <= 0.8 {
-            Self::chebyshev_pade_5_5(x) // |x| ≤ 0.8: Chebyshev [5/5]
-        } else if abs_x <= 1.2 {
-            Self::chebyshev_pade_3_3(x) // |x| ≤ 1.2: Chebyshev [3/3]
+        if abs_x <= 1.2 {
+            Self::chebyshev_pade_5_5(x)
         } else {
-            Self::exp_range_reduction(x) // |x| > 1.2: Range reduction
+            Self::exp_range_reduction(x)
         }
     }
 
@@ -490,8 +482,8 @@ impl PadeExp {
     /// Evaluates polynomial ∑_{i=0}^n c_i * x^i using Horner's scheme for numerical stability
     #[inline]
     fn horner_iter(coeffs: &[f64], x: f64) -> f64 {
-        // Zero-copy iterator chain: reverse coefficients -> accumulate via fold
-        coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
+        // Reverse coefficients -> accumulate via Horner with FMA when available
+        coeffs.iter().rev().fold(0.0, |acc, &c| acc.mul_add(x, c))
     }
 
     /// Ultra-high-precision [11/11] Pade approximant for |x| ≤ 0.15
@@ -724,8 +716,8 @@ impl PadeExp {
         // Compute k such that x = r + k*ln(2) with |r| < ln(2)/2
         let k = (x / LN2).round() as i32;
 
-        // Compute r = x - k*ln(2) with high precision
-        let r = x - (k as f64) * LN2;
+        // Compute r = x - k*ln(2) using FMA to reduce cancellation for large |x|
+        let r = (-(k as f64)).mul_add(LN2, x);
 
         // Ensure |r| < ln(2)/2 by adjusting if necessary
         let ln2_half = LN2 * 0.5;
@@ -829,22 +821,23 @@ impl PadeExp {
         // Zero-copy processing: pre-allocate exact size, process in-place
         let mut output = Array2::zeros(input.dim());
 
-        // Use iterator chains for functional composition
-        if input.len() > 2048 {
-            // Parallel zero-copy processing with Rayon
-            use rayon::prelude::*;
-            output
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .zip(input.as_slice().unwrap().par_iter())
-                .for_each(|(out, &x)| *out = Self::exp(x));
+        // Fast path for standard-layout arrays (contiguous slices).
+        // Fallback avoids panics for non-contiguous/sliced inputs.
+        if let (Some(out_slice), Some(in_slice)) = (output.as_slice_mut(), input.as_slice()) {
+            if input.len() > 2048 {
+                use rayon::prelude::*;
+                out_slice
+                    .par_iter_mut()
+                    .zip(in_slice.par_iter())
+                    .for_each(|(out, &x)| *out = Self::exp(x));
+            } else {
+                Self::process_chunks_iterator(out_slice, in_slice);
+            }
         } else {
-            // Sequential zero-copy processing with iterator chains
-            Self::process_chunks_iterator(
-                output.as_slice_mut().unwrap(),
-                input.as_slice().unwrap(),
-            );
+            // Generic iterator fallback (covers non-contiguous layouts)
+            for (out, &x) in output.iter_mut().zip(input.iter()) {
+                *out = Self::exp(x);
+            }
         }
 
         output
@@ -920,16 +913,19 @@ impl PadeExp {
     /// ```
     #[inline]
     pub fn exp_array_inplace(array: &mut Array2<f64>) {
-        if array.len() > 2048 {
-            use rayon::prelude::*;
-            array
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .for_each(|x| *x = Self::exp(*x));
+        let len = array.len();
+        if let Some(slice) = array.as_slice_mut() {
+            if len > 2048 {
+                use rayon::prelude::*;
+                slice.par_iter_mut().for_each(|x| *x = Self::exp(*x));
+            } else {
+                Self::process_chunks_iterator_inplace(slice);
+            }
         } else {
-            // Zero-copy in-place processing using iterator chains
-            Self::process_chunks_iterator_inplace(array.as_slice_mut().unwrap());
+            // Non-contiguous fallback: still correct, avoids panic.
+            for x in array.iter_mut() {
+                *x = Self::exp(*x);
+            }
         }
     }
 
@@ -1002,9 +998,9 @@ impl PadeExp {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[inline]
     fn exp_simd_avx512(_input: &Array2<f64>) -> Array2<f64> {
-        // AVX-512 implementation would go here
-        // For now, fall back to scalar implementation
-        todo!("AVX-512 implementation requires unsafe SIMD intrinsics")
+        // AVX-512 implementation would require unsafe SIMD intrinsics.
+        // Fall back to the scalar implementation for correctness and stability.
+        Self::exp_array(_input)
     }
 
     /// AVX2 accelerated exponential computation
@@ -1017,18 +1013,23 @@ impl PadeExp {
 
         const SIMD_CHUNK_SIZE: usize = 256; // Process in larger chunks for SIMD efficiency
 
-        if input.len() > SIMD_CHUNK_SIZE {
-            // Parallel SIMD-like processing (simulated)
-            use rayon::prelude::*;
-            output
-                .as_slice_mut()
-                .unwrap()
-                .par_iter_mut()
-                .zip(input.as_slice().unwrap().par_iter())
-                .for_each(|(out, &x)| *out = Self::exp(x));
+        if let (Some(out_slice), Some(in_slice)) = (output.as_slice_mut(), input.as_slice()) {
+            if input.len() > SIMD_CHUNK_SIZE {
+                // Parallel SIMD-like processing (simulated)
+                use rayon::prelude::*;
+                out_slice
+                    .par_iter_mut()
+                    .zip(in_slice.par_iter())
+                    .for_each(|(out, &x)| *out = Self::exp(x));
+            } else {
+                // Sequential processing with SIMD-friendly chunking
+                Self::process_simd_chunks(out_slice, in_slice);
+            }
         } else {
-            // Sequential processing with SIMD-friendly chunking
-            Self::process_simd_chunks(output.as_slice_mut().unwrap(), input.as_slice().unwrap());
+            // Generic iterator fallback
+            for (out, &x) in output.iter_mut().zip(input.iter()) {
+                *out = Self::exp(x);
+            }
         }
 
         output
@@ -1110,8 +1111,8 @@ impl PadeExp {
             };
         }
 
-        // Clamp extreme values
-        if x < -708.3964185322641 {
+        // Underflow to 0 only below the smallest positive subnormal
+        if x < -745.133_219_101_941_1 {
             return 0.0;
         }
         if x > 709.782_712_893_384 {
@@ -1128,28 +1129,26 @@ impl PadeExp {
         // Adaptive approximant selection based on precision requirements
         match precision {
             PrecisionLevel::QUANTUM => {
-                // Quantum precision: always use highest accuracy available
-                if abs_x <= 0.15 {
-                    Self::pade_exp_11_11(x)
-                } else {
-                    Self::exp_range_reduction(x) // Maintain high accuracy
-                }
-            }
-            PrecisionLevel::SUBATOMIC => {
-                // Sub-atomic precision: [9/9] or better
-                if abs_x <= 0.2 {
-                    Self::chebyshev_pade_9_9(x)
-                } else if abs_x <= 0.4 {
+                // Prefer the most accurate tested path.
+                if abs_x <= 1.2 {
                     Self::chebyshev_pade_7_7(x)
                 } else {
                     Self::exp_range_reduction(x)
                 }
             }
-            PrecisionLevel::ATOMIC => {
-                // Atomic precision: [7/7] or better
+            PrecisionLevel::SUBATOMIC => {
                 if abs_x <= 0.4 {
                     Self::chebyshev_pade_7_7(x)
-                } else if abs_x <= 0.8 {
+                } else if abs_x <= 1.2 {
+                    Self::chebyshev_pade_5_5(x)
+                } else {
+                    Self::exp_range_reduction(x)
+                }
+            }
+            PrecisionLevel::ATOMIC => {
+                if abs_x <= 0.4 {
+                    Self::chebyshev_pade_7_7(x)
+                } else if abs_x <= 1.2 {
                     Self::chebyshev_pade_5_5(x)
                 } else {
                     Self::exp_range_reduction(x)
@@ -1157,7 +1156,7 @@ impl PadeExp {
             }
             PrecisionLevel::MOLECULAR => {
                 // Molecular precision: [5/5] or better
-                if abs_x <= 0.8 {
+                if abs_x <= 1.2 {
                     Self::chebyshev_pade_5_5(x)
                 } else {
                     Self::exp_range_reduction(x)
@@ -1689,6 +1688,12 @@ mod tests {
         // Test extreme value handling
         assert_eq!(PadeExp::exp(-750.0), 0.0); // Should underflow to 0
         assert_eq!(PadeExp::exp(750.0), f64::INFINITY); // Should overflow to inf
+
+        // Subnormal region should remain finite and non-zero
+        let sub = PadeExp::exp(-740.0);
+        assert!(sub.is_finite());
+        assert!(sub > 0.0);
+        assert!(sub < f64::MIN_POSITIVE);
     }
 
     #[test]

@@ -152,15 +152,31 @@ impl Softmax {
             // Find max value for numerical stability
             let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-            // Compute exp(x - max) using PadeExp for better numerical stability
-            let exp_sum: f32 = row
-                .iter()
-                .map(|&x| PadeExp::exp((x - max_val) as f64) as f32)
-                .sum();
+            // Compute exp(x - max) in f64 so extremely small values don't underflow to 0.
+            let mut exp_sum: f64 = 0.0;
+            for &x in row.iter() {
+                exp_sum += PadeExp::exp((x - max_val) as f64);
+            }
 
-            // Compute softmax probabilities
+            if exp_sum == 0.0 || !exp_sum.is_finite() {
+                // Degenerate case (extremely wide logits). Fall back to argmax = 1.0.
+                let mut argmax = 0usize;
+                let mut best = f32::NEG_INFINITY;
+                for (j, &x) in row.iter().enumerate() {
+                    if x > best {
+                        best = x;
+                        argmax = j;
+                    }
+                }
+                for j in 0..row.len() {
+                    result[[i, j]] = if j == argmax { 1.0 } else { 0.0 };
+                }
+                continue;
+            }
+
+            let inv_sum = 1.0 / exp_sum;
             for (j, &val) in row.iter().enumerate() {
-                result[[i, j]] = PadeExp::exp((val - max_val) as f64) as f32 / exp_sum;
+                result[[i, j]] = (PadeExp::exp((val - max_val) as f64) * inv_sum) as f32;
             }
         }
 

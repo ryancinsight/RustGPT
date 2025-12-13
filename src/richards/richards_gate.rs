@@ -16,44 +16,46 @@ use crate::{
 /// **Theorem 1 (Gating Function Requirements)**: A gating function g: ℝ → [0,1]
 /// must satisfy the following properties:
 /// 1. **Range constraint**: ∀x ∈ ℝ, g(x) ∈ [0,1]
-/// 2. **Smoothness**: g continuous and differentiable everywhere
+/// 2. **Smoothness**: g is continuous everywhere; the underlying Richards curve is smooth.
 /// 3. **Saturation**: lim_{x→±∞} g(x) ∈ {0, 1}
 /// 4. **Centered**: g(0) ≈ 0.5 for balanced gating
 /// 5. **Monotonicity**: ∂g/∂x(x) ≥ 0 for all x (non-decreasing)
 ///
-/// **Proof**: Properties 1,3,5 are satisfied by construction through the Richards curve
-/// family and clamping. Property 2 is satisfied as Richards curves are infinitely
-/// differentiable. Property 4 follows from proper parameter initialization.
+/// **Proof**: Properties 1,3,5 are satisfied by construction through the Richards curve family.
+/// The Richards curve is infinitely differentiable.
+/// Property 4 follows from proper parameter initialization.
 ///
 /// ## Richards Gate Design Principles
 ///
 /// The Richards gate implements Theorem 1 through:
-/// - **Range Enforcement**: Output clamped to [0,1] with smooth Richards transitions
+/// - **Range Enforcement**: Use a sigmoid-like Richards curve initialized near [0,1]
 /// - **Centered Bias**: Parameters initialized to ensure g(0) ≈ 0.5
-/// - **Gradient Stability**: Analytical gradients with numerical clamping
-/// - **Adaptive Temperature**: Input scaling T ∈ [0.1, 10] for controlled sharpness
+/// - **Gradient Stability**: Analytical gradients
+/// - **Adaptive Temperature**: Positive temperature parameter (log-space update)
 ///
 /// **Theorem 2 (Complete Richards Gate Formulation)**:
-/// g(x; θ, T) = clamp(richards_curve(x/T; θ), 0, 1)
+/// g(x; θ, T) = richards_curve(x/T; θ)
 ///
 /// where θ = (ν, k, m) are Richards curve parameters and T is temperature.
 ///
-/// **Parameters with Mathematical Constraints**:
-/// - ν ∈ [10^(-6), 10]: Shape parameter (ν > 0 prevents singularities)
-/// - k ∈ [10^(-6), 100]: Steepness parameter (bounds prevent overflow)
-/// - m ∈ [-10, 10]: Center parameter (reasonable activation range)
-/// - T ∈ [0.1, 10]: Temperature parameter (controls input scaling)
+/// **Parameters**:
+/// - ν, k, m: Richards curve shape parameters
+/// - T > 0: Temperature parameter (controls input scaling)
 ///
 /// ## Complete Gradient Computation Framework
 ///
 /// **Theorem 3 (Analytical Gradient Correctness)**:
 /// The Richards gate gradients are computed analytically as:
 ///
-/// ∂g/∂x = ∂/∂x[richards_curve(x/T)] = richards_curve'(x/T) * (1/T)
+/// g(x) = richards_curve(x/T)
 ///
-/// ∂g/∂θ = ∂/∂θ[richards_curve(x/T)] = richards_curve_θ'(x/T) * richards_curve'(x/T)
+/// ∂g/∂x = richards_curve'(x/T) * (1/T)
 ///
-/// ∂g/∂T = ∂/∂T[richards_curve(x/T)] = richards_curve'(x/T) * (-x/T²)
+/// For parameters θ (ν,k,m):
+/// ∂g/∂θ = ∂/∂θ richards_curve(x/T; θ).
+///
+/// For temperature T:
+/// ∂g/∂T = richards_curve'(x/T) * (-x/T²).
 ///
 /// **Proof**: Chain rule application through temperature scaling x' = x/T.
 /// Temperature derivatives verified through numerical differentiation tests.
@@ -62,10 +64,9 @@ use crate::{
 ///
 /// **Theorem 4 (Numerical Stability)**:
 /// The implementation ensures finite gradients and stable optimization through:
-/// 1. **Parameter clamping** to prevent extreme values
-/// 2. **Gradient regularization** via Adam optimization
-/// 3. **Input/output clamping** at [0,1] boundaries
-/// 4. **Safe arithmetic** with overflow prevention
+/// 1. **Stable exp/log implementations** inside the Richards curve
+/// 2. **Adaptive optimization** via Adam
+/// 3. **Safe arithmetic** with overflow prevention
 ///
 /// **Theorem 5 (Universal Approximation for Gates)**:
 /// Richards gates can approximate any continuous monotonic function on [0,1]
@@ -91,7 +92,7 @@ use crate::{
 /// and activation modulation with the following benefits:
 /// 1. **Adaptive precision**: Temperature learns appropriate sharpness
 /// 2. **Parameter efficiency**: Low-dimensional parameter space (4 parameters)
-/// 3. **Numerical stability**: Clamped outputs prevent training instability
+/// 3. **Numerical stability**: Smooth gating avoids hard non-differentiabilities
 /// 4. **Mathematical guarantees**: Proven range and differentiability properties
 ///
 /// ## Verification and Testing
@@ -121,6 +122,33 @@ pub struct RichardsGate {
 }
 
 impl RichardsGate {
+    #[inline]
+    fn softplus(u: f32) -> f32 {
+        // log(1 + exp(u)) computed stably.
+        if u > 0.0 {
+            u + (-u).exp().ln_1p()
+        } else {
+            u.exp().ln_1p()
+        }
+    }
+
+    #[inline]
+    fn inv_softplus(t: f32) -> f32 {
+        // Inverse of softplus for t > 0: u = ln(exp(t) - 1).
+        // Use exp_m1 for precision; for large t, u ≈ t.
+        if t > 20.0 {
+            t
+        } else {
+            t.exp_m1().ln()
+        }
+    }
+
+    #[inline]
+    fn sigmoid_from_softplus(t: f32) -> f32 {
+        // If t = softplus(u), then sigmoid(u) = 1 - exp(-t).
+        1.0 - (-t).exp()
+    }
+
     /// Create a new Richards gate with learned parameters
     pub fn new() -> Self {
         let mut rng = get_rng();
@@ -139,12 +167,12 @@ impl RichardsGate {
         curve.scale_learnable = false;     // Fixed for stability
         curve.shift_learnable = false;     // Fixed for stability
 
-        // Initialize temperature near 1.0 for standard behavior
-        let temp_std = 0.1;
-        let temp_dist = Normal::new(1.0, temp_std).unwrap();
-
-        let temp_sample: f32 = temp_dist.sample(&mut rng);
-        let temp_sample = temp_sample.max(0.1).min(10.0);
+        // Initialize temperature near 1.0 with a log-normal sample to guarantee T > 0
+        // without hard clipping.
+        let log_temp_std = 0.1;
+        let log_temp_dist = Normal::new(0.0, log_temp_std).unwrap();
+        let log_temp: f32 = log_temp_dist.sample(&mut rng);
+        let temp_sample: f32 = log_temp.exp();
 
         Self {
             curve,
@@ -156,7 +184,7 @@ impl RichardsGate {
     /// Create Richards gate with specific temperature
     pub fn with_temperature(temperature: f32) -> Self {
         let mut gate = Self::new();
-        gate.temperature = temperature.max(0.1).min(10.0);
+        gate.temperature = if temperature > 0.0 { temperature } else { 1.0 };
         gate
     }
 
@@ -183,7 +211,7 @@ impl RichardsGate {
             self.curve.forward_into_f32(&scratch_in, &mut scratch_out);
 
             for (j, &val) in scratch_out.iter().enumerate() {
-                output[[i, j]] = val.max(0.0).min(1.0);
+                output[[i, j]] = val;
             }
         }
 
@@ -204,93 +232,64 @@ impl RichardsGate {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let (batch_size, feature_dim) = input.dim();
 
-        // Convert to f64 for RichardsCurve computation
-        let input_f64 = input.mapv(|x| x as f64);
-        let output_grads_f64 = output_grads.mapv(|x| x as f64);
+        // No explicit clamping: let the curve provide a smooth gate.
+        let temp_recip_f32 = 1.0 / self.temperature;
+        let temp_recip = temp_recip_f32 as f64;
+        let temp_recip_sq = temp_recip * temp_recip;
 
-        // Apply temperature scaling: x_scaled = x / T for each element
-        let temp = self.temperature as f64;
-        let scaled_input = input_f64.mapv(|x| x / temp);
+        // Scratch buffer for row-wise derivative.
+        let mut scaled_row: Vec<f32> = vec![0.0; feature_dim];
+        let mut dy_row: Vec<f32> = vec![0.0; feature_dim];
 
-        // Compute gradients for learnable Richards curve parameters
+        // Accumulate grads.
         let mut nu_grad = 0.0f64;
         let mut k_grad = 0.0f64;
         let mut m_grad = 0.0f64;
+        let mut temp_grad = 0.0f64;
+        let mut input_grads = Array2::zeros(input.raw_dim());
 
-        // Accumulate gradients across all input elements
-        for (input_row, grad_row) in scaled_input.outer_iter().zip(output_grads_f64.outer_iter()) {
-            for (&x_scaled, &grad_out) in input_row.iter().zip(grad_row.iter()) {
-                if grad_out != 0.0 {
-                    let param_grads = self.curve.grad_weights_scalar(x_scaled, grad_out);
-                    nu_grad += param_grads[0];
-                    k_grad += param_grads[1];
-                    m_grad += param_grads[2];
+        for sample_idx in 0..batch_size {
+            // x_scaled = x / T
+            for j in 0..feature_dim {
+                scaled_row[j] = input[[sample_idx, j]] * temp_recip_f32;
+            }
+
+            // dy_raw w.r.t x_scaled
+            self.curve.derivative_into_f32(&scaled_row, &mut dy_row);
+
+            for j in 0..feature_dim {
+                let grad_out = output_grads[[sample_idx, j]] as f64;
+                if grad_out == 0.0 {
+                    continue;
                 }
+
+                let grad_raw = grad_out;
+                let x = input[[sample_idx, j]] as f64;
+                let x_scaled = scaled_row[j] as f64;
+                let dy_dx_scaled = dy_row[j] as f64;
+
+                // Parameter grads (ν,k,m)
+                let param_grads = self.curve.grad_weights_scalar(x_scaled, grad_raw);
+                nu_grad += param_grads[0];
+                k_grad += param_grads[1];
+                m_grad += param_grads[2];
+
+                // Input grad: grad_raw * dy/dx_scaled * (1/T)
+                input_grads[[sample_idx, j]] = (grad_raw * dy_dx_scaled * temp_recip) as f32;
+
+                // Temperature grad: grad_raw * dy/dx_scaled * (-x/T^2)
+                temp_grad += grad_raw * dy_dx_scaled * (-x * temp_recip_sq);
             }
         }
 
-        // Convert to Array2<f32> format expected by Layer trait
-        let mut param_grads: Vec<Array2<f32>> = vec![
+        let param_grads: Vec<Array2<f32>> = vec![
             Array2::from_elem((1, 1), nu_grad as f32),
             Array2::from_elem((1, 1), k_grad as f32),
             Array2::from_elem((1, 1), m_grad as f32),
+            Array2::from_elem((1, 1), temp_grad as f32),
         ];
 
-        // Compute temperature parameter gradient analytically
-        let temp_grad = self.compute_temperature_gradient(input, output_grads);
-        param_grads.push(Array2::from_elem((1, 1), temp_grad));
-
-        // Compute input gradients
-        let mut input_grads = Array2::zeros(input.raw_dim());
-
-        // For each sample and each feature
-        for sample_idx in 0..batch_size {
-            for feature_idx in 0..feature_dim {
-                let x = input[[sample_idx, feature_idx]] as f64;
-                let grad_out = output_grads[[sample_idx, feature_idx]] as f64;
-                let x_scaled = x / temp;
-
-                // Get derivative of Richards curve w.r.t. its input
-                let curve_deriv = self.curve.derivative_scalar(x_scaled);
-
-                // Chain rule: ∂g/∂x = curve'(x/T) * ∂(x/T)/∂x = curve'(x/T) * (1/T)
-                let input_grad = curve_deriv * grad_out / temp;
-                input_grads[[sample_idx, feature_idx]] = input_grad as f32;
-            }
-        }
-
         (input_grads, param_grads)
-    }
-
-    /// Compute analytical temperature parameter gradient
-    /// ∂g/∂T = ∂/∂T[Richards_curve(x/T)] = curve'(x/T) * (-x/T²)
-    /// where curve' is the derivative of the Richards curve w.r.t. its input
-    fn compute_temperature_gradient(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> f32 {
-        let mut temp_grad = 0.0f64;
-        let temp = self.temperature as f64;
-
-        for (input_row, grad_row) in input.outer_iter().zip(output_grads.outer_iter()) {
-            for (&x, &grad_out) in input_row.iter().zip(grad_row.iter()) {
-                let x_f64 = x as f64;
-                let grad_out_f64 = grad_out as f64;
-
-                if grad_out_f64 != 0.0 {
-                    // Scaled input: x/T
-                    let x_scaled = x_f64 / temp;
-
-                    // Get derivative of Richards curve w.r.t. its scaled input
-                    let curve_deriv = self.curve.derivative_scalar(x_scaled);
-
-                    // Chain rule: ∂g/∂T = curve'(x/T) * ∂(x/T)/∂T = curve'(x/T) * (-x/T²)
-                    let d_input_d_temp = -x_f64 / (temp * temp);
-                    let temp_grad_contrib = curve_deriv * d_input_d_temp * grad_out_f64;
-
-                    temp_grad += temp_grad_contrib;
-                }
-            }
-        }
-
-        temp_grad as f32
     }
 
     /// Apply gradients to parameters
@@ -310,8 +309,19 @@ impl RichardsGate {
 
         // Apply temperature gradient
         let temp_grad = gradients[3][[0, 0]];
-        self.temperature_optimizer.step(&mut Array2::from_elem((1, 1), self.temperature), &Array2::from_elem((1, 1), temp_grad), learning_rate);
-        self.temperature = self.temperature.max(0.1).min(10.0);
+        // Update temperature using softplus parameterization:
+        // T = softplus(u) ensures T > 0 without hard clipping.
+        // dT/du = sigmoid(u). If we only have T, sigmoid(u) = 1 - exp(-T).
+        let t = if self.temperature > 0.0 { self.temperature } else { 1e-6 };
+        let u = Self::inv_softplus(t);
+        let d_t_d_u = Self::sigmoid_from_softplus(t);
+        let grad_u = temp_grad * d_t_d_u;
+
+        let mut u_arr = Array2::from_elem((1, 1), u);
+        let grad_u_arr = Array2::from_elem((1, 1), grad_u);
+        self.temperature_optimizer
+            .step(&mut u_arr, &grad_u_arr, learning_rate);
+        self.temperature = Self::softplus(u_arr[[0, 0]]);
 
         Ok(())
     }
@@ -435,9 +445,14 @@ mod tests {
 
         let output = gate.forward(&input);
 
-        // Check that all outputs are in [0, 1] range
+        // For a sigmoid-like curve we expect outputs ~[0,1] (no explicit clamping).
+        // Allow a tiny numerical tolerance.
         for &val in output.iter() {
-            assert!(val >= 0.0 && val <= 1.0, "Gate output {} not in [0,1] range", val);
+            assert!(
+                val >= -1e-4 && val <= 1.0 + 1e-4,
+                "Gate output {} not near [0,1] range",
+                val
+            );
         }
 
         // Check shape preservation

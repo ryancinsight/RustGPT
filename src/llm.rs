@@ -1338,7 +1338,13 @@ impl LLM {
 
             let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
             let sce_cfg = crate::loss::SymmetricCEConfig::default();
-            let sce = crate::loss::symmetric_cross_entropy(&probs, target_ids, sce_cfg.alpha, sce_cfg.beta, sce_cfg.epsilon);
+            let sce = crate::loss::symmetric_cross_entropy(
+                &probs,
+                target_ids,
+                sce_cfg.alpha,
+                sce_cfg.beta,
+                sce_cfg.epsilon,
+            );
             let loss_norm = sce / (target_ids.len().max(1) as f32);
             batch_loss += loss_norm;
             batch_base_loss += loss_norm;
@@ -1427,6 +1433,7 @@ impl LLM {
         batch: &[Vec<usize>],
         lr: f32,
     ) -> Result<(f32, f32, f32, Vec<f32>)> {
+        let check_finite = std::env::var_os("RUSTGPT_CHECK_FINITE").is_some();
         let mut batch_loss = 0.0;
         let mut batch_base_loss = 0.0;
         let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
@@ -1601,6 +1608,41 @@ impl LLM {
                 let (input_grads, param_grads) =
                     layer.compute_gradients(&layer_inputs[layer_idx], &grads_output);
 
+                if check_finite {
+                    if let Some((bad_i, bad_v)) = input_grads
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| !v.is_finite())
+                    {
+                        return Err(crate::errors::ModelError::Training {
+                            message: format!(
+                                "Non-finite input_grads at layer {} ({}) index {}: {}",
+                                layer_idx,
+                                layer.layer_type(),
+                                bad_i,
+                                bad_v
+                            ),
+                        });
+                    }
+
+                    for (g_idx, g) in param_grads.iter().enumerate() {
+                        if let Some((bad_i, bad_v)) =
+                            g.iter().enumerate().find(|(_, v)| !v.is_finite())
+                        {
+                            return Err(crate::errors::ModelError::Training {
+                                message: format!(
+                                    "Non-finite param_grads[{}] at layer {} ({}) index {}: {}",
+                                    g_idx,
+                                    layer_idx,
+                                    layer.layer_type(),
+                                    bad_i,
+                                    bad_v
+                                ),
+                            });
+                        }
+                    }
+                }
+
                 let layer_grad_norm: f32 = input_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
                 layer_grad_norms[layer_idx] += layer_grad_norm;
 
@@ -1699,13 +1741,32 @@ impl LLM {
                     tracing::warn!(layer_idx = layer_idx, max_abs, scale = s, "Applied max-abs gradient scaling");
                 }
 
-                // Sanitize non-finite gradients proactively
-                for grad in &mut clipped_grads {
-                    grad.iter_mut().for_each(|v| {
-                        if !v.is_finite() {
-                            *v = 0.0
+                if check_finite {
+                    for (g_idx, g) in clipped_grads.iter().enumerate() {
+                        if let Some((bad_i, bad_v)) =
+                            g.iter().enumerate().find(|(_, v)| !v.is_finite())
+                        {
+                            return Err(crate::errors::ModelError::Training {
+                                message: format!(
+                                    "Non-finite clipped_grads[{}] at layer {} ({}) index {}: {}",
+                                    g_idx,
+                                    layer_idx,
+                                    self.network[layer_idx].layer_type(),
+                                    bad_i,
+                                    bad_v
+                                ),
+                            });
                         }
-                    });
+                    }
+                } else {
+                    // Sanitize non-finite gradients proactively
+                    for grad in &mut clipped_grads {
+                        grad.iter_mut().for_each(|v| {
+                            if !v.is_finite() {
+                                *v = 0.0
+                            }
+                        });
+                    }
                 }
 
                 // Detect gradient anomalies (poisoning/training instability)
@@ -3227,7 +3288,13 @@ impl LLM {
             let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
             let target_len = target_ids.len();
             let probs_slice = probs.slice(s![0..target_len, ..]);
-            let ce = crate::loss::symmetric_cross_entropy(&probs_slice.to_owned(), target_ids, 1.0, 1.0, 1e-4);
+            let ce = crate::loss::symmetric_cross_entropy(
+                &probs_slice.to_owned(),
+                target_ids,
+                1.0,
+                1.0,
+                1e-4,
+            );
             total_ce += ce;
             count += 1;
         }

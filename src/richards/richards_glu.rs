@@ -19,7 +19,7 @@ pub struct RichardsGlu {
     pub cached_gated: Option<Array2<f32>>,
     // [MOD] Learnable RichardsActivation for value function
     pub richards_activation: RichardsActivation,
-    // [MOD] Learned RichardsGate for gating (ensures [0,1] output range)
+    // [MOD] Learned RichardsGate for gating
     pub gate: RichardsGate,
 }
 
@@ -131,10 +131,6 @@ impl Layer for RichardsGlu {
         let grad_w_out = gated.t().dot(output_grads);
         let grad_gated = output_grads.dot(&self.w_out.t());
 
-        // Compute gate_sigma for gradient computation
-        // Compute gate values
-        let gate_sigma = self.gate.forward_const(&x2);
-        
         let grad_value = &grad_gated * &gate_sigma;
         let grad_gate_sigma = &grad_gated * &value;
 
@@ -171,7 +167,9 @@ impl Layer for RichardsGlu {
             for j in 0..x2_slice.len() {
                 gate_scaled_row[j] = x2_slice[j] * gate_temp_reciprocal;
             }
-            self.gate.curve.derivative_into_f32(&gate_scaled_row, &mut gate_curve_deriv_row);
+            self.gate
+                .curve
+                .derivative_into_f32(&gate_scaled_row, &mut gate_curve_deriv_row);
 
             for j in 0..x1_row.len() {
                 grad_x1[[i, j]] = value_deriv_row[j] * grad_value[[i, j]];
