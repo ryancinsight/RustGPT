@@ -116,9 +116,15 @@ impl RichardsActivation {
     /// Backward pass: derivative of x * Richards(x)
     /// d/dx[x * Richards(x)] = Richards(x) + x * Richards'(x)
     pub fn derivative(&self, x: &Array1<f64>) -> Array1<f64> {
-        let richards_output = self.richards_curve.forward(x);
-        let richards_derivative = self.richards_curve.derivative(x);
-        &richards_output + x * &richards_derivative
+        let x_slice = x.as_slice().unwrap();
+        let mut out = Array1::<f64>::zeros(x.len());
+        let mut deriv = Array1::<f64>::zeros(x.len());
+        self.richards_curve
+            .eval_into(x_slice, out.as_slice_mut().unwrap(), deriv.as_slice_mut().unwrap());
+        for i in 0..x.len() {
+            out[i] = out[i] + x[i] * deriv[i];
+        }
+        out
     }
 
     /// f32-friendly derivative into a caller-provided buffer with scratch.
@@ -126,10 +132,8 @@ impl RichardsActivation {
     pub fn derivative_into_f32_with_scratch(&self, x: &[f32], out: &mut [f32], scratch: &mut [f32]) {
         debug_assert_eq!(x.len(), out.len());
         debug_assert_eq!(x.len(), scratch.len());
-        // out = Richards(x)
-        self.richards_curve.forward_into_f32(x, out);
-        // scratch = Richards'(x)
-        self.richards_curve.derivative_into_f32(x, scratch);
+        // out = Richards(x), scratch = Richards'(x)
+        self.richards_curve.eval_into_f32(x, out, scratch);
         for i in 0..x.len() {
             out[i] = out[i] + x[i] * scratch[i];
         }
@@ -137,8 +141,7 @@ impl RichardsActivation {
 
     /// Backward pass for a single scalar
     pub fn backward_scalar(&self, x: f64) -> f64 {
-        let richards_output = self.richards_curve.forward_scalar(x);
-        let richards_derivative = self.richards_curve.backward_scalar(x);
+        let (richards_output, richards_derivative) = self.richards_curve.eval_scalar(x);
         richards_output + x * richards_derivative
     }
 

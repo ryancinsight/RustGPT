@@ -1,4 +1,6 @@
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
+
+use crate::pade::PadeExp;
 
 /// Symmetric Cross Entropy (SCE) utilities
 ///
@@ -46,6 +48,53 @@ pub fn cross_entropy(probs: &Array2<f32>, targets: &[usize]) -> f32 {
     if rows > 0 { loss / (rows as f32) } else { 0.0 }
 }
 
+/// Numerically-stable cross-entropy computed directly from logits.
+///
+/// This avoids taking `ln(p)` on probabilities that may underflow to 0.0 in `f32`.
+/// Uses log-sum-exp with `ln_1p` for accuracy when the distribution is very peaky.
+pub fn cross_entropy_from_logits(logits: &ArrayView2<f32>, targets: &[usize]) -> f32 {
+    let vocab = logits.ncols();
+    let rows = logits.nrows().min(targets.len());
+    if rows == 0 || vocab == 0 {
+        return 0.0;
+    }
+
+    let mut loss_f64 = 0.0f64;
+
+    for i in 0..rows {
+        let t = targets[i];
+        if t >= vocab {
+            continue;
+        }
+
+        let row = logits.row(i);
+        let max_val = row
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        if !max_val.is_finite() {
+            // Degenerate row; keep behavior defined
+            continue;
+        }
+
+        // sum_j exp(logit_j - max)
+        let mut sum = 0.0f64;
+        for &x in row.iter() {
+            // (x - max) <= 0, so exp is safe.
+            sum += PadeExp::exp((x - max_val) as f64);
+        }
+
+        // sum >= 1 because it includes exp(0)=1 for the max element.
+        let sum_minus_1 = (sum - 1.0).max(0.0);
+        let lse = (max_val as f64) + sum_minus_1.ln_1p();
+        let logp_t = (logits[[i, t]] as f64) - lse;
+        loss_f64 -= logp_t;
+    }
+
+    (loss_f64 as f32) / (rows as f32)
+}
+
 pub fn cross_entropy_gradients(probs: &Array2<f32>, targets: &[usize]) -> Array2<f32> {
     let mut grads = probs.clone();
     let vocab = probs.ncols();
@@ -78,6 +127,40 @@ pub fn symmetric_cross_entropy(
     }
 
     let ce = cross_entropy(probs, targets);
+
+    let mut rce = 0.0f32;
+    for i in 0..rows {
+        let t = targets[i];
+        let mut c_sum = 0.0f32;
+        for k in 0..vocab {
+            let y = if k == t { 1.0 } else { epsilon }; // stabilized one-hot
+            c_sum += probs[[i, k]] * (-y.ln());
+        }
+        rce += c_sum;
+    }
+    rce /= rows as f32;
+
+    alpha * ce + beta * rce
+}
+
+/// Symmetric Cross Entropy where the CE term is computed from logits via log-sum-exp.
+///
+/// This reduces loss spikes caused by `f32` softmax underflow making `p_target == 0.0`.
+pub fn symmetric_cross_entropy_from_logits(
+    logits: &ArrayView2<f32>,
+    probs: &ArrayView2<f32>,
+    targets: &[usize],
+    alpha: f32,
+    beta: f32,
+    epsilon: f32,
+) -> f32 {
+    let vocab = probs.ncols();
+    let rows = probs.nrows().min(targets.len()).min(logits.nrows());
+    if rows == 0 || vocab == 0 {
+        return 0.0;
+    }
+
+    let ce = cross_entropy_from_logits(&logits.slice(ndarray::s![0..rows, ..]), &targets[..rows]);
 
     let mut rce = 0.0f32;
     for i in 0..rows {
