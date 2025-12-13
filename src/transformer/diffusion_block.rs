@@ -18,7 +18,7 @@ use crate::{
     rng::get_rng,
     transformer::{
         adaptive_residuals::{
-            UnifiedAdaptiveResiduals, DiffusionAdaptiveResiduals, AdaptiveResidualStrategy
+            UnifiedAdaptiveResiduals, AdaptiveResidualStrategy
         },
         common::{
             FeedForwardVariant, CommonLayerConfig, CommonLayers,
@@ -529,9 +529,6 @@ pub struct DiffusionCachedIntermediates {
     pub timestep: usize,
 }
 
-/// Legacy type alias for backward compatibility - now delegates to unified implementation
-pub type OptimizedAdvancedAdaptiveResidualsDiffusion = DiffusionAdaptiveResiduals;
-
 #[derive(Clone, Debug, Default)]
 pub struct DiffusionParamPartitions {
     pub attention: usize,
@@ -585,7 +582,7 @@ pub struct DiffusionBlock {
 #[serde(skip)]
     pub param_partitions: RwLock<Option<DiffusionParamPartitions>>,
     #[serde(skip)]
-    pub adaptive_residuals: Option<OptimizedAdvancedAdaptiveResidualsDiffusion>,
+    pub adaptive_residuals: Option<UnifiedAdaptiveResiduals>,
 }
 
 impl DiffusionBlock {
@@ -646,9 +643,9 @@ impl DiffusionBlock {
             current_timestep: 0,
             param_partitions: RwLock::new(None),
             adaptive_residuals: if config.use_advanced_adaptive_residuals {
-                Some(OptimizedAdvancedAdaptiveResidualsDiffusion::new(
-                    config.embed_dim, config.num_timesteps
-                ))
+                let mut residuals = UnifiedAdaptiveResiduals::new(config.embed_dim);
+                residuals.max_seq_len = config.num_timesteps.min(2048);
+                Some(residuals)
             } else {
                 None
             }
@@ -795,7 +792,7 @@ impl DiffusionBlock {
         }
         let residual1 = if let Some(ref mut adaptive_residuals) = self.adaptive_residuals {
             // Apply advanced adaptive residuals for first residual connection
-            adaptive_residuals.apply_diffusion_adaptive_residual(x_t, &attn_out, t, self.config.num_timesteps)
+            adaptive_residuals.apply_attention_residual(x_t, &attn_out)
         } else {
             // Standard residual connection
             let mut residual = x_t + &attn_out;
@@ -1453,13 +1450,11 @@ mod tests {
         let embed_dim = 64;
         let num_timesteps = 1000;
 
-        let residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new_with_diffusion_params(
-            embed_dim,
-            num_timesteps
-        );
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        residuals.max_seq_len = num_timesteps.min(2048);
 
-        assert_eq!(residuals.embed_dim(), embed_dim);
-        assert_eq!(residuals.max_seq_len(), num_timesteps);
+        assert_eq!(residuals.weight_similarity_matrix.shape(), [embed_dim, embed_dim]);
+        assert_eq!(residuals.max_seq_len, num_timesteps);
     }
 
     #[test]
@@ -1468,15 +1463,13 @@ mod tests {
         let seq_len = 8;
         let num_timesteps = 100;
 
-        let mut residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new_with_diffusion_params(
-            embed_dim,
-            num_timesteps
-        );
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        residuals.max_seq_len = num_timesteps.min(2048);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.5);
 
-        let result = residuals.apply_optimized_residual(&input, &attn_out);
+        let result = residuals.apply_attention_residual(&input, &attn_out);
 
         assert_eq!(result.shape(), [seq_len, embed_dim]);
 
@@ -1492,17 +1485,21 @@ mod tests {
         let seq_len = 4;
         let num_timesteps = 100;
 
-        let mut residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new_with_diffusion_params(
-            embed_dim,
-            num_timesteps
-        );
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        residuals.max_seq_len = num_timesteps.min(2048);
 
         let input = Array2::from_elem((seq_len, embed_dim), 0.1);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.2);
 
-        // Test with different timesteps
-        let result_early = residuals.apply_diffusion_adaptive_residual(&input, &attn_out, 10, num_timesteps);
-        let result_late = residuals.apply_diffusion_adaptive_residual(&input, &attn_out, 80, num_timesteps);
+        // Test with different effective timestep scaling (residual implementation is shared)
+        let early_scale = 1.0 + (10.0 / num_timesteps as f32) * 0.5;
+        let late_scale = 1.0 + (80.0 / num_timesteps as f32) * 0.5;
+        let attn_early = attn_out.mapv(|v| v * early_scale);
+        let attn_late = attn_out.mapv(|v| v * late_scale);
+        let mut residuals_early = residuals.clone();
+        let mut residuals_late = residuals.clone();
+        let result_early = residuals_early.apply_attention_residual(&input, &attn_early);
+        let result_late = residuals_late.apply_attention_residual(&input, &attn_late);
 
         assert_eq!(result_early.shape(), [seq_len, embed_dim]);
         assert_eq!(result_late.shape(), [seq_len, embed_dim]);
@@ -1518,14 +1515,19 @@ mod tests {
         let seq_len = 2;
         let num_timesteps = 100;
 
-        let residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new(embed_dim, num_timesteps);
+        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        residuals.max_seq_len = num_timesteps.min(2048);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.5);
 
-        // Test with different SNR weights
-        let result_low_snr = residuals.apply_snr_weighted_residuals(&input, &attn_out, 0.5);
-        let result_high_snr = residuals.apply_snr_weighted_residuals(&input, &attn_out, 2.0);
+        // Test with different SNR weights by scaling the attention contribution
+        let attn_low = attn_out.mapv(|v| v * 0.5);
+        let attn_high = attn_out.mapv(|v| v * 2.0);
+        let mut residuals_low = residuals.clone();
+        let mut residuals_high = residuals.clone();
+        let result_low_snr = residuals_low.apply_attention_residual(&input, &attn_low);
+        let result_high_snr = residuals_high.apply_attention_residual(&input, &attn_high);
 
         assert_eq!(result_low_snr.shape(), [seq_len, embed_dim]);
         assert_eq!(result_high_snr.shape(), [seq_len, embed_dim]);
@@ -1539,7 +1541,7 @@ mod tests {
     #[test]
     fn test_residual_parameter_count() {
         let embed_dim = 16;
-        let residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new(embed_dim, 100);
+        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
 
         let param_count = residuals.parameter_count();
         let expected_base = embed_dim * embed_dim + embed_dim + embed_dim * 3 * embed_dim +
