@@ -12,6 +12,7 @@ use crate::{
         head::PolyHead,
         params::PolyAttentionParamInfo,
         position::cope::CoPE,
+        utils::{smooth_clip_tanh, smooth_clip_tanh_with_grad},
     },
     network::Layer,
     mixtures::{
@@ -805,32 +806,24 @@ impl PolyAttention {
                             s += q_pe[pos];
                         }
 
-                        // Mathematical stability: clamp attention scores to prevent overflow in
-                        // polynomial computation Attention scores represent
-                        // log-probabilities, so clamping to [-10, 10] prevents extreme values
-                        // while preserving the relative ordering needed for attention
-                        let s_clamped = s.clamp(-8.0, 8.0);
+                            // Numerical stability: smoothly saturate extreme scores to avoid
+                            // hard clamp discontinuities.
+                            let (s_stable, ds_stable_ds) = smooth_clip_tanh_with_grad(s, 8.0);
 
                         // Numerically stable polynomial computation with overflow protection
                         let sp = if p_i32 <= 3 {
                             // Direct computation for small powers (more efficient and stable)
                             match p_i32 {
-                                1 => s_clamped,
-                                2 => s_clamped * s_clamped,
-                                3 => s_clamped * s_clamped * s_clamped,
+                                1 => s_stable,
+                                2 => s_stable * s_stable,
+                                3 => s_stable * s_stable * s_stable,
                                 _ => unreachable!(),
                             }
                         } else {
                             // For higher powers, use iterative multiplication with overflow check
                             let mut result = 1.0;
-                            let current = s_clamped;
                             for _ in 0..p_i32 {
-                                result *= current;
-                                // Check for overflow and clamp if necessary
-                                if !result.is_finite() {
-                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
-                                    break;
-                                }
+                                result *= s_stable;
                             }
                             result
                         };
@@ -851,25 +844,19 @@ impl PolyAttention {
                             // Direct computation for small powers (more efficient and stable)
                             match p_i32 {
                                 1 => 1.0,
-                                2 => s_clamped,
-                                3 => s_clamped * s_clamped,
+                                2 => s_stable,
+                                3 => s_stable * s_stable,
                                 _ => unreachable!(),
                             }
                         } else {
                             // For higher powers, use iterative multiplication with overflow check
                             let mut result = 1.0;
-                            let current = s_clamped;
                             for _ in 0..(p_i32 - 1) {
-                                result *= current;
-                                // Check for overflow and clamp if necessary
-                                if !result.is_finite() {
-                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
-                                    break;
-                                }
+                                result *= s_stable;
                             }
                             result
                         };
-                        let d_s_ij = dphi_ij * scale * a * (self.p as f32) * spm1;
+                        let d_s_ij = dphi_ij * scale * a * (self.p as f32) * spm1 * ds_stable_ds;
 
                         // Numerical stability check: detect gradient anomalies early
                         if !d_s_ij.is_finite() {
@@ -933,25 +920,24 @@ impl PolyAttention {
                                 s += q_pe[pos];
                             }
 
-                            // Mathematical stability: clamp attention scores to prevent overflow in
-                            // polynomial computation
-                            let s_clamped = s.clamp(-8.0, 8.0);
+                            // Smoothly bound attention scores to avoid hard clamp discontinuities.
+                            let s_stable = smooth_clip_tanh(s, 8.0);
 
                             // Numerically stable polynomial computation with overflow protection
                             let sp = if p_i32 <= 3 {
                                 match p_i32 {
-                                    1 => s_clamped,
-                                    2 => s_clamped * s_clamped,
-                                    3 => s_clamped * s_clamped * s_clamped,
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
                                     _ => unreachable!(),
                                 }
                             } else {
                                 let mut result = 1.0;
-                                let current = s_clamped;
+                                let current = s_stable;
                                 for _ in 0..p_i32 {
                                     result *= current;
                                     if !result.is_finite() {
-                                        result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                        result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
                                         break;
                                     }
                                 }
@@ -1546,21 +1532,21 @@ impl PolyAttention {
                         if pos < q_pe.len() {
                             s += q_pe[pos];
                         }
-                        let s_clamped = s.clamp(-8.0, 8.0);
+                        let (s_stable, ds_stable_ds) = smooth_clip_tanh_with_grad(s, 8.0);
                         let sp = if p_i32 <= 3 {
                             match p_i32 {
-                                1 => s_clamped,
-                                2 => s_clamped * s_clamped,
-                                3 => s_clamped * s_clamped * s_clamped,
+                                1 => s_stable,
+                                2 => s_stable * s_stable,
+                                3 => s_stable * s_stable * s_stable,
                                 _ => unreachable!(),
                             }
                         } else {
                             let mut result = 1.0;
-                            let current = s_clamped;
+                            let current = s_stable;
                             for _ in 0..p_i32 {
                                 result *= current;
                                 if !result.is_finite() {
-                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                    result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
                                     break;
                                 }
                             }
@@ -1577,23 +1563,23 @@ impl PolyAttention {
                         let spm1 = if p_i32 <= 3 {
                             match p_i32 {
                                 1 => 1.0,
-                                2 => s_clamped,
-                                3 => s_clamped * s_clamped,
+                                2 => s_stable,
+                                3 => s_stable * s_stable,
                                 _ => unreachable!(),
                             }
                         } else {
                             let mut result = 1.0;
-                            let current = s_clamped;
+                            let current = s_stable;
                             for _ in 0..(p_i32 - 1) {
                                 result *= current;
                                 if !result.is_finite() {
-                                    result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                    result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
                                     break;
                                 }
                             }
                             result
                         };
-                        let d_s_ij = dphi_ij * scale * a * (self.p as f32) * spm1;
+                        let d_s_ij = dphi_ij * scale * a * (self.p as f32) * spm1 * ds_stable_ds;
                         if !d_s_ij.is_finite() {
                             anomaly = true;
                         }
@@ -1624,21 +1610,21 @@ impl PolyAttention {
                             if pos < q_pe.len() {
                                 s += q_pe[pos];
                             }
-                            let s_clamped = s.clamp(-8.0, 8.0);
+                            let s_stable = smooth_clip_tanh(s, 8.0);
                             let sp = if p_i32 <= 3 {
                                 match p_i32 {
-                                    1 => s_clamped,
-                                    2 => s_clamped * s_clamped,
-                                    3 => s_clamped * s_clamped * s_clamped,
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
                                     _ => unreachable!(),
                                 }
                             } else {
                                 let mut result = 1.0;
-                                let current = s_clamped;
+                                let current = s_stable;
                                 for _ in 0..p_i32 {
                                     result *= current;
                                     if !result.is_finite() {
-                                        result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN };
+                                        result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
                                         break;
                                     }
                                 }

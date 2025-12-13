@@ -23,6 +23,7 @@ proptest! {
             max_window_size: seq_len,
             window_adaptation_strategy: llm::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
+            use_advanced_adaptive_residuals: false,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));

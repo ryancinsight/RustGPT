@@ -31,6 +31,7 @@ thread_local! {
 /// # Example
 /// ```
 /// use llm::rng::{set_seed, get_rng};
+/// use rand::Rng;
 ///
 /// set_seed(42);
 /// let mut rng = get_rng();

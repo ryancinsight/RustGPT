@@ -1083,32 +1083,41 @@ impl RichardsCurve {
         let total_elements = (batch_size * embedding_dim) as f64;
 
         // Parallel accumulation of scalar parameter gradients
-        // We iterate over the underlying slices if possible for max speed
-        let x_slice = x.as_slice().unwrap();
-        let grad_slice = output_grads.as_slice().unwrap();
-
-        // Use fold/reduce to accumulate gradients in parallel
-        let mut grads_accum = x_slice.par_iter()
-            .zip(grad_slice.par_iter())
-            .fold(
-                || vec![0.0f64; scalar_param_count],
-                |mut acc, (&xi, &dy)| {
-                    let param_grads = self.grad_weights_scalar(xi, dy);
-                    for i in 0..scalar_param_count {
-                        acc[i] += param_grads[i];
-                    }
-                    acc
+        // We iterate over the underlying slices if possible for max speed.
+        // Some call sites pass non-contiguous views; handle those without panicking.
+        let mut grads_accum = if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
+            x_slice
+                .par_iter()
+                .zip(grad_slice.par_iter())
+                .fold(
+                    || vec![0.0f64; scalar_param_count],
+                    |mut acc, (&xi, &dy)| {
+                        let param_grads = self.grad_weights_scalar(xi, dy);
+                        for i in 0..scalar_param_count {
+                            acc[i] += param_grads[i];
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![0.0f64; scalar_param_count],
+                    |mut a, b| {
+                        for i in 0..scalar_param_count {
+                            a[i] += b[i];
+                        }
+                        a
+                    },
+                )
+        } else {
+            let mut acc = vec![0.0f64; scalar_param_count];
+            for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
+                let param_grads = self.grad_weights_scalar(xi, dy);
+                for i in 0..scalar_param_count {
+                    acc[i] += param_grads[i];
                 }
-            )
-            .reduce(
-                || vec![0.0f64; scalar_param_count],
-                |mut a, b| {
-                    for i in 0..scalar_param_count {
-                        a[i] += b[i];
-                    }
-                    a
-                }
-            );
+            }
+            acc
+        };
 
         // Average scalar parameters across batch and features
         for i in 0..scalar_param_count {
@@ -1129,45 +1138,70 @@ impl RichardsCurve {
 
         if (self.gamma_learnable || self.bias_learnable) && (self.gamma.is_some() || self.bias.is_some()) {
             // Compute raw Richards output (without gamma/bias) as a flat buffer.
-            let mut raw_out = vec![0.0f64; x_slice.len()];
-            self.forward_into(x_slice, &mut raw_out);
+            // Use standard iteration order so this works for non-contiguous arrays too.
+            let mut raw_out = vec![0.0f64; x.len()];
+            let mut xi = 0;
+            for &xv in x.iter() {
+                raw_out[xi] = self.forward_scalar(xv);
+                xi += 1;
+            }
 
             // Accumulate per-feature sums in a cache-friendly way.
-            let (sum_gamma, sum_bias) = raw_out
-                .par_chunks_exact(embedding_dim)
-                .zip(grad_slice.par_chunks_exact(embedding_dim))
-                .fold(
-                    || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
-                    |mut acc, (raw_row, grad_row)| {
-                        if self.gamma_learnable {
-                            for j in 0..embedding_dim {
-                                acc.0[j] += raw_row[j] * grad_row[j];
+            let (sum_gamma, sum_bias) = if let Some(grad_slice) = output_grads.as_slice() {
+                raw_out
+                    .par_chunks_exact(embedding_dim)
+                    .zip(grad_slice.par_chunks_exact(embedding_dim))
+                    .fold(
+                        || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
+                        |mut acc, (raw_row, grad_row)| {
+                            if self.gamma_learnable {
+                                for j in 0..embedding_dim {
+                                    acc.0[j] += raw_row[j] * grad_row[j];
+                                }
                             }
-                        }
-                        if self.bias_learnable {
-                            for j in 0..embedding_dim {
-                                acc.1[j] += grad_row[j];
+                            if self.bias_learnable {
+                                for j in 0..embedding_dim {
+                                    acc.1[j] += grad_row[j];
+                                }
                             }
-                        }
-                        acc
-                    },
-                )
-                .reduce(
-                    || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
-                    |mut a, b| {
-                        if self.gamma_learnable {
-                            for j in 0..embedding_dim {
-                                a.0[j] += b.0[j];
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
+                        |mut a, b| {
+                            if self.gamma_learnable {
+                                for j in 0..embedding_dim {
+                                    a.0[j] += b.0[j];
+                                }
                             }
-                        }
-                        if self.bias_learnable {
-                            for j in 0..embedding_dim {
-                                a.1[j] += b.1[j];
+                            if self.bias_learnable {
+                                for j in 0..embedding_dim {
+                                    a.1[j] += b.1[j];
+                                }
                             }
+                            a
+                        },
+                    )
+            } else {
+                let mut sum_gamma = vec![0.0f64; embedding_dim];
+                let mut sum_bias = vec![0.0f64; embedding_dim];
+
+                for (raw_row, grad_row) in raw_out.chunks_exact(embedding_dim).zip(output_grads.outer_iter()) {
+                    if self.gamma_learnable {
+                        for j in 0..embedding_dim {
+                            sum_gamma[j] += raw_row[j] * grad_row[j];
                         }
-                        a
-                    },
-                );
+                    }
+                    if self.bias_learnable {
+                        for j in 0..embedding_dim {
+                            sum_bias[j] += grad_row[j];
+                        }
+                    }
+                }
+
+                (sum_gamma, sum_bias)
+            };
 
             let denom = batch_size as f64;
 
