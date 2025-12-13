@@ -3,7 +3,8 @@ use rayon::prelude::*;
 
 use crate::{
     attention::{head::PolyHead, position::cope::CoPE},
-    attention::memory::with_tls_phi,
+    attention::memory::{with_tls_acc_f64, with_tls_phi},
+    attention::utils::{smooth_clip_tanh, smooth_saturate_01},
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
     richards::RichardsGate,
 };
@@ -139,7 +140,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             ctx.head_selection_config.gating.soft_top_p_alpha,
         );
         let activation_scale = ctx.head_selection_config.max_heads.max(1) as f32;
-        soft_weights.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
+        soft_weights.mapv_inplace(|v| smooth_saturate_01(v * activation_scale));
         *ctx.cached_soft_top_p_mask = Some(soft_weights.clone());
 
         let mut soft_weights = soft_weights;
@@ -354,18 +355,38 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                             let mut s_val = scores_row[idx];
                             let pos = i.saturating_sub(j);
                             if pos < q_pe.len() { s_val += q_pe[pos]; }
-                            let s_clamped = s_val.clamp(-8.0, 8.0);
-                            let sp = if p_i32 <= 3 { match p_i32 { 1 => s_clamped, 2 => s_clamped * s_clamped, 3 => s_clamped * s_clamped * s_clamped, _ => unreachable!(), } } else {
-                                let mut result: f32 = 1.0; let current = s_clamped; for _ in 0..p_i32 { result *= current; if !result.is_finite() { result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN }; break; } } result };
+                            let s_stable = smooth_clip_tanh(s_val, 8.0);
+                            let sp = if p_i32 <= 3 {
+                                match p_i32 {
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                // With smooth saturation, `s_stable` is bounded so this is safe.
+                                let mut result: f32 = 1.0;
+                                for _ in 0..p_i32 {
+                                    result *= s_stable;
+                                }
+                                result
+                            };
                             phi_row[idx] = scale * (a * sp + b);
                         }
                         let v_slice = v.slice(s![j_start..j_end_excl, ..]);
-                        for h in 0..ctx.head_dim { y_row[h] = 0.0; }
-                        let eff = eff_i;
-                        for idx in 0..mlen {
-                            let phi = phi_row[idx] * eff;
-                            for h in 0..ctx.head_dim { y_row[h] += phi * v_slice[[idx, h]]; }
-                        }
+                        with_tls_acc_f64(ctx.head_dim, |acc| {
+                            acc.fill(0.0);
+                            let eff = eff_i as f64;
+                            for idx in 0..mlen {
+                                let phi = (phi_row[idx] as f64) * eff;
+                                for h in 0..ctx.head_dim {
+                                    acc[h] += phi * (v_slice[[idx, h]] as f64);
+                                }
+                            }
+                            for h in 0..ctx.head_dim {
+                                y_row[h] = acc[h] as f32;
+                            }
+                        });
                     });
                 });
             let mut out_block = Array2::<f32>::zeros((n, ctx.embed_dim));
@@ -492,9 +513,9 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
                 for idx in 0..m {
                     let j = j_start + idx; let mut s_val = scores_row[idx];
                     let pos = i.saturating_sub(j); if pos < q_pe.len() { s_val += q_pe[pos]; }
-                    let s_clamped = s_val.clamp(-8.0, 8.0);
-                    let sp = if p_i32 <= 3 { match p_i32 { 1 => s_clamped, 2 => s_clamped*s_clamped, 3 => s_clamped*s_clamped*s_clamped, _ => unreachable!(), } } else {
-                        let mut result: f32 = 1.0; let current = s_clamped; for _ in 0..p_i32 { result *= current; if !result.is_finite() { result = if s_clamped >= 0.0 { f32::MAX } else { f32::MIN }; break; } } result };
+                    let s_stable = smooth_clip_tanh(s_val, 8.0);
+                    let sp = if p_i32 <= 3 { match p_i32 { 1 => s_stable, 2 => s_stable*s_stable, 3 => s_stable*s_stable*s_stable, _ => unreachable!(), } } else {
+                        let mut result: f32 = 1.0; let current = s_stable; for _ in 0..p_i32 { result *= current; if !result.is_finite() { result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN }; break; } } result };
                     phi_row[idx] = scale * (a * sp + b);
                 }
                 let v_slice = v.slice(s![j_start..j_end_excl, ..]);
@@ -531,16 +552,21 @@ fn apply_soft_top_p_with_richards(
 
     // Process each token
     for (token_idx, token_gates) in gates.outer_iter().enumerate() {
-        // Convert to 1D array for processing
-        let token_gates_1d = token_gates.as_slice().unwrap();
-
         // Sort probabilities and compute cumulative sum (following AutoDeco approach)
-        let mut prob_indices: Vec<usize> = (0..token_gates_1d.len()).collect();
-        prob_indices.sort_by(|&i, &j| token_gates_1d[j].partial_cmp(&token_gates_1d[i]).unwrap());
+        let token_len = token_gates.len();
+        let mut prob_indices: Vec<usize> = (0..token_len).collect();
+        prob_indices.sort_by(|&i, &j| {
+            let a = token_gates[i];
+            let b = token_gates[j];
+            // Treat NaNs as very small so they sink to the end.
+            let a = if a.is_finite() { a } else { f32::NEG_INFINITY };
+            let b = if b.is_finite() { b } else { f32::NEG_INFINITY };
+            b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        let mut sorted_probs = Vec::with_capacity(token_gates_1d.len());
+        let mut sorted_probs = Vec::with_capacity(token_len);
         for &idx in &prob_indices {
-            sorted_probs.push(token_gates_1d[idx]);
+            sorted_probs.push(token_gates[idx]);
         }
 
         // Compute cumulative sum
@@ -561,22 +587,19 @@ fn apply_soft_top_p_with_richards(
             // sigmoid
             let activation = smooth_sigmoid.forward_scalar((alpha * diff) as f64) as f32;
 
-            // Add numerical stabilization: clamp the activation before exponential
-            let clamped_activation = activation.clamp(-5.0, 5.0);
-
             // Apply PadeExp directly for numerical stability
-            soft_mask.push(crate::pade::PadeExp::exp(clamped_activation as f64) as f32);
+            soft_mask.push(crate::pade::PadeExp::exp(activation as f64) as f32);
         }
 
         // Unsort the mask
-        let mut unsorted_mask = vec![0.0; token_gates_1d.len()];
+        let mut unsorted_mask = vec![0.0; token_len];
         for (i, &idx) in prob_indices.iter().enumerate() {
             unsorted_mask[idx] = soft_mask[i];
         }
 
         // Apply mask and renormalize
-        let mut masked_probs = Vec::with_capacity(token_gates_1d.len());
-        for (i, &prob) in token_gates_1d.iter().enumerate() {
+        let mut masked_probs = Vec::with_capacity(token_len);
+        for (i, &prob) in token_gates.iter().enumerate() {
             masked_probs.push(prob * unsorted_mask[i]);
         }
 
@@ -587,7 +610,7 @@ fn apply_soft_top_p_with_richards(
             }
         } else {
             // Fallback to original if all masked
-            for (i, &prob) in token_gates_1d.iter().enumerate() {
+            for (i, &prob) in token_gates.iter().enumerate() {
                 result[[token_idx, i]] = prob;
             }
         }

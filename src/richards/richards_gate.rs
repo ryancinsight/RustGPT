@@ -123,6 +123,20 @@ pub struct RichardsGate {
 
 impl RichardsGate {
     #[inline]
+    fn softplus_beta(z: f32, beta: f32) -> f32 {
+        // softplus_beta(z) = log(1+exp(beta*z))/beta
+        // beta controls sharpness; larger -> closer to hard clamp.
+        Self::softplus(beta * z) / beta
+    }
+
+    #[inline]
+    fn smooth_clamp(x: f32, lo: f32, hi: f32, beta: f32) -> f32 {
+        // Smooth approximation of clamp(x, lo, hi):
+        // lo + softplus(x-lo) - softplus(x-hi)
+        lo + Self::softplus_beta(x - lo, beta) - Self::softplus_beta(x - hi, beta)
+    }
+
+    #[inline]
     fn softplus(u: f32) -> f32 {
         // log(1 + exp(u)) computed stably.
         if u > 0.0 {
@@ -322,6 +336,9 @@ impl RichardsGate {
         self.temperature_optimizer
             .step(&mut u_arr, &grad_u_arr, learning_rate);
         self.temperature = Self::softplus(u_arr[[0, 0]]);
+
+        // Keep temperature in a stable operating range without hard clipping.
+        self.temperature = Self::smooth_clamp(self.temperature, 0.1, 10.0, 10.0);
 
         Ok(())
     }
@@ -555,7 +572,8 @@ mod tests {
         let (input_grads, param_grads) = gate.compute_gradients(&input, &output_grads);
 
         // Numerical gradient check for temperature parameter
-        let eps = 1e-6;
+        // f32 forward path: use a larger epsilon to avoid numerical cancellation.
+        let eps = 1e-3;
         let temp_orig = gate.temperature;
 
         // Forward pass with original temperature

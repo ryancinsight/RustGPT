@@ -1458,8 +1458,8 @@ mod tests {
             num_timesteps
         );
 
-        assert_eq!(residuals.embed_dim, embed_dim);
-        assert_eq!(residuals.max_seq_len, num_timesteps);
+        assert_eq!(residuals.embed_dim(), embed_dim);
+        assert_eq!(residuals.max_seq_len(), num_timesteps);
     }
 
     #[test]
@@ -1508,16 +1508,17 @@ mod tests {
         assert_eq!(result_late.shape(), [seq_len, embed_dim]);
 
         // Both should produce finite, reasonable values
-        assert!(result_early.iter().all(|&x| x.is_finite()));
-        assert!(result_late.iter().all(|&x| x.is_finite()));
+        assert!(result_early.iter().all(|x: &f32| x.is_finite()));
+        assert!(result_late.iter().all(|x: &f32| x.is_finite()));
     }
 
     #[test]
     fn test_snr_weighted_residuals() {
         let embed_dim = 8;
         let seq_len = 2;
+        let num_timesteps = 100;
 
-        let residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new(embed_dim);
+        let residuals = OptimizedAdvancedAdaptiveResidualsDiffusion::new(embed_dim, num_timesteps);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.5);
