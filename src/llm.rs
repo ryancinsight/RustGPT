@@ -814,6 +814,8 @@ impl LLM {
             let mut avg_experts_sum = 0.0f32;
             let mut significant_experts_sum = 0.0f32;
             let mut routing_entropy_sum = 0.0f32;
+            let mut experts_load_cv_sum = 0.0f32;
+            let mut experts_load_cv_count = 0usize;
             let mut experts_layers_count = 0usize;
             let mut total_experts_sum = 0usize;
 
@@ -872,9 +874,12 @@ impl LLM {
                         let layer_avg_active_experts = moe.config.get_avg_active_experts();
                         let layer_significant_experts = moe.config.get_avg_significant_experts();
                         let layer_routing_entropy = moe.config.get_routing_entropy();
+                        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
                         avg_experts_sum += layer_avg_active_experts;
                         significant_experts_sum += layer_significant_experts;
                         routing_entropy_sum += layer_routing_entropy;
+                        experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+                        experts_load_cv_count += 1;
                         experts_layers_count += 1;
                         total_experts_sum += moe.config.num_experts;
                     }
@@ -887,9 +892,12 @@ impl LLM {
                         let layer_avg_active_experts = moe.config.get_avg_active_experts();
                         let layer_significant_experts = moe.config.get_avg_significant_experts();
                         let layer_routing_entropy = moe.config.get_routing_entropy();
+                        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
                         avg_experts_sum += layer_avg_active_experts;
                         significant_experts_sum += layer_significant_experts;
                         routing_entropy_sum += layer_routing_entropy;
+                        experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+                        experts_load_cv_count += 1;
                         experts_layers_count += 1;
                         total_experts_sum += moe.config.num_experts;
                     }
@@ -928,9 +936,12 @@ impl LLM {
                                 let layer_avg_active_experts = moe.config.get_avg_active_experts();
                                 let layer_significant_experts = moe.config.get_avg_significant_experts();
                                 let layer_routing_entropy = moe.config.get_routing_entropy();
+                                let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
                                 avg_experts_sum += layer_avg_active_experts;
                                 significant_experts_sum += layer_significant_experts;
                                 routing_entropy_sum += layer_routing_entropy;
+                                experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+                                experts_load_cv_count += 1;
                                 experts_layers_count += 1;
                                 total_experts_sum += moe.config.num_experts;
                             }
@@ -942,9 +953,12 @@ impl LLM {
                                 let layer_avg_active_experts = moe.config.get_avg_active_experts();
                                 let layer_significant_experts = moe.config.get_avg_significant_experts();
                                 let layer_routing_entropy = moe.config.get_routing_entropy();
+                                let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
                                 avg_experts_sum += layer_avg_active_experts;
                                 significant_experts_sum += layer_significant_experts;
                                 routing_entropy_sum += layer_routing_entropy;
+                                experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+                                experts_load_cv_count += 1;
                                 experts_layers_count += 1;
                                 total_experts_sum += moe.config.num_experts;
                             }
@@ -955,9 +969,12 @@ impl LLM {
                     let layer_avg_active_experts = moe.config.get_avg_active_experts();
                     let layer_significant_experts = moe.config.get_avg_significant_experts();
                     let layer_routing_entropy = moe.config.get_routing_entropy();
+                    let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
                     avg_experts_sum += layer_avg_active_experts;
                     significant_experts_sum += layer_significant_experts;
                     routing_entropy_sum += layer_routing_entropy;
+                    experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+                    experts_load_cv_count += 1;
                     experts_layers_count += 1;
                     total_experts_sum += moe.config.num_experts;
                 }
@@ -1000,6 +1017,11 @@ impl LLM {
             };
             let avg_routing_entropy = if experts_layers_count > 0 {
                 routing_entropy_sum / experts_layers_count as f32
+            } else {
+                0.0
+            };
+            let experts_load_cv = if experts_load_cv_count > 0 {
+                experts_load_cv_sum / experts_load_cv_count as f32
             } else {
                 0.0
             };
@@ -1048,6 +1070,20 @@ impl LLM {
                 0.0
             };
 
+            // Balanced discrete distribution implied by (active_heads, active_experts).
+            // If active_heads is not divisible by active_experts, the best possible split is:
+            // - remainder experts get ceil(active_heads/active_experts)
+            // - the rest get floor(active_heads/active_experts)
+            let (heads_per_expert_min, heads_per_expert_max, heads_per_expert_remainder) =
+                if active_experts > 0 {
+                    let min_h = active_heads / active_experts;
+                    let rem = active_heads % active_experts;
+                    let max_h = min_h + if rem > 0 { 1 } else { 0 };
+                    (min_h, max_h, rem)
+                } else {
+                    (0, 0, 0)
+                };
+
             tracing::info!(
                 epoch = epoch,
                 tau_min = tau_min_log,
@@ -1062,7 +1098,11 @@ impl LLM {
                 active_experts = active_experts,
                 total_experts = total_experts,
                 heads_per_expert = heads_per_expert,
+                heads_per_expert_min = heads_per_expert_min,
+                heads_per_expert_max = heads_per_expert_max,
+                heads_per_expert_remainder = heads_per_expert_remainder,
                 avg_routing_entropy = avg_routing_entropy,
+                experts_load_cv = experts_load_cv,
                 "Attention/MoH/MoE metrics: heads {}/{}; experts {}/{}; heads/expert {:.2}",
                 active_heads,
                 total_heads,

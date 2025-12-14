@@ -566,7 +566,11 @@ impl Layer for TransformerBlock {
         let ffn_out = match &mut self.feedforward {
             FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_out),
             FeedForwardVariant::MixtureOfExperts(layer) => {
-                layer.forward_with_head_activity(&norm2_out, Some(head_activity_ratio))
+                layer.forward_with_head_features(
+                    &norm2_out,
+                    Some(head_activity_ratio),
+                    self.attention.last_head_activity_vec.as_deref(),
+                )
             }
         };
         

@@ -1,4 +1,4 @@
-use ndarray::{Array2, s};
+use ndarray::{Array1, Array2, Axis, s};
 use rayon::prelude::*;
 
 use crate::{
@@ -45,6 +45,9 @@ pub struct ForwardResult {
     pub tau_metrics: Option<(f32, f32)>,
     pub pred_norm: Option<f32>,
     pub avg_active_heads: Option<f32>,
+    /// Mean gating/selection value per head for this forward pass.
+    /// Length = num_heads when available.
+    pub head_activity_vec: Option<Array1<f32>>,
 }
 
 /// Compute polynomial attention forward pass
@@ -429,11 +432,23 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         None
     };
 
+    let head_activity_vec = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+        let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
+        let mut v = sanitized
+            .mean_axis(Axis(0))
+            .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
+        v.mapv_inplace(|x| if x.is_finite() { x.max(0.0) } else { 0.0 });
+        Some(v)
+    } else {
+        None
+    };
+
     ForwardResult {
         output: out,
         tau_metrics,
         pred_norm,
         avg_active_heads,
+        head_activity_vec,
     }
 }
 
@@ -548,7 +563,18 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
     };
     let tau_metrics = if tau_count_local > 0 { ctx.head_selection_config.metrics_tau_min = tau_min_local; ctx.head_selection_config.metrics_tau_max = tau_max_local; ctx.head_selection_config.metrics_tau_sum = tau_sum_local; ctx.head_selection_config.metrics_tau_count = tau_count_local; Some((tau_min_local, tau_max_local)) } else { None };
     let pred_norm = if g_count_local > 0 { let rms = (g_sq_sum_local / g_count_local as f32).sqrt(); ctx.head_selection_config.metrics_g_sq_sum = g_sq_sum_local; ctx.head_selection_config.metrics_g_count = g_count_local; Some(rms) } else { None };
-    ForwardResult { output: out, tau_metrics, pred_norm, avg_active_heads }
+    let head_activity_vec = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+        let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
+        let mut v = sanitized
+            .mean_axis(Axis(0))
+            .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
+        v.mapv_inplace(|x| if x.is_finite() { x.max(0.0) } else { 0.0 });
+        Some(v)
+    } else {
+        None
+    };
+
+    ForwardResult { output: out, tau_metrics, pred_norm, avg_active_heads, head_activity_vec }
 }
 
 /// Apply soft top-p selection using Richards sigmoid for smooth activation

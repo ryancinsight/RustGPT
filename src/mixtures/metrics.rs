@@ -219,17 +219,24 @@ impl MixtureMetrics {
 
         // Calculate entropy of the average gate values using iterator chains
         let total_sum: f32 = self.active_sum_per_component.iter().sum();
-        if total_sum == 0.0 {
+        if !total_sum.is_finite() || total_sum <= 0.0 {
             return 0.0;
         }
 
-        self.active_sum_per_component
+        let neg_sum = self
+            .active_sum_per_component
             .iter()
-            .map(|&sum| sum / total_sum)
-            .filter(|&prob| prob > 0.0)
+            .map(|&sum| {
+                let s = if sum.is_finite() { sum.max(0.0) } else { 0.0 };
+                s / total_sum
+            })
+            .filter(|&prob| prob.is_finite() && prob > 0.0)
             .map(|prob| prob * prob.ln())
-            .sum::<f32>()
-            .abs() // Entropy is always positive
+            .sum::<f32>();
+
+        // H = -∑ p ln(p)
+        let h = -neg_sum;
+        if h.is_finite() { h.max(0.0) } else { 0.0 }
     }
 
     /// Get RMS of gate values (useful for monitoring training stability)

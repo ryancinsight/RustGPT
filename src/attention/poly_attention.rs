@@ -271,6 +271,8 @@ pub struct PolyAttention {
     pub last_pred_norm: Option<f32>,
     #[serde(skip_serializing, skip_deserializing)]
     pub last_avg_active_heads: Option<f32>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub last_head_activity_vec: Option<Vec<f32>>,
     eff_skip_threshold: f32,
 
     #[serde(skip_serializing, skip_deserializing)]
@@ -379,6 +381,7 @@ impl PolyAttention {
             last_tau_metrics: None,
             last_pred_norm: None,
             last_avg_active_heads: None,
+            last_head_activity_vec: None,
             eff_skip_threshold: 1e-4,
             parallel_batch_size: 32,
             parallel_timeout_ms: 0,
@@ -529,6 +532,7 @@ impl PolyAttention {
         }
         self.last_pred_norm = result.pred_norm;
         self.last_avg_active_heads = result.avg_active_heads;
+        self.last_head_activity_vec = result.head_activity_vec.as_ref().map(|v| v.to_vec());
 
         self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
         result.output
@@ -565,6 +569,18 @@ impl PolyAttention {
             parallel_timeout_ms: self.parallel_timeout_ms,
         };
         let result = crate::attention::forward::compute_poly_attention_forward_baseline(&mut ctx, causal);
+
+        // Update metrics from the result (baseline path)
+        if let Some((tmin, tmax)) = result.tau_metrics {
+            self.last_tau_metrics = Some((tmin, tmax));
+        } else {
+            self.last_tau_metrics = None;
+        }
+        self.last_pred_norm = result.pred_norm;
+        self.last_avg_active_heads = result.avg_active_heads;
+        self.last_head_activity_vec = result.head_activity_vec.as_ref().map(|v| v.to_vec());
+
+        self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
         result.output
     }
 

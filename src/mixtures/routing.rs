@@ -278,7 +278,7 @@ pub fn compute_routing_entropy(routing_weights: &ndarray::ArrayView2<f32>) -> f3
     let num_tokens = routing_weights.nrows() as f32;
 
     // Use iterator chains for zero-copy entropy computation
-    routing_weights
+    let neg_sum = routing_weights
         .outer_iter()
         .map(|token_weights| {
             token_weights
@@ -288,8 +288,10 @@ pub fn compute_routing_entropy(routing_weights: &ndarray::ArrayView2<f32>) -> f3
                 .sum::<f32>()
         })
         .sum::<f32>()
-        .abs()
-        / num_tokens
+        / num_tokens;
+
+    let h = -neg_sum;
+    if h.is_finite() { h.max(0.0) } else { 0.0 }
 }
 
 /// Get average number of active components per token
