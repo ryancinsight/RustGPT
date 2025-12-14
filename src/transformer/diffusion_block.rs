@@ -745,12 +745,17 @@ impl DiffusionBlock {
             DiffusionPredictionTarget::Sample => {
                 let sqrt_alpha = self.noise_scheduler.sqrt_alpha_cumprod(t);
                 let sqrt_one_minus_alpha = self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
-                (x_t - (output * sqrt_alpha)) / sqrt_one_minus_alpha.max(1e-6)
+                if sqrt_one_minus_alpha.is_finite() && sqrt_one_minus_alpha > 0.0 {
+                    (x_t - (output * sqrt_alpha)) / sqrt_one_minus_alpha
+                } else {
+                    Array2::<f32>::zeros(x_t.raw_dim())
+                }
             }
             DiffusionPredictionTarget::VPrediction => {
                 let sqrt_alpha = self.noise_scheduler.sqrt_alpha_cumprod(t);
                 let sqrt_one_minus_alpha = self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
-                (output * sqrt_one_minus_alpha) + (x_t * sqrt_alpha) // Approximation/derivation check needed, but standard V-pred conversion
+                // For v-prediction (Salimans & Ho): eps = sqrt(1-ᾱ_t) * x_t + sqrt(ᾱ_t) * v
+                (x_t * sqrt_one_minus_alpha) + (output * sqrt_alpha)
             }
         }
     }
@@ -818,28 +823,32 @@ impl DiffusionBlock {
             output
         };
 
+        // Compute the predicted noise before moving intermediates into the cache.
+        let mut predicted_noise = self.convert_prediction_to_epsilon(x_t, &output, t);
+        Self::sanitize_tensor("predicted_noise", &mut predicted_noise);
+
+        // Move owned intermediates into the cache to avoid extra cloning.
+        let h_vec = Array1::from_vec(h.row(0).to_vec());
+
         *self.cached_intermediates.write().unwrap() = Some(DiffusionCachedIntermediates {
             input: x_t.clone(),
             time_embed,
             norm1_out,
-            norm1_mod: norm1_mod.clone(),
-            residual1: residual1.clone(),
+            norm1_mod,
+            residual1,
             norm2_out,
-            norm2_mod: norm2_mod.clone(),
-            h_vec: Array1::from_vec(h.row(0).to_vec()),
-            gamma_attn: gamma_attn_vec.clone(),
-            beta_attn: beta_attn_vec.clone(),
-            gamma_ffn: gamma_ffn_vec.clone(),
-            beta_ffn: beta_ffn_vec.clone(),
-            gamma_beta: gamma_beta.clone(),
-            attn_out: attn_out.clone(),
-            ffn_out: ffn_out.clone(),
-            output: output.clone(),
+            norm2_mod,
+            h_vec,
+            gamma_attn: gamma_attn_vec,
+            beta_attn: beta_attn_vec,
+            gamma_ffn: gamma_ffn_vec,
+            beta_ffn: beta_ffn_vec,
+            gamma_beta,
+            attn_out,
+            ffn_out,
+            output,
             timestep: t,
         });
-
-        let mut predicted_noise = self.convert_prediction_to_epsilon(x_t, &output, t);
-        Self::sanitize_tensor("predicted_noise", &mut predicted_noise);
         if self.adaptive_window_on {
             if let Some(pn) = self.attention.last_pred_norm {
                 let mut ws = self.current_window_size.unwrap_or(self.win_max);
@@ -876,8 +885,8 @@ impl DiffusionBlock {
         let normal = Normal::new(0.0, 1.0).unwrap();
         let mut rng = get_rng();
         if let Some(slice) = x_t.as_slice_mut() {
-            slice.par_iter_mut().for_each(|v| {
-                *v = normal.sample(&mut get_rng()) as f32;
+            slice.par_iter_mut().for_each_init(|| get_rng(), |rng, v| {
+                *v = normal.sample(rng) as f32;
             });
         } else {
             for v in x_t.iter_mut() {
