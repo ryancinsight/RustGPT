@@ -96,9 +96,14 @@ impl MixtureMetrics {
             self.resize(num_components);
         }
 
-        // Update per-component activation sums across all tokens
+        // Update per-component activation sums across all tokens.
+        // Be robust to any non-finite gate values (treat them as 0.0 for metrics).
         for component_idx in 0..self.active_sum_per_component.len() {
-            let component_sum: f32 = gate_values.column(component_idx).sum();
+            let component_sum: f32 = gate_values
+                .column(component_idx)
+                .iter()
+                .map(|&v| if v.is_finite() { v } else { 0.0 })
+                .sum();
             self.active_sum_per_component[component_idx] += component_sum;
         }
 
@@ -106,7 +111,9 @@ impl MixtureMetrics {
         for token_idx in 0..gate_values.nrows() {
             let token_gates = gate_values.row(token_idx);
             for component_idx in 0..self.active_sum_per_component.len() {
-                if token_gates[component_idx] > 0.1 {
+                let gate_val = token_gates[component_idx];
+                let gate_val = if gate_val.is_finite() { gate_val } else { 0.0 };
+                if gate_val > 0.1 {
                     // Threshold for "active"
                     self.token_count_per_component[component_idx] += 1;
                 }
@@ -115,12 +122,15 @@ impl MixtureMetrics {
 
         // Update gate value statistics
         for &gate_val in gate_values.iter() {
+            if !gate_val.is_finite() {
+                continue;
+            }
             self.gate_min = self.gate_min.min(gate_val);
             self.gate_max = self.gate_max.max(gate_val);
             self.gate_sum += gate_val;
             self.gate_sq_sum += gate_val * gate_val;
+            self.gate_count += 1;
         }
-        self.gate_count += gate_values.len();
         self.total_decisions += gate_values.nrows();
     }
 
@@ -194,15 +204,11 @@ impl MixtureMetrics {
             return 0.0;
         }
 
-        // Count components with gate value > 0.1 as "significant"
-        let significant_count: usize = self.gate_count.saturating_sub(
-            self.active_sum_per_component
-                .iter()
-                .map(|&sum| if sum <= 0.1 { 1 } else { 0 })
-                .sum::<usize>(),
-        );
-
-        significant_count as f32 / self.total_decisions as f32
+        // token_count_per_component tracks, for each component, how many tokens had gate > 0.1.
+        // Summing across components yields the total number of "significant" component activations
+        // across all tokens.
+        let total_significant: usize = self.token_count_per_component.iter().copied().sum();
+        total_significant as f32 / self.total_decisions as f32
     }
 
     /// Get gating entropy (higher = more uniform distribution across components)
@@ -381,5 +387,43 @@ mod tests {
 
         let avg = metrics.get_avg_active_components();
         assert!((avg - 1.0).abs() < 1e-6); // Should be 1.0 (normalized)
+    }
+
+    #[test]
+    fn test_metrics_nan_inf_robustness() {
+        let mut metrics = MixtureMetrics::new(3);
+        let gate_values = ndarray::Array2::from_shape_vec(
+            (2, 3),
+            vec![
+                1.0, 0.0, 0.0,
+                f32::NAN, f32::INFINITY, 0.0,
+            ],
+        )
+        .unwrap();
+
+        metrics.update(&gate_values.view());
+
+        assert!(metrics.get_avg_active_components().is_finite());
+        assert!(metrics.get_avg_significant_components().is_finite());
+        assert!(metrics.get_gating_entropy().is_finite());
+    }
+
+    #[test]
+    fn test_get_avg_significant_components() {
+        let mut metrics = MixtureMetrics::new(3);
+        let gate_values = ndarray::Array2::from_shape_vec(
+            (2, 3),
+            vec![
+                0.2, 0.2, 0.6, // 3 significant (>0.1)
+                0.0, 0.15, 0.85, // 2 significant (>0.1)
+            ],
+        )
+        .unwrap();
+
+        metrics.update(&gate_values.view());
+
+        // (3 + 2) / 2 tokens = 2.5
+        let avg = metrics.get_avg_significant_components();
+        assert!((avg - 2.5).abs() < 1e-6);
     }
 }

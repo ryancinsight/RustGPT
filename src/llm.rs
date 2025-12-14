@@ -360,12 +360,27 @@ impl LLM {
         // Forward through embeddings
         let mut hidden = self.network[0].forward(&token_ids);
 
+        // Similarity context threaded across successive TransformerBlock layers.
+        let mut similarity_ctx: Option<Array2<f32>> = None;
+
         // Forward through all layers except output projection
         let network_len = self.network.len();
         for i in 1..network_len {
             match &mut self.network[i] {
                 LayerEnum::OutputProjection(_) => break, // Stop before output projection
-                layer => hidden = layer.forward(&hidden),
+                LayerEnum::TransformerBlock(block) => {
+                    block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                    hidden = block.forward(&hidden);
+                    if let Some(existing) = similarity_ctx.as_mut() {
+                        existing.assign(block.activation_similarity_matrix());
+                    } else {
+                        similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                    }
+                }
+                layer => {
+                    similarity_ctx = None;
+                    hidden = layer.forward(&hidden);
+                }
             }
         }
 
@@ -568,8 +583,26 @@ impl LLM {
             let mut hidden_states = input.clone();
             let mut logits = Array2::zeros((1, self.vocab.size()));
 
+            // Similarity context threaded across successive TransformerBlock layers.
+            let mut similarity_ctx: Option<Array2<f32>> = None;
+
             for (i, layer) in self.network.iter_mut().enumerate() {
-                input = layer.forward(&input);
+                input = match layer {
+                    LayerEnum::TransformerBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(&input);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    _ => {
+                        similarity_ctx = None;
+                        layer.forward(&input)
+                    }
+                };
 
                 // Capture hidden states before output projection (second-to-last layer)
                 if i == network_len - 2 {
@@ -827,6 +860,33 @@ impl LLM {
                         avg_heads_per_token_sum += layer_avg_active_heads;
                         heads_layers_count += 1;
                     }
+
+                    // Pull through MoE metrics when MoE is used inside the block.
+                    if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
+                        &block.feedforward
+                    {
+                        let layer_avg_active_experts = moe.config.get_avg_active_experts();
+                        let layer_significant_experts = moe.config.get_avg_significant_experts();
+                        let layer_routing_entropy = moe.config.get_routing_entropy();
+                        avg_experts_sum += layer_avg_active_experts;
+                        significant_experts_sum += layer_significant_experts;
+                        routing_entropy_sum += layer_routing_entropy;
+                        experts_layers_count += 1;
+                    }
+                }
+                if let LayerEnum::DiffusionBlock(block) = layer {
+                    // Pull through MoE metrics when MoE is used inside the diffusion block.
+                    if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
+                        &block.feedforward
+                    {
+                        let layer_avg_active_experts = moe.config.get_avg_active_experts();
+                        let layer_significant_experts = moe.config.get_avg_significant_experts();
+                        let layer_routing_entropy = moe.config.get_routing_entropy();
+                        avg_experts_sum += layer_avg_active_experts;
+                        significant_experts_sum += layer_significant_experts;
+                        routing_entropy_sum += layer_routing_entropy;
+                        experts_layers_count += 1;
+                    }
                 }
                 if let LayerEnum::LRM(lrm) = layer {
                     if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
@@ -848,6 +908,38 @@ impl LLM {
                             per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
                         avg_heads_per_token_sum += layer_avg_active_heads;
                         heads_layers_count += 1;
+                    }
+
+                    // Pull through MoE metrics when MoE is used inside the recursive core block.
+                    // LRM wraps either a TransformerBlock or DiffusionBlock.
+                    let guard = lrm.block.read().unwrap();
+                    match &*guard {
+                        crate::transformer::lrm::RecursiveBlockVariant::Transformer(b) => {
+                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
+                                &b.feedforward
+                            {
+                                let layer_avg_active_experts = moe.config.get_avg_active_experts();
+                                let layer_significant_experts = moe.config.get_avg_significant_experts();
+                                let layer_routing_entropy = moe.config.get_routing_entropy();
+                                avg_experts_sum += layer_avg_active_experts;
+                                significant_experts_sum += layer_significant_experts;
+                                routing_entropy_sum += layer_routing_entropy;
+                                experts_layers_count += 1;
+                            }
+                        }
+                        crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
+                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
+                                &b.feedforward
+                            {
+                                let layer_avg_active_experts = moe.config.get_avg_active_experts();
+                                let layer_significant_experts = moe.config.get_avg_significant_experts();
+                                let layer_routing_entropy = moe.config.get_routing_entropy();
+                                avg_experts_sum += layer_avg_active_experts;
+                                significant_experts_sum += layer_significant_experts;
+                                routing_entropy_sum += layer_routing_entropy;
+                                experts_layers_count += 1;
+                            }
+                        }
                     }
                 }
                 if let LayerEnum::MixtureOfExperts(moe) = layer {
@@ -889,17 +981,17 @@ impl LLM {
             let avg_active_experts = if experts_layers_count > 0 {
                 avg_experts_sum / experts_layers_count as f32
             } else {
-                f32::NAN
+                0.0
             };
             let avg_significant_experts = if experts_layers_count > 0 {
                 significant_experts_sum / experts_layers_count as f32
             } else {
-                f32::NAN
+                0.0
             };
             let avg_routing_entropy = if experts_layers_count > 0 {
                 routing_entropy_sum / experts_layers_count as f32
             } else {
-                f32::NAN
+                0.0
             };
 
             tracing::info!(
@@ -1467,9 +1559,26 @@ impl LLM {
             let mut layer_variances: Vec<f32> = Vec::new();
             let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
 
+            let mut similarity_ctx: Option<Array2<f32>> = None;
+
             for layer in &mut self.network {
                 layer_inputs.push(input.clone());
-                input = layer.forward(&input);
+                input = match layer {
+                    LayerEnum::TransformerBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(&input);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    _ => {
+                        similarity_ctx = None;
+                        layer.forward(&input)
+                    }
+                };
 
                 // Compute variance of layer output in single pass
                 let (sum, sum_sq) = input

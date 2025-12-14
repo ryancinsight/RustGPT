@@ -36,6 +36,12 @@ pub struct UnifiedAdaptiveResiduals {
     /// Compact weight similarity matrix (embed_dim × embed_dim)
     pub weight_similarity_matrix: Array2<f32>,
 
+    /// Activation-derived similarity representation (embed_dim × embed_dim)
+    ///
+    /// This tracks, per layer, how input channels align with output channels.
+    /// Values are bounded smoothly into [-1, 1] and updated as an EMA.
+    pub activation_similarity_matrix: Array2<f32>,
+
     /// Per-channel affinity scores (embed_dim × 1)
     pub layer_affinity_scores: Array2<f32>,
 
@@ -80,6 +86,14 @@ pub struct UnifiedAdaptiveResiduals {
     similarity_update_rate: f32,
     residual_stability_threshold: f32,
 
+    /// Representative similarity statistics (EMA)
+    ///
+    /// These are not trained parameters; they track running alignment between
+    /// the residual stream and the residual branch. They provide a stable,
+    /// representative signal for modulating residual gating.
+    similarity_ema_global: f32,
+    similarity_ema_per_channel: Array2<f32>,
+
     /// Performance caches
     similarity_matrix_valid: bool,
     last_similarity_update: usize,
@@ -122,6 +136,7 @@ impl UnifiedAdaptiveResiduals {
 
         // Initialize with intelligent defaults for better convergence
         let weight_similarity_matrix = Array2::from_elem((embed_dim, embed_dim), 0.1);
+        let activation_similarity_matrix = Array2::zeros((embed_dim, embed_dim));
         let layer_affinity_scores = Array2::from_elem((embed_dim, 1), 1.0);
 
         // Combined QKV attention parameters for efficiency
@@ -175,6 +190,7 @@ impl UnifiedAdaptiveResiduals {
 
         Self {
             weight_similarity_matrix,
+            activation_similarity_matrix,
             layer_affinity_scores,
             residual_attention_qkv,
             channel_affinity_matrix,
@@ -196,9 +212,109 @@ impl UnifiedAdaptiveResiduals {
             embed_dim,
             similarity_update_rate: 0.01,
             residual_stability_threshold: 0.1,
+            similarity_ema_global: 0.0,
+            similarity_ema_per_channel: Array2::zeros((embed_dim, 1)),
             similarity_matrix_valid: false,
             last_similarity_update: 0,
         }
+    }
+
+    #[inline]
+    fn update_activation_similarity_matrix(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
+        // Update an EMA similarity matrix between input/output channels.
+        // This is meant as a *representation* of how similarity evolves per layer.
+        let rate = smooth_clamp(self.similarity_update_rate, 0.0, 1.0, 10.0);
+        if rate <= 0.0 {
+            return;
+        }
+
+        let seq_len = input.nrows().min(output.nrows());
+        let embed_dim = input.ncols().min(output.ncols()).min(self.embed_dim);
+        if seq_len == 0 || embed_dim == 0 {
+            return;
+        }
+
+        // Sample along sequence to reduce cost: O(sample * d^2).
+        let sample = seq_len.min(32);
+        let step = (seq_len / sample).max(1);
+
+        // Precompute per-channel norms on the sampled rows.
+        let mut nx = vec![0.0f64; embed_dim];
+        let mut ny = vec![0.0f64; embed_dim];
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
+            for j in 0..embed_dim {
+                let x = input[[seq_idx, j]];
+                let y = output[[seq_idx, j]];
+                let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                nx[j] += xs * xs;
+                ny[j] += ys * ys;
+            }
+        }
+
+        for i in 0..embed_dim {
+            for j in 0..embed_dim {
+                let mut dot = 0.0f64;
+                for seq_idx in (0..seq_len).step_by(step).take(sample) {
+                    let x = input[[seq_idx, i]];
+                    let y = output[[seq_idx, j]];
+                    let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                    let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                    dot += xs * ys;
+                }
+
+                let denom = (nx[i] * ny[j]).sqrt();
+                let sim = if denom > 1e-12 { (dot / denom) as f32 } else { 0.0 };
+                let sim = if sim.is_finite() { sim.tanh() } else { 0.0 };
+
+                let prev = self.activation_similarity_matrix[[i, j]];
+                self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
+            }
+        }
+    }
+
+    #[inline]
+    fn update_similarity_ema(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
+        let rate = smooth_clamp(self.similarity_update_rate, 0.0, 1.0, 10.0);
+        if rate <= 0.0 {
+            return;
+        }
+
+        let seq_len = input.nrows().min(output.nrows());
+        let embed_dim = input.ncols().min(output.ncols()).min(self.embed_dim);
+        if seq_len == 0 || embed_dim == 0 {
+            return;
+        }
+
+        // Per-channel cosine similarity across the sequence dimension.
+        // Uses f64 accumulation for numerical accuracy and robustness.
+        let mut global_acc = 0.0f64;
+        for embed_idx in 0..embed_dim {
+            let mut dot = 0.0f64;
+            let mut nx = 0.0f64;
+            let mut ny = 0.0f64;
+            for seq_idx in 0..seq_len {
+                let x = input[[seq_idx, embed_idx]];
+                let y = output[[seq_idx, embed_idx]];
+                let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                dot += xs * ys;
+                nx += xs * xs;
+                ny += ys * ys;
+            }
+
+            let denom = (nx * ny).sqrt();
+            let sim = if denom > 1e-12 { (dot / denom) as f32 } else { 0.0 };
+            let sim = if sim.is_finite() { sim.tanh() } else { 0.0 };
+
+            let prev = self.similarity_ema_per_channel[[embed_idx, 0]];
+            self.similarity_ema_per_channel[[embed_idx, 0]] = (1.0 - rate) * prev + rate * sim;
+            global_acc += self.similarity_ema_per_channel[[embed_idx, 0]] as f64;
+        }
+
+        let mean = (global_acc / embed_dim as f64) as f32;
+        self.similarity_ema_global = if mean.is_finite() { mean } else { 0.0 };
+        self.last_similarity_update = self.last_similarity_update.saturating_add(1);
     }
 
     /// SIMD-optimized cosine similarity computation
@@ -284,11 +400,11 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
     fn apply_attention_residual(&mut self, input: &Array2<f32>, attn_out: &Array2<f32>) -> Array2<f32> {
         let seq_len = input.nrows();
 
-        // Ensure similarity matrix is current
-        if !self.similarity_matrix_valid {
-            let dummy_weights = Array2::from_elem((seq_len, self.embed_dim), 0.1);
-            self.compute_batch_similarity_matrix(&dummy_weights, &dummy_weights);
-        }
+        // Update representative similarity statistics.
+        self.update_similarity_ema(input, attn_out);
+
+        // Update per-layer similarity representation matrix (input→output channel similarity).
+        self.update_activation_similarity_matrix(input, attn_out);
 
         // Similarity-based residual fusion.
         // Signed gating: positive similarity increases contribution; negative similarity
@@ -306,7 +422,10 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
             for embed_idx in 0..self.embed_dim {
                 let affinity = smooth_clamp(self.layer_affinity_scores[[embed_idx, 0]], 0.0, 2.0, beta_clamp);
                 let scale = self.attention_residual_scales[[embed_idx, 0]];
-                let gate = sim_centered * affinity * scale;
+                // Confidence from representative per-channel similarity magnitude.
+                let rep = self.similarity_ema_per_channel[[embed_idx.min(self.embed_dim - 1), 0]];
+                let conf = smooth_clamp(rep.abs(), 0.0, 1.0, beta_clamp);
+                let gate = sim_centered * affinity * scale * (0.5 + 0.5 * conf);
                 let gate = smooth_clamp(gate, -gate_limit, gate_limit, beta_clamp);
                 let weight = 1.0 + gate;
 
@@ -329,7 +448,7 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
         let beta_clamp = 10.0;
         let sim_beta = 1.5;
         let gate_limit = 2.0;
-        let avg_similarity = smooth_clamp(self.weight_similarity_matrix.mean().unwrap_or(0.0), -1.0, 1.0, beta_clamp);
+        let avg_similarity = smooth_clamp(self.similarity_ema_global, -1.0, 1.0, beta_clamp);
 
         for seq_idx in 0..seq_len {
             let sim_raw = Self::cosine_similarity_rows(residual1, ffn_out, seq_idx);
@@ -338,7 +457,9 @@ impl AdaptiveResidualStrategy for UnifiedAdaptiveResiduals {
 
             for embed_idx in 0..self.embed_dim {
                 let scale = self.ffn_residual_scales[[embed_idx, 0]];
-                let gate = sim_centered * avg_similarity * scale;
+                let rep = self.similarity_ema_per_channel[[embed_idx.min(self.embed_dim - 1), 0]];
+                let rep = smooth_clamp(rep, -1.0, 1.0, beta_clamp);
+                let gate = sim_centered * (0.5 * avg_similarity + 0.5 * rep) * scale;
                 let gate = smooth_clamp(gate, -gate_limit, gate_limit, beta_clamp);
                 let effective_scale = 1.0 + gate;
 

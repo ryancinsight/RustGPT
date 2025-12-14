@@ -44,6 +44,7 @@ pub struct ForwardResult {
     pub output: Array2<f32>,
     pub tau_metrics: Option<(f32, f32)>,
     pub pred_norm: Option<f32>,
+    pub avg_active_heads: Option<f32>,
 }
 
 /// Compute polynomial attention forward pass
@@ -422,10 +423,17 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         None
     };
 
+    let avg_active_heads = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+        Some(crate::mixtures::routing::compute_avg_active_components(&gate_values.view()))
+    } else {
+        None
+    };
+
     ForwardResult {
         output: out,
         tau_metrics,
         pred_norm,
+        avg_active_heads,
     }
 }
 
@@ -532,10 +540,15 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
         out = out + &out_block;
     }
 
-    if gate_values.nrows() > 0 && gate_values.ncols() > 0 { ctx.head_selection_config.update_metrics(&gate_values.view()); }
+    let avg_active_heads = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+        ctx.head_selection_config.update_metrics(&gate_values.view());
+        Some(crate::mixtures::routing::compute_avg_active_components(&gate_values.view()))
+    } else {
+        None
+    };
     let tau_metrics = if tau_count_local > 0 { ctx.head_selection_config.metrics_tau_min = tau_min_local; ctx.head_selection_config.metrics_tau_max = tau_max_local; ctx.head_selection_config.metrics_tau_sum = tau_sum_local; ctx.head_selection_config.metrics_tau_count = tau_count_local; Some((tau_min_local, tau_max_local)) } else { None };
     let pred_norm = if g_count_local > 0 { let rms = (g_sq_sum_local / g_count_local as f32).sqrt(); ctx.head_selection_config.metrics_g_sq_sum = g_sq_sum_local; ctx.head_selection_config.metrics_g_count = g_count_local; Some(rms) } else { None };
-    ForwardResult { output: out, tau_metrics, pred_norm }
+    ForwardResult { output: out, tau_metrics, pred_norm, avg_active_heads }
 }
 
 /// Apply soft top-p selection using Richards sigmoid for smooth activation
