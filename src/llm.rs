@@ -810,10 +810,12 @@ impl LLM {
             let mut pred_norm_count = 0usize;
             let mut avg_heads_per_token_sum = 0.0f32;
             let mut heads_layers_count = 0usize;
+            let mut total_heads_sum = 0usize;
             let mut avg_experts_sum = 0.0f32;
             let mut significant_experts_sum = 0.0f32;
             let mut routing_entropy_sum = 0.0f32;
             let mut experts_layers_count = 0usize;
+            let mut total_experts_sum = 0usize;
 
             for layer in &mut self.network {
                 if let LayerEnum::PolyAttention(pa) = layer {
@@ -836,6 +838,7 @@ impl LLM {
                             per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
                         avg_heads_per_token_sum += layer_avg_active_heads;
                         heads_layers_count += 1;
+                        total_heads_sum += per_head.len();
                     }
                 }
                 if let LayerEnum::TransformerBlock(block) = layer {
@@ -859,6 +862,7 @@ impl LLM {
                             per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
                         avg_heads_per_token_sum += layer_avg_active_heads;
                         heads_layers_count += 1;
+                        total_heads_sum += per_head.len();
                     }
 
                     // Pull through MoE metrics when MoE is used inside the block.
@@ -872,6 +876,7 @@ impl LLM {
                         significant_experts_sum += layer_significant_experts;
                         routing_entropy_sum += layer_routing_entropy;
                         experts_layers_count += 1;
+                        total_experts_sum += moe.config.num_experts;
                     }
                 }
                 if let LayerEnum::DiffusionBlock(block) = layer {
@@ -886,6 +891,7 @@ impl LLM {
                         significant_experts_sum += layer_significant_experts;
                         routing_entropy_sum += layer_routing_entropy;
                         experts_layers_count += 1;
+                        total_experts_sum += moe.config.num_experts;
                     }
                 }
                 if let LayerEnum::LRM(lrm) = layer {
@@ -908,6 +914,7 @@ impl LLM {
                             per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
                         avg_heads_per_token_sum += layer_avg_active_heads;
                         heads_layers_count += 1;
+                        total_heads_sum += per_head.len();
                     }
 
                     // Pull through MoE metrics when MoE is used inside the recursive core block.
@@ -925,6 +932,7 @@ impl LLM {
                                 significant_experts_sum += layer_significant_experts;
                                 routing_entropy_sum += layer_routing_entropy;
                                 experts_layers_count += 1;
+                                total_experts_sum += moe.config.num_experts;
                             }
                         }
                         crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
@@ -938,6 +946,7 @@ impl LLM {
                                 significant_experts_sum += layer_significant_experts;
                                 routing_entropy_sum += layer_routing_entropy;
                                 experts_layers_count += 1;
+                                total_experts_sum += moe.config.num_experts;
                             }
                         }
                     }
@@ -950,6 +959,7 @@ impl LLM {
                     significant_experts_sum += layer_significant_experts;
                     routing_entropy_sum += layer_routing_entropy;
                     experts_layers_count += 1;
+                    total_experts_sum += moe.config.num_experts;
                 }
             }
 
@@ -994,6 +1004,50 @@ impl LLM {
                 0.0
             };
 
+            // Presentable (active/total) counts and a coupled ratio.
+            let total_heads = if heads_layers_count > 0 {
+                ((total_heads_sum as f32) / (heads_layers_count as f32)).round().max(0.0) as usize
+            } else {
+                0
+            };
+            let total_experts = if experts_layers_count > 0 {
+                ((total_experts_sum as f32) / (experts_layers_count as f32)).round().max(0.0) as usize
+            } else {
+                0
+            };
+
+            let avg_active_heads_s = if avg_active_heads.is_finite() {
+                avg_active_heads.max(0.0)
+            } else {
+                0.0
+            };
+            let avg_significant_experts_s = if avg_significant_experts.is_finite() {
+                avg_significant_experts.max(0.0)
+            } else {
+                0.0
+            };
+
+            let active_heads = if total_heads > 0 {
+                avg_active_heads_s
+                    .round()
+                    .clamp(0.0, total_heads as f32) as usize
+            } else {
+                0
+            };
+            // For display, treat "active experts" as those with significant weight (> 0.1).
+            let active_experts = if total_experts > 0 {
+                avg_significant_experts_s
+                    .round()
+                    .clamp(0.0, total_experts as f32) as usize
+            } else {
+                0
+            };
+            let heads_per_expert = if active_experts > 0 {
+                active_heads as f32 / active_experts as f32
+            } else {
+                0.0
+            };
+
             tracing::info!(
                 epoch = epoch,
                 tau_min = tau_min_log,
@@ -1001,10 +1055,20 @@ impl LLM {
                 tau_range = tau_range_log,
                 pred_norm_rms = pred_norm_rms,
                 avg_active_heads = avg_active_heads,
+                active_heads = active_heads,
+                total_heads = total_heads,
                 avg_active_experts = avg_active_experts,
                 avg_significant_experts = avg_significant_experts,
+                active_experts = active_experts,
+                total_experts = total_experts,
+                heads_per_expert = heads_per_expert,
                 avg_routing_entropy = avg_routing_entropy,
-                "Attention/MoH/MoE metrics"
+                "Attention/MoH/MoE metrics: heads {}/{}; experts {}/{}; heads/expert {:.2}",
+                active_heads,
+                total_heads,
+                active_experts,
+                total_experts,
+                heads_per_expert
             );
 
             // Collect current richards_glu richards weights for delta tracking

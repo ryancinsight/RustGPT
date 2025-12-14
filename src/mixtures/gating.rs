@@ -205,22 +205,37 @@ impl GatingConfig {
 pub fn select_top_k_components(gate_values: &ndarray::Array2<f32>, k: usize) -> Vec<Vec<usize>> {
     let mut selections = Vec::new();
 
+    if gate_values.nrows() == 0 || gate_values.ncols() == 0 {
+        return selections;
+    }
+
+    let k = k.clamp(1, gate_values.ncols());
+
     for row in gate_values.outer_iter() {
-        let mut component_gates: Vec<(usize, f32)> = row
-            .iter()
-            .enumerate()
-            .map(|(idx, &gate)| (idx, gate))
-            .collect();
+        // Maintain a small set of best (score, idx) pairs (O(E*k)).
+        let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
+        for (idx, &gate) in row.iter().enumerate() {
+            let score = if gate.is_finite() { gate } else { f32::NEG_INFINITY };
+            if best.len() < k {
+                best.push((score, idx));
+                continue;
+            }
 
-        // Sort by gate value (descending)
-        component_gates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let mut min_pos = 0usize;
+            let mut min_score = best[0].0;
+            for (p, (s, _)) in best.iter().enumerate().skip(1) {
+                if *s < min_score {
+                    min_score = *s;
+                    min_pos = p;
+                }
+            }
 
-        // Take top-k components
-        let selected: Vec<usize> = component_gates
-            .into_iter()
-            .take(k)
-            .map(|(idx, _)| idx)
-            .collect();
+            if score > min_score {
+                best[min_pos] = (score, idx);
+            }
+        }
+
+        let selected: Vec<usize> = best.into_iter().map(|(_s, idx)| idx).collect();
 
         selections.push(selected);
     }
