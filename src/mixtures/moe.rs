@@ -835,6 +835,10 @@ pub struct MixtureOfExperts {
     /// Cached expert outputs for gradient computation
     #[serde(skip)]
     cached_expert_outputs: Option<Vec<ndarray::Array2<f32>>>,
+
+    /// Cached per-expert weighted grad buffers for backward() to reduce allocations
+    #[serde(skip)]
+    cached_weighted_grads: Option<Vec<ndarray::Array2<f32>>>,
 }
 
 impl MixtureOfExperts {
@@ -858,6 +862,7 @@ impl MixtureOfExperts {
             cached_router_input: None,
             cached_active_expert_mask: None,
             cached_expert_outputs: None,
+            cached_weighted_grads: None,
         }
     }
 
@@ -937,25 +942,12 @@ impl MixtureOfExperts {
             base_k
         };
 
-        // Build sparse top-k mask and apply to routing probabilities.
-        let mask = top_k_mask(&routing_probs, effective_k);
-        let mut masked_probs = routing_probs;
-        masked_probs.zip_mut_with(&mask, |p, &m| {
-            *p = if p.is_finite() { *p } else { 0.0 };
-            *p *= m;
-        });
-
-        // Renormalize per token so probabilities sum to 1 (if any selected).
-        for mut row in masked_probs.outer_iter_mut() {
-            let sum: f32 = row.iter().map(|&v| if v.is_finite() { v } else { 0.0 }).sum();
-            if sum > 0.0 {
-                for v in row.iter_mut() {
-                    *v /= sum;
-                }
-            }
-        }
-
+        // Sparse top-k masking + renormalization in one pass (no explicit mask matrix).
+        // Also computes which experts were active for at least one token.
+        let (masked_probs, active_mask) = masked_top_k_probs_and_active(&routing_probs, effective_k);
+        self.cached_active_expert_mask = Some(active_mask);
         self.cached_routing_probs = Some(masked_probs);
+
         let masked_probs = self
             .cached_routing_probs
             .as_ref()
@@ -964,35 +956,35 @@ impl MixtureOfExperts {
         // Update routing metrics for training based on *active* routing.
         self.config.update_metrics(&masked_probs.view());
 
-        // Determine which experts are active for at least one token.
-        let mut active_experts = Vec::new();
-        for e in 0..self.config.num_experts {
-            let mut any = false;
-            for t in 0..mask.nrows() {
-                if mask[[t, e]] > 0.0 {
-                    any = true;
-                    break;
-                }
-            }
-            if any {
-                active_experts.push(e);
+        let active_experts: Vec<usize> = self
+            .cached_active_expert_mask
+            .as_ref()
+            .expect("active expert mask must be cached")
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &a)| if a { Some(i) } else { None })
+            .collect();
+
+        // Compute only active experts; keep cache length = num_experts.
+        // Reuse cached buffers when possible and avoid cloning large expert outputs.
+        let mut expert_outputs = self.cached_expert_outputs.take().unwrap_or_default();
+        let desired_len = self.config.num_experts;
+        if expert_outputs.len() != desired_len {
+            expert_outputs = vec![ndarray::Array2::<f32>::zeros(input.raw_dim()); desired_len];
+        } else if !expert_outputs.is_empty() && expert_outputs[0].raw_dim() != input.raw_dim() {
+            for out in &mut expert_outputs {
+                *out = ndarray::Array2::<f32>::zeros(input.raw_dim());
             }
         }
 
-        let mut active_mask = vec![false; self.config.num_experts];
         for &e in &active_experts {
-            active_mask[e] = true;
+            expert_outputs[e] = self.experts[e].forward(input);
         }
-        self.cached_active_expert_mask = Some(active_mask);
-
-        // Compute only active experts; keep cache length = num_experts for downstream gradients.
-        let mut expert_outputs =
-            vec![ndarray::Array2::<f32>::zeros(input.raw_dim()); self.config.num_experts];
-        for &e in &active_experts {
-            let out = self.experts[e].forward(input);
-            expert_outputs[e] = out;
-        }
-        self.cached_expert_outputs = Some(expert_outputs.clone());
+        self.cached_expert_outputs = Some(expert_outputs);
+        let expert_outputs = self
+            .cached_expert_outputs
+            .as_ref()
+            .expect("expert outputs must be cached");
 
         // Weighted sum of expert outputs using masked routing probabilities.
         let mut output = ndarray::Array2::zeros(input.raw_dim());
@@ -1056,7 +1048,7 @@ impl Layer for MixtureOfExperts {
     }
 
     fn backward(&mut self, grads: &ndarray::Array2<f32>, lr: f32) -> ndarray::Array2<f32> {
-        // Simplified backward: route gradients to all experts weighted by routing probabilities
+        // Backward: route gradients to experts weighted by routing probabilities
         let routing_probs = self
             .cached_routing_probs
             .as_ref()
@@ -1064,43 +1056,64 @@ impl Layer for MixtureOfExperts {
 
         let mut total_grad_input = ndarray::Array2::zeros(grads.raw_dim());
 
-        // Use zip to iterate over experts and their corresponding routing columns simultaneously
-        self.experts
-            .iter_mut()
-            .zip(routing_probs.columns())
-            .for_each(|(expert, routing_col)| {
-                // Weight gradients by routing probabilities for this expert using zip
-                let weighted_grads: Vec<ndarray::Array1<f32>> = grads
-                    .outer_iter()
-                    .zip(routing_col.iter())
-                    .map(|(grad_row, &weight)| grad_row.mapv(|x| x * weight))
-                    .collect();
+        let active_mask = self
+            .cached_active_expert_mask
+            .as_ref()
+            .map(|m| m.as_slice());
 
-                // Convert Vec<Array1> to Array2 for expert backward pass
-                let weighted_grads_2d = if !weighted_grads.is_empty() {
-                    let nrows = weighted_grads.len();
-                    let ncols = weighted_grads[0].len();
-                    let flat_data = weighted_grads
-                        .into_iter()
-                        .flat_map(|row: ndarray::Array1<f32>| row.into_iter())
-                        .collect::<Vec<f32>>();
-                    ndarray::Array2::from_shape_vec((nrows, ncols), flat_data).unwrap()
-                } else {
-                    ndarray::Array2::zeros(grads.raw_dim())
-                };
+        // Reuse weighted gradient buffers per expert.
+        let mut weighted_buffers = self.cached_weighted_grads.take().unwrap_or_default();
+        if weighted_buffers.len() != self.experts.len() {
+            weighted_buffers = vec![ndarray::Array2::<f32>::zeros(grads.raw_dim()); self.experts.len()];
+        } else if !weighted_buffers.is_empty() && weighted_buffers[0].raw_dim() != grads.raw_dim() {
+            for b in &mut weighted_buffers {
+                *b = ndarray::Array2::<f32>::zeros(grads.raw_dim());
+            }
+        }
 
-                // Get expert input gradients
-                let expert_grad_input = expert.backward(&weighted_grads_2d, lr);
+        for (expert_idx, expert) in self.experts.iter_mut().enumerate() {
+            if let Some(m) = active_mask {
+                if expert_idx < m.len() && !m[expert_idx] {
+                    continue;
+                }
+            }
 
-                // Weight input gradients back by routing probabilities using zip
-                expert_grad_input
-                    .outer_iter()
-                    .zip(routing_col.iter())
-                    .zip(total_grad_input.outer_iter_mut())
-                    .for_each(|((grad_row, &weight), mut total_row)| {
-                        total_row.scaled_add(weight, &grad_row);
-                    });
-            });
+            let routing_col = routing_probs.column(expert_idx);
+            let weighted_grads_2d = &mut weighted_buffers[expert_idx];
+            weighted_grads_2d.fill(0.0);
+
+            for (token_idx, (grad_row, &weight)) in
+                grads.outer_iter().zip(routing_col.iter()).enumerate()
+            {
+                let w = if weight.is_finite() { weight } else { 0.0 };
+                if w == 0.0 {
+                    continue;
+                }
+
+                let mut dst = weighted_grads_2d.row_mut(token_idx);
+                for (d, &g) in dst.iter_mut().zip(grad_row.iter()) {
+                    let g = if g.is_finite() { g } else { 0.0 };
+                    *d = g * w;
+                }
+            }
+
+            // Get expert input gradients
+            let expert_grad_input = expert.backward(weighted_grads_2d, lr);
+
+            // Weight input gradients back by routing probabilities
+            for ((grad_row, &weight), mut total_row) in expert_grad_input
+                .outer_iter()
+                .zip(routing_col.iter())
+                .zip(total_grad_input.outer_iter_mut())
+            {
+                let w = if weight.is_finite() { weight } else { 0.0 };
+                if w != 0.0 {
+                    total_row.scaled_add(w, &grad_row);
+                }
+            }
+        }
+
+        self.cached_weighted_grads = Some(weighted_buffers);
 
         total_grad_input
     }
@@ -1151,26 +1164,40 @@ impl Layer for MixtureOfExperts {
             .as_ref()
             .expect("forward must be called before compute_gradients");
 
-        // 1. Route gradients to all experts weighted by routing probabilities
+        let active_mask = self
+            .cached_active_expert_mask
+            .as_ref()
+            .map(|m| m.as_slice());
+
+        // 1. Route gradients to experts weighted by (post-mask) routing probabilities.
+        // Only build grads for experts that were active for at least one token.
         let mut expert_output_grads =
             vec![ndarray::Array2::zeros(output_grads.raw_dim()); self.config.num_experts];
         for expert_idx in 0..self.config.num_experts {
+            if let Some(m) = active_mask {
+                if expert_idx < m.len() && !m[expert_idx] {
+                    continue;
+                }
+            }
             for token_idx in 0..output_grads.nrows() {
-                let routing_weight = cached_routing_probs[[token_idx, expert_idx]];
-                expert_output_grads[expert_idx]
-                    .row_mut(token_idx)
-                    .assign(&output_grads.row(token_idx).mapv(|x| x * routing_weight));
+                let mut w = cached_routing_probs[[token_idx, expert_idx]];
+                w = if w.is_finite() { w } else { 0.0 };
+                if w == 0.0 {
+                    continue;
+                }
+
+                let src_row = output_grads.row(token_idx);
+                let mut dst_row = expert_output_grads[expert_idx].row_mut(token_idx);
+                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
+                    let src = if src.is_finite() { src } else { 0.0 };
+                    *dst = src * w;
+                }
             }
         }
 
         // 2. Compute gradients for each expert
         let mut all_param_grads = Vec::new();
         let mut grad_input = ndarray::Array2::zeros(cached_input.raw_dim());
-
-        let active_mask = self
-            .cached_active_expert_mask
-            .as_ref()
-            .map(|m| m.as_slice());
 
         let zero_expert_grads = |expert: &RichardsExpert| -> Vec<ndarray::Array2<f32>> {
             let act_len = expert.glu.richards_activation.weights().len();
@@ -1208,21 +1235,8 @@ impl Layer for MixtureOfExperts {
             all_param_grads.extend(expert_param_grads);
         }
 
-        // 3. Compute router gradients from the main loss
-        // Router gradients based on how routing affects the weighted expert outputs
-        let mut routing_grads = ndarray::Array2::zeros(cached_routing_probs.raw_dim());
-        for token_idx in 0..cached_routing_probs.nrows() {
-            let token_output_grad = output_grads.row(token_idx);
-            for expert_idx in 0..self.config.num_experts {
-                let expert_output = cached_expert_outputs[expert_idx].row(token_idx);
-                let dot_product = token_output_grad
-                    .iter()
-                    .zip(expert_output.iter())
-                    .map(|(&g, &o)| g * o)
-                    .sum::<f32>();
-                routing_grads[[token_idx, expert_idx]] = dot_product;
-            }
-        }
+        // 3. Compute router gradients from the main loss (only for experts with non-zero
+        // routing weight after sparse masking).
 
         // Compute router gradients manually using cached activations
         // Use cached router activations from the predict() call
@@ -1247,31 +1261,41 @@ impl Layer for MixtureOfExperts {
             .as_ref()
             .expect("Router predict must be called before MoE gradient computation");
 
-        // Compute softmax gradients manually: dL/d_logits = routing_grads * (routing_probs * (1 -
-        // routing_probs)) But since routing_grads is already w.r.t. routing_probs, we need
-        // to compute the Jacobian
+        // Compute softmax gradients efficiently (vector-Jacobian product).
+        // If y = softmax(z) and g = dL/dy, then dL/dz = y * (g - <g, y>).
         let routing_probs = self
             .cached_routing_probs
             .as_ref()
             .expect("routing probs must be cached");
-        let mut d_logits = ndarray::Array2::zeros(routing_grads.raw_dim());
+        let mut d_logits = ndarray::Array2::zeros(routing_probs.raw_dim());
 
-        for i in 0..routing_grads.nrows() {
-            for j in 0..routing_grads.ncols() {
-                let y_j = routing_probs[[i, j]];
-                let mut grad_sum = 0.0;
+        for token_idx in 0..routing_probs.nrows() {
+            let token_output_grad = output_grads.row(token_idx);
+            let mut dot_gy = 0.0f32;
+            let mut active_pairs: Vec<(usize, f32, f32)> = Vec::new();
 
-                for k in 0..routing_grads.ncols() {
-                    let y_k = routing_probs[[i, k]];
-                    let dy_k_d_logits_j = if j == k {
-                        y_j * (1.0 - y_j)
-                    } else {
-                        -y_j * y_k
-                    };
-                    grad_sum += routing_grads[[i, k]] * dy_k_d_logits_j;
+            for expert_idx in 0..self.config.num_experts {
+                let y = routing_probs[[token_idx, expert_idx]];
+                let y = if y.is_finite() { y } else { 0.0 };
+                if y == 0.0 {
+                    continue;
                 }
+                let expert_output = cached_expert_outputs[expert_idx].row(token_idx);
+                let g = token_output_grad
+                    .iter()
+                    .zip(expert_output.iter())
+                    .map(|(&g, &o)| {
+                        let g = if g.is_finite() { g } else { 0.0 };
+                        let o = if o.is_finite() { o } else { 0.0 };
+                        g * o
+                    })
+                    .sum::<f32>();
+                active_pairs.push((expert_idx, g, y));
+                dot_gy += g * y;
+            }
 
-                d_logits[[i, j]] = grad_sum;
+            for (expert_idx, g, y) in active_pairs {
+                d_logits[[token_idx, expert_idx]] = y * (g - dot_gy);
             }
         }
 
@@ -1416,30 +1440,82 @@ impl Layer for MixtureOfExperts {
         // Reset cached routing decisions and expert outputs
         self.cached_routing_probs = None;
         self.cached_expert_outputs = None;
+        self.cached_weighted_grads = None;
     }
 }
 
-/// Build a per-token top-k selection mask (1 for selected experts, 0 otherwise).
-fn top_k_mask(routing_probs: &ndarray::Array2<f32>, k: usize) -> ndarray::Array2<f32> {
-    let k = k.max(1);
-    let mut mask = ndarray::Array2::<f32>::zeros(routing_probs.raw_dim());
-    routing_probs
-        .outer_iter()
-        .enumerate()
-        .for_each(|(token_idx, row)| {
-            let mut indices: Vec<usize> = (0..row.len()).collect();
-            indices.sort_by(|&a, &b| {
-                let va = row[a];
-                let vb = row[b];
-                let va = if va.is_finite() { va } else { f32::NEG_INFINITY };
-                let vb = if vb.is_finite() { vb } else { f32::NEG_INFINITY };
-                vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            indices.into_iter().take(k).for_each(|idx| {
-                mask[[token_idx, idx]] = 1.0;
-            });
-        });
-    mask
+fn masked_top_k_probs_and_active(
+    routing_probs: &ndarray::Array2<f32>,
+    k: usize,
+) -> (ndarray::Array2<f32>, Vec<bool>) {
+    let n_tokens = routing_probs.nrows();
+    let n_experts = routing_probs.ncols();
+
+    if n_tokens == 0 || n_experts == 0 {
+        return (
+            ndarray::Array2::<f32>::zeros((n_tokens, n_experts)),
+            vec![false; n_experts],
+        );
+    }
+
+    let k = k.clamp(1, n_experts);
+    let mut masked = ndarray::Array2::<f32>::zeros(routing_probs.raw_dim());
+    let mut active = vec![false; n_experts];
+
+    for (token_idx, row) in routing_probs.outer_iter().enumerate() {
+        // Maintain a small set of best (score, idx) pairs.
+        let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
+        for (idx, &v) in row.iter().enumerate() {
+            let score = if v.is_finite() { v } else { f32::NEG_INFINITY };
+            if best.len() < k {
+                best.push((score, idx));
+                continue;
+            }
+
+            // Find current minimum in best.
+            let mut min_pos = 0usize;
+            let mut min_score = best[0].0;
+            for (p, (s, _)) in best.iter().enumerate().skip(1) {
+                if *s < min_score {
+                    min_score = *s;
+                    min_pos = p;
+                }
+            }
+
+            if score > min_score {
+                best[min_pos] = (score, idx);
+            }
+        }
+
+        // Deterministic-ish ordering (descending score) for stable fill.
+        best.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut sum = 0.0f32;
+        for &(_score, idx) in &best {
+            active[idx] = true;
+            let mut p = row[idx];
+            p = if p.is_finite() { p } else { 0.0 };
+            if p < 0.0 {
+                p = 0.0;
+            }
+            masked[[token_idx, idx]] = p;
+            sum += p;
+        }
+
+        if sum > 0.0 {
+            for &(_score, idx) in &best {
+                masked[[token_idx, idx]] /= sum;
+            }
+        } else {
+            // Fallback: uniform over selected indices.
+            let w = 1.0 / best.len() as f32;
+            for &(_score, idx) in &best {
+                masked[[token_idx, idx]] = w;
+            }
+        }
+    }
+
+    (masked, active)
 }
 
 #[cfg(test)]
