@@ -8,6 +8,7 @@ thread_local! {
     static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
     static TLS_PHI:    RefCell<Option<ndarray::Array1<f32>>> = RefCell::new(None); // (w)
     static TLS_ACC_F64: RefCell<Option<Vec<f64>>> = RefCell::new(None); // (d_h)
+    static TLS_QPE: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
 /// Get or create a thread-local scratch buffer for attention scores (N×N matrices)
@@ -88,5 +89,16 @@ pub fn with_tls_acc_f64<R>(len: usize, f: impl FnOnce(&mut [f64]) -> R) -> R {
         }
         let buf = opt.as_mut().unwrap();
         f(buf.as_mut_slice())
+    })
+}
+
+#[inline]
+pub fn with_tls_qpe<R>(len: usize, f: impl FnOnce(&mut Vec<f32>) -> R) -> R {
+    TLS_QPE.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() != len {
+            buf.resize(len, 0.0);
+        }
+        f(&mut buf)
     })
 }

@@ -3,7 +3,7 @@ use rayon::prelude::*;
 
 use crate::{
     attention::{head::PolyHead, position::cope::CoPE},
-    attention::memory::{with_tls_acc_f64, with_tls_phi},
+    attention::memory::{with_tls_acc_f64, with_tls_phi, with_tls_qpe},
     attention::utils::{smooth_clip_tanh, smooth_saturate_01},
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
     richards::RichardsGate,
@@ -304,26 +304,26 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
     // Extract projections for the attention computation loop
     let head_projections = projections_acc;
 
-    // Create gate values array for metrics update
-    // gate_values_acc contains effective gating values (g * thresholds) per head, concatenate them
+    // Create gate values array for metrics update.
+    // Build directly into an Array2 to avoid an intermediate Vec allocation.
     let gate_values = if !gate_values_acc.is_empty() {
         let n_tokens = gate_values_acc[0].nrows();
         let n_heads = gate_values_acc.len();
+        let mut gate_values = ndarray::Array2::<f32>::zeros((n_tokens, n_heads));
 
-        // Use iterator chain to collect all gate values in correct order
-        let gate_data: Vec<f32> = (0..n_tokens)
-            .flat_map(|token_idx| {
-                gate_values_acc
-                    .iter()
-                    .map(move |gate_col| gate_col[[token_idx, 0]])
-            })
-            .collect();
+        for (h, gate_col) in gate_values_acc.iter().enumerate() {
+            for t in 0..n_tokens {
+                gate_values[[t, h]] = gate_col[[t, 0]];
+            }
+        }
 
-        ndarray::Array2::from_shape_vec((n_tokens, n_heads), gate_data)
-            .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n_tokens, n_heads)))
+        gate_values
     } else {
         ndarray::Array2::<f32>::zeros((0, 0))
     };
+
+    // Reuse a single head-output buffer across heads to reduce allocations.
+    let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
 
     // Process attention computation for each head
     for (h_idx, (q, k, v, _g_col, eff_col)) in head_projections.into_iter().enumerate() {
@@ -335,7 +335,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             let start = h_idx * ctx.head_dim;
             let end = start + ctx.head_dim;
             let w_block = ctx.w_out.slice(s![start..end, ..]);
-            let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
+            y_head.fill(0.0);
             use rayon::prelude::*;
             y_head
                 .axis_iter_mut(ndarray::Axis(0))
@@ -347,55 +347,64 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                     let j_start = match ctx.window_size { Some(w) => i.saturating_sub(w - 1), None => 0 };
                     let j_end_excl = if causal { i + 1 } else { n };
                     let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
-                    let mut q_pe = Vec::with_capacity(max_pos + 1);
-                    q_pe.extend((0..=max_pos).map(|pos| q.row(i).dot(&ctx.cope.pos_embeddings.row(pos))));
-                    let k_slice = k.slice(s![j_start..j_end_excl, ..]);
-                    let k_slice_t = k_slice.t();
-                    let scores_row = q.row(i).dot(&k_slice_t) * dk_scale;
-                    let mlen = j_end_excl.saturating_sub(j_start);
-                    with_tls_phi(mlen, |phi_row| {
-                        for idx in 0..mlen {
-                            let j = j_start + idx;
-                            let mut s_val = scores_row[idx];
-                            let pos = i.saturating_sub(j);
-                            if pos < q_pe.len() { s_val += q_pe[pos]; }
-                            let s_stable = smooth_clip_tanh(s_val, 8.0);
-                            let sp = if p_i32 <= 3 {
-                                match p_i32 {
-                                    1 => s_stable,
-                                    2 => s_stable * s_stable,
-                                    3 => s_stable * s_stable * s_stable,
-                                    _ => unreachable!(),
-                                }
-                            } else {
-                                // With smooth saturation, `s_stable` is bounded so this is safe.
-                                let mut result: f32 = 1.0;
-                                for _ in 0..p_i32 {
-                                    result *= s_stable;
-                                }
-                                result
-                            };
-                            phi_row[idx] = scale * (a * sp + b);
+                    let q_row_i = q.row(i);
+                    with_tls_qpe(max_pos + 1, |q_pe| {
+                        for pos in 0..=max_pos {
+                            q_pe[pos] = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
                         }
-                        let v_slice = v.slice(s![j_start..j_end_excl, ..]);
-                        with_tls_acc_f64(ctx.head_dim, |acc| {
-                            acc.fill(0.0);
-                            let eff = eff_i as f64;
+
+                        let k_slice = k.slice(s![j_start..j_end_excl, ..]);
+                        let k_slice_t = k_slice.t();
+                        let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
+                        let mlen = j_end_excl.saturating_sub(j_start);
+                        with_tls_phi(mlen, |phi_row| {
                             for idx in 0..mlen {
-                                let phi = (phi_row[idx] as f64) * eff;
-                                for h in 0..ctx.head_dim {
-                                    acc[h] += phi * (v_slice[[idx, h]] as f64);
+                                let j = j_start + idx;
+                                let mut s_val = scores_row[idx];
+                                let pos = i.saturating_sub(j);
+                                if pos < q_pe.len() {
+                                    s_val += q_pe[pos];
                                 }
+
+                                let s_stable = smooth_clip_tanh(s_val, 8.0);
+                                let sp = if p_i32 <= 3 {
+                                    match p_i32 {
+                                        1 => s_stable,
+                                        2 => s_stable * s_stable,
+                                        3 => s_stable * s_stable * s_stable,
+                                        _ => unreachable!(),
+                                    }
+                                } else {
+                                    // With smooth saturation, `s_stable` is bounded so this is safe.
+                                    let mut result: f32 = 1.0;
+                                    for _ in 0..p_i32 {
+                                        result *= s_stable;
+                                    }
+                                    result
+                                };
+
+                                phi_row[idx] = scale * (a * sp + b);
                             }
-                            for h in 0..ctx.head_dim {
-                                y_row[h] = acc[h] as f32;
-                            }
+
+                            let v_slice = v.slice(s![j_start..j_end_excl, ..]);
+                            with_tls_acc_f64(ctx.head_dim, |acc| {
+                                acc.fill(0.0);
+                                let eff = eff_i as f64;
+                                for idx in 0..mlen {
+                                    let phi = (phi_row[idx] as f64) * eff;
+                                    for h in 0..ctx.head_dim {
+                                        acc[h] += phi * (v_slice[[idx, h]] as f64);
+                                    }
+                                }
+                                for h in 0..ctx.head_dim {
+                                    y_row[h] = acc[h] as f32;
+                                }
+                            });
                         });
                     });
                 });
-            let mut out_block = Array2::<f32>::zeros((n, ctx.embed_dim));
-            ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 0.0, &mut out_block);
-            out = out + &out_block;
+            // Accumulate directly into `out` to avoid allocating an intermediate block.
+            ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 1.0, &mut out);
         }
     }
 
@@ -508,10 +517,13 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
     let gate_values = if !gate_values_acc.is_empty() {
         let n_tokens = gate_values_acc[0].nrows();
         let n_heads = gate_values_acc.len();
-        let gate_data: Vec<f32> = (0..n_tokens)
-            .flat_map(|token_idx| gate_values_acc.iter().map(move |gate_col| gate_col[[token_idx,0]]))
-            .collect();
-        ndarray::Array2::from_shape_vec((n_tokens, n_heads), gate_data).unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n_tokens, n_heads)))
+        let mut gate_values = ndarray::Array2::<f32>::zeros((n_tokens, n_heads));
+        for (h, gate_col) in gate_values_acc.iter().enumerate() {
+            for t in 0..n_tokens {
+                gate_values[[t, h]] = gate_col[[t, 0]];
+            }
+        }
+        gate_values
     } else { ndarray::Array2::<f32>::zeros((0,0)) };
 
     for (h_idx, (q,k,v,_g_col,eff_col)) in projections_acc.into_iter().enumerate() {
@@ -526,11 +538,15 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
                 let j_start = match ctx.window_size { Some(w) => i.saturating_sub(w-1), None => 0 };
                 let j_end_excl = if causal { i+1 } else { n };
                 let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
-                let mut q_pe = Vec::with_capacity(max_pos+1);
-                q_pe.extend((0..=max_pos).map(|pos| q.row(i).dot(&ctx.cope.pos_embeddings.row(pos))));
+                let q_row_i = q.row(i);
+                with_tls_qpe(max_pos + 1, |q_pe| {
+                    for pos in 0..=max_pos {
+                        q_pe[pos] = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
+                    }
+
                 let k_slice = k.slice(s![j_start..j_end_excl, ..]);
                 let k_slice_t = k_slice.t();
-                let scores_row = q.row(i).dot(&k_slice_t) * dk_scale;
+                let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
                 let m = j_end_excl.saturating_sub(j_start);
                 let mut phi_row = ndarray::Array1::<f32>::zeros(m);
                 for idx in 0..m {
@@ -546,13 +562,12 @@ pub fn compute_poly_attention_forward_baseline(ctx: &mut ForwardContext, causal:
                 ndarray::linalg::general_mat_mul(1.0, &phi_row.view().insert_axis(ndarray::Axis(0)), &v_slice, 0.0, &mut row_buf);
                 row_buf.mapv_inplace(|x| x * eff_i);
                 (i, row_buf)
+                })
             })
             .collect();
         let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
         for (i, buf) in row_buffers { let mut y_row = y_head.slice_mut(s![i..i+1, ..]); y_row.assign(&buf); }
-        let mut out_block = Array2::<f32>::zeros((n, ctx.embed_dim));
-        ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 0.0, &mut out_block);
-        out = out + &out_block;
+        ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 1.0, &mut out);
     }
 
     let avg_active_heads = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {

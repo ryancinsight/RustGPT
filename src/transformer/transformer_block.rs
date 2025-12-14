@@ -391,12 +391,12 @@ impl TransformerBlock {
 
         let d = input.ncols().max(1) as f32;
         let k = strength / d;
-        let mixed = input.dot(context);
-        let mut out = input.clone();
-        out.zip_mut_with(&mixed, |o, &m| {
-            let ms = if m.is_finite() { m } else { 0.0 };
-            *o = if o.is_finite() { *o } else { 0.0 };
-            *o += k * ms;
+        // Compute output directly from the dot-product buffer to avoid an extra full input clone.
+        let mut out = input.dot(context);
+        out.zip_mut_with(input, |o, &x| {
+            let ms = if o.is_finite() { *o } else { 0.0 };
+            let xs = if x.is_finite() { x } else { 0.0 };
+            *o = xs + k * ms;
         });
         out
     }
