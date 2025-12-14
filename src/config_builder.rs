@@ -72,6 +72,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
             load_balance_weight: 0.01,
             sparsity_weight: 0.001,
             diversity_weight: 0.005,
+            use_head_conditioning: true,
         });
     }
 

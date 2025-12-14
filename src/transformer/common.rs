@@ -104,11 +104,32 @@ impl CommonLayers {
 
         let feedforward = if config.use_moe {
             if let Some(moe_config) = &config.moe_config {
-                let moe_layer = MixtureOfExperts::new(
-                    config.embed_dim,
-                    (config.embed_dim / 4).max(32),
-                    moe_config.clone(),
-                );
+                // Keep parameter count roughly constant vs dense FFN by shrinking expert_hidden_dim
+                // when MoE is enabled. This is important for tiny-model regimes (e.g. ~36k params)
+                // where MoE should not inflate total parameters by num_experts.
+                let router_hidden_dim = (config.embed_dim / 4).max(32);
+                let baseline_ffn_params = RichardsGlu::new(config.embed_dim, config.hidden_dim).parameters();
+
+                let mut adj = moe_config.clone();
+                let suggested = (config.hidden_dim / adj.num_experts.max(1)).max(4);
+                if adj.expert_hidden_dim > suggested {
+                    adj.expert_hidden_dim = suggested;
+                }
+
+                // If we're still above the baseline (router overhead, head-conditioning),
+                // decrement a bit until we fit.
+                for _ in 0..32 {
+                    let moe_params = MixtureOfExperts::new(config.embed_dim, router_hidden_dim, adj.clone()).parameters();
+                    if moe_params <= baseline_ffn_params {
+                        break;
+                    }
+                    if adj.expert_hidden_dim <= 4 {
+                        break;
+                    }
+                    adj.expert_hidden_dim = adj.expert_hidden_dim.saturating_sub(1).max(4);
+                }
+
+                let moe_layer = MixtureOfExperts::new(config.embed_dim, router_hidden_dim, adj);
                 FeedForwardVariant::MixtureOfExperts(Box::new(moe_layer))
             } else {
                 let richards_glu = RichardsGlu::new(config.embed_dim, config.hidden_dim);

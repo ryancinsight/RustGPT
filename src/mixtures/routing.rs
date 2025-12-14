@@ -114,9 +114,11 @@ fn apply_top_k_selection(gates: &ndarray::ArrayView2<f32>, k: usize) -> ndarray:
             // Create sorted indices by value (descending) using iterator chains
             let mut indices: Vec<usize> = (0..token_gates.len()).collect();
             indices.sort_by(|&a, &b| {
-                token_gates[b]
-                    .partial_cmp(&token_gates[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let va = token_gates[a];
+                let vb = token_gates[b];
+                let va = if va.is_finite() { va } else { f32::NEG_INFINITY };
+                let vb = if vb.is_finite() { vb } else { f32::NEG_INFINITY };
+                vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
             });
 
             // Set top-k indices to 1.0
@@ -202,8 +204,17 @@ fn apply_softmax_selection(
 ) -> ndarray::Array2<f32> {
     let mut softmax = Softmax::new();
 
+    let temperature = if temperature.is_finite() && temperature > 1e-6 {
+        temperature
+    } else {
+        1.0
+    };
+
     // Scale gates by temperature
-    let scaled_gates = gates.mapv(|x| x / temperature);
+    let scaled_gates = gates.mapv(|x| {
+        let x = if x.is_finite() { x } else { 0.0 };
+        x / temperature
+    });
 
     // Apply softmax using the existing implementation
     softmax.forward(&scaled_gates.view())
@@ -211,6 +222,9 @@ fn apply_softmax_selection(
 
 /// Compute routing entropy for a batch of routing decisions
 pub fn compute_routing_entropy(routing_weights: &ndarray::ArrayView2<f32>) -> f32 {
+    if routing_weights.nrows() == 0 {
+        return 0.0;
+    }
     let num_tokens = routing_weights.nrows() as f32;
 
     // Use iterator chains for zero-copy entropy computation
@@ -230,6 +244,9 @@ pub fn compute_routing_entropy(routing_weights: &ndarray::ArrayView2<f32>) -> f3
 
 /// Get average number of active components per token
 pub fn compute_avg_active_components(routing_weights: &ndarray::ArrayView2<f32>) -> f32 {
+    if routing_weights.nrows() == 0 {
+        return 0.0;
+    }
     // Use iterator chains for zero-copy computation
     routing_weights
         .outer_iter()

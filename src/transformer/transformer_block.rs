@@ -7,6 +7,7 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    adam::Adam,
     attention::poly_attention::PolyAttention,
     errors::Result,
     network::Layer,
@@ -24,11 +25,16 @@ use crate::{
     },
 };
 
+fn default_similarity_context_strength() -> Array2<f32> {
+    Array2::zeros((1, 1))
+}
+
 /// Type alias for cached transformer block intermediates to improve readability
 /// Uses Arc<Array2<f32>> for input to enable zero-copy sharing between forward and backward passes.
 /// This eliminates an O(seq_len × embed_dim) clone per forward pass.
 pub type CachedIntermediates = (
-    Arc<Array2<f32>>,  // input - Arc for zero-copy sharing
+    Arc<Array2<f32>>,  // input_original - Arc for zero-copy sharing
+    Arc<Array2<f32>>,  // input_used - Arc for zero-copy sharing
     Array2<f32>,       // norm1_out
     Array2<f32>,       // residual1
     Array2<f32>,       // norm2_out
@@ -41,7 +47,7 @@ pub type CachedIntermediates = (
 /// - Attention mechanism (with residual connection)
 /// - Pre-feedforward normalization
 /// - Feedforward network (with residual connection)
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Debug)]
 pub struct TransformerBlock {
     /// Pre-attention layer normalization
     pub pre_attention_norm: RichardsNorm,
@@ -69,6 +75,80 @@ pub struct TransformerBlock {
 
     #[serde(skip_serializing, skip_deserializing)]
     window_entropy_ema: f32,
+
+    /// Activation-derived similarity representation (embed_dim × embed_dim).
+    ///
+    /// This is updated each forward pass and can be passed to the next layer
+    /// as a context signal (positive focus + negative contrast).
+    #[serde(skip_serializing, skip_deserializing)]
+    activation_similarity_matrix: Array2<f32>,
+
+    /// Incoming similarity context from the previous transformer layer.
+    /// Used to modulate the *next* layer’s residual-stream input.
+    #[serde(skip_serializing, skip_deserializing)]
+    incoming_similarity_context: Option<Array2<f32>>,
+
+    /// Strength of the similarity-context mixing for next-layer conditioning.
+    ///
+    /// Applied as: X' = X + (strength / embed_dim) * X·S
+    #[serde(default = "default_similarity_context_strength")]
+    similarity_context_strength: Array2<f32>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    opt_similarity_context_strength: Adam,
+
+    /// EMA update rate for the activation similarity matrix.
+    #[serde(skip_serializing, skip_deserializing)]
+    similarity_update_rate: f32,
+}
+
+// Custom deserialization to ensure runtime-only buffers/optimizers are initialized with
+// correct shapes after loading a persisted model.
+impl<'de> Deserialize<'de> for TransformerBlock {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TransformerBlockSerde {
+            pre_attention_norm: RichardsNorm,
+            attention: PolyAttention,
+            pre_ffn_norm: RichardsNorm,
+            feedforward: FeedForwardVariant,
+            config: TransformerBlockConfig,
+
+            #[serde(default = "default_similarity_context_strength")]
+            similarity_context_strength: Array2<f32>,
+        }
+
+        let data = TransformerBlockSerde::deserialize(deserializer)?;
+        let embed_dim = data.config.embed_dim;
+
+        // Ensure strength is always a 1×1 scalar.
+        let scalar = data
+            .similarity_context_strength
+            .get((0, 0))
+            .copied()
+            .unwrap_or(0.0);
+        let mut similarity_context_strength = Array2::zeros((1, 1));
+        similarity_context_strength[[0, 0]] = if scalar.is_finite() { scalar } else { 0.0 };
+
+        Ok(Self {
+            pre_attention_norm: data.pre_attention_norm,
+            attention: data.attention,
+            pre_ffn_norm: data.pre_ffn_norm,
+            feedforward: data.feedforward,
+            config: data.config,
+            cached_intermediates: RwLock::new(None),
+            param_partitions: RwLock::new(None),
+            window_entropy_ema: 0.0,
+            activation_similarity_matrix: Array2::zeros((embed_dim, embed_dim)),
+            incoming_similarity_context: None,
+            similarity_context_strength,
+            opt_similarity_context_strength: Adam::new((1, 1)),
+            similarity_update_rate: 0.01,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,6 +157,7 @@ struct ParamPartitions {
     feedforward: usize,
     pre_ffn_norm: usize,
     pre_attn_norm: usize,
+    similarity_context_strength: usize,
 }
 
 /// Configuration for a transformer block
@@ -191,8 +272,13 @@ impl TransformerBlock {
     /// - Final input grads: d_input = d_input_direct + pre_attention_norm.backward(d_norm1_out)
     /// Create a new transformer block with the given configuration
     pub fn new(config: TransformerBlockConfig) -> Self {
+        let embed_dim = config.embed_dim;
         let common_config = CommonLayerConfig::from(&config);
         let layers = CommonLayers::new(&common_config);
+
+        // Fully adaptive: this starts at 0 and is learned.
+        let similarity_context_strength = Array2::zeros((1, 1));
+        let opt_similarity_context_strength = Adam::new((1, 1));
 
         Self {
             pre_attention_norm: layers.pre_attention_norm,
@@ -203,7 +289,116 @@ impl TransformerBlock {
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
             window_entropy_ema: 0.0,
+
+            activation_similarity_matrix: Array2::zeros((embed_dim, embed_dim)),
+            incoming_similarity_context: None,
+            similarity_context_strength,
+            opt_similarity_context_strength,
+            similarity_update_rate: 0.01,
         }
+    }
+
+    pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
+        &self.activation_similarity_matrix
+    }
+
+    pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
+        if let Some(ctx) = context {
+            if ctx.nrows() != self.config.embed_dim || ctx.ncols() != self.config.embed_dim {
+                // Shape mismatch: ignore rather than panic.
+                self.incoming_similarity_context = None;
+                return;
+            }
+
+            if let Some(existing) = self.incoming_similarity_context.as_mut() {
+                if existing.dim() == ctx.dim() {
+                    existing.assign(ctx);
+                } else {
+                    *existing = ctx.clone();
+                }
+            } else {
+                self.incoming_similarity_context = Some(ctx.clone());
+            }
+        } else {
+            self.incoming_similarity_context = None;
+        }
+    }
+
+    #[inline]
+    fn update_activation_similarity_matrix(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
+        // Match the adaptive_residuals representation update: channel-to-channel cosine similarity
+        // across (sampled) sequence positions, bounded smoothly into [-1, 1], EMA updated.
+        let rate = self.similarity_update_rate.clamp(0.0, 1.0);
+        if rate <= 0.0 {
+            return;
+        }
+
+        let seq_len = input.nrows().min(output.nrows());
+        let embed_dim = input.ncols().min(output.ncols()).min(self.config.embed_dim);
+        if seq_len == 0 || embed_dim == 0 {
+            return;
+        }
+
+        let sample = seq_len.min(32);
+        let step = (seq_len / sample).max(1);
+
+        let mut nx = vec![0.0f64; embed_dim];
+        let mut ny = vec![0.0f64; embed_dim];
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
+            for j in 0..embed_dim {
+                let x = input[[seq_idx, j]];
+                let y = output[[seq_idx, j]];
+                let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                nx[j] += xs * xs;
+                ny[j] += ys * ys;
+            }
+        }
+
+        for i in 0..embed_dim {
+            for j in 0..embed_dim {
+                let mut dot = 0.0f64;
+                for seq_idx in (0..seq_len).step_by(step).take(sample) {
+                    let x = input[[seq_idx, i]];
+                    let y = output[[seq_idx, j]];
+                    let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                    let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                    dot += xs * ys;
+                }
+
+                let denom = (nx[i] * ny[j]).sqrt();
+                let sim = if denom > 1e-12 { (dot / denom) as f32 } else { 0.0 };
+                let sim = if sim.is_finite() { sim.tanh() } else { 0.0 };
+
+                let prev = self.activation_similarity_matrix[[i, j]];
+                self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
+            }
+        }
+    }
+
+    #[inline]
+    fn apply_similarity_context(&self, input: &Array2<f32>, context: &Array2<f32>) -> Array2<f32> {
+        let strength = self.similarity_context_strength[[0, 0]];
+        let strength = if strength.is_finite() { strength } else { 0.0 };
+        if strength == 0.0 {
+            return input.clone();
+        }
+
+        // Expect embed_dim × embed_dim context.
+        if input.ncols() != context.nrows() || context.nrows() != context.ncols() {
+            return input.clone();
+        }
+
+        let d = input.ncols().max(1) as f32;
+        let k = strength / d;
+        let mixed = input.dot(context);
+        let mut out = input.clone();
+        out.zip_mut_with(&mixed, |o, &m| {
+            let ms = if m.is_finite() { m } else { 0.0 };
+            *o = if o.is_finite() { *o } else { 0.0 };
+            *o += k * ms;
+        });
+        out
     }
 
     /// Create a transformer block from a model configuration
@@ -258,21 +453,30 @@ impl TransformerBlock {
             + self.attention.parameters()
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
+            + 1 // similarity_context_strength (scalar)
     }
 
     /// Get the weight norm (Frobenius norm) for LARS adaptive learning rates
     pub fn weight_norm(&self) -> f32 {
+        let s = self.similarity_context_strength[[0, 0]];
+        let s2 = if s.is_finite() { s * s } else { 0.0 };
+
         (self.pre_attention_norm.weight_norm().powi(2)
             + self.attention.weight_norm().powi(2)
             + self.pre_ffn_norm.weight_norm().powi(2)
-            + self.feedforward.weight_norm().powi(2))
+            + self.feedforward.weight_norm().powi(2)
+            + s2)
         .sqrt()
     }
 }
 
 impl ParamPartitions {
     fn total(&self) -> usize {
-        self.attention + self.feedforward + self.pre_ffn_norm + self.pre_attn_norm
+        self.attention
+            + self.feedforward
+            + self.pre_ffn_norm
+            + self.pre_attn_norm
+            + self.similarity_context_strength
     }
 }
 
@@ -282,15 +486,21 @@ impl Layer for TransformerBlock {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // Zero-copy: wrap input in Arc for shared ownership between forward cache and backward pass.
-        // This eliminates an O(seq_len × embed_dim) clone that was previously needed.
-        let input_arc = Arc::new(input.clone());
+        // Apply incoming similarity context from the *previous* transformer layer.
+        // This makes the similarity matrix an explicit signal used by the next layer.
+        let input_original_arc = Arc::new(input.clone());
+
+        let input_used_arc: Arc<Array2<f32>> = if let Some(ctx) = self.incoming_similarity_context.as_ref() {
+            Arc::new(self.apply_similarity_context(input_original_arc.as_ref(), ctx))
+        } else {
+            input_original_arc.clone()
+        };
         
         // Pre-attention normalization
-        let norm1_out = self.pre_attention_norm.forward(input);
+        let norm1_out = self.pre_attention_norm.forward(input_used_arc.as_ref());
 
         // Attention with residual connection - compute dynamic window size
-        let seq_len = input.nrows();
+        let seq_len = input_used_arc.nrows();
         let base_w = self
             .config
             .window_size
@@ -331,17 +541,34 @@ impl Layer for TransformerBlock {
         
         // Attention forward
         let attn_out = self.attention.forward(&norm1_out);
+
+        // Head activity ratio from MoH (avg active heads / num_heads).
+        let head_activity_ratio = if let Some(avg) = self.attention.last_avg_active_heads {
+            let denom = (self.config.num_heads.max(1)) as f32;
+            let r = avg / denom;
+            if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
+        } else {
+            1.0
+        };
+
+        // Update per-layer similarity representation matrix (input→attention-output channel similarity).
+        self.update_activation_similarity_matrix(input_used_arc.as_ref(), &attn_out);
         
         // In-place residual connection: take ownership and add in-place
         // This avoids allocating a new array for residual1
         let mut residual1 = attn_out;
-        residual1 += input; // ndarray supports += for in-place addition
+        residual1 += input_used_arc.as_ref(); // ndarray supports += for in-place addition
 
         // Pre-feedforward normalization
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
 
         // Feedforward with residual connection
-        let ffn_out = self.feedforward.forward(&norm2_out);
+        let ffn_out = match &mut self.feedforward {
+            FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_out),
+            FeedForwardVariant::MixtureOfExperts(layer) => {
+                layer.forward_with_head_activity(&norm2_out, Some(head_activity_ratio))
+            }
+        };
         
         // In-place final residual: reuse ffn_out allocation
         let mut output = ffn_out;
@@ -349,7 +576,8 @@ impl Layer for TransformerBlock {
 
         // Cache intermediates with Arc for zero-copy backward pass access
         *self.cached_intermediates.write().unwrap() = Some((
-            input_arc,
+            input_original_arc,
+            input_used_arc,
             norm1_out,
             residual1,
             norm2_out,
@@ -386,9 +614,9 @@ impl Layer for TransformerBlock {
         // Access cached intermediates without cloning the entire tuple.
         // The Arc<Array2> for input enables zero-copy access.
         let guard = self.cached_intermediates.read().unwrap();
-        if let Some((input_arc, norm1_out, residual1, norm2_out)) = guard.as_ref() {
-            // Zero-copy access to input through Arc
-            let input_cached: &Array2<f32> = input_arc.as_ref();
+        if let Some((input_original_arc, input_used_arc, norm1_out, residual1, norm2_out)) = guard.as_ref() {
+            let input_original: &Array2<f32> = input_original_arc.as_ref();
+            let input_used: &Array2<f32> = input_used_arc.as_ref();
             
             // Compute gradients through the transformer block layers
 
@@ -422,11 +650,47 @@ impl Layer for TransformerBlock {
 
             let (norm1_input_grad, pre_attn_param_grads) = self
                 .pre_attention_norm
-                .compute_gradients(input_cached, &attn_input_grad);
+                .compute_gradients(input_used, &attn_input_grad);
 
-            // The final input gradients are the gradients w.r.t. the transformer input
-            // (combining gradients from residual and attention path)
-            let final_input_grads = input_grads_ref + &norm1_input_grad;
+            // Gradients w.r.t. the *mixed* input used by this block: dX'.
+            let final_input_used_grads = input_grads_ref + &norm1_input_grad;
+
+            // Gradient for learnable similarity_context_strength.
+            // X' = X + (s/d) * (X·S)
+            // dL/ds = (1/d) * sum(dX' ⊙ (X·S))
+            let mut similarity_strength_grad = Array2::zeros((1, 1));
+            if let Some(ctx) = self.incoming_similarity_context.as_ref() {
+                if ctx.nrows() == self.config.embed_dim && ctx.ncols() == self.config.embed_dim {
+                    let d = (self.config.embed_dim.max(1)) as f32;
+                    let mixed = input_original.dot(ctx);
+                    let mut acc = 0.0f64;
+                    for (g, m) in final_input_used_grads.iter().zip(mixed.iter()) {
+                        let gs = if g.is_finite() { *g as f64 } else { 0.0 };
+                        let ms = if m.is_finite() { *m as f64 } else { 0.0 };
+                        acc += gs * ms;
+                    }
+                    similarity_strength_grad[[0, 0]] = (acc as f32) / d;
+                }
+            }
+
+            // Backprop through similarity-context mixing for upstream gradient.
+            // If X' = X + k * X·S, then dX = dX' + k * dX'·S^T.
+            let mut final_input_grads = final_input_used_grads;
+            if let Some(ctx) = self.incoming_similarity_context.as_ref() {
+                if ctx.nrows() == self.config.embed_dim && ctx.ncols() == self.config.embed_dim {
+                    let d = (self.config.embed_dim.max(1)) as f32;
+                    let s = self.similarity_context_strength[[0, 0]];
+                    let s = if s.is_finite() { s } else { 0.0 };
+                    let k = s / d;
+                    if k != 0.0 {
+                        let corr = final_input_grads.dot(&ctx.t());
+                        final_input_grads.zip_mut_with(&corr, |g, &c| {
+                            let cs = if c.is_finite() { c } else { 0.0 };
+                            *g += k * cs;
+                        });
+                    }
+                }
+            }
 
             // Capture gradient partition sizes so apply_gradients can re-slice accurately later
             let partitions = ParamPartitions {
@@ -434,6 +698,7 @@ impl Layer for TransformerBlock {
                 feedforward: ffn_param_grads.len(),
                 pre_ffn_norm: pre_ffn_param_grads.len(),
                 pre_attn_norm: pre_attn_param_grads.len(),
+                similarity_context_strength: 1,
             };
             // Release read lock before acquiring write lock
             drop(guard);
@@ -447,6 +712,7 @@ impl Layer for TransformerBlock {
             all_param_grads.extend(ffn_param_grads);
             all_param_grads.extend(pre_ffn_param_grads);
             all_param_grads.extend(pre_attn_param_grads);
+            all_param_grads.push(similarity_strength_grad);
 
             (final_input_grads, all_param_grads)
         } else {
@@ -482,9 +748,17 @@ impl Layer for TransformerBlock {
                 }
                 None
             })
-            .unwrap_or_else(|| ParamPartitions {
-            attention: param_grads.len(),
-            ..ParamPartitions::default()
+            .unwrap_or_else(|| {
+                let n = param_grads.len();
+                if n >= 1 {
+                    ParamPartitions {
+                        attention: n - 1,
+                        similarity_context_strength: 1,
+                        ..ParamPartitions::default()
+                    }
+                } else {
+                    ParamPartitions::default()
+                }
             });
 
         // Zero-copy gradient sanitization: only clone and modify gradients that need fixing.
@@ -569,6 +843,15 @@ impl Layer for TransformerBlock {
             let owned_grads: Vec<Array2<f32>> = pre_attn_grads.iter().map(|c| c.as_ref().clone()).collect();
             self.pre_attention_norm
                 .apply_gradients(&owned_grads, lr)?;
+        }
+
+        // Apply learned similarity-context strength gradient (scalar)
+        let ctx_range = next_range(partitions.similarity_context_strength);
+        if !ctx_range.is_empty() {
+            if let Some(g) = sanitized.get(ctx_range.start) {
+                self.opt_similarity_context_strength
+                    .step(&mut self.similarity_context_strength, g.as_ref(), lr);
+            }
         }
 
         if let Ok(mut guard) = self.param_partitions.write() {

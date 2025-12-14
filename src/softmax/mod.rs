@@ -150,12 +150,24 @@ impl Softmax {
         // Compute softmax for each row
         for (i, row) in logits.outer_iter().enumerate() {
             // Find max value for numerical stability
-            let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut max_val = f32::NEG_INFINITY;
+            let mut any_finite = false;
+            for &x in row.iter() {
+                if x.is_finite() {
+                    any_finite = true;
+                    max_val = max_val.max(x);
+                }
+            }
+            if !any_finite {
+                max_val = 0.0;
+            }
 
             // Compute exp(x - max) in f64 so extremely small values don't underflow to 0.
             let mut exp_sum: f64 = 0.0;
             for &x in row.iter() {
-                exp_sum += PadeExp::exp((x - max_val) as f64);
+                if x.is_finite() {
+                    exp_sum += PadeExp::exp((x - max_val) as f64);
+                }
             }
 
             if exp_sum == 0.0 || !exp_sum.is_finite() {
@@ -163,7 +175,7 @@ impl Softmax {
                 let mut argmax = 0usize;
                 let mut best = f32::NEG_INFINITY;
                 for (j, &x) in row.iter().enumerate() {
-                    if x > best {
+                    if x.is_finite() && x > best {
                         best = x;
                         argmax = j;
                     }
@@ -176,7 +188,11 @@ impl Softmax {
 
             let inv_sum = 1.0 / exp_sum;
             for (j, &val) in row.iter().enumerate() {
-                result[[i, j]] = (PadeExp::exp((val - max_val) as f64) * inv_sum) as f32;
+                result[[i, j]] = if val.is_finite() {
+                    (PadeExp::exp((val - max_val) as f64) * inv_sum) as f32
+                } else {
+                    0.0
+                };
             }
         }
 

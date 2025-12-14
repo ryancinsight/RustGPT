@@ -269,6 +269,8 @@ pub struct PolyAttention {
 
     pub last_tau_metrics: Option<(f32, f32)>,
     pub last_pred_norm: Option<f32>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub last_avg_active_heads: Option<f32>,
     eff_skip_threshold: f32,
 
     #[serde(skip_serializing, skip_deserializing)]
@@ -376,6 +378,7 @@ impl PolyAttention {
             token_latent_features: None,
             last_tau_metrics: None,
             last_pred_norm: None,
+            last_avg_active_heads: None,
             eff_skip_threshold: 1e-4,
             parallel_batch_size: 32,
             parallel_timeout_ms: 0,
@@ -525,6 +528,7 @@ impl PolyAttention {
             self.last_tau_metrics = None;
         }
         self.last_pred_norm = result.pred_norm;
+        self.last_avg_active_heads = result.avg_active_heads;
 
         self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
         result.output
