@@ -47,6 +47,21 @@ pub enum AttentionType {
     PolyAttention { degree_p: usize },
 }
 
+/// Temporal mixing mechanism selection (attention vs recurrent/SSM-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TemporalMixingType {
+    /// Attention-based temporal mixing (default)
+    Attention,
+    /// Recurrent RG-LRU temporal mixing (Hawk/Griffin-style)
+    RgLru,
+}
+
+impl Default for TemporalMixingType {
+    fn default() -> Self {
+        TemporalMixingType::Attention
+    }
+}
+
 /// Strategy for sampling diffusion timesteps during training
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffusionTimestepStrategy {
@@ -159,6 +174,10 @@ pub struct ModelConfig {
     /// Attention mechanism selection (SelfAttention vs PolyAttention)
     pub attention: AttentionType,
 
+    /// Temporal mixing type selection (attention vs RG-LRU)
+    #[serde(default)]
+    pub temporal_mixing: TemporalMixingType,
+
     /// Enable Mixture-of-Experts (MoE) for feedforward layers
     ///
     /// When enabled, replaces standard feedforward layers with sparse MoE layers.
@@ -225,6 +244,7 @@ impl ModelConfig {
                 soft_top_p_alpha: 15.0, // Reduced for numerical stability
             },
             attention: AttentionType::SelfAttention,
+            temporal_mixing: TemporalMixingType::Attention,
             moe_router: None, // Default: no MoE (standard feedforward)
             trm_use_diffusion: false,
             trm_num_recursions: None,

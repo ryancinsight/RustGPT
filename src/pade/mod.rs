@@ -505,6 +505,7 @@ impl PadeExp {
     ///
     /// **Computational Cost**: 45 operations (22 mul/add for P, 22 for Q, 1 division)
     #[inline]
+    #[allow(dead_code)]
     fn pade_exp_11_11(x: f64) -> f64 {
         // Ultra-high-precision [11/11] Pade approximant coefficients
         // These coefficients are mathematically derived for optimal convergence
@@ -560,6 +561,7 @@ impl PadeExp {
     ///
     /// **Computational Cost**: 39 operations (19 mul/add for P, 19 for Q, 1 division)
     #[inline]
+    #[allow(dead_code)]
     fn chebyshev_pade_9_9(x: f64) -> f64 {
         // Chebyshev-optimized [9/9] coefficients using equioscillation principles
         // These coefficients maintain the original Pade structure but are optimized

@@ -5,15 +5,14 @@ pub mod richards_curve;
 pub mod richards_gate;
 pub mod richards_glu;
 pub mod richards_norm;
+pub mod math;
 
-// Re-export PadeExp from the shared pade module
-pub use crate::pade::*;
-
-pub use self::richards_act::*;
+// Keep the root `richards` namespace tight: re-export only the primary public types.
+pub use self::richards_act::{RichardsActivation, RichardsAttention};
 pub use self::richards_curve::{RichardsCurve, WeightsIter};
-pub use self::richards_gate::*;
-pub use self::richards_glu::*;
-pub use self::richards_norm::*;
+pub use self::richards_gate::RichardsGate;
+pub use self::richards_glu::RichardsGlu;
+pub use self::richards_norm::RichardsNorm;
 
 /// Variant types for Richards curve initialization and constraints
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]

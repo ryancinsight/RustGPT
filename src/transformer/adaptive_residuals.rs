@@ -132,7 +132,7 @@ impl UnifiedAdaptiveResiduals {
     /// Create new unified adaptive residuals with performance tuning
     pub fn new(embed_dim: usize) -> Self {
         use rand::prelude::*;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Initialize with intelligent defaults for better convergence
         let weight_similarity_matrix = Array2::from_elem((embed_dim, embed_dim), 0.1);

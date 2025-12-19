@@ -15,11 +15,11 @@ use crate::{
         HeadSelectionStrategy,
         moe::ExpertRouterConfig,
     },
-    model_config::{ModelConfig, WindowAdaptationStrategy},
+    model_config::{ModelConfig, WindowAdaptationStrategy, TemporalMixingType},
     richards::RichardsNorm,
     transformer::{
         common::{
-            FeedForwardVariant, CommonLayerConfig, CommonLayers,
+            FeedForwardVariant, CommonLayerConfig, CommonLayers, TemporalMixingLayer,
             apply_adaptive_gradients
         }
     },
@@ -52,8 +52,8 @@ pub struct TransformerBlock {
     /// Pre-attention layer normalization
     pub pre_attention_norm: RichardsNorm,
 
-    /// Attention mechanism (PolyAttention, SelfAttention, etc.)
-    pub attention: PolyAttention,
+    /// Temporal mixing mechanism (attention or RG-LRU)
+    pub temporal_mixing: TemporalMixingLayer,
 
     /// Pre-feedforward layer normalization
     pub pre_ffn_norm: RichardsNorm,
@@ -110,23 +110,68 @@ impl<'de> Deserialize<'de> for TransformerBlock {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct TransformerBlockSerde {
-            pre_attention_norm: RichardsNorm,
-            attention: PolyAttention,
-            pre_ffn_norm: RichardsNorm,
-            feedforward: FeedForwardVariant,
-            config: TransformerBlockConfig,
+        #[serde(untagged)]
+        enum TransformerBlockSerdeCompat {
+            V1 {
+                pre_attention_norm: RichardsNorm,
+                attention: PolyAttention,
+                pre_ffn_norm: RichardsNorm,
+                feedforward: FeedForwardVariant,
+                config: TransformerBlockConfig,
 
-            #[serde(default = "default_similarity_context_strength")]
-            similarity_context_strength: Array2<f32>,
+                #[serde(default = "default_similarity_context_strength")]
+                similarity_context_strength: Array2<f32>,
+            },
+            V2 {
+                pre_attention_norm: RichardsNorm,
+                temporal_mixing: TemporalMixingLayer,
+                pre_ffn_norm: RichardsNorm,
+                feedforward: FeedForwardVariant,
+                config: TransformerBlockConfig,
+
+                #[serde(default = "default_similarity_context_strength")]
+                similarity_context_strength: Array2<f32>,
+            },
         }
 
-        let data = TransformerBlockSerde::deserialize(deserializer)?;
-        let embed_dim = data.config.embed_dim;
+        let (pre_attention_norm, temporal_mixing, pre_ffn_norm, feedforward, config, similarity_context_strength_raw) =
+            match TransformerBlockSerdeCompat::deserialize(deserializer)? {
+                TransformerBlockSerdeCompat::V1 {
+                    pre_attention_norm,
+                    attention,
+                    pre_ffn_norm,
+                    feedforward,
+                    config,
+                    similarity_context_strength,
+                } => (
+                    pre_attention_norm,
+                    TemporalMixingLayer::Attention(attention),
+                    pre_ffn_norm,
+                    feedforward,
+                    config,
+                    similarity_context_strength,
+                ),
+                TransformerBlockSerdeCompat::V2 {
+                    pre_attention_norm,
+                    temporal_mixing,
+                    pre_ffn_norm,
+                    feedforward,
+                    config,
+                    similarity_context_strength,
+                } => (
+                    pre_attention_norm,
+                    temporal_mixing,
+                    pre_ffn_norm,
+                    feedforward,
+                    config,
+                    similarity_context_strength,
+                ),
+            };
+
+        let embed_dim = config.embed_dim;
 
         // Ensure strength is always a 1×1 scalar.
-        let scalar = data
-            .similarity_context_strength
+        let scalar = similarity_context_strength_raw
             .get((0, 0))
             .copied()
             .unwrap_or(0.0);
@@ -134,11 +179,11 @@ impl<'de> Deserialize<'de> for TransformerBlock {
         similarity_context_strength[[0, 0]] = if scalar.is_finite() { scalar } else { 0.0 };
 
         Ok(Self {
-            pre_attention_norm: data.pre_attention_norm,
-            attention: data.attention,
-            pre_ffn_norm: data.pre_ffn_norm,
-            feedforward: data.feedforward,
-            config: data.config,
+            pre_attention_norm,
+            temporal_mixing,
+            pre_ffn_norm,
+            feedforward,
+            config,
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
             window_entropy_ema: 0.0,
@@ -153,7 +198,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
 
 #[derive(Clone, Debug, Default)]
 struct ParamPartitions {
-    attention: usize,
+    temporal_mixing: usize,
     feedforward: usize,
     pre_ffn_norm: usize,
     pre_attn_norm: usize,
@@ -189,6 +234,10 @@ pub struct TransformerBlockConfig {
 
     /// Head selection strategy for attention
     pub head_selection: HeadSelectionStrategy,
+
+    /// Temporal mixing mechanism (attention or RG-LRU)
+    #[serde(default)]
+    pub temporal_mixing: TemporalMixingType,
 
     /// Adaptive window sizing enabled
     pub use_adaptive_window: bool,
@@ -257,6 +306,7 @@ impl From<&TransformerBlockConfig> for CommonLayerConfig {
             use_moe: config.use_moe,
             moe_config: config.moe_config.clone(),
             head_selection: config.head_selection.clone(),
+            temporal_mixing: config.temporal_mixing,
         }
     }
 }
@@ -282,7 +332,7 @@ impl TransformerBlock {
 
         Self {
             pre_attention_norm: layers.pre_attention_norm,
-            attention: layers.attention,
+            temporal_mixing: layers.temporal_mixing,
             pre_ffn_norm: layers.pre_ffn_norm,
             feedforward: layers.feedforward,
             config,
@@ -426,6 +476,7 @@ impl TransformerBlock {
                 .as_ref()
                 .map(|router| ExpertRouterConfig::from_router(router)),
             head_selection: config.head_selection.clone(),
+            temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
             min_window_size: config.min_window_size,
             max_window_size: config.max_window_size,
@@ -450,7 +501,7 @@ impl TransformerBlock {
     /// Get the total number of parameters in this transformer block
     pub fn parameter_count(&self) -> usize {
         self.pre_attention_norm.parameters()
-            + self.attention.parameters()
+            + self.temporal_mixing.parameters()
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
             + 1 // similarity_context_strength (scalar)
@@ -462,7 +513,7 @@ impl TransformerBlock {
         let s2 = if s.is_finite() { s * s } else { 0.0 };
 
         (self.pre_attention_norm.weight_norm().powi(2)
-            + self.attention.weight_norm().powi(2)
+            + self.temporal_mixing.weight_norm().powi(2)
             + self.pre_ffn_norm.weight_norm().powi(2)
             + self.feedforward.weight_norm().powi(2)
             + s2)
@@ -472,7 +523,7 @@ impl TransformerBlock {
 
 impl ParamPartitions {
     fn total(&self) -> usize {
-        self.attention
+        self.temporal_mixing
             + self.feedforward
             + self.pre_ffn_norm
             + self.pre_attn_norm
@@ -499,7 +550,7 @@ impl Layer for TransformerBlock {
         // Pre-attention normalization
         let norm1_out = self.pre_attention_norm.forward(input_used_arc.as_ref());
 
-        // Attention with residual connection - compute dynamic window size
+        // Temporal mixing with residual connection
         let seq_len = input_used_arc.nrows();
         let base_w = self
             .config
@@ -509,58 +560,92 @@ impl Layer for TransformerBlock {
         if self.config.use_adaptive_window {
             let min_w = self.config.min_window_size.max(1);
             let max_w = self.config.max_window_size.max(min_w);
-            match self.config.window_adaptation_strategy {
-                WindowAdaptationStrategy::Fixed => {
-                    dynamic_w = base_w.min(seq_len.max(1));
+            // Adaptive window is attention-specific; skip when not using attention.
+            if matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+                match self.config.window_adaptation_strategy {
+                    WindowAdaptationStrategy::Fixed => {
+                        dynamic_w = base_w.min(seq_len.max(1));
+                    }
+                    WindowAdaptationStrategy::SequenceLengthBased => {
+                        let w = (seq_len / 2).max(min_w).min(max_w);
+                        dynamic_w = w;
+                    }
+                    WindowAdaptationStrategy::AttentionEntropy => {
+                        let alpha = self.config.entropy_ema_alpha.clamp(0.0, 1.0);
+                        let (tau_span, pred_rms) = match &self.temporal_mixing {
+                            TemporalMixingLayer::Attention(attn) => {
+                                let tau_span = if let Some((tmin, tmax)) = attn.last_tau_metrics {
+                                    (tmax - tmin).abs().max(0.0)
+                                } else {
+                                    0.0
+                                };
+                                let pred_rms = attn.last_pred_norm.unwrap_or(0.0).max(0.0);
+                                (tau_span, pred_rms)
+                            }
+                            _ => (0.0, 0.0),
+                        };
+                        let signal = (0.7 * tau_span + 0.3 * pred_rms).clamp(0.0, 1.0);
+                        self.window_entropy_ema = alpha * signal + (1.0 - alpha) * self.window_entropy_ema;
+                        let w = min_w as f32
+                            + self.window_entropy_ema * (max_w.saturating_sub(min_w) as f32);
+                        dynamic_w = w.round() as usize;
+                    }
+                    WindowAdaptationStrategy::PerplexityBased => {
+                        dynamic_w = base_w.min(seq_len.max(1));
+                    }
                 }
-                WindowAdaptationStrategy::SequenceLengthBased => {
-                    let w = (seq_len / 2).max(min_w).min(max_w);
-                    dynamic_w = w;
-                }
-                WindowAdaptationStrategy::AttentionEntropy => {
-                    let alpha = self.config.entropy_ema_alpha.clamp(0.0, 1.0);
-                    let tau_span = if let Some((tmin, tmax)) = self.attention.last_tau_metrics {
-                        (tmax - tmin).abs().max(0.0)
-                    } else {
-                        0.0
-                    };
-                    let pred_rms = self.attention.last_pred_norm.unwrap_or(0.0).max(0.0);
-                    let signal = (0.7 * tau_span + 0.3 * pred_rms).clamp(0.0, 1.0);
-                    self.window_entropy_ema = alpha * signal + (1.0 - alpha) * self.window_entropy_ema;
-                    let w = min_w as f32 + self.window_entropy_ema * (max_w.saturating_sub(min_w) as f32);
-                    dynamic_w = w.round() as usize;
-                }
-                WindowAdaptationStrategy::PerplexityBased => {
-                    dynamic_w = base_w.min(seq_len.max(1));
-                }
+                dynamic_w = dynamic_w.min(seq_len.max(1));
+                dynamic_w = dynamic_w.clamp(min_w, max_w);
             }
-            dynamic_w = dynamic_w.min(seq_len.max(1));
-            dynamic_w = dynamic_w.clamp(min_w, max_w);
         }
-        self.attention.set_window_size(Some(dynamic_w));
-        
-        // Attention forward
-        let attn_out = self.attention.forward(&norm1_out);
+
+        // Push window-size to attention only (no-op for RG-LRU).
+        if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
+            attn.set_window_size(Some(dynamic_w));
+        }
+
+        // Temporal mixing forward
+        let mix_out = self.temporal_mixing.forward(&norm1_out);
 
         // Head activity ratio from MoH (avg active heads / num_heads).
-        let head_activity_ratio = if let Some(avg) = self.attention.last_avg_active_heads {
-            let denom = (self.config.num_heads.max(1)) as f32;
-            let r = avg / denom;
-            if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
-        } else {
-            1.0
+        let head_activity_ratio = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => {
+                if let Some(avg) = attn.last_avg_active_heads {
+                    let denom = (self.config.num_heads.max(1)) as f32;
+                    let r = avg / denom;
+                    if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
+                } else {
+                    1.0
+                }
+            }
+            TemporalMixingLayer::RgLruMoH(rglru) => {
+                if let Some(avg) = rglru.last_avg_active_heads {
+                    let denom = (self.config.num_heads.max(1)) as f32;
+                    let r = avg / denom;
+                    if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
+                } else {
+                    1.0
+                }
+            }
+            _ => 1.0,
         };
 
-        // Update per-layer similarity representation matrix (input→attention-output channel similarity).
-        self.update_activation_similarity_matrix(input_used_arc.as_ref(), &attn_out);
+        // Update per-layer similarity representation matrix (input→mix-output channel similarity).
+        self.update_activation_similarity_matrix(input_used_arc.as_ref(), &mix_out);
         
         // In-place residual connection: take ownership and add in-place
         // This avoids allocating a new array for residual1
-        let mut residual1 = attn_out;
+        let mut residual1 = mix_out;
         residual1 += input_used_arc.as_ref(); // ndarray supports += for in-place addition
 
         // Pre-feedforward normalization
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
+
+        let head_activity_vec = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
+            _ => None,
+        };
 
         // Feedforward with residual connection
         let ffn_out = match &mut self.feedforward {
@@ -569,7 +654,7 @@ impl Layer for TransformerBlock {
                 layer.forward_with_head_features(
                     &norm2_out,
                     Some(head_activity_ratio),
-                    self.attention.last_head_activity_vec.as_deref(),
+                    head_activity_vec,
                 )
             }
         };
@@ -649,12 +734,12 @@ impl Layer for TransformerBlock {
             let input_grads_ref = &residual1_total_grads;
 
             // Get attention gradients
-            let (attn_input_grad, attn_param_grads) =
-                self.attention.compute_gradients(norm1_out, &residual1_total_grads);
+            let (mix_input_grad, mix_param_grads) =
+                self.temporal_mixing.compute_gradients(norm1_out, &residual1_total_grads);
 
             let (norm1_input_grad, pre_attn_param_grads) = self
                 .pre_attention_norm
-                .compute_gradients(input_used, &attn_input_grad);
+                .compute_gradients(input_used, &mix_input_grad);
 
             // Gradients w.r.t. the *mixed* input used by this block: dX'.
             let final_input_used_grads = input_grads_ref + &norm1_input_grad;
@@ -698,7 +783,7 @@ impl Layer for TransformerBlock {
 
             // Capture gradient partition sizes so apply_gradients can re-slice accurately later
             let partitions = ParamPartitions {
-                attention: attn_param_grads.len(),
+                temporal_mixing: mix_param_grads.len(),
                 feedforward: ffn_param_grads.len(),
                 pre_ffn_norm: pre_ffn_param_grads.len(),
                 pre_attn_norm: pre_attn_param_grads.len(),
@@ -712,7 +797,7 @@ impl Layer for TransformerBlock {
             }
 
             // Collect all parameter gradients in deterministic order
-            all_param_grads.extend(attn_param_grads);
+            all_param_grads.extend(mix_param_grads);
             all_param_grads.extend(ffn_param_grads);
             all_param_grads.extend(pre_ffn_param_grads);
             all_param_grads.extend(pre_attn_param_grads);
@@ -756,7 +841,7 @@ impl Layer for TransformerBlock {
                 let n = param_grads.len();
                 if n >= 1 {
                     ParamPartitions {
-                        attention: n - 1,
+                        temporal_mixing: n - 1,
                         similarity_context_strength: 1,
                         ..ParamPartitions::default()
                     }
@@ -774,7 +859,7 @@ impl Layer for TransformerBlock {
                 if val.is_nan() || val.is_infinite() {
                     // Replace NaN/inf with small random noise to break symmetry
                     use rand::prelude::*;
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     clipped.mapv_inplace(|_| 0.01 * (rng.random::<f32>() - 0.5));
                     break;
                 }
@@ -805,17 +890,17 @@ impl Layer for TransformerBlock {
             start..idx
         };
 
-        // Apply attention gradients with adaptive scaling (LARS-style)
-        let attn_range = next_range(partitions.attention);
-        let attention_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[attn_range.clone()].to_vec();
-        if !attention_grads.is_empty() {
+        // Apply temporal-mixing gradients with adaptive scaling (LARS-style)
+        let mix_range = next_range(partitions.temporal_mixing);
+        let mixing_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[mix_range.clone()].to_vec();
+        if !mixing_grads.is_empty() {
             // Convert Cow to owned for apply_gradients (needed for downstream API)
-            let owned_grads: Vec<Array2<f32>> = attention_grads.iter().map(|c| c.as_ref().clone()).collect();
+            let owned_grads: Vec<Array2<f32>> = mixing_grads.iter().map(|c| c.as_ref().clone()).collect();
             apply_adaptive_gradients(
                 &owned_grads,
-                self.attention.weight_norm(),
+                self.temporal_mixing.weight_norm(),
                 lr,
-                |grads, lr| self.attention.apply_gradients(grads, lr)
+                |grads, lr| self.temporal_mixing.apply_gradients(grads, lr)
             )?;
         }
 
@@ -898,6 +983,7 @@ mod tests {
                 top_p: 0.9,
                 soft_top_p_alpha: 15.0,
             },
+            temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
@@ -937,6 +1023,7 @@ mod tests {
                 top_p: 0.9,
                 soft_top_p_alpha: 15.0,
             },
+            temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
@@ -972,6 +1059,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
@@ -1003,6 +1091,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
@@ -1037,6 +1126,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
@@ -1078,6 +1168,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,

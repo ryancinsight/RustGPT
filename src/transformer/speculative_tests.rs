@@ -2,10 +2,8 @@
 mod tests {
     use crate::transformer::speculative::SpeculativeSamplingConfig;
     use crate::transformer::diffusion_block::{DiffusionBlock, DiffusionBlockConfig, NoiseSchedule, DiffusionPredictionTarget};
-    use crate::model_config::DiffusionTimestepStrategy;
+    use crate::model_config::{DiffusionTimestepStrategy, TemporalMixingType};
     use crate::mixtures::HeadSelectionStrategy;
-    use ndarray::Array2;
-
     fn create_dummy_block() -> DiffusionBlock {
         let config = DiffusionBlockConfig {
             embed_dim: 16,
@@ -26,6 +24,7 @@ mod tests {
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
             time_embed_dim: 16,
             mask_token_id: None,
+            temporal_mixing: TemporalMixingType::Attention,
             use_advanced_adaptive_residuals: false, // Disable for testing
         };
         DiffusionBlock::new(config)

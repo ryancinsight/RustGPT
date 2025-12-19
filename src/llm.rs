@@ -844,27 +844,55 @@ impl LLM {
                     }
                 }
                 if let LayerEnum::TransformerBlock(block) = layer {
-                    // Pull through attention metrics from within the block
-                    if let Some((min_tau, max_tau)) = block.attention.take_tau_metrics() {
-                        tau_available = true;
-                        if min_tau < tau_min_epoch {
-                            tau_min_epoch = min_tau;
+                    // Pull through MoH instrumentation from the temporal-mixing layer.
+                    match &mut block.temporal_mixing {
+                        crate::transformer::common::TemporalMixingLayer::Attention(attn) => {
+                            if let Some((min_tau, max_tau)) = attn.take_tau_metrics() {
+                                tau_available = true;
+                                if min_tau < tau_min_epoch {
+                                    tau_min_epoch = min_tau;
+                                }
+                                if max_tau > tau_max_epoch {
+                                    tau_max_epoch = max_tau;
+                                }
+                            }
+                            if let Some(rms_g) = attn.take_pred_norm() {
+                                pred_norm_sum += rms_g;
+                                pred_norm_count += 1;
+                            }
+                            let per_head = attn.get_head_metrics_and_reset();
+                            if !per_head.is_empty() {
+                                let layer_avg_active_heads =
+                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                avg_heads_per_token_sum += layer_avg_active_heads;
+                                heads_layers_count += 1;
+                                total_heads_sum += per_head.len();
+                            }
                         }
-                        if max_tau > tau_max_epoch {
-                            tau_max_epoch = max_tau;
+                        crate::transformer::common::TemporalMixingLayer::RgLruMoH(rglru) => {
+                            if let Some((min_tau, max_tau)) = rglru.take_tau_metrics() {
+                                tau_available = true;
+                                if min_tau < tau_min_epoch {
+                                    tau_min_epoch = min_tau;
+                                }
+                                if max_tau > tau_max_epoch {
+                                    tau_max_epoch = max_tau;
+                                }
+                            }
+                            if let Some(rms_g) = rglru.take_pred_norm() {
+                                pred_norm_sum += rms_g;
+                                pred_norm_count += 1;
+                            }
+                            let per_head = rglru.get_head_metrics_and_reset();
+                            if !per_head.is_empty() {
+                                let layer_avg_active_heads =
+                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                avg_heads_per_token_sum += layer_avg_active_heads;
+                                heads_layers_count += 1;
+                                total_heads_sum += per_head.len();
+                            }
                         }
-                    }
-                    if let Some(rms_g) = block.attention.take_pred_norm() {
-                        pred_norm_sum += rms_g;
-                        pred_norm_count += 1;
-                    }
-                    let per_head = block.attention.get_head_metrics_and_reset();
-                    if !per_head.is_empty() {
-                        let layer_avg_active_heads =
-                            per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                        avg_heads_per_token_sum += layer_avg_active_heads;
-                        heads_layers_count += 1;
-                        total_heads_sum += per_head.len();
+                        _ => {}
                     }
 
                     // Pull through MoE metrics when MoE is used inside the block.
@@ -1251,10 +1279,18 @@ impl LLM {
             };
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer {
-                    tb.attention.adapt_degree(&metrics);
+                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                        &mut tb.temporal_mixing
+                    {
+                        attn.adapt_degree(&metrics);
+                    }
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer {
-                    db.attention.adapt_degree(&metrics);
+                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                        &mut db.temporal_mixing
+                    {
+                        attn.adapt_degree(&metrics);
+                    }
                 }
                 if let LayerEnum::PolyAttention(pa) = layer {
                     pa.adapt_degree(&metrics);
@@ -1383,9 +1419,13 @@ impl LLM {
             let mut rec_tau_max = f32::NAN;
             for layer in &self.network {
                 if let LayerEnum::LRM(lrm) = layer {
-                    lb_loss = lrm.attention().head_selection_config.compute_load_balance_loss();
-                    cx_loss = lrm.attention().head_selection_config.compute_complexity_loss(lrm.attention().moh_num_active() as f32);
-                    sp_loss = lrm.attention().head_selection_config.compute_sparsity_loss();
+                    lb_loss = lrm.attention().moh.head_selection_config.compute_load_balance_loss();
+                    cx_loss = lrm
+                        .attention()
+                        .moh
+                        .head_selection_config
+                        .compute_complexity_loss(lrm.attention().moh_num_active() as f32);
+                    sp_loss = lrm.attention().moh.head_selection_config.compute_sparsity_loss();
                     if !lrm.recursion_metrics.is_empty() {
                         let mut hsum = 0.0f32;
                         let mut c = 0usize;
@@ -1429,8 +1469,13 @@ impl LLM {
                     let heads = lrm.attention().num_heads() as f32;
                     let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 { (avg_active_heads / heads).clamp(0.1, 1.0) } else { 0.5 };
                     lrm.set_latent_update_alpha(0.03 + 0.05 * (1.0 - h_ratio));
-                    let ent = lrm.attention().head_selection_config.gating.get_gating_entropy();
-                    let g = &mut lrm.attention_mut().head_selection_config.gating;
+                    let ent = lrm
+                        .attention()
+                        .moh
+                        .head_selection_config
+                        .gating
+                        .get_gating_entropy();
+                    let g = &mut lrm.attention_mut().moh.head_selection_config.gating;
                     if ent < 0.2 { g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2); }
                     if avg_active_heads.is_finite() {
                         if avg_active_heads > heads * 0.5 { g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2); }
@@ -1547,12 +1592,42 @@ impl LLM {
 
             let target_avg = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().moh_num_active() as f32, _ => 0.0 };
             let moh_penalty = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg), _ => 0.0 };
+
+            let moe_penalty = match &self.network[t_idx] {
+                LayerEnum::LRM(lrm) => {
+                    let guard = lrm.block.read().unwrap();
+                    match &*guard {
+                        crate::transformer::lrm::RecursiveBlockVariant::Transformer(b) => {
+                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                                let target_avg_experts = moe.config.gating.num_active as f32;
+                                moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                            } else {
+                                0.0
+                            }
+                        }
+                        crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
+                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                                let target_avg_experts = moe.config.gating.num_active as f32;
+                                moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                            } else {
+                                0.0
+                            }
+                        }
+                    }
+                }
+                _ => 0.0,
+            };
             
             if moh_penalty > 10.0 {
                  info!("High MoH penalty in batch: {}", moh_penalty);
             }
+
+              if moe_penalty > 10.0 {
+                  info!("High MoE penalty in batch: {}", moe_penalty);
+              }
             
             batch_loss += moh_penalty;
+              batch_loss += moe_penalty;
 
             let grads_logits = crate::loss::symmetric_cross_entropy_gradients(&probs, target_ids, sce_cfg.alpha, sce_cfg.beta, sce_cfg.epsilon);
 
@@ -1730,34 +1805,74 @@ impl LLM {
                 };
                 let mut aux_loss_sum = 0.0f32;
                 if !aux_steps.is_empty() {
-                    let rn_idx = t_idx + 1;
-                    let op_idx = t_idx + 2;
+                    // IMPORTANT: Do NOT call forward() on real layers here.
+                    // OutputProjection/DynamicTanhNorm rely on internal cached_input for gradients;
+                    // calling forward() for aux supervision would overwrite caches and corrupt the
+                    // main backward pass.
+
+                    // Find the normalization layer after the LRM and the output projection layer.
+                    let mut rn_idx: Option<usize> = None;
+                    let mut op_idx: Option<usize> = None;
+                    for i in (t_idx + 1)..self.network.len() {
+                        if matches!(self.network[i], LayerEnum::DynamicTanhNorm(_)) {
+                            rn_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if let Some(rn_i) = rn_idx {
+                        for i in (rn_i + 1)..self.network.len() {
+                            if matches!(self.network[i], LayerEnum::OutputProjection(_)) {
+                                op_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+
+                    let (rn_idx, op_idx) = match (rn_idx, op_idx) {
+                        (Some(rn), Some(op)) => (rn, op),
+                        _ => {
+                            tracing::warn!(
+                                "TRM supervision skipped: could not find Norm/OutputProjection after LRM"
+                            );
+                            // Still add the aux loss (0.0) and proceed with main backward.
+                            batch_loss += aux_loss_sum;
+                            continue;
+                        }
+                    };
+
+                    // Clone layers to keep aux supervision cache-isolated.
+                    let mut rn_clone = match &self.network[rn_idx] {
+                        LayerEnum::DynamicTanhNorm(n) => n.clone(),
+                        _ => {
+                            batch_loss += aux_loss_sum;
+                            continue;
+                        }
+                    };
+                    let mut op_clone = match &self.network[op_idx] {
+                        LayerEnum::OutputProjection(op) => op.clone(),
+                        _ => {
+                            batch_loss += aux_loss_sum;
+                            continue;
+                        }
+                    };
+
                     let steps_total = aux_steps.len();
                     let aux_base: f32 = 1.0;
                     let decay_rate: f32 = 0.6; // decay towards earlier steps
-                    for (si, y_t) in aux_steps.iter().cloned().enumerate() {
+                    for (si, y_t) in aux_steps.iter().enumerate() {
                         let mut grad_y_in_opt: Option<Array2<f32>> = None;
                         {
-                            let (head, tail) = self.network.split_at_mut(op_idx);
-                            let rn_layer = &mut head[rn_idx];
-                            let op_layer = &mut tail[0];
-                            let norm_y = rn_layer.forward(&y_t);
-                            let logits_t = op_layer.forward(&norm_y);
+                            let norm_y = rn_clone.forward(y_t);
+                            let logits_t = op_clone.forward(&norm_y);
                             let probs_t = crate::softmax::Softmax::new().forward_immutable(&logits_t.view());
-                            // compressed targets: use last token only
-                            let compressed_targets: &[usize] = if !target_ids.is_empty() {
-                                &target_ids[target_ids.len().saturating_sub(1)..]
-                            } else {
-                                target_ids
-                            };
                             let sce_t = crate::loss::symmetric_cross_entropy(
                                 &probs_t,
-                                compressed_targets,
+                                target_ids,
                                 sce_cfg.alpha,
                                 sce_cfg.beta,
                                 sce_cfg.epsilon,
                             );
-                            let sce_t_norm = sce_t / (compressed_targets.len().max(1) as f32);
+                            let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
                             // per-step weight: heavier on later steps
                             let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
                             let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
@@ -1769,14 +1884,14 @@ impl LLM {
                             aux_loss_sum += sce_t_norm * step_weight;
                             let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
                                 &probs_t,
-                                compressed_targets,
+                                target_ids,
                                 sce_cfg.alpha,
                                 sce_cfg.beta,
                                 sce_cfg.epsilon,
                             );
                             grad_logits_t.mapv_inplace(|v| v * step_weight);
-                            let (grad_norm_in, _) = op_layer.compute_gradients(&norm_y, &grad_logits_t);
-                            let (grad_y_in, _) = rn_layer.compute_gradients(&y_t, &grad_norm_in);
+                            let (grad_norm_in, _) = op_clone.compute_gradients(&norm_y, &grad_logits_t);
+                            let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
                             grad_y_in_opt = Some(grad_y_in);
                         }
                         if let Some(grad_y_in) = grad_y_in_opt {
@@ -1806,8 +1921,35 @@ impl LLM {
 
                 let target_avg = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().moh_num_active() as f32, _ => 0.0 };
                 let moh_penalty = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg), _ => 0.0 };
+                let moe_penalty = match &self.network[t_idx] {
+                    LayerEnum::LRM(lrm) => {
+                        let guard = lrm.block.read().unwrap();
+                        match &*guard {
+                            crate::transformer::lrm::RecursiveBlockVariant::Transformer(b) => {
+                                if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                                    let target_avg_experts = moe.config.gating.num_active as f32;
+                                    moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                                } else {
+                                    0.0
+                                }
+                            }
+                            crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
+                                if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                                    let target_avg_experts = moe.config.gating.num_active as f32;
+                                    moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                                } else {
+                                    0.0
+                                }
+                            }
+                        }
+                    }
+                    _ => 0.0,
+                };
                 if moh_penalty > 0.01 {
                      tracing::info!("MoH Penalty (not in loss): {}", moh_penalty);
+                }
+                if moe_penalty > 0.01 {
+                     tracing::info!("MoE Penalty (not in loss): {}", moe_penalty);
                 }
 
                 batch_loss += aux_loss_sum;
@@ -2845,12 +2987,20 @@ impl LLM {
             let mut pred_norm_rms: Option<f32> = None;
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer {
-                    tau_range = tb.attention.take_tau_metrics();
-                    pred_norm_rms = tb.attention.take_pred_norm();
+                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                        &mut tb.temporal_mixing
+                    {
+                        tau_range = attn.take_tau_metrics();
+                        pred_norm_rms = attn.take_pred_norm();
+                    }
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer {
-                    tau_range = db.attention.take_tau_metrics();
-                    pred_norm_rms = db.attention.take_pred_norm();
+                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                        &mut db.temporal_mixing
+                    {
+                        tau_range = attn.take_tau_metrics();
+                        pred_norm_rms = attn.take_pred_norm();
+                    }
                 }
                 if let LayerEnum::LRM(lrm) = layer {
                     tau_range = lrm.attention_mut().take_tau_metrics();
@@ -2868,10 +3018,18 @@ impl LLM {
             };
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer {
-                    tb.attention.adapt_degree(&metrics);
+                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                        &mut tb.temporal_mixing
+                    {
+                        attn.adapt_degree(&metrics);
+                    }
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer {
-                    db.attention.adapt_degree(&metrics);
+                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                        &mut db.temporal_mixing
+                    {
+                        attn.adapt_degree(&metrics);
+                    }
                 }
                 if let LayerEnum::LRM(lrm) = layer {
                     lrm.attention_mut().adapt_degree(&metrics);

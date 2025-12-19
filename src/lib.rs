@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod pade;
 pub mod richards;
 pub mod softmax;
+pub mod ssm;
 
 // removed: pub mod head_router;
 pub mod llm;

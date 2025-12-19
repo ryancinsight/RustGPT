@@ -108,6 +108,7 @@ fn build_diffusion_layers(
             mask_token_id: Some(mask_id),
             prediction_target: config.diffusion_prediction_target.clone(),
             timestep_strategy: config.diffusion_timestep_strategy,
+            temporal_mixing: config.temporal_mixing,
             use_advanced_adaptive_residuals: true, // Enable by default for diffusion blocks
         };
 
