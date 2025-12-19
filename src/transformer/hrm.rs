@@ -99,6 +99,7 @@ impl HRM {
             use_moe: config.moe_router.is_some(),
             moe_config: None, // Simplified for now
             head_selection: config.head_selection.clone(),
+            temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
             min_window_size: config.min_window_size,
             max_window_size: config.max_window_size,
@@ -480,6 +481,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            temporal_mixing: crate::model_config::TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 4,
             max_window_size: 32,
@@ -517,6 +519,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            temporal_mixing: crate::model_config::TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 4,
             max_window_size: 16,

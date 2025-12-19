@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use crate::{
     model_config::DiffusionTimestepStrategy,
+    model_config::TemporalMixingType,
     transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
 };
 
@@ -118,6 +119,29 @@ pub struct Args {
     /// Each MoE layer contains multiple expert networks with learned routing
     #[arg(long)]
     pub moe: bool,
+
+    /// Temporal mixing mechanism (attention vs SSM-style RG-LRU)
+    #[arg(long, value_enum, default_value_t = TemporalMixingCli::Attention)]
+    pub temporal_mixing: TemporalMixingCli,
+}
+
+/// CLI representation of temporal mixing types
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum TemporalMixingCli {
+    /// Use attention for temporal mixing (default)
+    Attention,
+    /// Use RG-LRU recurrent temporal mixing (SSM-style)
+    #[value(alias = "rglru", alias = "rg-lru", alias = "ssm")]
+    RgLru,
+}
+
+impl From<TemporalMixingCli> for TemporalMixingType {
+    fn from(arg: TemporalMixingCli) -> Self {
+        match arg {
+            TemporalMixingCli::Attention => TemporalMixingType::Attention,
+            TemporalMixingCli::RgLru => TemporalMixingType::RgLru,
+        }
+    }
 }
 
 /// CLI representation of diffusion prediction targets

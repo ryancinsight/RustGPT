@@ -281,6 +281,96 @@ impl ThresholdPredictor {
         )
     }
 
+    /// Compute gradients for parameters **and** return gradient w.r.t. the predictor input.
+    ///
+    /// This is useful when the gating predictor is part of a larger differentiable routing
+    /// mechanism (e.g., MoH/MoE) and upstream layers need gradients through the router.
+    pub fn compute_gradients_with_input(
+        &self,
+        output_grads: &ndarray::Array2<f32>,
+    ) -> (
+        ndarray::Array2<f32>,
+        ndarray::Array2<f32>,
+        ndarray::Array1<f32>,
+        ndarray::Array2<f32>,
+        ndarray::Array1<f32>,
+        Option<ndarray::Array2<f32>>,
+        Vec<f64>,
+    ) {
+        // Retrieve cached activations
+        let cached_input = self
+            .cached_input
+            .as_ref()
+            .expect("predict must be called before compute_gradients_with_input");
+        let cached_output = self
+            .cached_output
+            .as_ref()
+            .expect("predict must be called before compute_gradients_with_input");
+        let cached_activated = self
+            .cached_activated
+            .as_ref()
+            .expect("predict must be called before compute_gradients_with_input");
+        let cached_normalized = self
+            .cached_normalized
+            .as_ref()
+            .expect("predict must be called before compute_gradients_with_input");
+        let cached_hidden = self
+            .cached_hidden
+            .as_ref()
+            .expect("predict must be called before compute_gradients_with_input");
+
+        // Gradient through Richards sigmoid
+        let output_f64 = cached_output.mapv(|x| x as f64);
+        let output_grads_f64 = output_grads.mapv(|x| x as f64);
+        let sigmoid_grad_f64 = self.sigmoid.backward_matrix(&output_f64, &output_grads_f64);
+        let d_output = sigmoid_grad_f64.mapv(|x| x as f32);
+
+        // Second layer gradients
+        let grad_weights2 = cached_activated.t().dot(&d_output);
+        let grad_bias2 = d_output.sum_axis(ndarray::Axis(0));
+
+        // Gradient w.r.t. activated (before second layer)
+        let d_activated = d_output.dot(&self.weights2.t());
+
+        // Gradient through Richards activation
+        let normalized_f64 = cached_normalized.mapv(|x| x as f64);
+        let d_activated_f64 = d_activated.mapv(|x| x as f64);
+        let activation_grad_f64 = self
+            .activation
+            .backward_matrix(&normalized_f64, &d_activated_f64);
+        let d_normalized = activation_grad_f64.mapv(|x| x as f32);
+
+        // Gradient through Richards normalization
+        let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
+
+        // First layer gradients
+        let grad_weights1: ndarray::Array2<f32> = cached_input.t().dot(&d_hidden);
+        let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
+        let grad_cond_w = if let Some(cond_in) = &self.cached_cond_input {
+            Some(cond_in.t().dot(&d_hidden))
+        } else {
+            None
+        };
+
+        // Gradient w.r.t. predictor input
+        let grad_input = d_hidden.dot(&self.weights1.t());
+
+        // Activation parameter gradients
+        let activation_grads = self
+            .activation
+            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
+
+        (
+            grad_input,
+            grad_weights1,
+            grad_bias1,
+            grad_weights2,
+            grad_bias2,
+            grad_cond_w,
+            activation_grads,
+        )
+    }
+
     /// Get parameters for gradient computation
     pub fn parameters(&self) -> Vec<&ndarray::Array2<f32>> {
         vec![&self.weights1, &self.weights2]

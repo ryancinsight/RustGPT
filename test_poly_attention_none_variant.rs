@@ -14,23 +14,23 @@ fn main() {
     let mut poly_none = PolyAttention::new(64, 4, 3, 512, None); // p=3 (odd)
 
     // Replace the gate_poly with different variants
-    poly_sigmoid.gate.curve = RichardsCurve::new_learnable(Variant::Sigmoid);
-    poly_none.gate.curve = RichardsCurve::new_learnable(Variant::None);
+    poly_sigmoid.moh.gate.curve = RichardsCurve::new_learnable(Variant::Sigmoid);
+    poly_none.moh.gate.curve = RichardsCurve::new_learnable(Variant::None);
 
     println!("1. Parameter Count Comparison:");
     println!(
         "  Sigmoid gate parameters: {}",
-        poly_sigmoid.gate.curve.weights().len()
+        poly_sigmoid.moh.gate.curve.weights().len()
     );
     println!(
         "  None gate parameters: {}",
-        poly_none.gate.curve.weights().len()
+        poly_none.moh.gate.curve.weights().len()
     );
     println!();
 
     println!("2. Initial Gate Parameters:");
-    println!("  Sigmoid gate: {:?}", poly_sigmoid.gate.curve.weights());
-    println!("  None gate: {:?}", poly_none.gate.curve.weights());
+    println!("  Sigmoid gate: {:?}", poly_sigmoid.moh.gate.curve.weights());
+    println!("  None gate: {:?}", poly_none.moh.gate.curve.weights());
     println!();
 
     // Test with sample input
@@ -73,8 +73,8 @@ fn main() {
     let synthetic_grads = Array2::<f32>::ones((grad_shape[0], grad_shape[1]).f()) * 0.01;
 
     // Store initial parameters
-    let sigmoid_initial = poly_sigmoid.gate.curve.weights();
-    let none_initial = poly_none.gate.curve.weights();
+    let sigmoid_initial = poly_sigmoid.moh.gate.curve.weights();
+    let none_initial = poly_none.moh.gate.curve.weights();
 
     for epoch in 0..epochs {
         // Backward pass for both models
@@ -85,20 +85,20 @@ fn main() {
             println!(
                 "  Epoch {}: Sigmoid params: {:?}",
                 epoch,
-                poly_sigmoid.gate.curve.weights()
+                poly_sigmoid.moh.gate.curve.weights()
             );
             println!(
                 "  Epoch {}: None params: {:?}",
                 epoch,
-                poly_none.gate.curve.weights()
+                poly_none.moh.gate.curve.weights()
             );
             println!();
         }
     }
 
     // Calculate parameter changes
-    let sigmoid_final = poly_sigmoid.gate.curve.weights();
-    let none_final = poly_none.gate.curve.weights();
+    let sigmoid_final = poly_sigmoid.moh.gate.curve.weights();
+    let none_final = poly_none.moh.gate.curve.weights();
 
     println!("5. Parameter Change Analysis:");
 
@@ -106,14 +106,14 @@ fn main() {
     let sigmoid_changes: Vec<f64> = sigmoid_initial
         .iter()
         .zip(sigmoid_final.iter())
-        .map(|(init, final_val)| (final_val - init).abs())
+        .map(|(init, final_val)| (*final_val - *init).abs())
         .collect();
 
     // None changes (8 parameters)
     let none_changes: Vec<f64> = none_initial
         .iter()
         .zip(none_final.iter())
-        .map(|(init, final_val)| (final_val - init).abs())
+        .map(|(init, final_val)| (*final_val - *init).abs())
         .collect();
 
     println!("  Sigmoid parameter changes: {:?}", sigmoid_changes);
@@ -130,18 +130,18 @@ fn main() {
     println!("6. Richards Coefficients Analysis:");
     println!(
         "  Sigmoid a,b: {:.6}, {:.6} (fixed)",
-        poly_sigmoid.gate.curve.output_gain.unwrap_or(1.0),
-        poly_sigmoid.gate.curve.output_bias.unwrap_or(0.0)
+        poly_sigmoid.moh.gate.curve.output_gain.unwrap_or(1.0),
+        poly_sigmoid.moh.gate.curve.output_bias.unwrap_or(0.0)
     );
     println!(
         "  None a,b: {:.6}, {:.6} (learnable)",
-        poly_none.gate.curve.output_gain.unwrap_or(1.0),
-        poly_none.gate.curve.output_bias.unwrap_or(0.0)
+        poly_none.moh.gate.curve.output_gain.unwrap_or(1.0),
+        poly_none.moh.gate.curve.output_bias.unwrap_or(0.0)
     );
 
     // Check if a,b changed for None variant
-    let none_a_changed = (poly_none.gate.curve.output_gain.unwrap_or(1.0) - 1.0).abs() > 1e-6;
-    let none_b_changed = (poly_none.gate.curve.output_bias.unwrap_or(0.0) - 0.0).abs() > 1e-6;
+    let none_a_changed = (poly_none.moh.gate.curve.output_gain.unwrap_or(1.0) - 1.0).abs() > 1e-6;
+    let none_b_changed = (poly_none.moh.gate.curve.output_bias.unwrap_or(0.0) - 0.0).abs() > 1e-6;
 
     println!("  None variant a changed: {}", none_a_changed);
     println!("  None variant b changed: {}", none_b_changed);

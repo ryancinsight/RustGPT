@@ -45,6 +45,7 @@ impl Default for LRMConfig {
                 use_moe: false,
                 moe_config: None,
                 head_selection: crate::mixtures::HeadSelectionStrategy::Fixed { num_active: 8 },
+                temporal_mixing: crate::model_config::TemporalMixingType::Attention,
                 use_adaptive_window: false,
                 min_window_size: 512,
                 max_window_size: 4096,
@@ -200,8 +201,14 @@ impl<'a> std::ops::Deref for PolyAttentionReadGuard<'a> {
     type Target = PolyAttention;
     fn deref(&self) -> &Self::Target {
         match &*self.guard {
-            RecursiveBlockVariant::Transformer(b) => &b.attention,
-            RecursiveBlockVariant::Diffusion(b) => &b.attention,
+            RecursiveBlockVariant::Transformer(b) => match &b.temporal_mixing {
+                crate::transformer::common::TemporalMixingLayer::Attention(attn) => attn,
+                _ => panic!("LRM attention() called but TransformerBlock is not using attention"),
+            },
+            RecursiveBlockVariant::Diffusion(b) => match &b.temporal_mixing {
+                crate::transformer::common::TemporalMixingLayer::Attention(attn) => attn,
+                _ => panic!("LRM attention() called but DiffusionBlock is not using attention"),
+            },
         }
     }
 }
@@ -214,8 +221,14 @@ impl<'a> std::ops::Deref for PolyAttentionWriteGuard<'a> {
     type Target = PolyAttention;
     fn deref(&self) -> &Self::Target {
         match &*self.guard {
-            RecursiveBlockVariant::Transformer(b) => &b.attention,
-            RecursiveBlockVariant::Diffusion(b) => &b.attention,
+            RecursiveBlockVariant::Transformer(b) => match &b.temporal_mixing {
+                crate::transformer::common::TemporalMixingLayer::Attention(attn) => attn,
+                _ => panic!("LRM attention_mut() called but TransformerBlock is not using attention"),
+            },
+            RecursiveBlockVariant::Diffusion(b) => match &b.temporal_mixing {
+                crate::transformer::common::TemporalMixingLayer::Attention(attn) => attn,
+                _ => panic!("LRM attention_mut() called but DiffusionBlock is not using attention"),
+            },
         }
     }
 }
@@ -223,8 +236,14 @@ impl<'a> std::ops::Deref for PolyAttentionWriteGuard<'a> {
 impl<'a> std::ops::DerefMut for PolyAttentionWriteGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut *self.guard {
-            RecursiveBlockVariant::Transformer(b) => &mut b.attention,
-            RecursiveBlockVariant::Diffusion(b) => &mut b.attention,
+            RecursiveBlockVariant::Transformer(b) => match &mut b.temporal_mixing {
+                crate::transformer::common::TemporalMixingLayer::Attention(attn) => attn,
+                _ => panic!("LRM attention_mut() called but TransformerBlock is not using attention"),
+            },
+            RecursiveBlockVariant::Diffusion(b) => match &mut b.temporal_mixing {
+                crate::transformer::common::TemporalMixingLayer::Attention(attn) => attn,
+                _ => panic!("LRM attention_mut() called but DiffusionBlock is not using attention"),
+            },
         }
     }
 }
@@ -264,6 +283,7 @@ impl LRM {
             use_moe: config.moe_router.is_some(),
             moe_config: None,
             head_selection: config.head_selection.clone(),
+            temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
             min_window_size: config.min_window_size,
             max_window_size: config.max_window_size,
@@ -450,7 +470,7 @@ impl LRM {
             
             if all.len() == rec_grads.len() {
                 for (bg, rg) in all.iter_mut().zip(rec_grads.iter()) {
-                    *bg = bg as &Array2<f32> + rg;
+                    bg.zip_mut_with(rg, |a, &b| *a += b);
                 }
             } else {
                 // Should not happen if block structure is constant

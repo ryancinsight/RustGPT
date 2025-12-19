@@ -212,7 +212,7 @@ fn apply_soft_top_p_selection(
         let mut soft_mask = Vec::with_capacity(cumulative.len());
         for &c in &cumulative {
             let relu_val = (c - top_p).max(0.0);
-            soft_mask.push(crate::richards::PadeExp::exp((-alpha * relu_val) as f64) as f32);
+            soft_mask.push(crate::pade::PadeExp::exp((-alpha * relu_val) as f64) as f32);
         }
 
         // Unsort the mask

@@ -6,14 +6,13 @@ use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    attention::poly_attention::PolyAttention,
     errors::Result,
     network::Layer,
     mixtures::{
         HeadSelectionStrategy,
         moe::ExpertRouterConfig,
     },
-    model_config::{DiffusionTimestepStrategy},
+    model_config::{DiffusionTimestepStrategy, TemporalMixingType},
     richards::RichardsNorm,
     rng::get_rng,
     transformer::{
@@ -22,6 +21,7 @@ use crate::{
         },
         common::{
             FeedForwardVariant, CommonLayerConfig, CommonLayers,
+            TemporalMixingLayer,
             sanitize_and_clip_gradients, apply_adaptive_gradients
         },
         transformer_block::TransformerBlockConfig
@@ -69,6 +69,10 @@ pub struct DiffusionBlockConfig {
     pub head_selection: HeadSelectionStrategy,
     pub time_embed_dim: usize,
     pub mask_token_id: Option<usize>,
+
+    /// Temporal mixing mechanism (attention or RG-LRU)
+    #[serde(default)]
+    pub temporal_mixing: TemporalMixingType,
 
     /// Enable advanced weight similarity-based adaptive residuals (enabled by default)
     pub use_advanced_adaptive_residuals: bool,
@@ -531,7 +535,7 @@ pub struct DiffusionCachedIntermediates {
 
 #[derive(Clone, Debug, Default)]
 pub struct DiffusionParamPartitions {
-    pub attention: usize,
+    pub temporal_mixing: usize,
     pub feedforward: usize,
     pub pre_ffn_norm: usize,
     pub pre_attention_norm: usize,
@@ -553,7 +557,8 @@ pub struct DiffusionParamPartitions {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DiffusionBlock {
     pub config: DiffusionBlockConfig,
-    pub attention: PolyAttention,
+    #[serde(alias = "attention")]
+    pub temporal_mixing: TemporalMixingLayer,
     pub feedforward: FeedForwardVariant,
     pub pre_attention_norm: RichardsNorm,
     pub pre_ffn_norm: RichardsNorm,
@@ -597,6 +602,7 @@ impl DiffusionBlock {
             use_moe: config.use_moe,
             moe_config: config.moe_config.clone(),
             head_selection: config.head_selection.clone(),
+            temporal_mixing: config.temporal_mixing,
         };
         let layers = CommonLayers::new(&common_config);
 
@@ -617,7 +623,7 @@ impl DiffusionBlock {
 
         Self {
             config: config.clone(),
-            attention: layers.attention,
+            temporal_mixing: layers.temporal_mixing,
             feedforward: layers.feedforward,
             pre_attention_norm: layers.pre_attention_norm,
             pre_ffn_norm: layers.pre_ffn_norm,
@@ -766,7 +772,9 @@ impl DiffusionBlock {
         if self.current_window_size != self.config.window_size {
             self.config.window_size = self.current_window_size;
         }
-        self.attention.set_window_size(self.current_window_size);
+        if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
+            attn.set_window_size(self.current_window_size);
+        }
         let time_embed = self.time_embedding.forward(t, self.config.num_timesteps);
         let (gamma_beta, h) = self.time_conditioner.forward(&time_embed, self.use_ema_for_sampling);
         
@@ -789,8 +797,8 @@ impl DiffusionBlock {
         let mut norm1_mod = Self::apply_film(&norm1_out, &gamma_attn_vec, &beta_attn_vec);
         Self::sanitize_tensor("norm1_mod", &mut norm1_mod);
         let mut attn_out = self
-            .attention
-            .forward_impl(&norm1_mod, self.config.causal_attention);
+            .temporal_mixing
+            .forward_with_causal(&norm1_mod, self.config.causal_attention);
         Self::sanitize_tensor("attn_out", &mut attn_out);
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
@@ -850,15 +858,17 @@ impl DiffusionBlock {
             timestep: t,
         });
         if self.adaptive_window_on {
-            if let Some(pn) = self.attention.last_pred_norm {
-                let mut ws = self.current_window_size.unwrap_or(self.win_max);
-                if pn > self.pred_up {
-                    ws = (ws + self.win_step_up).min(self.win_max);
-                } else if pn < self.pred_down {
-                    ws = ws.saturating_sub(self.win_step_down).max(self.win_min);
+            if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
+                if let Some(pn) = attn.last_pred_norm {
+                    let mut ws = self.current_window_size.unwrap_or(self.win_max);
+                    if pn > self.pred_up {
+                        ws = (ws + self.win_step_up).min(self.win_max);
+                    } else if pn < self.pred_down {
+                        ws = ws.saturating_sub(self.win_step_down).max(self.win_min);
+                    }
+                    self.current_window_size = Some(ws);
+                    attn.set_window_size(self.current_window_size);
                 }
-                self.current_window_size = Some(ws);
-                self.attention.set_window_size(self.current_window_size);
             }
         }
         predicted_noise
@@ -1100,7 +1110,7 @@ impl Layer for DiffusionBlock {
 
     fn parameters(&self) -> usize {
         self.pre_attention_norm.parameters()
-            + self.attention.parameters()
+            + self.temporal_mixing.parameters()
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
             + 4
@@ -1108,7 +1118,7 @@ impl Layer for DiffusionBlock {
 
     fn weight_norm(&self) -> f32 {
         (self.pre_attention_norm.weight_norm().powi(2)
-            + self.attention.weight_norm().powi(2)
+            + self.temporal_mixing.weight_norm().powi(2)
             + self.pre_ffn_norm.weight_norm().powi(2)
             + self.feedforward.weight_norm().powi(2)
             + self.time_conditioner.weight_norm().powi(2))
@@ -1193,7 +1203,7 @@ impl Layer for DiffusionBlock {
             let attn_out_grads = residual1_total_grads.clone();
 
             let (attn_input_grad_mod, attn_param_grads) =
-                self.attention.compute_gradients(norm1_mod, &attn_out_grads);
+                self.temporal_mixing.compute_gradients(norm1_mod, &attn_out_grads);
 
             let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
                 Self::film_backward(&attn_input_grad_mod, norm1_out, &gamma_attn_vec);
@@ -1256,7 +1266,7 @@ impl Layer for DiffusionBlock {
             all_param_grads.extend(time_grads);
 
             let partitions = DiffusionParamPartitions {
-                attention: attn_grad_count,
+                temporal_mixing: attn_grad_count,
                 feedforward: ffn_grad_count,
                 pre_ffn_norm: pre_ffn_grad_count,
                 pre_attention_norm: pre_attn_grad_count,
@@ -1310,7 +1320,7 @@ impl Layer for DiffusionBlock {
                     "DiffusionBlock::apply_gradients missing partition metadata; routing all gradients to attention as a safe fallback"
                 );
                 DiffusionParamPartitions {
-                    attention: sanitized.len(),
+                    temporal_mixing: sanitized.len(),
                     feedforward: 0,
                     pre_ffn_norm: 0,
                     pre_attention_norm: 0,
@@ -1340,19 +1350,19 @@ impl Layer for DiffusionBlock {
             start..idx0
         };
 
-        if partitions.attention + partitions.feedforward + partitions.pre_ffn_norm + partitions.pre_attention_norm + partitions.time_conditioner != sanitized.len() {
+        if partitions.temporal_mixing + partitions.feedforward + partitions.pre_ffn_norm + partitions.pre_attention_norm + partitions.time_conditioner != sanitized.len() {
             // Just a warning, proceed with best effort
         }
 
-        // Attention gradients
-        let attn_range = next_range(partitions.attention);
+        // Temporal-mixing gradients
+        let attn_range = next_range(partitions.temporal_mixing);
         if !attn_range.is_empty() {
             let attention_grads = &sanitized[attn_range];
             apply_adaptive_gradients(
                 attention_grads,
-                self.attention.weight_norm(),
+                self.temporal_mixing.weight_norm(),
                 lr,
-                |grads, lr| self.attention.apply_gradients(grads, lr)
+                |grads, lr| self.temporal_mixing.apply_gradients(grads, lr)
             )?;
         }
 
@@ -1429,6 +1439,7 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
             head_selection: t.head_selection,
             time_embed_dim: t.embed_dim * 4,
             mask_token_id: None,
+            temporal_mixing: t.temporal_mixing,
             use_advanced_adaptive_residuals: t.use_advanced_adaptive_residuals,
         }
     }

@@ -1,12 +1,12 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use crate::adam::Adam;
-use crate::pade::PadeExp;
 use rayon::prelude::*;
 use std::marker::PhantomData;
 
 // Rayon parallelism has overhead for small slices; avoid it on tiny tensors.
 const PAR_THRESHOLD: usize = 1024;
+
 
 // --- Zero-cost (compile-time) variant specialization ---
 
@@ -41,8 +41,8 @@ impl VariantMarker for TanhLike {
 
 #[derive(Clone, Copy)]
 struct RichardsKernel<V: VariantMarker> {
-    nu: f64,
-    k: f64,
+    nu_eff: f64,
+    k_eff: f64,
     m: f64,
     beta: f64,
     temp_reciprocal: f64,
@@ -58,33 +58,15 @@ struct RichardsKernel<V: VariantMarker> {
 
 impl<V: VariantMarker> RichardsKernel<V> {
     #[inline]
-    fn softplus(t: f64) -> f64 {
-        // log(1 + exp(t)) computed stably.
-        if t > 0.0 {
-            t + PadeExp::exp(-t).ln_1p()
-        } else {
-            PadeExp::exp(t).ln_1p()
-        }
-    }
-
-    #[inline]
-    fn sigmoid(t: f64) -> f64 {
-        // 1 / (1 + exp(-t)) computed stably.
-        if t >= 0.0 {
-            1.0 / (1.0 + PadeExp::exp(-t))
-        } else {
-            let e = PadeExp::exp(t);
-            e / (1.0 + e)
-        }
-    }
-
-    #[inline]
     fn from_curve(curve: &RichardsCurve) -> Self {
         let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = curve.get_all_params();
         let (adaptive_scale, adaptive_shift) = curve.get_adaptive_scaling();
+        // `get_all_params` enforces nu>0, beta>0, temp>0.
+        let nu_eff = nu;
+        let k_eff = if curve.birch_exponential_tail { k * nu_eff } else { k };
         Self {
-            nu,
-            k,
+            nu_eff,
+            k_eff,
             m,
             beta,
             temp_reciprocal: 1.0 / temp,
@@ -94,7 +76,7 @@ impl<V: VariantMarker> RichardsKernel<V> {
             shift,
             adaptive_scale,
             adaptive_shift,
-            inv_nu: if nu <= 0.0 { 0.0 } else { -1.0 / nu },
+            inv_nu: -1.0 / nu,
             _variant: PhantomData,
         }
     }
@@ -109,7 +91,7 @@ impl<V: VariantMarker> RichardsKernel<V> {
     #[inline]
     fn derivative_one_f64(&self, xi: f64) -> f64 {
         let (sigma, r, _ln_base, nu_eff, dinput_dx) = self.common_terms(xi);
-        let dsig_dinput = (sigma * self.k * r) / nu_eff;
+        let dsig_dinput = (sigma * self.k_eff * r) / nu_eff;
         self.output_gain * V::OUTER_SCALE * dsig_dinput * dinput_dx
     }
 
@@ -123,7 +105,7 @@ impl<V: VariantMarker> RichardsKernel<V> {
         let gate = V::gate(sigma);
         let y = self.output_gain * gate + self.output_bias;
 
-        let dsig_dinput = (sigma * self.k * r) / nu_eff;
+        let dsig_dinput = (sigma * self.k_eff * r) / nu_eff;
         let dy_dx = self.output_gain * V::OUTER_SCALE * dsig_dinput * dinput_dx;
         (y, dy_dx)
     }
@@ -135,35 +117,18 @@ impl<V: VariantMarker> RichardsKernel<V> {
         let temp_scaled = adaptive_normalized * self.temp_reciprocal;
         let input = V::INPUT_SCALE * (self.scale * temp_scaled + self.shift);
 
-        let exponent: f64 = -self.k * (input - self.m);
+        let exponent: f64 = -self.k_eff * (input - self.m);
 
         // base = 1 + beta * exp(exponent)
-        // Compute in log1p space to avoid overflow for large positive exponent.
-        let (ln_base, r) = if self.beta > 0.0 {
-            if self.beta == 0.0 {
-                (0.0, 0.0)
-            } else {
-                let t = self.beta.ln() + exponent;
-                let ln_b = Self::softplus(t);
-                let rr = Self::sigmoid(t);
-                (ln_b, rr)
-            }
-        } else {
-            // For non-positive beta the curve may be ill-defined for non-integer powers.
-            // Keep the direct formulation (may produce NaN, which can be detected upstream).
-            let exp_term = PadeExp::exp(exponent);
-            let base = 1.0 + self.beta * exp_term;
-            let ln_b = base.ln();
-            let rr = (self.beta * exp_term) / base;
-            (ln_b, rr)
-        };
+        // Use log1p-space to avoid overflow for large positive exponent.
+        // ln_base = log(base) = softplus(ln(beta) + exponent)
+        // r = beta*exp(exponent)/base = sigmoid(ln(beta) + exponent)
+        let t = self.beta.ln() + exponent;
+        let ln_base = super::math::softplus_f64(t);
+        let r = super::math::sigmoid_f64(t);
 
-        let nu_eff = if self.nu <= 0.0 { 1.0 } else { self.nu };
-        let sigma = if self.nu <= 0.0 {
-            (-ln_base).exp()
-        } else {
-            (self.inv_nu * ln_base).exp()
-        };
+        let nu_eff = self.nu_eff;
+        let sigma = super::math::exp_f64(self.inv_nu * ln_base);
         let dinput_dx = V::INPUT_SCALE * self.scale * self.adaptive_scale * self.temp_reciprocal;
         (sigma, r, ln_base, nu_eff, dinput_dx)
     }
@@ -197,10 +162,12 @@ impl<V: VariantMarker> RichardsKernel<V> {
 ///
 /// **Asymmetry Properties:**
 /// - β = 1.0: Standard Richards curve σ(x) = [1 + e^(-k(x-m))]^(-1/ν)
-/// - β = 0.0: Constant function σ(x) = 1.0 (degenerate case)
 /// - 0 < β < 1: Softer sigmoid transitions
 /// - β > 1: Sharper sigmoid transitions
-/// - β < 0: Inverted sigmoid behavior
+///
+/// **Implementation Note:** This codebase enforces β > 0 for global numerical stability
+/// (see `get_all_params`). Negative or zero β would make `log(1 + β·exp(…))` undefined
+/// on parts of ℝ, so it is treated as invalid configuration.
 ///
 /// **Mathematical Interpretation:**
 /// The β parameter scales the exponential term, controlling the steepness and asymmetry
@@ -352,10 +319,23 @@ pub struct RichardsCurve {
     pub scale: Option<f64>, // Input scaling
     pub shift: Option<f64>, // Input shift
 
+    /// Birch-inspired exponential-tail mode.
+    ///
+    /// When enabled, the exponent uses an effective growth rate `k_eff = k * nu`.
+    /// This keeps the left-tail exponential rate in input-space approximately
+    /// independent of `nu` (i.e. $\sigma(x) \approx C\,e^{k x}$ as $x\to-\infty$),
+    /// while still allowing `nu` to shape the overall sigmoid asymmetry.
+    #[serde(default)]
+    pub birch_exponential_tail: bool,
+
     // Per-feature output transformation (used by normalization variants)
-    #[serde(skip_serializing, skip_deserializing)]
+    //
+    // These are learnable parameters (RichardsNorm uses them), so they must be persisted.
+    // `default` keeps backward compatibility with older checkpoints where these fields
+    // were absent.
+    #[serde(default)]
     pub gamma: Option<Array2<f32>>, // Per-feature scale (shape: [1, d])
-    #[serde(skip_serializing, skip_deserializing)]
+    #[serde(default)]
     pub bias: Option<Array2<f32>>,  // Per-feature bias (shape: [1, d])
 
     // Polynomial input transformation (used by Polynomial variant)
@@ -418,30 +398,19 @@ pub struct RichardsCurve {
 
 #[allow(dead_code)]
 impl RichardsCurve {
-    #[inline]
-    fn softplus_f64(u: f64) -> f64 {
-        if u > 0.0 {
-            u + (-u).exp().ln_1p() // Softplus function for positive u
-        } else {
-            u.exp().ln_1p()
-        }
+    const MIN_POS_PARAM: f64 = 1e-6;
+
+    // NOTE: shared numerics live in `super::math`.
+
+    /// Enable/disable Birch-inspired exponential-tail behavior.
+    pub fn set_birch_exponential_tail(&mut self, enabled: bool) {
+        self.birch_exponential_tail = enabled;
     }
 
-    #[inline]
-    fn inv_softplus_f64(t: f64) -> f64 {
-        // Inverse softplus for t>0: u = ln(exp(t) - 1).
-        // Uses exp_m1 for precision when t is small; for large t, u ≈ t.
-        if t > 20.0 { 
-            t 
-        } else { 
-            t.exp_m1().ln() 
-        }
-    }
-
-    #[inline]
-    fn sigmoid_from_softplus_f64(t: f64) -> f64 {
-        // If t = softplus(u), then sigmoid(u) = exp(u)/(1+exp(u)) = 1 - exp(-t).
-        1.0 - (-t).exp() 
+    /// Builder-style toggle for Birch-inspired exponential-tail behavior.
+    pub fn with_birch_exponential_tail(mut self, enabled: bool) -> Self {
+        self.birch_exponential_tail = enabled;
+        self
     }
 
         #[inline]
@@ -596,6 +565,14 @@ impl RichardsCurve {
             _ => false, // Disable polynomial for other variants
         };
 
+        // Enable Birch-inspired exponential tail by default for sigmoid-like generalized logistic
+        // usage (helps ensure exponential behavior in the left tail across nu values).
+        // Keep it disabled for Tanh, where the notion of “small size” growth is less aligned.
+        let birch_exponential_tail = match variant {
+            super::Variant::Tanh => false,
+            _ => true,
+        };
+
         Self {
             // Parameter values (Some for fixed, None for learnable)
             nu: None,
@@ -607,6 +584,8 @@ impl RichardsCurve {
             output_bias: output_bias_val,
             scale: None,
             shift: None,
+
+            birch_exponential_tail,
 
             // Polynomial transformation
             poly_power: if polynomial_initialized { Some(1) } else { None },  // Default to degree 1 (identity)
@@ -668,6 +647,8 @@ impl RichardsCurve {
             output_bias: Some(0.0),
             scale: Some(1.0),
             shift: Some(0.0),
+
+            birch_exponential_tail: true,
             learned_nu: None,
             learned_k: None,
             learned_m: None,
@@ -721,6 +702,8 @@ impl RichardsCurve {
                 output_bias: Some(0.0),
                 scale: Some(1.0),
                 shift: Some(0.0),
+
+                birch_exponential_tail: true,
                 learned_nu: None,
                 learned_k: None,
                 learned_m: None,
@@ -775,6 +758,8 @@ impl RichardsCurve {
                  output_bias: Some(0.0),
                  scale: Some(1.0),  // Fixed for specific variant
                  shift: Some(0.0),  // Fixed for specific variant
+
+                birch_exponential_tail: false,
                 learned_nu: None,
                 learned_k: None,
                 learned_m: None,
@@ -829,6 +814,8 @@ impl RichardsCurve {
                  output_bias: Some(0.0),
                  scale: Some(1.0),  // Fixed for specific variant
                  shift: Some(0.0),  // Fixed for specific variant
+
+                birch_exponential_tail: true,
                 learned_nu: None,
                 learned_k: None,
                 learned_m: None,
@@ -939,15 +926,34 @@ impl RichardsCurve {
 
     /// Helper: get all parameters at once to reduce redundancy.
     fn get_all_params(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
-        let nu = self.get_param(self.nu, self.learned_nu, 1.0);
-        let k = self.get_param(self.k, self.learned_k, 1.0);
+        let mut nu = self.get_param(self.nu, self.learned_nu, 1.0);
+        let mut k = self.get_param(self.k, self.learned_k, 1.0);
         let m = self.get_param(self.m, self.learned_m, 0.0);
-        let beta = self.get_param(self.beta, self.learned_beta, 1.0);
-        let temp = self.get_param(self.temperature, self.learned_temperature, 1.0);
+        let mut beta = self.get_param(self.beta, self.learned_beta, 1.0);
+        let mut temp = self.get_param(self.temperature, self.learned_temperature, 1.0);
         let output_gain = self.get_param(self.output_gain, self.learned_output_gain, 1.0);
         let output_bias = self.get_param(self.output_bias, self.learned_output_bias, 0.0);
         let scale = self.get_param(self.scale, self.learned_scale, 1.0);
         let shift = self.get_param(self.shift, self.learned_shift, 0.0);
+
+        // --- SOTA safety constraints ---
+        // These keep the generalized logistic family well-defined for all call sites.
+        // Learnable paths already enforce positivity via softplus, but fixed values in
+        // configs/checkpoints can still be invalid.
+        if !nu.is_finite() || nu <= 0.0 {
+            nu = Self::MIN_POS_PARAM;
+        }
+        if !k.is_finite() || k == 0.0 {
+            // Preserve sign if caller provided it; otherwise default positive.
+            k = Self::MIN_POS_PARAM.copysign(if k == 0.0 { 1.0 } else { k });
+        }
+        if !beta.is_finite() || beta <= 0.0 {
+            beta = Self::MIN_POS_PARAM;
+        }
+        if !temp.is_finite() || temp <= 0.0 {
+            temp = Self::MIN_POS_PARAM;
+        }
+
         (nu, k, m, beta, temp, output_gain, output_bias, scale, shift)
     }
 
@@ -1262,6 +1268,7 @@ impl RichardsCurve {
     fn grad_weights_scalar_into_kernel<V: VariantMarker>(&self, x: f64, grad_output: f64, out: &mut [f64]) {
         // Forward: f(x) = output_gain * gate(x) + output_bias
         let (nu, k, m, beta, temp, output_gain, _, scale, shift) = self.get_all_params();
+        let birch_tail = self.birch_exponential_tail;
         let input_scale = V::INPUT_SCALE;
         let outer_scale = V::OUTER_SCALE;
         let (adaptive_scale, adaptive_shift) = self.get_adaptive_scaling();
@@ -1270,71 +1277,61 @@ impl RichardsCurve {
         let temp_scaled = adaptive_normalized / temp;
         let input = input_scale * (scale * temp_scaled + shift);
 
-        let exponent = -k * (input - m);
+        // `get_all_params` enforces nu>0, beta>0, temp>0.
+        let nu_eff = nu;
+        let k_eff = if birch_tail { k * nu_eff } else { k };
+
+        let exponent = -k_eff * (input - m);
 
         // base = 1 + beta * exp(exponent)
-        // Use log1p-space to avoid overflow; also compute r = beta*exp(exponent)/base.
-        let (ln_base, r, exp_term, base) = if beta > 0.0 {
-            if beta == 0.0 {
-                (0.0, 0.0, 0.0, 1.0)
-            } else {
-                let t = beta.ln() + exponent;
-                let ln_b = RichardsKernel::<V>::softplus(t);
-                let rr = RichardsKernel::<V>::sigmoid(t);
+        // ln_base = log(base) = softplus(ln(beta) + exponent)
+        // r = beta*exp(exponent)/base = sigmoid(ln(beta) + exponent)
+        let t = beta.ln() + exponent;
+        let ln_base = super::math::softplus_f64(t);
+        let r = super::math::sigmoid_f64(t);
 
-                // Keep exp_term/base only when needed (beta gradients).
-                // Reconstruct exp_term/base = r/beta without forming exp_term.
-                let exp_over_base = rr / beta;
-                // Provide placeholders for legacy uses.
-                (ln_b, rr, exp_over_base, 1.0)
-            }
-        } else {
-            // Non-positive beta may be ill-defined; keep direct formulation.
-            let exp_t = PadeExp::exp(exponent);
-            let b = 1.0 + beta * exp_t;
-            (b.ln(), (beta * exp_t) / b, exp_t, b)
-        };
-
-        let nu_eff = if nu <= 0.0 { 1.0 } else { nu };
-        let sigma = if nu <= 0.0 {
-            (-ln_base).exp()
-        } else {
-            (-(ln_base) / nu).exp()
-        };
+        let sigma = super::math::exp_f64(-(ln_base) / nu);
         let gate = V::gate(sigma);
 
         // dsigma/dinput = sigma * k * (beta*exp_term/base) / nu_eff = sigma * k * r / nu_eff
-        let dsigma_dinput = (sigma * k * r) / nu_eff;
+        let dsigma_dinput = (sigma * k_eff * r) / nu_eff;
 
         let pref = grad_output * output_gain * outer_scale;
 
         let mut pos = 0usize;
         if self.nu_learnable {
-            if nu <= 0.0 {
-                out[pos] = 0.0;
+            // Birch-tail mode: nu also affects exponent via k_eff = k * nu.
+            // d ln(sigma)/dnu = ln_base/nu^2 + (k * (input-m) * r)/nu
+            let d_ln_sigma_d_nu = if birch_tail {
+                (ln_base / (nu * nu)) + (k * (input - m) * r) / nu
             } else {
-                let d_sigma_d_nu = sigma * ln_base / (nu * nu);
-                out[pos] = pref * d_sigma_d_nu;
-            }
+                ln_base / (nu * nu)
+            };
+            let d_sigma_d_nu = sigma * d_ln_sigma_d_nu;
+            out[pos] = pref * d_sigma_d_nu;
             pos += 1;
         }
         if self.k_learnable {
-            let d_sigma_d_k = (sigma / nu_eff) * (input - m) * r;
+            let d_sigma_d_k = if birch_tail {
+                sigma * (input - m) * r
+            } else {
+                (sigma / nu_eff) * (input - m) * r
+            };
             out[pos] = pref * d_sigma_d_k;
             pos += 1;
         }
         if self.m_learnable {
-            let d_sigma_d_m = -(sigma / nu_eff) * k * r;
+            let d_sigma_d_m = if birch_tail {
+                -(sigma) * k * r
+            } else {
+                -(sigma / nu_eff) * k * r
+            };
             out[pos] = pref * d_sigma_d_m;
             pos += 1;
         }
         if self.beta_learnable {
-            let d_sigma_d_beta = if beta > 0.0 {
-                // exp_term/base = r/beta (computed above as exp_term placeholder)
-                -(sigma / nu_eff) * exp_term
-            } else {
-                -(sigma / nu_eff) * exp_term / base
-            };
+            // d ln(base)/d beta = exp(exponent)/base = r/beta
+            let d_sigma_d_beta = -(sigma / nu_eff) * (r / beta);
             out[pos] = pref * d_sigma_d_beta;
             pos += 1;
         }
@@ -1415,8 +1412,8 @@ impl RichardsCurve {
         if self.nu_learnable {
             let nu = self.get_param(self.nu, self.learned_nu, 1.0);
             let nu_pos = if nu > 0.0 { nu } else { 1e-6 };
-            let u = Self::inv_softplus_f64(nu_pos);
-            let d_nu_d_u = Self::sigmoid_from_softplus_f64(nu_pos);
+            let u = super::math::inv_softplus_f64(nu_pos);
+            let d_nu_d_u = super::math::sigmoid_from_softplus_f64(nu_pos);
             param_values.push(u as f32);
             grad_values.push((gradients[grad_idx] * d_nu_d_u) as f32);
             grad_idx += 1;
@@ -1424,8 +1421,8 @@ impl RichardsCurve {
         if self.k_learnable {
             let k = self.get_param(self.k, self.learned_k, 1.0);
             let k_pos = if k > 0.0 { k } else { 1e-6 };
-            let u = Self::inv_softplus_f64(k_pos);
-            let d_k_d_u = Self::sigmoid_from_softplus_f64(k_pos);
+            let u = super::math::inv_softplus_f64(k_pos);
+            let d_k_d_u = super::math::sigmoid_from_softplus_f64(k_pos);
             param_values.push(u as f32);
             grad_values.push((gradients[grad_idx] * d_k_d_u) as f32);
             grad_idx += 1;
@@ -1438,8 +1435,8 @@ impl RichardsCurve {
         if self.beta_learnable {
             let beta = self.get_param(self.beta, self.learned_beta, 1.0);
             let beta_pos = if beta > 0.0 { beta } else { 1e-6 };
-            let u = Self::inv_softplus_f64(beta_pos);
-            let d_beta_d_u = Self::sigmoid_from_softplus_f64(beta_pos);
+            let u = super::math::inv_softplus_f64(beta_pos);
+            let d_beta_d_u = super::math::sigmoid_from_softplus_f64(beta_pos);
             param_values.push(u as f32);
             grad_values.push((gradients[grad_idx] * d_beta_d_u) as f32);
             grad_idx += 1;
@@ -1447,8 +1444,8 @@ impl RichardsCurve {
         if self.temperature_learnable {
             let t = self.get_param(self.temperature, self.learned_temperature, 1.0);
             let t_pos = if t > 0.0 { t } else { 1e-6 };
-            let u = Self::inv_softplus_f64(t_pos);
-            let d_t_d_u = Self::sigmoid_from_softplus_f64(t_pos);
+            let u = super::math::inv_softplus_f64(t_pos);
+            let d_t_d_u = super::math::sigmoid_from_softplus_f64(t_pos);
             param_values.push(u as f32);
             grad_values.push((gradients[grad_idx] * d_t_d_u) as f32);
             grad_idx += 1;
@@ -1504,11 +1501,11 @@ impl RichardsCurve {
             // Apply updates back to learned parameters (no hard clipping)
             let mut idx = 0;
             if self.nu_learnable {
-                self.learned_nu = Some(Self::softplus_f64(params[[idx, 0]] as f64));
+                self.learned_nu = Some(super::math::softplus_f64(params[[idx, 0]] as f64));
                 idx += 1;
             }
             if self.k_learnable {
-                self.learned_k = Some(Self::softplus_f64(params[[idx, 0]] as f64));
+                self.learned_k = Some(super::math::softplus_f64(params[[idx, 0]] as f64));
                 idx += 1;
             }
             if self.m_learnable {
@@ -1516,11 +1513,11 @@ impl RichardsCurve {
                 idx += 1;
             }
             if self.beta_learnable {
-                self.learned_beta = Some(Self::softplus_f64(params[[idx, 0]] as f64));
+                self.learned_beta = Some(super::math::softplus_f64(params[[idx, 0]] as f64));
                 idx += 1;
             }
             if self.temperature_learnable {
-                self.learned_temperature = Some(Self::softplus_f64(params[[idx, 0]] as f64));
+                self.learned_temperature = Some(super::math::softplus_f64(params[[idx, 0]] as f64));
                 idx += 1;
             }
             if self.output_gain_learnable {
@@ -2096,6 +2093,44 @@ mod tests {
         assert!(sharp_output > soft_output,
             "Lower temperature should amplify transitions: sharp={}, soft={}", 
             sharp_output, soft_output);
+    }
+
+    #[test]
+    fn test_birch_exponential_tail_decouples_nu_in_left_tail() {
+        // In Birch-tail mode we scale the exponent by nu so the left-tail behaves like:
+        // sigma(x) ~= C * exp(k * x), independent of nu.
+        let k = 1.7;
+
+        let mut c1 = RichardsCurve::sigmoid(false).with_birch_exponential_tail(true);
+        c1.k = Some(k);
+        c1.nu = Some(0.5);
+        c1.m = Some(0.0);
+        c1.beta = Some(1.0);
+        c1.temperature = Some(1.0);
+        c1.scale = Some(1.0);
+        c1.shift = Some(0.0);
+
+        let mut c2 = c1.clone();
+        c2.nu = Some(2.0);
+
+        let x1 = -20.0;
+        let x2 = -21.0;
+        let ratio1 = c1.forward_scalar(x2) / c1.forward_scalar(x1);
+        let ratio2 = c2.forward_scalar(x2) / c2.forward_scalar(x1);
+        let expected = (k * (x2 - x1)).exp();
+
+        assert!((ratio1 - expected).abs() < 1e-3, "ratio1={} expected={}", ratio1, expected);
+        assert!((ratio2 - expected).abs() < 1e-3, "ratio2={} expected={}", ratio2, expected);
+        assert!((ratio1 - ratio2).abs() < 1e-4, "ratios should match across nu: {} vs {}", ratio1, ratio2);
+
+        // Sanity check: default Richards behavior depends on nu (ratio ~= exp(k*(x2-x1)/nu)).
+        let mut r1 = c1.clone();
+        r1.set_birch_exponential_tail(false);
+        let mut r2 = c2.clone();
+        r2.set_birch_exponential_tail(false);
+        let rr1 = r1.forward_scalar(x2) / r1.forward_scalar(x1);
+        let rr2 = r2.forward_scalar(x2) / r2.forward_scalar(x1);
+        assert!((rr1 - rr2).abs() > 1e-4, "default Richards ratios should differ across nu: {} vs {}", rr1, rr2);
     }
 
     #[test]

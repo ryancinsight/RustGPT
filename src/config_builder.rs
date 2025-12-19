@@ -63,6 +63,9 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     // Set attention mechanism to PolyAttention
     config.attention = AttentionType::PolyAttention { degree_p: 3 };
 
+    // Select temporal mixing mechanism (attention vs SSM-style RG-LRU)
+    config.temporal_mixing = args.temporal_mixing.into();
+
     // Enable MoE if requested
     if args.moe {
         config.moe_router = Some(crate::mixtures::moe::ExpertRouter::LearnedMoE {
@@ -73,6 +76,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
             sparsity_weight: 0.001,
             diversity_weight: 0.005,
             use_head_conditioning: true,
+            use_learned_k_adaptation: true,
         });
     }
 

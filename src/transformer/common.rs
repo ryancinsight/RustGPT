@@ -8,7 +8,84 @@ use crate::{
     },
     network::Layer,
     attention::poly_attention::PolyAttention,
+    model_config::TemporalMixingType,
+    ssm::rg_lru::{MoHRgLru, RgLru},
 };
+
+/// Temporal-mixing layer variants shared between TransformerBlock and DiffusionBlock.
+///
+/// Important: this enum is *tagged* (not `untagged`) to avoid ambiguous decoding when
+/// multiple variants share field names (e.g., attention vs RG-LRU MoH).
+///
+/// Legacy attention-only checkpoints are still supported via TransformerBlock's custom
+/// deserializer, which maps the old `attention: PolyAttention` field into this enum.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", content = "data")]
+pub enum TemporalMixingLayer {
+    Attention(PolyAttention),
+    RgLruMoH(MoHRgLru),
+    RgLru(RgLru),
+}
+
+impl TemporalMixingLayer {
+    #[inline]
+    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
+        }
+    }
+
+    #[inline]
+    pub fn forward_with_causal(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.forward_impl(input, causal),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
+        }
+    }
+
+    #[inline]
+    pub fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.compute_gradients(input, output_grads),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.compute_gradients(input, output_grads),
+            TemporalMixingLayer::RgLru(layer) => layer.compute_gradients(input, output_grads),
+        }
+    }
+
+    #[inline]
+    pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.apply_gradients(grads, lr),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.apply_gradients(grads, lr),
+            TemporalMixingLayer::RgLru(layer) => layer.apply_gradients(grads, lr),
+        }
+    }
+
+    #[inline]
+    pub fn parameters(&self) -> usize {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.parameters(),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.parameters(),
+            TemporalMixingLayer::RgLru(layer) => layer.parameters(),
+        }
+    }
+
+    #[inline]
+    pub fn weight_norm(&self) -> f32 {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.weight_norm(),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.weight_norm(),
+            TemporalMixingLayer::RgLru(layer) => layer.weight_norm(),
+        }
+    }
+}
 
 /// Feedforward network variants used in transformer blocks
 #[derive(Serialize, Deserialize, Debug)]
@@ -76,13 +153,15 @@ pub struct CommonLayerConfig {
     pub use_moe: bool,
     pub moe_config: Option<ExpertRouterConfig>,
     pub head_selection: HeadSelectionStrategy,
+    #[serde(default)]
+    pub temporal_mixing: TemporalMixingType,
 }
 
 /// Common layers shared between TransformerBlock and DiffusionBlock
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CommonLayers {
     pub pre_attention_norm: RichardsNorm,
-    pub attention: PolyAttention,
+    pub temporal_mixing: TemporalMixingLayer,
     pub pre_ffn_norm: RichardsNorm,
     pub feedforward: FeedForwardVariant,
 }
@@ -90,15 +169,27 @@ pub struct CommonLayers {
 impl CommonLayers {
     pub fn new(config: &CommonLayerConfig) -> Self {
         let pre_attention_norm = RichardsNorm::new(config.embed_dim);
-        
-        let mut attention = PolyAttention::new(
-            config.embed_dim,
-            config.num_heads,
-            config.poly_degree,
-            config.max_pos,
-            config.window_size,
-        );
-        attention.set_head_selection_config(&config.head_selection);
+
+        let temporal_mixing = match config.temporal_mixing {
+            TemporalMixingType::Attention => {
+                let mut attention = PolyAttention::new(
+                    config.embed_dim,
+                    config.num_heads,
+                    config.poly_degree,
+                    config.max_pos,
+                    config.window_size,
+                );
+                attention.set_head_selection_config(&config.head_selection);
+                TemporalMixingLayer::Attention(attention)
+            }
+            TemporalMixingType::RgLru => {
+                TemporalMixingLayer::RgLruMoH(MoHRgLru::new(
+                    config.embed_dim,
+                    config.num_heads,
+                    &config.head_selection,
+                ))
+            }
+        };
 
         let pre_ffn_norm = RichardsNorm::new(config.embed_dim);
 
@@ -142,7 +233,7 @@ impl CommonLayers {
 
         Self {
             pre_attention_norm,
-            attention,
+            temporal_mixing,
             pre_ffn_norm,
             feedforward,
         }
@@ -150,14 +241,14 @@ impl CommonLayers {
 
     pub fn parameter_count(&self) -> usize {
         self.pre_attention_norm.parameters()
-            + self.attention.parameters()
+            + self.temporal_mixing.parameters()
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
     }
 
     pub fn weight_norm(&self) -> f32 {
         (self.pre_attention_norm.weight_norm().powi(2)
-            + self.attention.weight_norm().powi(2)
+            + self.temporal_mixing.weight_norm().powi(2)
             + self.pre_ffn_norm.weight_norm().powi(2)
             + self.feedforward.weight_norm().powi(2))
         .sqrt()

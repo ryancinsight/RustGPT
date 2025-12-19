@@ -4,7 +4,7 @@
 //! When a seed is set, all random operations use a deterministic sequence.
 //! When no seed is set, the default thread-local RNG is used.
 
-use rand::{RngCore, SeedableRng, Rng};
+use rand::{RngCore, SeedableRng};
 use rand::rngs::StdRng;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -205,6 +205,7 @@ pub fn kaiming_normal_scale(fan_in: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     #[test]
     fn test_deterministic_rng() {

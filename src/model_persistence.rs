@@ -10,7 +10,12 @@ use crate::{
 
 /// Current model format version
 /// Increment this when making breaking changes to the serialization format
-const MODEL_VERSION: u32 = 1;
+const MODEL_VERSION: u32 = 2;
+
+fn default_data_format() -> Option<String> {
+    // New saves always set this explicitly.
+    None
+}
 
 /// Versioned model container with integrity checking
 #[derive(Serialize, Deserialize, Clone)]
@@ -19,6 +24,9 @@ pub struct VersionedModel {
     pub version: u32,
     /// SHA256 checksum of the serialized model data (hex string)
     pub checksum: String,
+    /// Payload codec used for `data` (e.g., "json", "msgpack", "bincode2")
+    #[serde(default = "default_data_format")]
+    pub data_format: Option<String>,
     /// Serialized model data (JSON or binary)
     pub data: Vec<u8>,
     /// Metadata for debugging and tracking
@@ -54,18 +62,19 @@ impl VersionedModel {
     /// Returns `ModelError::Serialization` if serialization fails
     pub fn from_llm(llm: &LLM, format: &str, description: Option<String>) -> Result<Self> {
         // Serialize the model
-        let data = match format {
-            "json" => serde_json::to_vec_pretty(llm).map_err(|e| ModelError::Serialization {
+        let (data_format, data) = match format {
+            "json" => (
+                Some("json".to_string()),
+                serde_json::to_vec_pretty(llm).map_err(|e| ModelError::Serialization {
                 source: Box::new(e),
             })?,
-            "binary" => {
-                let config = bincode::config::standard();
-                bincode::serde::encode_to_vec(llm, config).map_err(|e| {
-                    ModelError::Serialization {
-                        source: Box::new(e),
-                    }
-                })?
-            }
+            ),
+            "binary" => (
+                Some("msgpack".to_string()),
+                rmp_serde::to_vec_named(llm).map_err(|e| ModelError::Serialization {
+                    source: Box::new(e),
+                })?,
+            ),
             _ => {
                 return Err(ModelError::InvalidInput {
                     message: format!("Unsupported format: {}", format),
@@ -91,6 +100,7 @@ impl VersionedModel {
         Ok(VersionedModel {
             version: MODEL_VERSION,
             checksum,
+            data_format,
             data,
             metadata,
         })
@@ -161,14 +171,26 @@ impl VersionedModel {
         self.validate_version()?;
         self.validate_checksum()?;
 
+        // Prefer the stored payload codec if present.
+        let effective_format = self
+            .data_format
+            .as_deref()
+            .unwrap_or(format);
+
         // Deserialize
-        let llm = match format {
+        let llm = match effective_format {
             "json" => {
                 serde_json::from_slice(&self.data).map_err(|e| ModelError::Serialization {
                     source: Box::new(e),
                 })?
             }
-            "binary" => {
+            "msgpack" | "binary" => {
+                rmp_serde::from_slice(&self.data).map_err(|e| ModelError::Serialization {
+                    source: Box::new(e),
+                })?
+            }
+            // Legacy payload codec for MODEL_VERSION=1 files.
+            "bincode2" => {
                 let config = bincode::config::standard();
                 let (llm, _): (LLM, usize) = bincode::serde::decode_from_slice(&self.data, config)
                     .map_err(|e| ModelError::Serialization {
@@ -178,7 +200,7 @@ impl VersionedModel {
             }
             _ => {
                 return Err(ModelError::InvalidInput {
-                    message: format!("Unsupported format: {}", format),
+                    message: format!("Unsupported format: {}", effective_format),
                 });
             }
         };
@@ -235,6 +257,7 @@ impl LLM {
         tracing::info!(
             path = path,
             version = MODEL_VERSION,
+            data_format = versioned.data_format.as_deref().unwrap_or(format),
             checksum = &versioned.checksum[..16], // Log first 16 chars
             architecture = &versioned.metadata.architecture,
             "Model saved with versioning and integrity check"
@@ -260,13 +283,20 @@ impl LLM {
             versioned.metadata.saved_at
         );
 
-        let format = if path.ends_with(".json") {
+        let requested_format = if path.ends_with(".json") {
             "json"
         } else {
             "binary"
         };
 
-        versioned.to_llm(format)
+        // Back-compat: older v1 files used bincode v2 for the payload but didn't store a codec tag.
+        if versioned.version == 1 && versioned.data_format.is_none() && requested_format == "binary" {
+            let mut v = versioned;
+            v.data_format = Some("bincode2".to_string());
+            return v.to_llm(requested_format);
+        }
+
+        versioned.to_llm(requested_format)
     }
 
     /// Get the architecture name for metadata

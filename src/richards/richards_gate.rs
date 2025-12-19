@@ -138,29 +138,17 @@ impl RichardsGate {
 
     #[inline]
     fn softplus(u: f32) -> f32 {
-        // log(1 + exp(u)) computed stably.
-        if u > 0.0 {
-            u + (-u).exp().ln_1p()
-        } else {
-            u.exp().ln_1p()
-        }
+        super::math::softplus_f32(u)
     }
 
     #[inline]
     fn inv_softplus(t: f32) -> f32 {
-        // Inverse of softplus for t > 0: u = ln(exp(t) - 1).
-        // Use exp_m1 for precision; for large t, u ≈ t.
-        if t > 20.0 {
-            t
-        } else {
-            t.exp_m1().ln()
-        }
+        super::math::inv_softplus_f32(t)
     }
 
     #[inline]
     fn sigmoid_from_softplus(t: f32) -> f32 {
-        // If t = softplus(u), then sigmoid(u) = 1 - exp(-t).
-        1.0 - (-t).exp()
+        super::math::sigmoid_from_softplus_f32(t)
     }
 
     /// Create a new Richards gate with learned parameters
@@ -186,7 +174,7 @@ impl RichardsGate {
         let log_temp_std = 0.1;
         let log_temp_dist = Normal::new(0.0, log_temp_std).unwrap();
         let log_temp: f32 = log_temp_dist.sample(&mut rng);
-        let temp_sample: f32 = log_temp.exp();
+        let temp_sample: f32 = super::math::exp_f32(log_temp);
 
         Self {
             curve,
@@ -483,7 +471,7 @@ mod tests {
         let output_grads = Array2::ones((1, 3));
 
         // Forward pass
-        let output = gate.forward(&input);
+        let _ = gate.forward(&input);
 
         // Compute gradients
         let (input_grads, param_grads) = gate.compute_gradients(&input, &output_grads);
@@ -632,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_richards_gate_smoothness_and_differentiability() {
-        let mut gate = RichardsGate::new();
+        let gate = RichardsGate::new();
 
         // Test on a range of inputs
         let input = Array2::from_shape_vec((1, 100), (0..100).map(|i| -5.0 + (i as f32) * 0.1).collect()).unwrap();
@@ -656,8 +644,6 @@ mod tests {
 
     #[test]
     fn test_richards_gate_convergence_properties() {
-        use crate::adam::Adam; // Ensure Adam import for testing
-
         let mut gate = RichardsGate::new();
         let input = Array2::from_shape_vec((10, 1), vec![-1.0, -0.5, 0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]).unwrap();
         let target = Array2::from_shape_vec((10, 1), vec![0.1, 0.2, 0.5, 0.55, 0.8, 0.9, 0.95, 0.98, 0.99, 1.0]).unwrap();
