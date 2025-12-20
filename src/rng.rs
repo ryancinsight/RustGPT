@@ -4,10 +4,12 @@
 //! When a seed is set, all random operations use a deterministic sequence.
 //! When no seed is set, the default thread-local RNG is used.
 
-use rand::{RngCore, SeedableRng};
-use rand::rngs::StdRng;
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+use rand::{RngCore, SeedableRng, rngs::StdRng};
 
 /// Global seed value (0 means unseeded/random)
 static GLOBAL_SEED: AtomicU64 = AtomicU64::new(0);
@@ -30,7 +32,7 @@ thread_local! {
 ///
 /// # Example
 /// ```
-/// use llm::rng::{set_seed, get_rng};
+/// use llm::rng::{get_rng, set_seed};
 /// use rand::Rng;
 ///
 /// set_seed(42);
@@ -40,12 +42,12 @@ thread_local! {
 pub fn set_seed(seed: u64) {
     GLOBAL_SEED.store(seed, Ordering::SeqCst);
     SEED_SET.store(true, Ordering::SeqCst);
-    
+
     // Reset thread-local RNG so it gets re-initialized with new seed
     SEEDED_RNG.with(|rng| {
         *rng.borrow_mut() = None;
     });
-    
+
     println!("🎲 Random seed set to: {}", seed);
 }
 
@@ -117,21 +119,21 @@ pub fn get_rng() -> DeterministicRng {
         // Create a new seeded RNG each time, but advance the seed
         // to ensure different sequences for different call sites
         let base_seed = GLOBAL_SEED.load(Ordering::SeqCst);
-        
+
         // Use thread-local counter to generate unique seeds per call
         thread_local! {
             static CALL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
         }
-        
+
         let counter = CALL_COUNTER.with(|c| {
             let mut counter = c.borrow_mut();
             *counter = counter.wrapping_add(1);
             *counter
         });
-        
+
         // Mix seed with counter using a simple hash-like operation
         let mixed_seed = base_seed.wrapping_add(counter.wrapping_mul(0x9E3779B97F4A7C15));
-        
+
         DeterministicRng::Seeded(StdRng::seed_from_u64(mixed_seed))
     } else {
         DeterministicRng::Random(rand::rng())
@@ -170,13 +172,11 @@ pub fn get_rng_with_subseed(sub_seed: u64) -> StdRng {
 /// A vector of random f32 values
 pub fn random_normal_vec(size: usize, scale: f32) -> Vec<f32> {
     use rand_distr::{Distribution, Normal};
-    
+
     let mut rng = get_rng();
     let normal = Normal::new(0.0, scale as f64).unwrap();
-    
-    (0..size)
-        .map(|_| normal.sample(&mut rng) as f32)
-        .collect()
+
+    (0..size).map(|_| normal.sample(&mut rng) as f32).collect()
 }
 
 /// Xavier/Glorot uniform initialization
@@ -204,22 +204,23 @@ pub fn kaiming_normal_scale(fan_in: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::Rng;
+
+    use super::*;
 
     #[test]
     fn test_deterministic_rng() {
         set_seed(12345);
-        
+
         let mut rng1 = get_rng();
         let values1: Vec<f32> = (0..10).map(|_| rng1.random()).collect();
-        
+
         // Reset and regenerate
         set_seed(12345);
-        
+
         let mut rng2 = get_rng();
         let values2: Vec<f32> = (0..10).map(|_| rng2.random()).collect();
-        
+
         // Note: Due to how we mix seeds, the first call after set_seed
         // should produce the same sequence
         // However, subsequent calls may differ due to the counter
@@ -231,13 +232,13 @@ mod tests {
     #[test]
     fn test_subseed() {
         set_seed(42);
-        
+
         let mut rng1 = get_rng_with_subseed(1);
         let mut rng2 = get_rng_with_subseed(2);
-        
+
         let v1: f32 = rng1.random();
         let v2: f32 = rng2.random();
-        
+
         // Different subseeds should produce different values
         assert_ne!(v1, v2);
     }
@@ -246,9 +247,9 @@ mod tests {
     fn test_random_normal_vec() {
         set_seed(999);
         let vec = random_normal_vec(100, 0.1);
-        
+
         assert_eq!(vec.len(), 100);
-        
+
         // Check values are roughly normally distributed around 0
         let mean: f32 = vec.iter().sum::<f32>() / vec.len() as f32;
         assert!(mean.abs() < 0.1, "Mean should be close to 0, got {}", mean);

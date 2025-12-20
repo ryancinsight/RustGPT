@@ -11,18 +11,16 @@ use crate::{
     MAX_SEQ_LEN, Vocab,
     decoding::GreedyDecoder,
     errors::{ModelError, Result},
+    layers::transformer::speculative::{SpeculativeMode, SpeculativeSamplingConfig},
     metrics::text::corpus_bleu_1_2,
     model_config::DiffusionTimestepStrategy,
     network::{Layer, LayerEnum},
     rng::get_rng,
-    transformer::speculative::{SpeculativeSamplingConfig, SpeculativeMode},
 };
-
 
 impl LayerEnum {
     // Removed downcast helpers for SelfAttention/TRM to simplify to PolyAttention-only
 }
-
 
 fn response_span_from_tokens(vocab: &Vocab, tokens: &[usize]) -> Option<(usize, usize)> {
     if tokens.is_empty() {
@@ -67,7 +65,6 @@ fn response_span_from_tokens(vocab: &Vocab, tokens: &[usize]) -> Option<(usize, 
     }
     None
 }
-
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum DecoderType {
@@ -127,7 +124,8 @@ impl Default for LLM {
             decoder,
             median_grad_ema: None,
             speculative_config: None,
-            speculative_mode: SpeculativeMode::Diffusion, // Default to diffusion mode for backward compatibility
+            speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
+                                                           * backward compatibility */
         }
     }
 }
@@ -142,7 +140,8 @@ impl LLM {
             decoder,
             median_grad_ema: None,
             speculative_config: None,
-            speculative_mode: SpeculativeMode::Diffusion, // Default to diffusion mode for backward compatibility
+            speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
+                                                           * backward compatibility */
         }
     }
 
@@ -155,7 +154,8 @@ impl LLM {
             decoder,
             median_grad_ema: None,
             speculative_config: None,
-            speculative_mode: SpeculativeMode::Diffusion, // Default to diffusion mode for backward compatibility
+            speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
+                                                           * backward compatibility */
         }
     }
 
@@ -186,7 +186,8 @@ impl LLM {
         self.speculative_mode = mode;
         info!(
             "Enabled speculative sampling: mode={}, {}",
-            mode, cfg.description()
+            mode,
+            cfg.description()
         );
     }
 
@@ -212,16 +213,17 @@ impl LLM {
     }
 
     /// Generate next token using speculative sampling for transformers
-    /// 
+    ///
     /// This implements speculative decoding where a lightweight draft model (early layers)
     /// proposes candidate tokens, and the full model verifies them.
-    /// 
+    ///
     /// Algorithm:
     /// 1. Draft phase: Generate γ candidate tokens using only draft_layers of the model
     /// 2. Verify phase: Score candidates with full model
     /// 3. Accept/reject: Use probability ratio threshold τ for rejection sampling
-    /// 
-    /// Reference: "Fast Inference from Transformers via Speculative Decoding" (Leviathan et al., 2022)
+    ///
+    /// Reference: "Fast Inference from Transformers via Speculative Decoding" (Leviathan et al.,
+    /// 2022)
     pub fn generate_speculative_transformer(
         &mut self,
         current_tokens: &[usize],
@@ -237,11 +239,13 @@ impl LLM {
         }
 
         let vocab_size = self.vocab.size();
-        
+
         // Convert tokens to embeddings (convert to f32)
-        let token_ids_f32 = Array2::from_shape_vec((1, current_tokens.len()),
-            current_tokens.iter().map(|&x| x as f32).collect())
-            .expect("Failed to create token array");
+        let token_ids_f32 = Array2::from_shape_vec(
+            (1, current_tokens.len()),
+            current_tokens.iter().map(|&x| x as f32).collect(),
+        )
+        .expect("Failed to create token array");
 
         // Forward pass through embeddings
         let mut draft_hidden = self.network[0].forward(&token_ids_f32); // TokenEmbeddings
@@ -263,16 +267,16 @@ impl LLM {
 
         // Get probabilities for last position from draft model
         let last_row = draft_logits.row(draft_logits.shape()[0] - 1);
-        let draft_probs = crate::softmax::Softmax::new().forward_immutable(
-            &last_row.to_owned().insert_axis(Axis(0)).view()
-        );
-        
+        let draft_probs = crate::soft::Softmax::new()
+            .forward_immutable(&last_row.to_owned().insert_axis(Axis(0)).view());
+
         // Get top-γ candidates from draft model
         let candidates = self.get_top_k_tokens(&draft_probs, gamma);
-        
+
         if candidates.is_empty() {
             // Fallback to greedy from draft
-            return draft_probs.iter()
+            return draft_probs
+                .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i)
@@ -282,23 +286,23 @@ impl LLM {
         // Get full model probabilities for verification
         // Run through all layers (full model)
         let full_logits = self.get_sequence_logit(current_tokens);
-        let target_probs = crate::softmax::Softmax::new().forward_immutable(&full_logits.view());
+        let target_probs = crate::soft::Softmax::new().forward_immutable(&full_logits.view());
 
         // Speculative decoding acceptance with rejection sampling
         // Accept token i with probability min(1, p_target(i) / p_draft(i))
         let mut rng = get_rng();
-        
+
         for &candidate_token in &candidates {
             if candidate_token >= vocab_size {
                 continue; // Skip invalid tokens
             }
-            
+
             let q_draft = draft_probs[[0, candidate_token]].max(1e-10);
             let q_target = target_probs[[0, candidate_token]].max(1e-10);
-            
+
             // Rejection sampling: accept with probability min(1, q_target/q_draft)
             let acceptance_prob = (q_target / q_draft).min(1.0);
-            
+
             // For tau threshold mode: accept if ratio exceeds tau
             // For probabilistic mode: accept with probability = acceptance_prob
             if acceptance_prob >= tau {
@@ -315,15 +319,23 @@ impl LLM {
         // This ensures we sample from the "residual" of the target distribution
         let mut adjusted_probs = Vec::with_capacity(vocab_size);
         let mut sum = 0.0f32;
-        
+
         for i in 0..vocab_size {
-            let p_target = if i < target_probs.len() { target_probs[[0, i]] } else { 0.0 };
-            let p_draft = if i < draft_probs.len() { draft_probs[[0, i]] } else { 0.0 };
+            let p_target = if i < target_probs.len() {
+                target_probs[[0, i]]
+            } else {
+                0.0
+            };
+            let p_draft = if i < draft_probs.len() {
+                draft_probs[[0, i]]
+            } else {
+                0.0
+            };
             let p_adj = (p_target - p_draft).max(0.0);
             adjusted_probs.push(p_adj);
             sum += p_adj;
         }
-        
+
         if sum > 1e-10 {
             // Sample from adjusted distribution
             let r: f32 = rng.random::<f32>() * sum;
@@ -335,9 +347,10 @@ impl LLM {
                 }
             }
         }
-        
+
         // Ultimate fallback: greedy from target
-        target_probs.iter()
+        target_probs
+            .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
@@ -353,9 +366,11 @@ impl LLM {
         }
 
         // Convert tokens to embeddings (convert to f32)
-        let token_ids = Array2::from_shape_vec((1, tokens.len()),
-            tokens.iter().map(|&x| x as f32).collect())
-            .expect("Failed to create token array");
+        let token_ids = Array2::from_shape_vec(
+            (1, tokens.len()),
+            tokens.iter().map(|&x| x as f32).collect(),
+        )
+        .expect("Failed to create token array");
 
         // Forward through embeddings
         let mut hidden = self.network[0].forward(&token_ids);
@@ -392,15 +407,16 @@ impl LLM {
         };
 
         // Return logits for the last position
-        logits.row(logits.shape()[0] - 1).to_owned().insert_axis(Axis(0))
+        logits
+            .row(logits.shape()[0] - 1)
+            .to_owned()
+            .insert_axis(Axis(0))
     }
 
     /// Get top-k tokens from probability distribution
     fn get_top_k_tokens(&self, probs: &Array2<f32>, k: usize) -> Vec<usize> {
-        let mut token_probs: Vec<(usize, f32)> = probs.iter()
-            .enumerate()
-            .map(|(i, &p)| (i, p))
-            .collect();
+        let mut token_probs: Vec<(usize, f32)> =
+            probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
 
         token_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         token_probs.truncate(k);
@@ -457,16 +473,20 @@ impl LLM {
         // Show speculative decoder when enabled, otherwise show base decoder type
         let decoder_desc = match (&self.speculative_config, self.speculative_mode) {
             (Some(cfg), SpeculativeMode::Transformer) => {
-                format!("SpeculativeDecoder(γ={}, τ={:.4}, layers={})", 
-                    cfg.gamma, cfg.tau, cfg.draft_layers)
+                format!(
+                    "SpeculativeDecoder(γ={}, τ={:.4}, layers={})",
+                    cfg.gamma, cfg.tau, cfg.draft_layers
+                )
             }
             (Some(cfg), SpeculativeMode::Diffusion) => {
-                format!("SpeculativeDiffusion(γ={}, τ={:.4}, layers={})", 
-                    cfg.gamma, cfg.tau, cfg.draft_layers)
+                format!(
+                    "SpeculativeDiffusion(γ={}, τ={:.4}, layers={})",
+                    cfg.gamma, cfg.tau, cfg.draft_layers
+                )
             }
             (None, _) => self.decoder.layer_type().to_string(),
         };
-        
+
         format!("{}, {}", network_layers, decoder_desc)
     }
 
@@ -498,28 +518,38 @@ impl LLM {
     /// Set TRM layers to inference mode for faster prediction
     pub fn set_trm_inference_mode(&mut self) {
         for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer { lrm.set_training_mode(false); }
+            if let LayerEnum::LRM(lrm) = layer {
+                lrm.set_training_mode(false);
+            }
         }
     }
 
     /// Set TRM layers to training mode for full supervision steps
     pub fn set_trm_training_mode(&mut self) {
         for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer { lrm.set_training_mode(true); }
+            if let LayerEnum::LRM(lrm) = layer {
+                lrm.set_training_mode(true);
+            }
         }
     }
 
     pub fn set_trm_recursions(&mut self, n: usize) {
         for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer { lrm.set_recursions(n); }
+            if let LayerEnum::LRM(lrm) = layer {
+                lrm.set_recursions(n);
+            }
         }
     }
 
     pub fn set_trm_steps(&mut self, supervision: Option<usize>, inference: Option<usize>) {
         for layer in &mut self.network {
             if let LayerEnum::LRM(lrm) = layer {
-                if let Some(s) = supervision { lrm.set_supervision_steps(s); }
-                if let Some(i) = inference { lrm.set_inference_steps(i); }
+                if let Some(s) = supervision {
+                    lrm.set_supervision_steps(s);
+                }
+                if let Some(i) = inference {
+                    lrm.set_inference_steps(i);
+                }
             }
         }
     }
@@ -628,16 +658,23 @@ impl LLM {
             // Get hidden states for the last position
             let _last_hidden = hidden_states.row(hidden_states.shape()[0] - 1).to_owned();
 
-            let next_token = if let (Some(cfg), SpeculativeMode::Transformer) = (self.speculative_config, self.speculative_mode) {
+            let next_token = if let (Some(cfg), SpeculativeMode::Transformer) =
+                (self.speculative_config, self.speculative_mode)
+            {
                 // Use speculative sampling for transformers
-                self.generate_speculative_transformer(&tokenized, cfg.gamma, cfg.tau, cfg.draft_layers)
+                self.generate_speculative_transformer(
+                    &tokenized,
+                    cfg.gamma,
+                    cfg.tau,
+                    cfg.draft_layers,
+                )
             } else {
                 // Use regular decoding
                 match &mut self.decoder {
                     DecoderType::Greedy(decoder) => {
                         // Simple greedy decoding
                         let probs =
-                            crate::softmax::Softmax::new().forward_immutable(&last_logit.view());
+                            crate::soft::Softmax::new().forward_immutable(&last_logit.view());
                         let tokens = decoder.decode(&probs);
                         tokens[0]
                     }
@@ -846,7 +883,7 @@ impl LLM {
                 if let LayerEnum::TransformerBlock(block) = layer {
                     // Pull through MoH instrumentation from the temporal-mixing layer.
                     match &mut block.temporal_mixing {
-                        crate::transformer::common::TemporalMixingLayer::Attention(attn) => {
+                        crate::layers::components::common::TemporalMixingLayer::Attention(attn) => {
                             if let Some((min_tau, max_tau)) = attn.take_tau_metrics() {
                                 tau_available = true;
                                 if min_tau < tau_min_epoch {
@@ -869,7 +906,7 @@ impl LLM {
                                 total_heads_sum += per_head.len();
                             }
                         }
-                        crate::transformer::common::TemporalMixingLayer::RgLruMoH(rglru) => {
+                        crate::layers::components::common::TemporalMixingLayer::RgLruMoH(rglru) => {
                             if let Some((min_tau, max_tau)) = rglru.take_tau_metrics() {
                                 tau_available = true;
                                 if min_tau < tau_min_epoch {
@@ -896,8 +933,9 @@ impl LLM {
                     }
 
                     // Pull through MoE metrics when MoE is used inside the block.
-                    if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
-                        &block.feedforward
+                    if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(
+                        moe,
+                    ) = &block.feedforward
                     {
                         let layer_avg_active_experts = moe.config.get_avg_active_experts();
                         let layer_significant_experts = moe.config.get_avg_significant_experts();
@@ -914,8 +952,9 @@ impl LLM {
                 }
                 if let LayerEnum::DiffusionBlock(block) = layer {
                     // Pull through MoE metrics when MoE is used inside the diffusion block.
-                    if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
-                        &block.feedforward
+                    if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(
+                        moe,
+                    ) = &block.feedforward
                     {
                         let layer_avg_active_experts = moe.config.get_avg_active_experts();
                         let layer_significant_experts = moe.config.get_avg_significant_experts();
@@ -957,8 +996,8 @@ impl LLM {
                     // LRM wraps either a TransformerBlock or DiffusionBlock.
                     let guard = lrm.block.read().unwrap();
                     match &*guard {
-                        crate::transformer::lrm::RecursiveBlockVariant::Transformer(b) => {
-                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
+                        crate::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
+                            if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) =
                                 &b.feedforward
                             {
                                 let layer_avg_active_experts = moe.config.get_avg_active_experts();
@@ -974,8 +1013,8 @@ impl LLM {
                                 total_experts_sum += moe.config.num_experts;
                             }
                         }
-                        crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) =
+                        crate::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
+                            if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) =
                                 &b.feedforward
                             {
                                 let layer_avg_active_experts = moe.config.get_avg_active_experts();
@@ -1056,12 +1095,16 @@ impl LLM {
 
             // Presentable (active/total) counts and a coupled ratio.
             let total_heads = if heads_layers_count > 0 {
-                ((total_heads_sum as f32) / (heads_layers_count as f32)).round().max(0.0) as usize
+                ((total_heads_sum as f32) / (heads_layers_count as f32))
+                    .round()
+                    .max(0.0) as usize
             } else {
                 0
             };
             let total_experts = if experts_layers_count > 0 {
-                ((total_experts_sum as f32) / (experts_layers_count as f32)).round().max(0.0) as usize
+                ((total_experts_sum as f32) / (experts_layers_count as f32))
+                    .round()
+                    .max(0.0) as usize
             } else {
                 0
             };
@@ -1078,9 +1121,7 @@ impl LLM {
             };
 
             let active_heads = if total_heads > 0 {
-                avg_active_heads_s
-                    .round()
-                    .clamp(0.0, total_heads as f32) as usize
+                avg_active_heads_s.round().clamp(0.0, total_heads as f32) as usize
             } else {
                 0
             };
@@ -1279,14 +1320,14 @@ impl LLM {
             };
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer {
-                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut tb.temporal_mixing
                     {
                         attn.adapt_degree(&metrics);
                     }
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer {
-                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut db.temporal_mixing
                     {
                         attn.adapt_degree(&metrics);
@@ -1353,7 +1394,8 @@ impl LLM {
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, batch_base_loss, grad_norm) = self.train_batch_trm_autoencoding(batch, lr)?;
+                let (batch_loss, batch_base_loss, grad_norm) =
+                    self.train_batch_trm_autoencoding(batch, lr)?;
                 total_loss += batch_loss;
                 total_base_loss += batch_base_loss;
                 total_grad_norm += grad_norm;
@@ -1405,11 +1447,31 @@ impl LLM {
                     }
                 }
             }
-            let tau_min_log = if tau_available { tau_min_epoch } else { f32::NAN };
-            let tau_max_log = if tau_available { tau_max_epoch } else { f32::NAN };
-            let tau_range_log = if tau_available { tau_max_epoch - tau_min_epoch } else { f32::NAN };
-            let pred_norm_rms = if pred_norm_count > 0 { pred_norm_sum / pred_norm_count as f32 } else { f32::NAN };
-            let avg_active_heads = if heads_layers_count > 0 { avg_heads_per_token_sum / heads_layers_count as f32 } else { f32::NAN };
+            let tau_min_log = if tau_available {
+                tau_min_epoch
+            } else {
+                f32::NAN
+            };
+            let tau_max_log = if tau_available {
+                tau_max_epoch
+            } else {
+                f32::NAN
+            };
+            let tau_range_log = if tau_available {
+                tau_max_epoch - tau_min_epoch
+            } else {
+                f32::NAN
+            };
+            let pred_norm_rms = if pred_norm_count > 0 {
+                pred_norm_sum / pred_norm_count as f32
+            } else {
+                f32::NAN
+            };
+            let avg_active_heads = if heads_layers_count > 0 {
+                avg_heads_per_token_sum / heads_layers_count as f32
+            } else {
+                f32::NAN
+            };
 
             let mut lb_loss = f32::NAN;
             let mut cx_loss = f32::NAN;
@@ -1419,13 +1481,21 @@ impl LLM {
             let mut rec_tau_max = f32::NAN;
             for layer in &self.network {
                 if let LayerEnum::LRM(lrm) = layer {
-                    lb_loss = lrm.attention().moh.head_selection_config.compute_load_balance_loss();
+                    lb_loss = lrm
+                        .attention()
+                        .moh
+                        .head_selection_config
+                        .compute_load_balance_loss();
                     cx_loss = lrm
                         .attention()
                         .moh
                         .head_selection_config
                         .compute_complexity_loss(lrm.attention().moh_num_active() as f32);
-                    sp_loss = lrm.attention().moh.head_selection_config.compute_sparsity_loss();
+                    sp_loss = lrm
+                        .attention()
+                        .moh
+                        .head_selection_config
+                        .compute_sparsity_loss();
                     if !lrm.recursion_metrics.is_empty() {
                         let mut hsum = 0.0f32;
                         let mut c = 0usize;
@@ -1434,8 +1504,12 @@ impl LLM {
                         for (h, mn, mx) in lrm.recursion_metrics.iter().cloned() {
                             hsum += h;
                             c += 1;
-                            if mn < tmin { tmin = mn; }
-                            if mx > tmax { tmax = mx; }
+                            if mn < tmin {
+                                tmin = mn;
+                            }
+                            if mx > tmax {
+                                tmax = mx;
+                            }
                         }
                         rec_avg_heads = if c > 0 { hsum / c as f32 } else { f32::NAN };
                         rec_tau_min = if c > 0 { tmin } else { f32::NAN };
@@ -1467,7 +1541,11 @@ impl LLM {
             for layer in &mut self.network {
                 if let LayerEnum::LRM(lrm) = layer {
                     let heads = lrm.attention().num_heads() as f32;
-                    let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 { (avg_active_heads / heads).clamp(0.1, 1.0) } else { 0.5 };
+                    let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 {
+                        (avg_active_heads / heads).clamp(0.1, 1.0)
+                    } else {
+                        0.5
+                    };
                     lrm.set_latent_update_alpha(0.03 + 0.05 * (1.0 - h_ratio));
                     let ent = lrm
                         .attention()
@@ -1476,10 +1554,15 @@ impl LLM {
                         .gating
                         .get_gating_entropy();
                     let g = &mut lrm.attention_mut().moh.head_selection_config.gating;
-                    if ent < 0.2 { g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2); }
+                    if ent < 0.2 {
+                        g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2);
+                    }
                     if avg_active_heads.is_finite() {
-                        if avg_active_heads > heads * 0.5 { g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2); }
-                        else { g.sparsity_weight = (g.sparsity_weight * 0.95).max(0.0); }
+                        if avg_active_heads > heads * 0.5 {
+                            g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2);
+                        } else {
+                            g.sparsity_weight = (g.sparsity_weight * 0.95).max(0.0);
+                        }
                     }
                     g.complexity_loss_weight = (g.complexity_loss_weight * 0.9) + 0.01;
                 }
@@ -1546,8 +1629,16 @@ impl LLM {
         let mut out_proj_idx: Option<usize> = None;
         for (i, layer) in self.network.iter().enumerate() {
             match layer {
-                LayerEnum::TokenEmbeddings(_) => if embeddings_idx.is_none() { embeddings_idx = Some(i) },
-                LayerEnum::LRM(_) => if trm_idx.is_none() { trm_idx = Some(i) },
+                LayerEnum::TokenEmbeddings(_) => {
+                    if embeddings_idx.is_none() {
+                        embeddings_idx = Some(i)
+                    }
+                }
+                LayerEnum::LRM(_) => {
+                    if trm_idx.is_none() {
+                        trm_idx = Some(i)
+                    }
+                }
                 LayerEnum::DynamicTanhNorm(_) => norm_idx = Some(i),
                 LayerEnum::OutputProjection(_) => out_proj_idx = Some(i),
                 _ => {}
@@ -1555,11 +1646,15 @@ impl LLM {
         }
 
         for sequence in batch {
-            if sequence.len() < 2 { continue; }
-            let input_ids = &sequence[..sequence.len()-1];
+            if sequence.len() < 2 {
+                continue;
+            }
+            let input_ids = &sequence[..sequence.len() - 1];
             let target_ids = &sequence[1..];
             let mut ids_arr = Array2::<f32>::zeros((1, input_ids.len()));
-            for (i, &token_id) in input_ids.iter().enumerate() { ids_arr[[0, i]] = token_id as f32; }
+            for (i, &token_id) in input_ids.iter().enumerate() {
+                ids_arr[[0, i]] = token_id as f32;
+            }
 
             let emb_idx = embeddings_idx.unwrap();
             let mut hidden = match &mut self.network[emb_idx] {
@@ -1569,15 +1664,28 @@ impl LLM {
 
             let t_idx = trm_idx.unwrap();
             let trm_input_saved = hidden.clone();
-            hidden = match &mut self.network[t_idx] { LayerEnum::LRM(l) => l.forward(&hidden), _ => hidden };
+            hidden = match &mut self.network[t_idx] {
+                LayerEnum::LRM(l) => l.forward(&hidden),
+                _ => hidden,
+            };
 
-            if let Some(nidx) = norm_idx { hidden = match &mut self.network[nidx] { LayerEnum::DynamicTanhNorm(n) => n.forward(&hidden), _ => hidden }; }
+            if let Some(nidx) = norm_idx {
+                hidden = match &mut self.network[nidx] {
+                    LayerEnum::DynamicTanhNorm(n) => n.forward(&hidden),
+                    _ => hidden,
+                };
+            }
 
             let logits = if let Some(opidx) = out_proj_idx {
-                match &mut self.network[opidx] { LayerEnum::OutputProjection(op) => op.forward(&hidden), _ => hidden.clone() }
-            } else { hidden.clone() };
+                match &mut self.network[opidx] {
+                    LayerEnum::OutputProjection(op) => op.forward(&hidden),
+                    _ => hidden.clone(),
+                }
+            } else {
+                hidden.clone()
+            };
 
-            let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
+            let probs = crate::soft::Softmax::new().forward_immutable(&logits.view());
             let sce_cfg = crate::loss::SymmetricCEConfig::default();
             let sce = crate::loss::symmetric_cross_entropy(
                 &probs,
@@ -1590,23 +1698,29 @@ impl LLM {
             batch_loss += loss_norm;
             batch_base_loss += loss_norm;
 
-            let target_avg = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().moh_num_active() as f32, _ => 0.0 };
-            let moh_penalty = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg), _ => 0.0 };
+            let target_avg = match &self.network[t_idx] {
+                LayerEnum::LRM(l) => l.attention().moh_num_active() as f32,
+                _ => 0.0,
+            };
+            let moh_penalty = match &self.network[t_idx] {
+                LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg),
+                _ => 0.0,
+            };
 
             let moe_penalty = match &self.network[t_idx] {
                 LayerEnum::LRM(lrm) => {
                     let guard = lrm.block.read().unwrap();
                     match &*guard {
-                        crate::transformer::lrm::RecursiveBlockVariant::Transformer(b) => {
-                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                        crate::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
+                            if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
                                 let target_avg_experts = moe.config.gating.num_active as f32;
                                 moe.config.compute_moe_aux_weighted_total(target_avg_experts)
                             } else {
                                 0.0
                             }
                         }
-                        crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                            if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                        crate::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
+                            if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
                                 let target_avg_experts = moe.config.gating.num_active as f32;
                                 moe.config.compute_moe_aux_weighted_total(target_avg_experts)
                             } else {
@@ -1617,23 +1731,34 @@ impl LLM {
                 }
                 _ => 0.0,
             };
-            
+
             if moh_penalty > 10.0 {
-                 info!("High MoH penalty in batch: {}", moh_penalty);
+                info!("High MoH penalty in batch: {}", moh_penalty);
             }
 
-              if moe_penalty > 10.0 {
-                  info!("High MoE penalty in batch: {}", moe_penalty);
-              }
-            
-            batch_loss += moh_penalty;
-              batch_loss += moe_penalty;
+            if moe_penalty > 10.0 {
+                info!("High MoE penalty in batch: {}", moe_penalty);
+            }
 
-            let grads_logits = crate::loss::symmetric_cross_entropy_gradients(&probs, target_ids, sce_cfg.alpha, sce_cfg.beta, sce_cfg.epsilon);
+            batch_loss += moh_penalty;
+            batch_loss += moe_penalty;
+
+            let grads_logits = crate::loss::symmetric_cross_entropy_gradients(
+                &probs,
+                target_ids,
+                sce_cfg.alpha,
+                sce_cfg.beta,
+                sce_cfg.epsilon,
+            );
 
             let (mut grad_hidden, op_param_grads) = if let Some(opidx) = out_proj_idx {
-                match &mut self.network[opidx] { LayerEnum::OutputProjection(op) => op.compute_gradients(&hidden, &grads_logits), _ => (grads_logits.clone(), Vec::new()) }
-            } else { (grads_logits.clone(), Vec::new()) };
+                match &mut self.network[opidx] {
+                    LayerEnum::OutputProjection(op) => op.compute_gradients(&hidden, &grads_logits),
+                    _ => (grads_logits.clone(), Vec::new()),
+                }
+            } else {
+                (grads_logits.clone(), Vec::new())
+            };
             if let Some(opidx) = out_proj_idx {
                 Self::accumulate_layer_gradients(
                     &mut accumulated_param_grads[opidx],
@@ -1642,9 +1767,17 @@ impl LLM {
                 );
             }
 
-            if let Some(nidx) = norm_idx { grad_hidden = match &mut self.network[nidx] { LayerEnum::DynamicTanhNorm(n) => n.backward(&grad_hidden, lr), _ => grad_hidden }; }
+            if let Some(nidx) = norm_idx {
+                grad_hidden = match &mut self.network[nidx] {
+                    LayerEnum::DynamicTanhNorm(n) => n.backward(&grad_hidden, lr),
+                    _ => grad_hidden,
+                };
+            }
 
-            let (trm_in_grad, trm_param_grads) = match &self.network[t_idx] { LayerEnum::LRM(layer) => layer.compute_gradients(&trm_input_saved, &grad_hidden), _ => (grad_hidden.clone(), Vec::new()) };
+            let (trm_in_grad, trm_param_grads) = match &self.network[t_idx] {
+                LayerEnum::LRM(layer) => layer.compute_gradients(&trm_input_saved, &grad_hidden),
+                _ => (grad_hidden.clone(), Vec::new()),
+            };
             let _ = trm_in_grad;
             Self::accumulate_layer_gradients(
                 &mut accumulated_param_grads[t_idx],
@@ -1770,7 +1903,7 @@ impl LLM {
             }
 
             let logits = input;
-            let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
+            let probs = crate::soft::Softmax::new().forward_immutable(&logits.view());
 
             // Symmetric cross-entropy loss and gradients
             let sce_cfg = crate::loss::SymmetricCEConfig::default();
@@ -1796,12 +1929,15 @@ impl LLM {
 
             let mut lrm_index: Option<usize> = None;
             for (i, layer) in self.network.iter().enumerate() {
-                if let LayerEnum::LRM(_) = layer { lrm_index = Some(i); break; }
+                if let LayerEnum::LRM(_) = layer {
+                    lrm_index = Some(i);
+                    break;
+                }
             }
             if let Some(t_idx) = lrm_index {
-                let aux_steps: Vec<Array2<f32>> = match &self.network[t_idx] {
-                    LayerEnum::LRM(lrm) => lrm.get_supervision_outputs().to_vec(),
-                    _ => Vec::new(),
+                let aux_steps: &[Array2<f32>] = match &self.network[t_idx] {
+                    LayerEnum::LRM(lrm) => lrm.get_supervision_outputs(),
+                    _ => &[],
                 };
                 let mut aux_loss_sum = 0.0f32;
                 if !aux_steps.is_empty() {
@@ -1864,7 +2000,8 @@ impl LLM {
                         {
                             let norm_y = rn_clone.forward(y_t);
                             let logits_t = op_clone.forward(&norm_y);
-                            let probs_t = crate::softmax::Softmax::new().forward_immutable(&logits_t.view());
+                            let probs_t =
+                                crate::soft::Softmax::new().forward_immutable(&logits_t.view());
                             let sce_t = crate::loss::symmetric_cross_entropy(
                                 &probs_t,
                                 target_ids,
@@ -1876,7 +2013,7 @@ impl LLM {
                             // per-step weight: heavier on later steps
                             let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
                             let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
-                            
+
                             if step_weight < 1e-5 {
                                 continue;
                             }
@@ -1890,13 +2027,17 @@ impl LLM {
                                 sce_cfg.epsilon,
                             );
                             grad_logits_t.mapv_inplace(|v| v * step_weight);
-                            let (grad_norm_in, _) = op_clone.compute_gradients(&norm_y, &grad_logits_t);
+                            let (grad_norm_in, _) =
+                                op_clone.compute_gradients(&norm_y, &grad_logits_t);
                             let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
                             grad_y_in_opt = Some(grad_y_in);
                         }
                         if let Some(grad_y_in) = grad_y_in_opt {
-                            let (_in_grad_unused, lrm_param_grads_step) = match &self.network[t_idx] {
-                                LayerEnum::LRM(layer) => layer.compute_gradients_at_step(si, &grad_y_in),
+                            let (_in_grad_unused, lrm_param_grads_step) = match &self.network[t_idx]
+                            {
+                                LayerEnum::LRM(layer) => {
+                                    layer.compute_gradients_at_step(si, &grad_y_in)
+                                }
                                 _ => (grad_y_in.clone(), Vec::new()),
                             };
                             if !lrm_param_grads_step.is_empty() {
@@ -1914,27 +2055,33 @@ impl LLM {
                         }
                     }
                 }
-                
+
                 if aux_loss_sum > 10.0 {
-                     tracing::info!("TRM Supervision Loss: {}", aux_loss_sum);
+                    tracing::info!("TRM Supervision Loss: {}", aux_loss_sum);
                 }
 
-                let target_avg = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().moh_num_active() as f32, _ => 0.0 };
-                let moh_penalty = match &self.network[t_idx] { LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg), _ => 0.0 };
+                let target_avg = match &self.network[t_idx] {
+                    LayerEnum::LRM(l) => l.attention().moh_num_active() as f32,
+                    _ => 0.0,
+                };
+                let moh_penalty = match &self.network[t_idx] {
+                    LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg),
+                    _ => 0.0,
+                };
                 let moe_penalty = match &self.network[t_idx] {
                     LayerEnum::LRM(lrm) => {
                         let guard = lrm.block.read().unwrap();
                         match &*guard {
-                            crate::transformer::lrm::RecursiveBlockVariant::Transformer(b) => {
-                                if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                            crate::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
+                                if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
                                     let target_avg_experts = moe.config.gating.num_active as f32;
                                     moe.config.compute_moe_aux_weighted_total(target_avg_experts)
                                 } else {
                                     0.0
                                 }
                             }
-                            crate::transformer::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                                if let crate::transformer::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                            crate::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
+                                if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
                                     let target_avg_experts = moe.config.gating.num_active as f32;
                                     moe.config.compute_moe_aux_weighted_total(target_avg_experts)
                                 } else {
@@ -1946,10 +2093,10 @@ impl LLM {
                     _ => 0.0,
                 };
                 if moh_penalty > 0.01 {
-                     tracing::info!("MoH Penalty (not in loss): {}", moh_penalty);
+                    tracing::info!("MoH Penalty (not in loss): {}", moh_penalty);
                 }
                 if moe_penalty > 0.01 {
-                     tracing::info!("MoE Penalty (not in loss): {}", moe_penalty);
+                    tracing::info!("MoE Penalty (not in loss): {}", moe_penalty);
                 }
 
                 batch_loss += aux_loss_sum;
@@ -1964,10 +2111,8 @@ impl LLM {
                     layer.compute_gradients(&layer_inputs[layer_idx], &grads_output);
 
                 if check_finite {
-                    if let Some((bad_i, bad_v)) = input_grads
-                        .iter()
-                        .enumerate()
-                        .find(|(_, v)| !v.is_finite())
+                    if let Some((bad_i, bad_v)) =
+                        input_grads.iter().enumerate().find(|(_, v)| !v.is_finite())
                     {
                         return Err(crate::errors::ModelError::Training {
                             message: format!(
@@ -2087,13 +2232,22 @@ impl LLM {
                 let mut max_abs: f32 = 0.0;
                 for g in &clipped_grads {
                     for &v in g.iter() {
-                        if v.abs() > max_abs { max_abs = v.abs(); }
+                        if v.abs() > max_abs {
+                            max_abs = v.abs();
+                        }
                     }
                 }
                 if max_abs > MAX_GRAD_ABS {
                     let s = MAX_GRAD_ABS / max_abs;
-                    for g in &mut clipped_grads { g.mapv_inplace(|v| v * s); }
-                    tracing::warn!(layer_idx = layer_idx, max_abs, scale = s, "Applied max-abs gradient scaling");
+                    for g in &mut clipped_grads {
+                        g.mapv_inplace(|v| v * s);
+                    }
+                    tracing::warn!(
+                        layer_idx = layer_idx,
+                        max_abs,
+                        scale = s,
+                        "Applied max-abs gradient scaling"
+                    );
                 }
 
                 if check_finite {
@@ -2239,7 +2393,12 @@ impl LLM {
 
         // PolyAttention-only: no learned threshold predictors to update
 
-        Ok((batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq))
+        Ok((
+            batch_loss,
+            batch_base_loss,
+            grad_norm,
+            layer_param_grad_norm_sq,
+        ))
     }
 
     /// Compute layer-wise adaptive learning rate using bidirectional LARS
@@ -2326,7 +2485,10 @@ impl LLM {
                     max_grad
                 );
                 return Err(ModelError::GradientError {
-                    message: format!("Gradient anomaly detected in layer {}: max gradient magnitude {}", i, max_grad),
+                    message: format!(
+                        "Gradient anomaly detected in layer {}: max gradient magnitude {}",
+                        i, max_grad
+                    ),
                 });
             }
 
@@ -2468,38 +2630,67 @@ impl LLM {
         let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
         let mut rng = get_rng();
         let min_snr_gamma = min_snr_gamma.max(1e-6);
-        let sampling_cdf = if matches!(timestep_strategy, DiffusionTimestepStrategy::MinSnr) {
+        // Base distribution (schedule/target-aware) + online adaptive reweighting (learned from
+        // data via per-timestep EMA difficulty). This keeps behavior largely self-tuning.
+        let base_weights_full: Vec<f32> =
             if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                let mut weights = Vec::with_capacity(num_timesteps);
-                for t in 0..num_timesteps {
-                    weights.push(b0.min_snr_weight(t, min_snr_gamma).max(1e-6));
-                }
-                let sum: f32 = weights.iter().sum();
-                if sum > 0.0 {
-                    let mut acc = 0.0f32;
-                    weights
-                        .into_iter()
-                        .map(|w| {
-                            acc += w / sum;
-                            acc.min(1.0)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
+                match timestep_strategy {
+                    DiffusionTimestepStrategy::MinSnr => (0..num_timesteps)
+                        .map(|t| b0.min_snr_weight(t, min_snr_gamma).max(1e-12))
+                        .collect(),
+                    DiffusionTimestepStrategy::EdmLogNormal => {
+                        // EDM log-normal sampling over σ, discretized over timesteps.
+                        let p_mean: f32 = -1.2;
+                        let p_std: f32 = 1.2;
+                        let norm_const: f32 = 1.0 / (p_std * (2.0 * std::f32::consts::PI).sqrt());
+                        (0..num_timesteps)
+                            .map(|t| {
+                                if t == 0 {
+                                    return 0.0;
+                                }
+                                let alpha_bar = b0
+                                    .noise_scheduler
+                                    .sqrt_alpha_cumprod(t)
+                                    .powi(2)
+                                    .clamp(1e-12, 1.0 - 1e-12);
+                                let sigma =
+                                    crate::layers::diffusion::edm::sigma_from_alpha_bar(alpha_bar)
+                                        .max(1e-6);
+                                let log_sigma = sigma.ln();
+                                let z = (log_sigma - p_mean) / p_std;
+                                (norm_const * (-0.5 * z * z).exp()).max(1e-12)
+                            })
+                            .collect()
+                    }
+                    DiffusionTimestepStrategy::Uniform => vec![1.0f32; num_timesteps],
                 }
             } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+                vec![1.0f32; num_timesteps]
+            };
+
+        let mut sampling_cdf: Vec<f32> = Vec::new();
+        let mut denoise_ema_per_t = vec![1.0f32; num_timesteps.max(1)];
+        let mut denoise_cnt_per_t = vec![0u32; num_timesteps.max(1)];
+        let denoise_ema_decay: f32 = 0.99;
+        let denoise_importance_power: f32 = 0.5;
+        let min_samples_before_adapt: u32 = 64;
+
+        // Online normalization for per-example MSE weights.
+        // Keeps loss/gradient scale stable even when the (adaptive) weighting becomes skewed.
+        let mut mse_weight_ema: f32 = 1.0;
+        let mse_weight_ema_decay: f32 = 0.995;
+        let mse_weight_min: f32 = 0.1;
+        let mse_weight_max: f32 = 10.0;
         let lambda_ce_schedule = |t: usize| -> f32 {
             let total = num_timesteps.max(1) as f32;
             let center = 0.5 * total;
             let sigma = (0.15 * total).max(1.0);
             let capped_t = t.min(num_timesteps.saturating_sub(1)) as f32;
             let x = (center - capped_t) / sigma;
-            let s = 1.0 / (1.0 + (-x).exp());
+            use std::sync::OnceLock;
+            static CURVE: OnceLock<crate::richards::RichardsCurve> = OnceLock::new();
+            let curve = CURVE.get_or_init(|| crate::richards::RichardsCurve::sigmoid(false));
+            let s = curve.forward_scalar(x as f64) as f32;
             s.clamp(0.5, 1.0)
         };
         let log_dir = std::path::Path::new("training_logs");
@@ -2537,9 +2728,59 @@ impl LLM {
                 lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
             };
             let effective_lr = base_lr * lr_scale;
+
+            // Epoch-level adaptive sampling CDF over the curriculum-active timesteps.
+            let max_t_epoch =
+                ((num_timesteps as f32) * ((epoch + 1) as f32 / epochs as f32)).round() as usize;
+            let active_steps_epoch = max_t_epoch.max(1);
+            sampling_cdf = {
+                // Normalize difficulty by mean to avoid collapsing onto a narrow band of
+                // timesteps as the EMA evolves.
+                let mut diff_sum = 0.0f32;
+                let mut diff_count = 0u32;
+                for t in 0..active_steps_epoch {
+                    if denoise_cnt_per_t.get(t).copied().unwrap_or(0) >= min_samples_before_adapt {
+                        diff_sum += denoise_ema_per_t.get(t).copied().unwrap_or(1.0).max(1e-12);
+                        diff_count = diff_count.saturating_add(1);
+                    }
+                }
+                let diff_mean = if diff_count > 0 {
+                    (diff_sum / diff_count as f32).max(1e-12)
+                } else {
+                    1.0
+                };
+
+                let mut weights = Vec::with_capacity(active_steps_epoch);
+                for t in 0..active_steps_epoch {
+                    let base = base_weights_full.get(t).copied().unwrap_or(1.0).max(1e-12);
+                    let adapt_ready =
+                        denoise_cnt_per_t.get(t).copied().unwrap_or(0) >= min_samples_before_adapt;
+                    let diff = if adapt_ready {
+                        let d = denoise_ema_per_t.get(t).copied().unwrap_or(1.0).max(1e-12);
+                        let ratio = (d / diff_mean).clamp(0.25, 4.0);
+                        ratio.powf(denoise_importance_power)
+                    } else {
+                        1.0
+                    };
+                    weights.push((base * diff).max(1e-12));
+                }
+                let sum: f32 = weights.iter().sum();
+                if sum > 0.0 && sum.is_finite() {
+                    let mut acc = 0.0f32;
+                    weights
+                        .into_iter()
+                        .map(|w| {
+                            acc += w / sum;
+                            acc.min(1.0)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
             let mut total_loss = 0.0f32;
-            let mut _total_mse = 0.0f32;
-            let _mse_examples = 0usize;
+            let mut total_mse = 0.0f32;
+            let mut mse_examples = 0usize;
             let mut total_ce = 0.0f32;
             let mut total_lambda_ce = 0.0f32;
             let mut count = 0usize;
@@ -2564,7 +2805,9 @@ impl LLM {
                     let target_ids = &training_row[1..];
 
                     let mut ids_arr = Array2::<f32>::zeros((1, input_ids.len()));
-                    for (i, &token_id) in input_ids.iter().enumerate() { ids_arr[[0, i]] = token_id as f32; }
+                    for (i, &token_id) in input_ids.iter().enumerate() {
+                        ids_arr[[0, i]] = token_id as f32;
+                    }
 
                     // x0 via embeddings
                     let emb_idx = embeddings_idx.unwrap();
@@ -2609,34 +2852,27 @@ impl LLM {
                             .len() as f32;
                         (unique / training_row.len().max(1) as f32).clamp(0.0, 1.0)
                     };
-                    let max_t = ((num_timesteps as f32) * ((epoch + 1) as f32 / epochs as f32))
-                        .round() as usize; // curriculum
-                    let active_steps = max_t.max(1);
-                    let candidate = match timestep_strategy {
-                        DiffusionTimestepStrategy::Uniform => rng.random_range(0..active_steps),
-                        DiffusionTimestepStrategy::MinSnr => {
-                            if sampling_cdf.is_empty() {
-                                rng.random_range(0..num_timesteps.max(1))
+                    let active_steps = active_steps_epoch;
+                    let candidate = if sampling_cdf.is_empty() {
+                        rng.random_range(0..active_steps)
+                    } else {
+                        let r: f32 = rand::random();
+                        let mut lo = 0usize;
+                        let mut hi = sampling_cdf.len();
+                        while lo < hi {
+                            let mid = (lo + hi) / 2;
+                            if sampling_cdf[mid] < r {
+                                lo = mid + 1;
                             } else {
-                                let r: f32 = rand::random();
-                                let mut lo = 0usize;
-                                let mut hi = sampling_cdf.len();
-                                while lo < hi {
-                                    let mid = (lo + hi) / 2;
-                                    if sampling_cdf[mid] < r {
-                                        lo = mid + 1;
-                                    } else {
-                                        hi = mid;
-                                    }
-                                }
-                                let idx = if lo >= sampling_cdf.len() {
-                                    sampling_cdf.len() - 1
-                                } else {
-                                    lo
-                                };
-                                idx.min(num_timesteps.saturating_sub(1))
+                                hi = mid;
                             }
                         }
+                        let idx = if lo >= sampling_cdf.len() {
+                            sampling_cdf.len() - 1
+                        } else {
+                            lo
+                        };
+                        idx.min(active_steps.saturating_sub(1))
                     };
                     let t = (((1.0 - complexity) * candidate as f32).round() as usize)
                         .min(active_steps - 1);
@@ -2698,15 +2934,16 @@ impl LLM {
                     } else {
                         if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
                             match b0.prediction_target() {
-                                crate::transformer::diffusion_block::DiffusionPredictionTarget::Epsilon => {
+                                crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
                                     let sa = sqrt_a.max(1e-6);
                                     (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
                                 }
-                                crate::transformer::diffusion_block::DiffusionPredictionTarget::VPrediction => {
+                                crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
                                     // x0 = sqrt(alpha_bar) * x_t − sqrt(1 − alpha_bar) * v
                                     (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
                                 }
-                                crate::transformer::diffusion_block::DiffusionPredictionTarget::Sample => pred.clone(),
+                                crate::layers::diffusion::DiffusionPredictionTarget::Sample => pred.clone(),
+                                crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => pred.clone(),
                             }
                         } else {
                             pred.clone()
@@ -2730,7 +2967,7 @@ impl LLM {
                     } else {
                         continue;
                     };
-                    let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
+                    let probs = crate::soft::Softmax::new().forward_immutable(&logits.view());
                     let target_len = target_ids.len();
                     let probs_slice = probs.slice(s![0..target_len, ..]);
                     let lambda_ce = if discrete_used {
@@ -2752,15 +2989,28 @@ impl LLM {
                         1e-4,
                     );
 
-                    let (denoise_target, w_mse) = if discrete_used {
+                    let (denoise_target, w_mse_raw) = if discrete_used {
                         (None, 1.0f32)
                     } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                        (
-                            Some(b0.training_target(&x0, &noise, t)),
-                            b0.min_snr_weight(t, min_snr_gamma),
-                        )
+                        let mut w = b0.min_snr_weight(t, min_snr_gamma);
+                        if b0.prediction_target()
+                            == crate::layers::diffusion::DiffusionPredictionTarget::EdmX0
+                        {
+                            w *= b0.edm_loss_weight(t);
+                        }
+                        (Some(b0.training_target(&x0, &noise, t)), w)
                     } else {
                         (None, 1.0f32)
+                    };
+
+                    if !discrete_used {
+                        mse_weight_ema = mse_weight_ema_decay * mse_weight_ema
+                            + (1.0 - mse_weight_ema_decay) * w_mse_raw.max(1e-12);
+                    }
+                    let w_mse = if discrete_used {
+                        1.0f32
+                    } else {
+                        (w_mse_raw / mse_weight_ema.max(1e-6)).clamp(mse_weight_min, mse_weight_max)
                     };
 
                     // CE grads expanded to full logits shape
@@ -2815,16 +3065,21 @@ impl LLM {
                         grad_hidden.clone()
                     } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
                         let grad_ce = match b0.prediction_target() {
-                            crate::transformer::diffusion_block::DiffusionPredictionTarget::Epsilon => {
+                            crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
                                 let sa = sqrt_a.max(1e-6);
                                 let coeff = -sqrt_one_minus_a / sa;
                                 grad_hidden.mapv(|x| x * coeff)
                             }
-                            crate::transformer::diffusion_block::DiffusionPredictionTarget::VPrediction => {
+                            crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
                                 let coeff = -sqrt_one_minus_a;
                                 grad_hidden.mapv(|x| x * coeff)
                             }
-                            crate::transformer::diffusion_block::DiffusionPredictionTarget::Sample => grad_hidden.clone(),
+                            crate::layers::diffusion::DiffusionPredictionTarget::Sample => {
+                                grad_hidden.clone()
+                            }
+                            crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => {
+                                grad_hidden.clone()
+                            }
                         };
                         let mut grad_total = grad_ce.mapv(|x| x * lambda_ce);
                         if let Some(target) = denoise_target.as_ref() {
@@ -2911,15 +3166,27 @@ impl LLM {
                     } else {
                         0.0
                     };
+                    if !discrete_used {
+                        total_mse += mse;
+                        mse_examples += 1;
+                    }
                     let loss = if discrete_used {
                         sce
                     } else {
-                        lambda_ce * sce + lambda_eps * mse
+                        lambda_ce * sce + (lambda_eps * w_mse) * mse
                     };
                     total_loss += loss;
                     total_ce += sce;
                     count += 1;
                     total_grad_norm_sq += grad_pred.iter().map(|&x| x * x).sum::<f32>();
+
+                    // Update adaptive timestep sampler statistics (learned difficulty).
+                    if !discrete_used && t < denoise_ema_per_t.len() {
+                        let prev = denoise_ema_per_t[t];
+                        denoise_ema_per_t[t] =
+                            denoise_ema_decay * prev + (1.0 - denoise_ema_decay) * mse.max(0.0);
+                        denoise_cnt_per_t[t] = denoise_cnt_per_t[t].saturating_add(1);
+                    }
                 }
                 // Apply averaged grads per layer after batch
                 for (idx, maybe_grads) in grads_per_layer.into_iter().enumerate() {
@@ -2966,8 +3233,8 @@ impl LLM {
             } else {
                 0.0
             };
-            let avg_mse = if _mse_examples > 0 {
-                _total_mse / _mse_examples as f32
+            let avg_mse = if mse_examples > 0 {
+                total_mse / mse_examples as f32
             } else {
                 0.0
             };
@@ -2987,7 +3254,7 @@ impl LLM {
             let mut pred_norm_rms: Option<f32> = None;
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer {
-                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut tb.temporal_mixing
                     {
                         tau_range = attn.take_tau_metrics();
@@ -2995,7 +3262,7 @@ impl LLM {
                     }
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer {
-                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut db.temporal_mixing
                     {
                         tau_range = attn.take_tau_metrics();
@@ -3018,14 +3285,14 @@ impl LLM {
             };
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer {
-                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut tb.temporal_mixing
                     {
                         attn.adapt_degree(&metrics);
                     }
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer {
-                    if let crate::transformer::common::TemporalMixingLayer::Attention(attn) =
+                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut db.temporal_mixing
                     {
                         attn.adapt_degree(&metrics);
@@ -3135,14 +3402,19 @@ impl LLM {
                 } else {
                     if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
                         match b0.prediction_target() {
-                            crate::transformer::diffusion_block::DiffusionPredictionTarget::Epsilon => {
+                            crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
                                 let sa = sqrt_a.max(1e-6);
                                 (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
                             }
-                            crate::transformer::diffusion_block::DiffusionPredictionTarget::VPrediction => {
+                            crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
                                 (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
                             }
-                            crate::transformer::diffusion_block::DiffusionPredictionTarget::Sample => pred.clone(),
+                            crate::layers::diffusion::DiffusionPredictionTarget::Sample => {
+                                pred.clone()
+                            }
+                            crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => {
+                                pred.clone()
+                            }
                         }
                     } else {
                         pred.clone()
@@ -3163,16 +3435,19 @@ impl LLM {
                 } else {
                     continue;
                 };
-                let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
+                let probs = crate::soft::Softmax::new().forward_immutable(&logits.view());
                 let target_len = target_ids.len();
                 let probs_slice = probs.slice(s![0..target_len, ..]);
                 let (denoise_target, w_mse) = if discrete_used {
                     (None, 1.0f32)
                 } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                    (
-                        Some(b0.training_target(&x0, &noise, t)),
-                        b0.min_snr_weight(t, min_snr_gamma),
-                    )
+                    let mut w = b0.min_snr_weight(t, min_snr_gamma);
+                    if b0.prediction_target()
+                        == crate::layers::diffusion::DiffusionPredictionTarget::EdmX0
+                    {
+                        w *= b0.edm_loss_weight(t);
+                    }
+                    (Some(b0.training_target(&x0, &noise, t)), w)
                 } else {
                     (None, 1.0f32)
                 };
@@ -3396,7 +3671,7 @@ impl LLM {
                     Some(l) => l,
                     None => break,
                 };
-                let softmax = crate::softmax::Softmax::new();
+                let softmax = crate::soft::Softmax::new();
                 let probs = softmax.forward_immutable(&logits.view());
                 if let LayerEnum::DiffusionBlock(b0) = &self.network[diffusion_blocks_idx[0]] {
                     if let Some(ds) = &b0.discrete_scheduler {
@@ -3493,8 +3768,8 @@ impl LLM {
             if !used_speculative {
                 for t in (1..=steps).rev() {
                     let t_idx = t - 1;
-                    let predicted_noise = self
-                        .forward_diffusion_stack(&diffusion_blocks_idx, &current_sample, t_idx);
+                    let predicted_noise =
+                        self.forward_diffusion_stack(&diffusion_blocks_idx, &current_sample, t_idx);
                     current_sample = self.apply_ddim_step(
                         scheduler_idx,
                         &current_sample,
@@ -3538,7 +3813,7 @@ impl LLM {
         let mut tokens = prompt_tokens.clone();
         let temperature: f32 = 1.0;
         let top_p: f32 = 0.9;
-        let softmax = crate::softmax::Softmax::new();
+        let softmax = crate::soft::Softmax::new();
         for i in prompt_tokens.len()..max_length {
             let mut row_scaled = logits.row(i).to_owned();
             if temperature > 0.0 {
@@ -3656,7 +3931,7 @@ impl LLM {
             } else {
                 continue;
             };
-            let probs = crate::softmax::Softmax::new().forward_immutable(&logits.view());
+            let probs = crate::soft::Softmax::new().forward_immutable(&logits.view());
             let target_len = target_ids.len();
             let probs_slice = probs.slice(s![0..target_len, ..]);
             let ce = crate::loss::symmetric_cross_entropy(
@@ -3828,7 +4103,11 @@ mod tests {
         LLM::accumulate_layer_gradients(&mut accumulator, mismatched, "TestLayer");
 
         assert_eq!(accumulator.len(), 2);
-        assert!(accumulator.iter().all(|grad| grad.iter().all(|&v| (v - 1.0).abs() < 1e-6)));
+        assert!(
+            accumulator
+                .iter()
+                .all(|grad| grad.iter().all(|&v| (v - 1.0).abs() < 1e-6))
+        );
     }
 }
 #[test]

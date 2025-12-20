@@ -72,4 +72,4 @@ path = "test_learning_bug_demo.rs"
 
 [[bin]]
 name = "debug_counts"
-path = "debug_counts.rs"
+path = "src/bin/debug_counts.rs"

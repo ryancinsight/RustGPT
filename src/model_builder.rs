@@ -1,14 +1,15 @@
 use crate::{
     embeddings::TokenEmbeddings,
     encoding::Vocab,
-    network::{Layer, LayerEnum},
+    layers::{
+        diffusion::{DiffusionBlock, DiffusionBlockConfig, EDM_SIGMA_DATA_DEFAULT, NoiseSchedule},
+        recurrence::LRM,
+        transformer::TransformerBlock,
+    },
     model_config::{ArchitectureType, ModelConfig},
+    network::{Layer, LayerEnum},
     output_projection::OutputProjection,
     richards::RichardsNorm,
-    transformer::{
-        DiffusionBlock, TransformerBlock, LRM,
-        diffusion_block::{DiffusionBlockConfig, NoiseSchedule},
-    },
 };
 
 /// Build a network based on the provided configuration
@@ -53,7 +54,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 
     // Set TRM/LRM layers to inference mode by default for speed
     for layer in &mut layers {
-        if let LayerEnum::LRM(lrm) = layer { lrm.set_training_mode(false); }
+        if let LayerEnum::LRM(lrm) = layer {
+            lrm.set_training_mode(false);
+        }
     }
 
     layers
@@ -107,6 +110,7 @@ fn build_diffusion_layers(
             use_adaptive_window: config.use_adaptive_window,
             mask_token_id: Some(mask_id),
             prediction_target: config.diffusion_prediction_target.clone(),
+            edm_sigma_data: EDM_SIGMA_DATA_DEFAULT,
             timestep_strategy: config.diffusion_timestep_strategy,
             temporal_mixing: config.temporal_mixing,
             use_advanced_adaptive_residuals: true, // Enable by default for diffusion blocks
@@ -194,6 +198,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                 NoiseSchedule::Cosine { .. } => "Cosine (Improved DDPM)",
                 NoiseSchedule::Linear { .. } => "Linear",
                 NoiseSchedule::Quadratic { .. } => "Quadratic",
+                NoiseSchedule::Karras { .. } => "Karras (σ-schedule mapped to VP)",
             };
             println!("  Noise Schedule: {}", schedule_label);
             println!(
@@ -266,8 +271,8 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 mod tests {
     use super::*;
     use crate::{
+        layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
         model_config::DiffusionTimestepStrategy,
-        transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
     };
 
     #[test]

@@ -66,8 +66,8 @@ impl VersionedModel {
             "json" => (
                 Some("json".to_string()),
                 serde_json::to_vec_pretty(llm).map_err(|e| ModelError::Serialization {
-                source: Box::new(e),
-            })?,
+                    source: Box::new(e),
+                })?,
             ),
             "binary" => (
                 Some("msgpack".to_string()),
@@ -172,10 +172,7 @@ impl VersionedModel {
         self.validate_checksum()?;
 
         // Prefer the stored payload codec if present.
-        let effective_format = self
-            .data_format
-            .as_deref()
-            .unwrap_or(format);
+        let effective_format = self.data_format.as_deref().unwrap_or(format);
 
         // Deserialize
         let llm = match effective_format {
@@ -290,7 +287,8 @@ impl LLM {
         };
 
         // Back-compat: older v1 files used bincode v2 for the payload but didn't store a codec tag.
-        if versioned.version == 1 && versioned.data_format.is_none() && requested_format == "binary" {
+        if versioned.version == 1 && versioned.data_format.is_none() && requested_format == "binary"
+        {
             let mut v = versioned;
             v.data_format = Some("bincode2".to_string());
             return v.to_llm(requested_format);

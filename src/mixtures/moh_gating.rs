@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adam::Adam,
-    mixtures::{routing::{apply_selection_algorithm, RoutingConfig, SelectionAlgorithm}, moh::{HeadSelectionConfig, HeadSelectionStrategy}},
+    mixtures::{
+        moh::{HeadSelectionConfig, HeadSelectionStrategy},
+        routing::{RoutingConfig, SelectionAlgorithm, apply_selection_algorithm},
+        threshold::ThresholdPredictor,
+    },
     richards::RichardsGate,
     rng::get_rng,
-    mixtures::threshold::ThresholdPredictor,
 };
 
 /// Shared Mixture-of-Heads (MoH) gating module.
@@ -17,7 +20,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoHGating {
     /// Per-head gating projection: X·W_g
-    pub w_g: Array2<f32>,     // (embed_dim, num_heads)
+    pub w_g: Array2<f32>, // (embed_dim, num_heads)
     pub alpha_g: Array2<f32>, // (1, num_heads)
     pub beta_g: Array2<f32>,  // (1, num_heads)
 
@@ -51,7 +54,9 @@ impl MoHGating {
         let std_g = (2.0f32 / embed_dim.max(1) as f32).sqrt();
         let normal_g = Normal::new(0.0, std_g as f64).unwrap();
 
-        let w_g = Array2::<f32>::from_shape_fn((embed_dim, num_heads), |_| normal_g.sample(&mut rng) as f32);
+        let w_g = Array2::<f32>::from_shape_fn((embed_dim, num_heads), |_| {
+            normal_g.sample(&mut rng) as f32
+        });
         let alpha_g = Array2::<f32>::ones((1, num_heads));
         let beta_g = Array2::<f32>::zeros((1, num_heads));
 
@@ -87,7 +92,9 @@ impl MoHGating {
         let embed_dim = self.w_g.nrows();
         self.head_selection_config = HeadSelectionConfig::from_strategy(strategy, num_heads);
 
-        if self.head_selection_config.gating.use_learned_predictor && self.threshold_predictor.is_none() {
+        if self.head_selection_config.gating.use_learned_predictor
+            && self.threshold_predictor.is_none()
+        {
             let predictor_hidden_dim = 128.min(embed_dim / 2).max(32);
             self.threshold_predictor = Some(ThresholdPredictor::new_with_cond(
                 embed_dim,
@@ -271,7 +278,9 @@ impl MoHGating {
 
     pub fn compute_moh_aux_losses(&self, target_avg_components: f32) -> (f32, f32, f32) {
         let lb = self.head_selection_config.compute_load_balance_loss();
-        let cx = self.head_selection_config.compute_complexity_loss(target_avg_components);
+        let cx = self
+            .head_selection_config
+            .compute_complexity_loss(target_avg_components);
         let sp = self.head_selection_config.compute_sparsity_loss();
         (lb, cx, sp)
     }
@@ -330,18 +339,29 @@ impl MoHGating {
                 .metrics
                 .token_count_per_component[h];
             let avg = if tokens > 0 {
-                self.head_selection_config.gating.metrics.active_sum_per_component[h] / tokens as f32
+                self.head_selection_config
+                    .gating
+                    .metrics
+                    .active_sum_per_component[h]
+                    / tokens as f32
             } else {
                 0.0
             };
             res.push((avg, tokens));
-            self.head_selection_config.gating.metrics.active_sum_per_component[h] = 0.0;
-            self.head_selection_config.gating.metrics.token_count_per_component[h] = 0;
+            self.head_selection_config
+                .gating
+                .metrics
+                .active_sum_per_component[h] = 0.0;
+            self.head_selection_config
+                .gating
+                .metrics
+                .token_count_per_component[h] = 0;
         }
         res
     }
 
-    /// Compute gradients for MoH gating parameters given upstream gradients w.r.t. effective weights.
+    /// Compute gradients for MoH gating parameters given upstream gradients w.r.t. effective
+    /// weights.
     ///
     /// Returns (grad_input, grad_params) where grad_params matches the ordering:
     /// w_g, alpha_g, beta_g, gate_poly, (optional predictor grads: w1,b1,w2,b2,cond_w,activation)
@@ -389,8 +409,9 @@ impl MoHGating {
         // Mask matrix m_mat for backward.
         let mut m_mat = Array2::<f32>::ones((n, num_heads));
 
-        // For learned predictor: recompute predictor output and apply the same per-row normalization.
-        // For SoftTopP: recompute the SoftTopP weights from g_mat (more reliable than relying on cache).
+        // For learned predictor: recompute predictor output and apply the same per-row
+        // normalization. For SoftTopP: recompute the SoftTopP weights from g_mat (more
+        // reliable than relying on cache).
         let mut pred_output: Option<Array2<f32>> = None;
         let mut pred_pre_norm: Option<Array2<f32>> = None;
         if self.head_selection_config.gating.use_learned_predictor {
@@ -501,8 +522,9 @@ impl MoHGating {
                     }
                 }
 
-                // Backprop through row-normalization: m = k * u / sum(u), where u is the pre-normalized predictor output.
-                // Use the saved pre-normalized values from this function's predictor forward.
+                // Backprop through row-normalization: m = k * u / sum(u), where u is the
+                // pre-normalized predictor output. Use the saved pre-normalized
+                // values from this function's predictor forward.
                 let u = pred_pre_norm
                     .clone()
                     .unwrap_or_else(|| Array2::<f32>::zeros((n, num_heads)));
@@ -546,8 +568,16 @@ impl MoHGating {
                 // Predictor->input gradient
                 grad_input += &dx_pred;
 
-                let gb1 = gb1_1d.clone().to_shape((gb1_1d.len(), 1)).unwrap().to_owned();
-                let gb2 = gb2_1d.clone().to_shape((gb2_1d.len(), 1)).unwrap().to_owned();
+                let gb1 = gb1_1d
+                    .clone()
+                    .to_shape((gb1_1d.len(), 1))
+                    .unwrap()
+                    .to_owned();
+                let gb2 = gb2_1d
+                    .clone()
+                    .to_shape((gb2_1d.len(), 1))
+                    .unwrap()
+                    .to_owned();
                 extra.push(gw1);
                 extra.push(gb1);
                 extra.push(gw2);
@@ -601,12 +631,16 @@ impl MoHGating {
         // grads ordering described in compute_gradients_from_eff.
         if grads.len() < 4 {
             return Err(crate::errors::ModelError::GradientError {
-                message: format!("MoHGating expected at least 4 grad arrays, got {}", grads.len()),
+                message: format!(
+                    "MoHGating expected at least 4 grad arrays, got {}",
+                    grads.len()
+                ),
             });
         }
         let mut idx = 0usize;
         self.opt_w_g.step(&mut self.w_g, &grads[idx], lr);
-        self.opt_alpha_g.step(&mut self.alpha_g, &grads[idx + 1], lr);
+        self.opt_alpha_g
+            .step(&mut self.alpha_g, &grads[idx + 1], lr);
         self.opt_beta_g.step(&mut self.beta_g, &grads[idx + 2], lr);
         idx += 3;
         let grad_gate_poly = &grads[idx];
@@ -627,17 +661,30 @@ impl MoHGating {
                     });
                 }
                 opt_w1.step(&mut pred.weights1, &grads[idx], lr);
-                let mut bias1_reshaped = pred.bias1.clone().to_shape((pred.bias1.len(), 1)).unwrap().to_owned();
+                let mut bias1_reshaped = pred
+                    .bias1
+                    .clone()
+                    .to_shape((pred.bias1.len(), 1))
+                    .unwrap()
+                    .to_owned();
                 opt_b1.step(&mut bias1_reshaped, &grads[idx + 1], lr);
-                pred.bias1.assign(&bias1_reshaped.view().to_shape(pred.bias1.len()).unwrap());
+                pred.bias1
+                    .assign(&bias1_reshaped.view().to_shape(pred.bias1.len()).unwrap());
                 opt_w2.step(&mut pred.weights2, &grads[idx + 2], lr);
-                let mut bias2_reshaped = pred.bias2.clone().to_shape((pred.bias2.len(), 1)).unwrap().to_owned();
+                let mut bias2_reshaped = pred
+                    .bias2
+                    .clone()
+                    .to_shape((pred.bias2.len(), 1))
+                    .unwrap()
+                    .to_owned();
                 opt_b2.step(&mut bias2_reshaped, &grads[idx + 3], lr);
-                pred.bias2.assign(&bias2_reshaped.view().to_shape(pred.bias2.len()).unwrap());
+                pred.bias2
+                    .assign(&bias2_reshaped.view().to_shape(pred.bias2.len()).unwrap());
                 if let Some(opt_cond) = &mut self.opt_cond_w_tau {
                     opt_cond.step(&mut pred.cond_w, &grads[idx + 4], lr);
                 }
-                let grad_activation_vec: Vec<f64> = grads[idx + 5].iter().map(|&x| x as f64).collect();
+                let grad_activation_vec: Vec<f64> =
+                    grads[idx + 5].iter().map(|&x| x as f64).collect();
                 pred.activation.step(&grad_activation_vec, lr as f64);
             }
         }

@@ -2,17 +2,15 @@ pub mod adam;
 pub mod attention;
 pub mod cli;
 pub mod config_builder;
-pub mod diffusion;
 pub mod evaluator;
 pub mod inference;
 pub mod interactive;
+pub mod layers;
 pub mod network;
 pub mod persistence;
 pub mod rng;
-pub mod training;
 pub mod trainer;
-pub mod transformer;
-// TRM module removed
+pub mod training;
 
 pub mod dataset_loader;
 pub mod embeddings;
@@ -21,17 +19,16 @@ pub mod loss;
 pub mod metrics;
 pub mod pade;
 pub mod richards;
-pub mod softmax;
-pub mod ssm;
+pub mod soft;
 
 // removed: pub mod head_router;
 pub mod llm;
 
+pub mod mixtures;
 pub mod model_builder;
 pub mod model_config;
 pub mod model_persistence;
 pub mod output_projection;
-pub mod mixtures;
 
 pub mod decoding;
 pub mod encoding;
@@ -54,6 +51,12 @@ pub use embeddings::TokenEmbeddings as Embeddings;
 // Also re-export encoding types for convenience
 pub use encoding::{SimpleTokenizer, Vocab};
 pub use errors::{ModelError, Result};
+// TRM is implemented via the recursive layer(s) under `layers::recurrence`.
+
+// Re-export core LLM functionality
+pub use evaluator::Evaluator;
+pub use inference::InferenceEngine;
+pub use llm::LLM;
 // removed head_router re-exports
 // pub use head_router::{RouterType, FullyAdaptiveHeadRouter};
 // Also re-export mixture types for convenience
@@ -63,19 +66,13 @@ pub use mixtures::{
 };
 pub use model_builder::{build_network, print_architecture_summary};
 pub use model_config::{ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy};
+pub use network::{Layer, LayerEnum};
+pub use persistence::ModelPersistence;
 // Also re-export RichardsGlu
 pub use richards::RichardsGlu;
 // Also re-export RichardsNorm as DynamicTanhNorm for compatibility
 pub use richards::RichardsNorm as DynamicTanhNorm;
-// TRM removed; use LRM via transformer::lrm
-
-// Re-export core LLM functionality
-pub use evaluator::Evaluator;
-pub use inference::InferenceEngine;
-pub use llm::LLM;
-pub use network::{Layer, LayerEnum};
-pub use persistence::ModelPersistence;
-pub use rng::{get_rng, set_seed, is_seeded, get_seed};
+pub use rng::{get_rng, get_seed, is_seeded, set_seed};
 pub use trainer::Trainer;
 
 // TRM tests removed

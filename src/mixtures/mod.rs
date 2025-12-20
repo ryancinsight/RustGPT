@@ -19,8 +19,6 @@ pub use moe::{
 pub use moh::{HeadRouter, HeadSelectionConfig, HeadSelectionStrategy};
 pub use moh_gating::MoHGating;
 // Re-export shared routing types
-pub use routing::{
-    Router, RoutingConfig, RoutingResult, SelectionAlgorithm,
-};
+pub use routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm};
 // Re-export shared threshold predictor
 pub use threshold::ThresholdPredictor;

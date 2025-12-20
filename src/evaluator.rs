@@ -1,9 +1,4 @@
-use crate::{
-    errors::Result,
-    llm::LLM,
-    metrics::text::corpus_bleu_1_2,
-    Vocab,
-};
+use crate::{Vocab, errors::Result, llm::LLM, metrics::text::corpus_bleu_1_2};
 
 /// Evaluation and metrics functionality for language models
 pub struct Evaluator;

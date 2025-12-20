@@ -17,7 +17,7 @@
 use ndarray::ArrayView2;
 use serde::{Deserialize, Serialize};
 
-use crate::{mixtures::threshold::ThresholdPredictor, softmax::Softmax};
+use crate::{mixtures::threshold::ThresholdPredictor, soft::Softmax};
 
 /// Common selection algorithms for routing decisions
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,8 +158,16 @@ fn apply_soft_top_p_selection(
 ) -> ndarray::Array2<f32> {
     let mut result = ndarray::Array2::<f32>::zeros(gates.raw_dim());
 
-    let top_p = if top_p.is_finite() { top_p.clamp(0.0, 1.0) } else { 1.0 };
-    let alpha = if alpha.is_finite() && alpha >= 0.0 { alpha } else { 50.0 };
+    let top_p = if top_p.is_finite() {
+        top_p.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let alpha = if alpha.is_finite() && alpha >= 0.0 {
+        alpha
+    } else {
+        50.0
+    };
 
     // Process each token
     for (token_idx, token_gates) in gates.outer_iter().enumerate() {
@@ -188,15 +196,27 @@ fn apply_soft_top_p_selection(
         prob_indices.sort_by(|&i, &j| {
             let a = token_gates[i];
             let b = token_gates[j];
-            let a = if a.is_finite() { a.max(0.0) / sum_w } else { 0.0 };
-            let b = if b.is_finite() { b.max(0.0) / sum_w } else { 0.0 };
+            let a = if a.is_finite() {
+                a.max(0.0) / sum_w
+            } else {
+                0.0
+            };
+            let b = if b.is_finite() {
+                b.max(0.0) / sum_w
+            } else {
+                0.0
+            };
             b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let mut sorted_probs = Vec::with_capacity(n);
         for &idx in &prob_indices {
             let p = token_gates[idx];
-            let p = if p.is_finite() { p.max(0.0) / sum_w } else { 0.0 };
+            let p = if p.is_finite() {
+                p.max(0.0) / sum_w
+            } else {
+                0.0
+            };
             sorted_probs.push(p);
         }
 
@@ -225,7 +245,11 @@ fn apply_soft_top_p_selection(
         let mut masked_probs = Vec::with_capacity(n);
         for i in 0..n {
             let prob = token_gates[i];
-            let prob = if prob.is_finite() { prob.max(0.0) / sum_w } else { 0.0 };
+            let prob = if prob.is_finite() {
+                prob.max(0.0) / sum_w
+            } else {
+                0.0
+            };
             masked_probs.push(prob * unsorted_mask[i]);
         }
 

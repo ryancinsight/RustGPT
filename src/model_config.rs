@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
     mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy},
-    transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
 };
 
 /// Architecture type for model configuration
@@ -54,6 +54,12 @@ pub enum TemporalMixingType {
     Attention,
     /// Recurrent RG-LRU temporal mixing (Hawk/Griffin-style)
     RgLru,
+
+    /// Mamba selective SSM (reference implementation)
+    Mamba,
+
+    /// Mamba-2 style selective SSM (reference implementation)
+    Mamba2,
 }
 
 impl Default for TemporalMixingType {
@@ -69,6 +75,11 @@ pub enum DiffusionTimestepStrategy {
     Uniform,
     /// Min-SNR weighted sampling (Karras et al., 2022)
     MinSnr,
+
+    /// EDM-style log-normal sampling in sigma-space (Karras et al., 2022).
+    ///
+    /// Recommended when using `NoiseSchedule::Karras` and/or `DiffusionPredictionTarget::EdmX0`.
+    EdmLogNormal,
 }
 
 /// Configuration for model architecture and hyperparameters

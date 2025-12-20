@@ -1,7 +1,4 @@
-use crate::{
-    errors::Result,
-    llm::LLM,
-};
+use crate::{errors::Result, llm::LLM};
 
 /// Model persistence functionality (save/load operations)
 pub struct ModelPersistence;
@@ -47,4 +44,3 @@ impl ModelPersistence {
         LLM::load_versioned(path)
     }
 }
-

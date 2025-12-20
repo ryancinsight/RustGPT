@@ -85,14 +85,16 @@ impl RichardsActivation {
     }
 
     /// Vectorized forward pass for f32 matrix input into a caller-provided output buffer.
-    pub fn forward_matrix_f32_into(&self, x: &ndarray::Array2<f32>, out: &mut ndarray::Array2<f32>) {
+    pub fn forward_matrix_f32_into(
+        &self,
+        x: &ndarray::Array2<f32>,
+        out: &mut ndarray::Array2<f32>,
+    ) {
         // Compute Richards(x) into out, then multiply by x elementwise.
         self.richards_curve.forward_matrix_f32_into(x, out);
-        ndarray::Zip::from(out)
-            .and(x)
-            .for_each(|o, &xi| {
-                *o *= xi;
-            });
+        ndarray::Zip::from(out).and(x).for_each(|o, &xi| {
+            *o *= xi;
+        });
     }
 
     /// Optimized forward pass that avoids intermediate allocation
@@ -119,8 +121,11 @@ impl RichardsActivation {
         let x_slice = x.as_slice().unwrap();
         let mut out = Array1::<f64>::zeros(x.len());
         let mut deriv = Array1::<f64>::zeros(x.len());
-        self.richards_curve
-            .eval_into(x_slice, out.as_slice_mut().unwrap(), deriv.as_slice_mut().unwrap());
+        self.richards_curve.eval_into(
+            x_slice,
+            out.as_slice_mut().unwrap(),
+            deriv.as_slice_mut().unwrap(),
+        );
         for i in 0..x.len() {
             out[i] = out[i] + x[i] * deriv[i];
         }
@@ -129,7 +134,12 @@ impl RichardsActivation {
 
     /// f32-friendly derivative into a caller-provided buffer with scratch.
     /// Computes: Richards(x) + x * Richards'(x)
-    pub fn derivative_into_f32_with_scratch(&self, x: &[f32], out: &mut [f32], scratch: &mut [f32]) {
+    pub fn derivative_into_f32_with_scratch(
+        &self,
+        x: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+    ) {
         debug_assert_eq!(x.len(), out.len());
         debug_assert_eq!(x.len(), scratch.len());
         // out = Richards(x), scratch = Richards'(x)
@@ -170,7 +180,8 @@ impl RichardsActivation {
 
     /// Update scaling based on input statistics
     pub fn update_scaling_from_max_abs(&mut self, max_abs_x: f64) {
-        self.richards_curve.update_scaling_from_max_abs_inplace(max_abs_x);
+        self.richards_curve
+            .update_scaling_from_max_abs_inplace(max_abs_x);
     }
 
     /// Get scaling parameters
@@ -179,7 +190,16 @@ impl RichardsActivation {
     }
 
     /// Set parameters directly
-    pub fn set_param(&mut self, nu: Option<f64>, k: Option<f64>, m: Option<f64>, beta: Option<f64>, output_gain: Option<f64>, output_bias: Option<f64>) {
-        self.richards_curve.set_param(nu, k, m, beta, output_gain, output_bias);
+    pub fn set_param(
+        &mut self,
+        nu: Option<f64>,
+        k: Option<f64>,
+        m: Option<f64>,
+        beta: Option<f64>,
+        output_gain: Option<f64>,
+        output_bias: Option<f64>,
+    ) {
+        self.richards_curve
+            .set_param(nu, k, m, beta, output_gain, output_bias);
     }
 }

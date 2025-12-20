@@ -1628,6 +1628,21 @@ impl PadeExp {
     }
 }
 
+// --- Lightweight numeric helpers ---
+//
+// Pad e9 is the project-wide replacement for `exp`.
+// Derived "soft" transforms (softplus/logsumexp/softmax, etc.) live in `crate::soft`.
+
+#[inline]
+pub fn exp_f64(x: f64) -> f64 {
+    PadeExp::exp(x)
+}
+
+#[inline]
+pub fn exp_f32(x: f32) -> f32 {
+    PadeExp::exp(x as f64) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use std::f64::consts::E;

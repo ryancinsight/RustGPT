@@ -401,10 +401,7 @@ mod tests {
         let mut metrics = MixtureMetrics::new(3);
         let gate_values = ndarray::Array2::from_shape_vec(
             (2, 3),
-            vec![
-                1.0, 0.0, 0.0,
-                f32::NAN, f32::INFINITY, 0.0,
-            ],
+            vec![1.0, 0.0, 0.0, f32::NAN, f32::INFINITY, 0.0],
         )
         .unwrap();
 

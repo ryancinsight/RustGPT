@@ -1,7 +1,7 @@
 use crate::{
+    EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
     cli::Args,
     model_config::{ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy},
-    MAX_SEQ_LEN, EMBEDDING_DIM, HIDDEN_DIM,
 };
 
 /// Build a complete model configuration from CLI arguments
@@ -24,14 +24,8 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     let window_adaptation_strategy = WindowAdaptationStrategy::AttentionEntropy;
 
     // Create base configuration
-    let mut config = ModelConfig::transformer(
-        EMBEDDING_DIM,
-        HIDDEN_DIM,
-        1,
-        MAX_SEQ_LEN,
-        None,
-        Some(8)
-    );
+    let mut config =
+        ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8));
 
     // Apply architecture-specific settings
     config.architecture = architecture;
@@ -82,4 +76,3 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
 
     config
 }
-

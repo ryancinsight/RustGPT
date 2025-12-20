@@ -61,13 +61,18 @@ pub struct ThresholdPredictor {
     #[serde(skip)]
     cached_output: Option<ndarray::Array2<f32>>,
     #[serde(skip)]
-    cached_cond_input: Option<ndarray::Array2<f32>>, 
+    cached_cond_input: Option<ndarray::Array2<f32>>,
     pub cond_w: ndarray::Array2<f32>,
 }
 
 impl ThresholdPredictor {
     /// Create a new threshold predictor with AutoDeco-inspired architecture
-    pub fn new_with_cond(embed_dim: usize, hidden_dim: usize, num_outputs: usize, cond_dim: usize) -> Self {
+    pub fn new_with_cond(
+        embed_dim: usize,
+        hidden_dim: usize,
+        num_outputs: usize,
+        cond_dim: usize,
+    ) -> Self {
         use rand::Rng;
         let mut rng = get_rng();
 
@@ -206,7 +211,7 @@ impl ThresholdPredictor {
         ndarray::Array1<f32>,
         ndarray::Array2<f32>,
         ndarray::Array1<f32>,
-        Option<ndarray::Array2<f32>>, 
+        Option<ndarray::Array2<f32>>,
         Vec<f64>,
     ) {
         // Retrieve cached activations
@@ -264,7 +269,9 @@ impl ThresholdPredictor {
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
         let grad_cond_w = if let Some(cond_in) = &self.cached_cond_input {
             Some(cond_in.t().dot(&d_hidden))
-        } else { None };
+        } else {
+            None
+        };
 
         // Activation parameter gradients (Richards curve parameters)
         let activation_grads = self

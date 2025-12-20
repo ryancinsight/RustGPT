@@ -1,7 +1,4 @@
-use crate::{
-    errors::Result,
-    llm::LLM,
-};
+use crate::{errors::Result, llm::LLM};
 
 /// Training functionality for language models
 pub struct Trainer;
@@ -75,6 +72,14 @@ impl Trainer {
         validation_ratio: f32,
         min_snr_gamma: f32,
     ) -> Result<()> {
-        llm.train_diffusion_ce(data, epochs, lr, batch_size, ce_weight, validation_ratio, min_snr_gamma)
+        llm.train_diffusion_ce(
+            data,
+            epochs,
+            lr,
+            batch_size,
+            ce_weight,
+            validation_ratio,
+            min_snr_gamma,
+        )
     }
 }

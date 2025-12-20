@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     embeddings::TokenEmbeddings,
+    layers::{recurrence::LRM, transformer::TransformerBlock},
     output_projection::OutputProjection,
     richards::{RichardsGlu, RichardsNorm},
-    transformer::{TransformerBlock, LRM},
 };
 
 /// Layer trait for neural network components
@@ -24,7 +24,11 @@ pub trait Layer {
     ) -> (Array2<f32>, Vec<Array2<f32>>);
     /// Apply gradients to layer parameters
     /// Returns GradientError if param_grads has incorrect length
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> crate::errors::Result<()>;
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::errors::Result<()>;
     fn zero_gradients(&mut self);
 }
 
@@ -43,7 +47,7 @@ pub enum LayerEnum {
     // Removed TRMBlock variant
     PolyAttention(Box<crate::attention::poly_attention::PolyAttention>),
     TransformerBlock(Box<TransformerBlock>),
-    DiffusionBlock(Box<crate::transformer::diffusion_block::DiffusionBlock>),
+    DiffusionBlock(Box<crate::layers::diffusion::DiffusionBlock>),
     LRM(Box<LRM>),
 }
 
@@ -156,7 +160,11 @@ impl Layer for LayerEnum {
         }
     }
 
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> crate::errors::Result<()> {
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::errors::Result<()> {
         match self {
             LayerEnum::TokenEmbeddings(layer) => layer.apply_gradients(gradients, learning_rate),
             // Removed SelfAttention arm

@@ -68,10 +68,7 @@ pub fn cross_entropy_from_logits(logits: &ArrayView2<f32>, targets: &[usize]) ->
         }
 
         let row = logits.row(i);
-        let max_val = row
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
         if !max_val.is_finite() {
             // Degenerate row; keep behavior defined
@@ -308,7 +305,7 @@ mod tests {
     #[test]
     fn test_sce_gradient_matches_finite_difference() {
         let logits: Array2<f32> = array![[2.0f32, -1.0f32]];
-        let softmax = crate::softmax::Softmax::new();
+        let softmax = crate::soft::Softmax::new();
         let probs = softmax.forward_immutable(&logits.view());
         let targets = [0usize];
         let alpha = 1.0;

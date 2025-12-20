@@ -1,6 +1,6 @@
 use llm::{
-    network::Layer,
     attention::poly_attention::PolyAttention,
+    network::Layer,
     richards::{RichardsCurve, Variant},
 };
 use ndarray::{Array2, ShapeBuilder};
@@ -29,7 +29,10 @@ fn main() {
     println!();
 
     println!("2. Initial Gate Parameters:");
-    println!("  Sigmoid gate: {:?}", poly_sigmoid.moh.gate.curve.weights());
+    println!(
+        "  Sigmoid gate: {:?}",
+        poly_sigmoid.moh.gate.curve.weights()
+    );
     println!("  None gate: {:?}", poly_none.moh.gate.curve.weights());
     println!();
 
