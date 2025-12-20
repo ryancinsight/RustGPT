@@ -1,8 +1,10 @@
+use llm::{
+    Layer,
+    layers::transformer::{TransformerBlock, TransformerBlockConfig},
+    mixtures::HeadSelectionStrategy,
+};
 use ndarray::Array2;
 use proptest::prelude::*;
-use llm::Layer;
-use llm::transformer::transformer_block::{TransformerBlock, TransformerBlockConfig};
-use llm::mixtures::HeadSelectionStrategy;
 
 proptest! {
     #[test]

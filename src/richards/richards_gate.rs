@@ -2,12 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    adam::Adam,
-    network::Layer,
-    richards::RichardsCurve,
-    rng::get_rng,
-};
+use crate::{adam::Adam, network::Layer, richards::RichardsCurve, rng::get_rng};
 
 /// # Richards Gate: Complete Mathematical Framework and Implementation
 ///
@@ -138,17 +133,17 @@ impl RichardsGate {
 
     #[inline]
     fn softplus(u: f32) -> f32 {
-        super::math::softplus_f32(u)
+        super::richards_curve::softplus_f32_richards(u)
     }
 
     #[inline]
     fn inv_softplus(t: f32) -> f32 {
-        super::math::inv_softplus_f32(t)
+        super::richards_curve::inv_softplus_f32_richards(t)
     }
 
     #[inline]
     fn sigmoid_from_softplus(t: f32) -> f32 {
-        super::math::sigmoid_from_softplus_f32(t)
+        super::richards_curve::unit_from_softplus_f32_richards(t)
     }
 
     /// Create a new Richards gate with learned parameters
@@ -162,19 +157,19 @@ impl RichardsGate {
         curve.nu_learnable = true;
         curve.k_learnable = true;
         curve.m_learnable = true;
-        curve.beta_learnable = false;      // Fixed for stability
+        curve.beta_learnable = false; // Fixed for stability
         curve.temperature_learnable = false; // We handle temperature separately
         curve.output_gain_learnable = false; // Fixed to 1.0 for [0,1] range
-        curve.output_bias_learnable = false;  // Fixed to 0.0 for [0,1] range
-        curve.scale_learnable = false;     // Fixed for stability
-        curve.shift_learnable = false;     // Fixed for stability
+        curve.output_bias_learnable = false; // Fixed to 0.0 for [0,1] range
+        curve.scale_learnable = false; // Fixed for stability
+        curve.shift_learnable = false; // Fixed for stability
 
         // Initialize temperature near 1.0 with a log-normal sample to guarantee T > 0
         // without hard clipping.
         let log_temp_std = 0.1;
         let log_temp_dist = Normal::new(0.0, log_temp_std).unwrap();
         let log_temp: f32 = log_temp_dist.sample(&mut rng);
-        let temp_sample: f32 = super::math::exp_f32(log_temp);
+        let temp_sample: f32 = super::richards_curve::exp_f32_richards(log_temp);
 
         Self {
             curve,
@@ -295,8 +290,13 @@ impl RichardsGate {
     }
 
     /// Apply gradients to parameters
-    pub fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<(), crate::errors::ModelError> {
-        if gradients.len() != 4 {  // nu, k, m, temperature
+    pub fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> Result<(), crate::errors::ModelError> {
+        if gradients.len() != 4 {
+            // nu, k, m, temperature
             return Err(crate::errors::ModelError::GradientError {
                 message: format!("RichardsGate expected 4 gradients, got {}", gradients.len()),
             });
@@ -314,7 +314,11 @@ impl RichardsGate {
         // Update temperature using softplus parameterization:
         // T = softplus(u) ensures T > 0 without hard clipping.
         // dT/du = sigmoid(u). If we only have T, sigmoid(u) = 1 - exp(-T).
-        let t = if self.temperature > 0.0 { self.temperature } else { 1e-6 };
+        let t = if self.temperature > 0.0 {
+            self.temperature
+        } else {
+            1e-6
+        };
         let u = Self::inv_softplus(t);
         let d_t_d_u = Self::sigmoid_from_softplus(t);
         let grad_u = temp_grad * d_t_d_u;
@@ -334,14 +338,18 @@ impl RichardsGate {
     /// Get parameter count for RichardsGate
     /// Richards curve scalars (nu, k, m) + temperature parameter
     pub fn parameters(&self) -> usize {
-        self.curve.scalar_weights_len() + 1  // Richards curve scalars + temperature
+        self.curve.scalar_weights_len() + 1 // Richards curve scalars + temperature
     }
 
     /// Get weight norm for regularization
     pub fn weight_norm(&self) -> f32 {
         // Calculate weight norm from curve weights and temperature
         let curve_weights = self.curve.weights();
-        let curve_norm = curve_weights.iter().map(|&w| (w as f32) * (w as f32)).sum::<f32>().sqrt();
+        let curve_norm = curve_weights
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>()
+            .sqrt();
         curve_norm + self.temperature.powi(2)
     }
 
@@ -354,7 +362,7 @@ impl RichardsGate {
 
     /// Check if parameters have been trained (always true for RichardsGate)
     pub fn has_trained_parameters(&self) -> bool {
-        true  // RichardsGate always has learnable parameters
+        true // RichardsGate always has learnable parameters
     }
 
     /// Update scaling from maximum absolute value (for numerical stability)
@@ -379,12 +387,20 @@ impl RichardsGate {
     }
 
     /// Backward pass for matrix input (delegates to underlying curve)
-    pub fn backward_matrix(&self, input: &ndarray::Array2<f64>, grad_output: &ndarray::Array2<f64>) -> ndarray::Array2<f64> {
+    pub fn backward_matrix(
+        &self,
+        input: &ndarray::Array2<f64>,
+        grad_output: &ndarray::Array2<f64>,
+    ) -> ndarray::Array2<f64> {
         self.curve.backward_matrix(input, grad_output)
     }
 
     /// Compute parameter gradients for matrix input (delegates to underlying curve)
-    pub fn grad_weights_matrix(&self, input: &ndarray::Array2<f64>, grad_output: &ndarray::Array2<f64>) -> Vec<f64> {
+    pub fn grad_weights_matrix(
+        &self,
+        input: &ndarray::Array2<f64>,
+        grad_output: &ndarray::Array2<f64>,
+    ) -> Vec<f64> {
         self.curve.grad_weights_matrix(input, grad_output)
     }
 
@@ -429,7 +445,11 @@ impl Layer for RichardsGate {
         self.compute_gradients(input, output_grads)
     }
 
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> crate::errors::Result<()> {
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::errors::Result<()> {
         self.apply_gradients(gradients, learning_rate)
     }
 
@@ -440,13 +460,15 @@ impl Layer for RichardsGate {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
+
+    use super::*;
 
     #[test]
     fn test_richards_gate_range() {
         let mut gate = RichardsGate::new();
-        let input = Array2::from_shape_vec((2, 3), vec![-10.0, 0.0, 10.0, -5.0, 5.0, 15.0]).unwrap();
+        let input =
+            Array2::from_shape_vec((2, 3), vec![-10.0, 0.0, 10.0, -5.0, 5.0, 15.0]).unwrap();
 
         let output = gate.forward(&input);
 
@@ -503,49 +525,79 @@ mod tests {
         let high_extremes = output_high.iter().filter(|&&x| x < 0.1 || x > 0.9).count();
 
         // Lower temperature should have more extreme values
-        assert!(low_extremes >= high_extremes,
-                "Low temp extremes: {}, High temp extremes: {}", low_extremes, high_extremes);
+        assert!(
+            low_extremes >= high_extremes,
+            "Low temp extremes: {}, High temp extremes: {}",
+            low_extremes,
+            high_extremes
+        );
     }
 
     #[test]
     fn test_richards_gate_mathematical_invariants() {
         let mut gate = RichardsGate::new();
-        let input = Array2::from_shape_vec((10, 1), vec![-10.0, -5.0, -1.0, -0.1, 0.0, 0.1, 1.0, 5.0, 10.0, 100.0]).unwrap();
+        let input = Array2::from_shape_vec(
+            (10, 1),
+            vec![-10.0, -5.0, -1.0, -0.1, 0.0, 0.1, 1.0, 5.0, 10.0, 100.0],
+        )
+        .unwrap();
 
         let output = gate.forward(&input);
 
         // Invariant 1: Range constraint ∀x ∈ ℝ, g(x) ∈ [0,1]
         for &val in output.iter() {
-            assert!(val >= 0.0 && val <= 1.0, "Gate output {} violates range constraint [0,1]", val);
+            assert!(
+                val >= 0.0 && val <= 1.0,
+                "Gate output {} violates range constraint [0,1]",
+                val
+            );
         }
 
         // Invariant 2: Centered at zero - g(0) should be close to 0.5
         // Find the output corresponding to input 0.0
         let zero_input_idx = input.iter().position(|&x| x == 0.0).unwrap();
         let g_zero = output[[zero_input_idx, 0]];
-        assert!((g_zero - 0.5).abs() < 0.1, "g(0) = {} not close to 0.5", g_zero);
+        assert!(
+            (g_zero - 0.5).abs() < 0.1,
+            "g(0) = {} not close to 0.5",
+            g_zero
+        );
 
         // Invariant 3: Saturation behavior - extreme inputs should approach 0 or 1
         // For very negative inputs, should approach 0
         let neg_extreme_idx = input.iter().position(|&x| x == -10.0).unwrap();
         let g_neg_extreme = output[[neg_extreme_idx, 0]];
-        assert!(g_neg_extreme < 0.2, "g(-10) = {} should approach 0", g_neg_extreme);
+        assert!(
+            g_neg_extreme < 0.2,
+            "g(-10) = {} should approach 0",
+            g_neg_extreme
+        );
 
         // For very positive inputs, should approach 1
         let pos_extreme_idx = input.iter().position(|&x| x == 100.0).unwrap();
         let g_pos_extreme = output[[pos_extreme_idx, 0]];
-        assert!(g_pos_extreme > 0.8, "g(100) = {} should approach 1", g_pos_extreme);
+        assert!(
+            g_pos_extreme > 0.8,
+            "g(100) = {} should approach 1",
+            g_pos_extreme
+        );
 
         // Invariant 4: Monotonicity - function should be non-decreasing
         for i in 1..input.len() {
-            let x_prev = input[[i-1, 0]];
+            let x_prev = input[[i - 1, 0]];
             let x_curr = input[[i, 0]];
-            let g_prev = output[[i-1, 0]];
+            let g_prev = output[[i - 1, 0]];
             let g_curr = output[[i, 0]];
 
             if x_prev < x_curr {
-                assert!(g_prev <= g_curr, "Function not monotonic: g({}) = {} > g({}) = {}",
-                       x_prev, g_prev, x_curr, g_curr);
+                assert!(
+                    g_prev <= g_curr,
+                    "Function not monotonic: g({}) = {} > g({}) = {}",
+                    x_prev,
+                    g_prev,
+                    x_curr,
+                    g_curr
+                );
             }
         }
     }
@@ -590,9 +642,13 @@ mod tests {
             abs_diff
         };
 
-        assert!(rel_error < 0.1, // 10% relative error tolerance
-                "Temperature gradient mismatch: numerical={}, analytical={}, rel_error={}",
-                numerical_grad, analytical_grad, rel_error);
+        assert!(
+            rel_error < 0.1, // 10% relative error tolerance
+            "Temperature gradient mismatch: numerical={}, analytical={}, rel_error={}",
+            numerical_grad,
+            analytical_grad,
+            rel_error
+        );
 
         // Verify input gradient is non-zero and reasonable
         let input_grad = input_grads[[0, 0]];
@@ -606,16 +662,22 @@ mod tests {
 
         // Test parameter clamping
         gate.temperature = 100.0; // Way outside bounds
-        let _ = gate.apply_gradients(&vec![
-            Array2::zeros((1, 1)), // nu grad
-            Array2::zeros((1, 1)), // k grad
-            Array2::zeros((1, 1)), // m grad
-            Array2::zeros((1, 1)), // temperature grad
-        ], 0.1);
+        let _ = gate.apply_gradients(
+            &vec![
+                Array2::zeros((1, 1)), // nu grad
+                Array2::zeros((1, 1)), // k grad
+                Array2::zeros((1, 1)), // m grad
+                Array2::zeros((1, 1)), // temperature grad
+            ],
+            0.1,
+        );
 
         // Should be clamped to reasonable range
-        assert!(gate.temperature >= 0.1 && gate.temperature <= 10.0,
-                "Temperature {} not clamped to [0.1, 10.0]", gate.temperature);
+        assert!(
+            gate.temperature >= 0.1 && gate.temperature <= 10.0,
+            "Temperature {} not clamped to [0.1, 10.0]",
+            gate.temperature
+        );
     }
 
     #[test]
@@ -623,7 +685,11 @@ mod tests {
         let gate = RichardsGate::new();
 
         // Test on a range of inputs
-        let input = Array2::from_shape_vec((1, 100), (0..100).map(|i| -5.0 + (i as f32) * 0.1).collect()).unwrap();
+        let input = Array2::from_shape_vec(
+            (1, 100),
+            (0..100).map(|i| -5.0 + (i as f32) * 0.1).collect(),
+        )
+        .unwrap();
         let (input_grads, _) = gate.compute_gradients(&input, &Array2::ones((1, 100)));
 
         // All gradients should be finite (smoothness)
@@ -633,20 +699,36 @@ mod tests {
 
         // Gradients should be continuous (no abrupt jumps)
         for i in 1..input_grads.len() {
-            let grad_diff = (input_grads[[0, i]] - input_grads[[0, i-1]]).abs();
-            assert!(grad_diff < 1.0, "Gradient discontinuity detected: diff = {}", grad_diff);
+            let grad_diff = (input_grads[[0, i]] - input_grads[[0, i - 1]]).abs();
+            assert!(
+                grad_diff < 1.0,
+                "Gradient discontinuity detected: diff = {}",
+                grad_diff
+            );
         }
 
         // Average gradient should be reasonable (not too extreme)
         let avg_grad = input_grads.mean().unwrap();
-        assert!(avg_grad.abs() < 10.0, "Average gradient {} is too extreme", avg_grad);
+        assert!(
+            avg_grad.abs() < 10.0,
+            "Average gradient {} is too extreme",
+            avg_grad
+        );
     }
 
     #[test]
     fn test_richards_gate_convergence_properties() {
         let mut gate = RichardsGate::new();
-        let input = Array2::from_shape_vec((10, 1), vec![-1.0, -0.5, 0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]).unwrap();
-        let target = Array2::from_shape_vec((10, 1), vec![0.1, 0.2, 0.5, 0.55, 0.8, 0.9, 0.95, 0.98, 0.99, 1.0]).unwrap();
+        let input = Array2::from_shape_vec(
+            (10, 1),
+            vec![-1.0, -0.5, 0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
+        )
+        .unwrap();
+        let target = Array2::from_shape_vec(
+            (10, 1),
+            vec![0.1, 0.2, 0.5, 0.55, 0.8, 0.9, 0.95, 0.98, 0.99, 1.0],
+        )
+        .unwrap();
 
         let mut losses = Vec::new();
 
@@ -675,13 +757,18 @@ mod tests {
         // Loss should decrease over time (convergence check)
         let initial_loss = losses[0];
         let final_loss = *losses.last().unwrap();
-        assert!(final_loss < initial_loss,
-                "Loss did not decrease: initial={}, final={}",
-                initial_loss, final_loss);
+        assert!(
+            final_loss < initial_loss,
+            "Loss did not decrease: initial={}, final={}",
+            initial_loss,
+            final_loss
+        );
 
         // Final loss should be reasonable (not stuck)
-        assert!(final_loss < initial_loss * 0.5,
-                "Insufficient convergence: final_loss/initial_loss = {}",
-                final_loss / initial_loss);
+        assert!(
+            final_loss < initial_loss * 0.5,
+            "Insufficient convergence: final_loss/initial_loss = {}",
+            final_loss / initial_loss
+        );
     }
 }

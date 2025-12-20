@@ -1,9 +1,9 @@
 use llm::{
     Layer,
     mixtures::HeadSelectionStrategy,
-    transformer::{
-        diffusion_block::{DiffusionBlock, DiffusionBlockConfig},
-        transformer_block::{TransformerBlock, TransformerBlockConfig},
+    layers::{
+        diffusion::{DiffusionBlock, DiffusionBlockConfig},
+        transformer::{TransformerBlock, TransformerBlockConfig},
     },
 };
 use ndarray::Array2;

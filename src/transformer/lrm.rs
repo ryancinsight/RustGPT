@@ -141,8 +141,6 @@ pub struct LRM {
     #[serde(skip_serializing, skip_deserializing)]
     latent_init: Option<LatentInit>, 
     #[serde(skip_serializing, skip_deserializing)]
-    cached_core_state: Option<CoreCache>,
-    #[serde(skip_serializing, skip_deserializing)]
     cached_supervision_outputs: Vec<Array2<f32>>, 
     #[serde(skip_serializing, skip_deserializing)]
     cached_step_states: Vec<SupervisionStepCache>, 
@@ -175,7 +173,7 @@ impl LatentInit {
     }
     fn project(&self, mean_input: &Array2<f32>) -> Array2<f32> {
         let mut out = mean_input.dot(&self.w);
-        out = &out + &self.b;
+        out += &self.b;
         out
     }
 }
@@ -261,7 +259,6 @@ impl LRM {
             is_training: false,
             cached_input: None,
             latent_init: Some(LatentInit::new(config.embed_dim)),
-            cached_core_state: None,
             cached_supervision_outputs: Vec::new(),
             cached_step_states: Vec::new(),
             recursion_metrics: Vec::new(),
@@ -343,7 +340,6 @@ impl LRM {
             for r in 0..bsz { acc += input[[r, c]]; }
             mean[[0, c]] = acc / (bsz as f32);
         }
-        self.cached_mean_input = Some(mean.clone());
         let mut z = if let Some(ref li) = self.latent_init {
             let z0 = li.project(&mean);
             let mut tiled = Array2::<f32>::zeros((bsz, embed_dim));
@@ -357,40 +353,64 @@ impl LRM {
             for r in 0..bsz { tiled.row_mut(r).assign(&z0.row(0)); }
             tiled
         };
+        // Store mean after using it to avoid a clone.
+        self.cached_mean_input = Some(mean);
         Self::sanitize(&mut z);
 
         let max_steps = self.get_max_steps();
         self.cached_supervision_outputs.clear();
         self.cached_step_states.clear();
-        self.cached_core_state = None;
+
+        // Reuse buffers to reduce per-step allocations.
+        let mut ans_in = Array2::<f32>::zeros((bsz, embed_dim));
+
+        // Hold a single write guard across the entire iterative solve.
+        // This is the “permission token” approach: acquire permission once, then
+        // operate on data many times.
+        let mut block_guard = self.block.write().unwrap();
 
         for _t in 0..max_steps {
-            let prev_y = y.clone();
+            // Move the previous y instead of cloning it; this is reused for:
+            // - recursion input
+            // - step-cache (training)
+            // - convergence check
+            // Replace y with a tiny placeholder to avoid allocating a full-sized buffer.
+            let prev_y = std::mem::replace(&mut y, Array2::<f32>::zeros((0, 0)));
             let initial_z = z.clone();
             
             // Run recursions (don't capture caches during forward pass to save memory)
-            let _ = self.run_recursions(&y, &mut z, false);
+            let _ = self.run_recursions_with_guard(&mut block_guard, &prev_y, &mut z, false);
 
-            let mut ans_in = &y + &z;
+            ans_in.assign(&prev_y);
+            ans_in += &z;
             Self::sanitize(&mut ans_in);
             
-            let new_y = self.block.write().unwrap().forward_step(&ans_in, 0); // Final answer step
+            // Final answer step.
+            let new_y = block_guard.forward_step(&ans_in, 0);
+            let answer_cache = block_guard.get_cache();
+
+            // Compute convergence metric without allocating temporaries.
+            let mut diff = 0.0f32;
+            let mut ny = 0.0f32;
+            for (a, b) in new_y.iter().zip(prev_y.iter()) {
+                diff += (*a - *b).abs();
+                ny += a.abs();
+            }
+            let rel = if ny > 0.0 { diff / ny } else { diff };
             
             if self.is_training {
-                if let Some(cache) = self.block.read().unwrap().get_cache() {
-                    self.cached_core_state = Some(cache.clone());
-                    // Store initial_z and y instead of full recursion caches (Gradient Checkpointing)
-                    self.cached_step_states.push(SupervisionStepCache::new(cache, initial_z, y.clone()));
+                // Store initial_z and prev_y instead of full recursion caches (Gradient Checkpointing)
+                if let Some(cache) = answer_cache {
+                    self.cached_step_states.push(SupervisionStepCache::new(cache, initial_z, prev_y));
+                } else {
+                    // Keep semantics consistent: still advance y even if cache is missing.
+                    // prev_y is dropped here.
                 }
                 self.cached_supervision_outputs.push(new_y.clone());
             }
-            
+
             y = new_y;
             Self::sanitize(&mut y);
-
-            let diff = (&y - &prev_y).mapv(|x| x.abs()).sum();
-            let ny = y.mapv(|x| x.abs()).sum();
-            let rel = if ny > 0.0 { diff / ny } else { diff };
             if rel < 1e-4 { break; }
         }
 
@@ -423,51 +443,53 @@ impl LRM {
         step_cache: &SupervisionStepCache,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let mut all = Vec::new();
-        
-        // 1. Backward through final answer step
-        self.block.read().unwrap().set_cache(Some(step_cache.answer_cache.clone()));
-        
+        // Hold a single write guard for the entire backward pass.
+        // This avoids repeated lock acquisition and removes the need for phased
+        // read/write permission switching during checkpoint replay.
+        let mut block_guard = self.block.write().unwrap();
+
+        // 1) Backward through final answer step.
+        block_guard.set_cache(Some(step_cache.answer_cache.clone()));
+
         let input_to_block = match &step_cache.answer_cache {
             CoreCache::Transformer(c) => &c.0,
             CoreCache::Diffusion(c) => &c.input,
         };
-        
-        let (d_ans_in, block_grads) = self.block.read().unwrap().compute_gradients(input_to_block, output_grads);
-        all.extend(block_grads);
+
+        let (d_ans_in, mut all) = block_guard.compute_gradients(input_to_block, output_grads);
         
         // 2. Backward through recursions
         // Gradient Checkpointing: Re-run forward pass to generate caches
         let mut z_replay = step_cache.initial_z.clone();
-        
+
         // No unsafe needed anymore!
-        let recs = self.run_recursions(&step_cache.y, &mut z_replay, true);
+        let recs = self.run_recursions_with_guard(&mut block_guard, &step_cache.y, &mut z_replay, true);
         
         // d_ans_in flows back to y and z.
         // d_y = d_ans_in, d_z = d_ans_in
         let mut d_z = d_ans_in.clone();
-        let mut d_y = d_ans_in.clone();
-        
+        let mut d_y = d_ans_in;
+
+        // Reuse a temp buffer for d_block_out to avoid per-recursion allocations.
+        let mut d_block_out = Array2::<f32>::zeros(d_z.raw_dim());
+
+        // 3) Backprop through replayed recursion caches.
         for rec in recs.iter().rev() {
-            self.block.read().unwrap().set_cache(Some(rec.clone()));
+            block_guard.set_cache(Some(rec.clone()));
             let rec_input = match rec {
                 CoreCache::Transformer(c) => &c.0,
                 CoreCache::Diffusion(c) => &c.input,
             };
-            
+
             // Gradient of z update: z_new = (1-a)z + a*block_out
             // d_block_out = d_z * a
-            let a = self.config.latent_update_alpha; 
-            let d_block_out = d_z.mapv(|x| x * a);
-            
-            let (d_combined, rec_grads) = self.block.read().unwrap().compute_gradients(rec_input, &d_block_out);
-            
-            // Accumulate block grads
-            // Note: We need to be careful about the order of gradients in 'all'.
-            // If we just extend, we get [answer_grads, rec_N_grads, rec_N-1_grads...]
-            // But apply_gradients expects a summed gradient for the shared block.
-            // So we should sum them up.
-            
+            let a = self.config.latent_update_alpha;
+            d_block_out.assign(&d_z);
+            d_block_out.mapv_inplace(|x| x * a);
+
+            let (d_combined, rec_grads) = block_guard.compute_gradients(rec_input, &d_block_out);
+
+            // Accumulate block grads into the answer-step grads.
             if all.len() == rec_grads.len() {
                 for (bg, rg) in all.iter_mut().zip(rec_grads.iter()) {
                     bg.zip_mut_with(rg, |a, &b| *a += b);
@@ -476,13 +498,13 @@ impl LRM {
                 // Should not happen if block structure is constant
                 tracing::warn!("Gradient length mismatch in LRM recursion");
             }
-            
-            // d_combined = d_y + d_z
-            // z update: z = (1-a)z + a*block_out
-            // d_z_prev = d_z * (1-a) + d_combined_z
+
             // d_combined = d_y + d_z (since input was y+z)
-            d_z = &d_z * (1.0 - a) + &d_combined;
-            d_y = &d_y + &d_combined;
+            // z update: z = (1-a)z + a*block_out
+            // d_z_prev = d_z * (1-a) + d_combined
+            d_z.mapv_inplace(|x| x * (1.0 - a));
+            d_z += &d_combined;
+            d_y += &d_combined;
 
             // Gradient clipping to prevent explosion during BPTT
             // This is crucial for LRM stability during instruction tuning
@@ -555,7 +577,13 @@ impl LRM {
 
     pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
         if self.config.num_recursions == 0 {
-            return self.block.write().unwrap().apply_gradients(param_grads, lr);
+            let res = self.block.write().unwrap().apply_gradients(param_grads, lr);
+            // Release forward caches early to reduce peak memory.
+            self.cached_input = None;
+            self.cached_mean_input = None;
+            self.cached_supervision_outputs.clear();
+            self.cached_step_states.clear();
+            return res;
         }
         if param_grads.is_empty() { return Ok(()); }
         
@@ -584,38 +612,65 @@ impl LRM {
                 li.b = &li.b - &(gb * lr);
             }
         }
+
+        // Release caches after gradient application to reduce memory pressure.
+        self.cached_input = None;
+        self.cached_mean_input = None;
+        self.cached_supervision_outputs.clear();
+        self.cached_step_states.clear();
         
         Ok(())
     }
 
     fn run_recursions(&self, y: &Array2<f32>, z: &mut Array2<f32>, capture_caches: bool) -> Vec<CoreCache> {
+        let mut block_guard = self.block.write().unwrap();
+        self.run_recursions_with_guard(&mut block_guard, y, z, capture_caches)
+    }
+
+    fn run_recursions_with_guard(
+        &self,
+        block_guard: &mut RecursiveBlockVariant,
+        y: &Array2<f32>,
+        z: &mut Array2<f32>,
+        capture_caches: bool,
+    ) -> Vec<CoreCache> {
         let mut caches = Vec::new();
+        let mut combined = Array2::<f32>::zeros(y.raw_dim());
+
         for r_step in 0..self.config.num_recursions {
-            let mut combined = y + &*z;
+            combined.assign(y);
+            combined += &*z;
             Self::sanitize(&mut combined);
-            let block_out = self.block.write().unwrap().forward_step(&combined, r_step);
-            
+            let block_out = block_guard.forward_step(&combined, r_step);
+
             if capture_caches {
-                if let Some(cache) = self.block.read().unwrap().get_cache() {
+                if let Some(cache) = block_guard.get_cache() {
                     caches.push(cache);
                 }
             }
-            
+
             let mut new_z = block_out;
             Self::sanitize(&mut new_z);
-            
+
             let a_base = self.config.latent_update_alpha;
-            let rel = {
-                let diff = (&new_z - &*z).mapv(|x| x.abs()).sum();
-                let nz = z.mapv(|x| x.abs()).sum();
-                if nz > 0.0 { diff / nz } else { diff }
-            };
-            let a = (a_base / (1.0 + rel * self.config.adapt_scale)).max(self.config.min_alpha).min(a_base);
+            let mut diff = 0.0f32;
+            let mut nz = 0.0f32;
+            for (a, b) in new_z.iter().zip(z.iter()) {
+                diff += (*a - *b).abs();
+                nz += b.abs();
+            }
+            let rel = if nz > 0.0 { diff / nz } else { diff };
+            let a = (a_base / (1.0 + rel * self.config.adapt_scale))
+                .max(self.config.min_alpha)
+                .min(a_base);
             let r = 1.0 - a;
-            if (r - 1.0).abs() > f32::EPSILON { z.mapv_inplace(|v| v * r); }
+            if (r - 1.0).abs() > f32::EPSILON {
+                z.mapv_inplace(|v| v * r);
+            }
             z.scaled_add(a, &new_z);
             Self::sanitize(z);
         }
+
         caches
     }
 }
@@ -623,7 +678,12 @@ impl LRM {
 impl Layer for LRM {
     fn layer_type(&self) -> &str { "LRM" }
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        self.cached_input = Some(input.clone());
+        // Only cache input when we truly need it (num_recursions == 0 path).
+        self.cached_input = if self.config.num_recursions == 0 {
+            Some(input.clone())
+        } else {
+            None
+        };
         match self.forward_recursive(input) { Ok(r) => r, Err(_) => input.clone() }
     }
     fn compute_gradients(&self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
@@ -632,11 +692,22 @@ impl Layer for LRM {
     }
     fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> { self.apply_gradients(param_grads, lr) }
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        if let Some(input) = &self.cached_input {
-            let (ig, pg) = self.compute_gradients_lrm(input, grads);
+        if self.config.num_recursions == 0 {
+            if let Some(input) = &self.cached_input {
+                let (ig, pg) = self.compute_gradients_lrm(input, grads);
+                let _ = self.apply_gradients(&pg, lr);
+                return ig;
+            }
+            return grads.clone();
+        }
+        // Recursion mode uses cached_step_states rather than cached_input.
+        if let Some(last_step) = self.cached_step_states.last() {
+            let (ig, pg) = self.compute_gradients_from_cache(last_step, grads);
             let _ = self.apply_gradients(&pg, lr);
             ig
-        } else { grads.clone() }
+        } else {
+            grads.clone()
+        }
     }
     fn parameters(&self) -> usize {
         let base = self.block.read().unwrap().parameters();

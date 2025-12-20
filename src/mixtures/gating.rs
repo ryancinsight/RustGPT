@@ -215,7 +215,11 @@ pub fn select_top_k_components(gate_values: &ndarray::Array2<f32>, k: usize) -> 
         // Maintain a small set of best (score, idx) pairs (O(E*k)).
         let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
         for (idx, &gate) in row.iter().enumerate() {
-            let score = if gate.is_finite() { gate } else { f32::NEG_INFINITY };
+            let score = if gate.is_finite() {
+                gate
+            } else {
+                f32::NEG_INFINITY
+            };
             if best.len() < k {
                 best.push((score, idx));
                 continue;

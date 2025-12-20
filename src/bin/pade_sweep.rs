@@ -47,13 +47,18 @@ fn main() {
     println!("PadeExp sweep (compare to std::exp)");
     for (min_x, max_x, n, label) in ranges {
         let (max_rel, worst_x) = max_rel_error_linear(min_x, max_x, n);
-        println!("{label:>22}: x∈[{min_x:>7.3},{max_x:>7.3}] max_rel={max_rel:.3e} at x={worst_x:.6}");
+        println!(
+            "{label:>22}: x∈[{min_x:>7.3},{max_x:>7.3}] max_rel={max_rel:.3e} at x={worst_x:.6}"
+        );
     }
 
     // Subnormal band sanity: exp(x) should be > 0 and < MIN_POSITIVE for part of it
     let x = -740.0;
     let y = PadeExp::exp(x);
-    println!("subnormal check: exp({x}) = {y:e} (MIN_POSITIVE={:e})", f64::MIN_POSITIVE);
+    println!(
+        "subnormal check: exp({x}) = {y:e} (MIN_POSITIVE={:e})",
+        f64::MIN_POSITIVE
+    );
 
     // Spot-check a few points
     for &x in &[-0.2, -0.15, -0.1, 0.1, 0.15, 0.2, 1.2] {
@@ -62,9 +67,7 @@ fn main() {
         let rel = if b != 0.0 { ((a - b) / b).abs() } else { 0.0 };
         let p55 = pade_5_5(x);
         let rel55 = if b != 0.0 { ((p55 - b) / b).abs() } else { 0.0 };
-        println!(
-            "x={x:>6.3}  pade={a:.17e}  std={b:.17e}  rel={rel:.3e}  p55_rel={rel55:.3e}"
-        );
+        println!("x={x:>6.3}  pade={a:.17e}  std={b:.17e}  rel={rel:.3e}  p55_rel={rel55:.3e}");
     }
 
     // Micro-benchmark (very rough)

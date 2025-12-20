@@ -1,8 +1,8 @@
 use clap::{Parser, ValueEnum};
+
 use crate::{
-    model_config::DiffusionTimestepStrategy,
-    model_config::TemporalMixingType,
-    transformer::diffusion_block::{DiffusionPredictionTarget, NoiseSchedule},
+    layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
+    model_config::{DiffusionTimestepStrategy, TemporalMixingType},
 };
 
 /// CLI argument parsing for the LLM training and inference tool
@@ -133,6 +133,14 @@ pub enum TemporalMixingCli {
     /// Use RG-LRU recurrent temporal mixing (SSM-style)
     #[value(alias = "rglru", alias = "rg-lru", alias = "ssm")]
     RgLru,
+
+    /// Use Mamba selective SSM
+    #[value(alias = "mamba")]
+    Mamba,
+
+    /// Use Mamba-2 style selective SSM
+    #[value(alias = "mamba2", alias = "mamba-2")]
+    Mamba2,
 }
 
 impl From<TemporalMixingCli> for TemporalMixingType {
@@ -140,6 +148,8 @@ impl From<TemporalMixingCli> for TemporalMixingType {
         match arg {
             TemporalMixingCli::Attention => TemporalMixingType::Attention,
             TemporalMixingCli::RgLru => TemporalMixingType::RgLru,
+            TemporalMixingCli::Mamba => TemporalMixingType::Mamba,
+            TemporalMixingCli::Mamba2 => TemporalMixingType::Mamba2,
         }
     }
 }
@@ -151,6 +161,10 @@ pub enum DiffusionTargetCli {
     Epsilon,
     #[value(alias = "v", alias = "vpred")]
     VPrediction,
+
+    /// EDM-style preconditioned x0 prediction
+    #[value(alias = "edm", alias = "edmx0", alias = "edm-x0")]
+    EdmX0,
 }
 
 impl From<DiffusionTargetCli> for DiffusionPredictionTarget {
@@ -158,6 +172,7 @@ impl From<DiffusionTargetCli> for DiffusionPredictionTarget {
         match arg {
             DiffusionTargetCli::Epsilon => DiffusionPredictionTarget::Epsilon,
             DiffusionTargetCli::VPrediction => DiffusionPredictionTarget::VPrediction,
+            DiffusionTargetCli::EdmX0 => DiffusionPredictionTarget::EdmX0,
         }
     }
 }
@@ -168,6 +183,8 @@ pub enum DiffusionScheduleCli {
     Cosine,
     Linear,
     Quadratic,
+    /// Karras/EDM-inspired sigma schedule mapped to VP betas
+    Karras,
 }
 
 impl From<DiffusionScheduleCli> for NoiseSchedule {
@@ -182,6 +199,11 @@ impl From<DiffusionScheduleCli> for NoiseSchedule {
                 beta_min: 1e-4,
                 beta_max: 0.02,
             },
+            DiffusionScheduleCli::Karras => NoiseSchedule::Karras {
+                sigma_min: 0.002,
+                sigma_max: 80.0,
+                rho: 7.0,
+            },
         }
     }
 }
@@ -192,6 +214,10 @@ pub enum DiffusionTimestepCli {
     Uniform,
     #[value(alias = "minsnr", alias = "min-snr")]
     MinSnr,
+
+    /// EDM-style log-normal sigma sampling (best with Karras schedule)
+    #[value(alias = "edm", alias = "edm-lognormal", alias = "log-sigma")]
+    EdmLogNormal,
 }
 
 impl From<DiffusionTimestepCli> for DiffusionTimestepStrategy {
@@ -199,7 +225,7 @@ impl From<DiffusionTimestepCli> for DiffusionTimestepStrategy {
         match arg {
             DiffusionTimestepCli::Uniform => DiffusionTimestepStrategy::Uniform,
             DiffusionTimestepCli::MinSnr => DiffusionTimestepStrategy::MinSnr,
+            DiffusionTimestepCli::EdmLogNormal => DiffusionTimestepStrategy::EdmLogNormal,
         }
     }
 }
-

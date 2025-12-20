@@ -2,7 +2,13 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{adam::Adam, errors::Result, network::Layer, richards::{RichardsActivation, RichardsGate, Variant}, rng::get_rng};
+use crate::{
+    adam::Adam,
+    errors::Result,
+    network::Layer,
+    richards::{RichardsActivation, RichardsGate, Variant},
+    rng::get_rng,
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RichardsGlu {
@@ -51,7 +57,6 @@ impl RichardsGlu {
             gate: RichardsGate::new(),
         }
     }
-
 }
 
 impl Layer for RichardsGlu {
@@ -115,9 +120,7 @@ impl Layer for RichardsGlu {
             .cached_swish
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| {
-                self.richards_activation.forward_matrix_f32(&x1)
-            });
+            .unwrap_or_else(|| self.richards_activation.forward_matrix_f32(&x1));
         // Compute gate values
         let gate_sigma = self.gate.forward_const(&x2);
 
@@ -144,7 +147,7 @@ impl Layer for RichardsGlu {
         let mut gate_scaled_row: Vec<f32> = Vec::new();
         let mut gate_curve_deriv_row: Vec<f32> = Vec::new();
         let gate_temp_reciprocal = 1.0 / self.gate.temperature;
-        
+
         for (i, (x1_row, x2_row)) in x1.outer_iter().zip(x2.outer_iter()).enumerate() {
             let x1_slice = x1_row.as_slice().unwrap();
             let x2_slice = x2_row.as_slice().unwrap();
@@ -159,8 +162,11 @@ impl Layer for RichardsGlu {
             }
 
             // value_deriv_row = d/dx[x * Richards(x)]
-            self.richards_activation
-                .derivative_into_f32_with_scratch(x1_slice, &mut value_deriv_row, &mut value_deriv_tmp);
+            self.richards_activation.derivative_into_f32_with_scratch(
+                x1_slice,
+                &mut value_deriv_row,
+                &mut value_deriv_tmp,
+            );
 
             // Gate derivative with temperature scaling:
             // g(x) = curve(x/T) => dg/dx = curve'(x/T) * (1/T)
@@ -193,14 +199,18 @@ impl Layer for RichardsGlu {
         let mut param_grads = vec![grad_w1, grad_w2, grad_w_out];
 
         // Compute RichardsActivation gradients (value function)
-        let mut value_grads_sum = Array2::<f32>::zeros((1, self.richards_activation.weights().len()));
+        let mut value_grads_sum =
+            Array2::<f32>::zeros((1, self.richards_activation.weights().len()));
 
         // Accumulate gradients for richards_activation (value function)
         for (i, x1_row) in x1.outer_iter().enumerate() {
             for (j, &x1_val) in x1_row.iter().enumerate() {
                 let grad_output = grad_value[[i, j]] as f64;
                 if grad_output != 0.0 {
-                    let value_grads = self.richards_activation.richards_curve.grad_weights_scalar(x1_val as f64, grad_output);
+                    let value_grads = self
+                        .richards_activation
+                        .richards_curve
+                        .grad_weights_scalar(x1_val as f64, grad_output);
                     for (k, &grad) in value_grads.iter().enumerate() {
                         value_grads_sum[[0, k]] += grad as f32;
                     }
@@ -227,12 +237,13 @@ impl Layer for RichardsGlu {
                 ),
             });
         }
-        
+
         // Update w1, w2, w_out
         self.optimizer_w1.step(&mut self.w1, &param_grads[0], lr);
         self.optimizer_w2.step(&mut self.w2, &param_grads[1], lr);
-        self.optimizer_w_out.step(&mut self.w_out, &param_grads[2], lr);
-        
+        self.optimizer_w_out
+            .step(&mut self.w_out, &param_grads[2], lr);
+
         // Update RichardsActivation weights
         let grad_value_vec: Vec<f64> = param_grads[3].iter().map(|&x| x as f64).collect();
         self.richards_activation.step(&grad_value_vec, lr as f64);
@@ -242,7 +253,7 @@ impl Layer for RichardsGlu {
             let gate_grads = &param_grads[4..];
             self.gate.apply_gradients(gate_grads, lr)?;
         }
-        
+
         Ok(())
     }
 

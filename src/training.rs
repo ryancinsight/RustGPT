@@ -1,10 +1,6 @@
 use tracing::warn;
-use crate::{
-    cli::Args,
-    dataset_loader::Dataset,
-    llm::LLM,
-    Vocab,
-};
+
+use crate::{Vocab, cli::Args, dataset_loader::Dataset, llm::LLM};
 
 /// Orchestrate the complete training pipeline
 pub fn run_training_pipeline(
@@ -30,17 +26,20 @@ pub fn run_training_pipeline(
             // User explicitly specified a mode
             match mode_str.to_lowercase().as_str() {
                 "transformer" | "trans" | "t" => {
-                    crate::transformer::speculative::SpeculativeMode::Transformer
+                    crate::layers::transformer::speculative::SpeculativeMode::Transformer
                 }
                 "diffusion" | "diff" | "d" => {
-                    crate::transformer::speculative::SpeculativeMode::Diffusion
+                    crate::layers::transformer::speculative::SpeculativeMode::Diffusion
                 }
                 _ => {
-                    warn!("Unknown speculative mode '{}', auto-detecting from model type", mode_str);
+                    warn!(
+                        "Unknown speculative mode '{}', auto-detecting from model type",
+                        mode_str
+                    );
                     if args.diffusion {
-                        crate::transformer::speculative::SpeculativeMode::Diffusion
+                        crate::layers::transformer::speculative::SpeculativeMode::Diffusion
                     } else {
-                        crate::transformer::speculative::SpeculativeMode::Transformer
+                        crate::layers::transformer::speculative::SpeculativeMode::Transformer
                     }
                 }
             }
@@ -48,10 +47,10 @@ pub fn run_training_pipeline(
             // Auto-detect from model type
             if args.diffusion {
                 println!("Auto-detected speculative mode: Diffusion (based on --diffusion flag)");
-                crate::transformer::speculative::SpeculativeMode::Diffusion
+                crate::layers::transformer::speculative::SpeculativeMode::Diffusion
             } else {
                 println!("Auto-detected speculative mode: Transformer (default model type)");
-                crate::transformer::speculative::SpeculativeMode::Transformer
+                crate::layers::transformer::speculative::SpeculativeMode::Transformer
             }
         };
 

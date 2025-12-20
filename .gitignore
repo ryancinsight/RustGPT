@@ -9,3 +9,6 @@ models/*.pb
 models/*.onnx
 *.bin
 *.csv
+
+# Local logs / run artifacts
+/logs/

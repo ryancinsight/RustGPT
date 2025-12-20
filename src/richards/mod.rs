@@ -5,14 +5,15 @@ pub mod richards_curve;
 pub mod richards_gate;
 pub mod richards_glu;
 pub mod richards_norm;
-pub mod math;
 
 // Keep the root `richards` namespace tight: re-export only the primary public types.
-pub use self::richards_act::{RichardsActivation, RichardsAttention};
-pub use self::richards_curve::{RichardsCurve, WeightsIter};
-pub use self::richards_gate::RichardsGate;
-pub use self::richards_glu::RichardsGlu;
-pub use self::richards_norm::RichardsNorm;
+pub use self::{
+    richards_act::{RichardsActivation, RichardsAttention},
+    richards_curve::{RichardsCurve, WeightsIter},
+    richards_gate::RichardsGate,
+    richards_glu::RichardsGlu,
+    richards_norm::RichardsNorm,
+};
 
 /// Variant types for Richards curve initialization and constraints
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]

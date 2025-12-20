@@ -1,11 +1,12 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use llm::{
     Layer,
-    mixtures::HeadSelectionStrategy,
-    model_config::DiffusionTimestepStrategy,
-    transformer::diffusion_block::{
-        DiffusionBlock, DiffusionBlockConfig, DiffusionPredictionTarget, NoiseSchedule,
+    layers::diffusion::{
+        DiffusionBlock, DiffusionBlockConfig, DiffusionPredictionTarget, EDM_SIGMA_DATA_DEFAULT,
+        NoiseSchedule,
     },
+    mixtures::HeadSelectionStrategy,
+    model_config::{DiffusionTimestepStrategy, TemporalMixingType},
 };
 use ndarray::Array2;
 
@@ -17,6 +18,7 @@ fn bench_forward(c: &mut Criterion) {
         poly_degree: 3,
         max_pos: 127,
         window_size: None,
+        use_adaptive_window: false,
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
@@ -27,7 +29,10 @@ fn bench_forward(c: &mut Criterion) {
         discrete_masked: false,
         mask_token_id: None,
         prediction_target: DiffusionPredictionTarget::default(),
+        edm_sigma_data: EDM_SIGMA_DATA_DEFAULT,
         timestep_strategy: DiffusionTimestepStrategy::Uniform,
+        temporal_mixing: TemporalMixingType::Attention,
+        use_advanced_adaptive_residuals: true,
     };
     let mut block = DiffusionBlock::new(config);
     block.set_timestep(500);
@@ -48,6 +53,7 @@ fn bench_sample(c: &mut Criterion) {
         poly_degree: 3,
         max_pos: 63,
         window_size: None,
+        use_adaptive_window: false,
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
@@ -58,7 +64,10 @@ fn bench_sample(c: &mut Criterion) {
         discrete_masked: false,
         mask_token_id: None,
         prediction_target: DiffusionPredictionTarget::default(),
+        edm_sigma_data: EDM_SIGMA_DATA_DEFAULT,
         timestep_strategy: DiffusionTimestepStrategy::Uniform,
+        temporal_mixing: TemporalMixingType::Attention,
+        use_advanced_adaptive_residuals: true,
     };
     let mut block = DiffusionBlock::new(config);
     c.bench_function("diffusion_block_sample_50", |b| {

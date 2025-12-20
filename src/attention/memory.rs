@@ -70,7 +70,9 @@ pub fn with_tls_phi<R>(len: usize, f: impl FnOnce(&mut ndarray::Array1<f32>) -> 
             Some(a) => a.len() != len,
             None => true,
         };
-        if need { *opt = Some(ndarray::Array1::<f32>::zeros(len)); }
+        if need {
+            *opt = Some(ndarray::Array1::<f32>::zeros(len));
+        }
         let vec = opt.as_mut().unwrap();
         f(vec)
     })

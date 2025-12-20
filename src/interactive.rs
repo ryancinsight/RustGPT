@@ -1,4 +1,5 @@
 use std::io::Write;
+
 use crate::llm::LLM;
 
 /// Run interactive mode for user input and model responses
