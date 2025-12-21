@@ -534,6 +534,11 @@ impl LRM {
             Array2::<f32>::zeros((0, 0))
         };
 
+        // Optimization: during inference, when ACT halting is enabled, avoid computing
+        // updates for tokens that have already halted.
+        let sparse_inference = halting_enabled && !self.is_training;
+        let halt_eps = self.config.halting.epsilon.clamp(1e-6, 0.5);
+
         for t in 0..max_steps {
             // Move the previous y instead of cloning it; this is reused for:
             // - recursion input
@@ -546,6 +551,124 @@ impl LRM {
             } else {
                 None
             };
+
+            if sparse_inference {
+                // Determine which tokens are still active.
+                let mut active_rows: Vec<usize> = Vec::new();
+                for r in 0..bsz {
+                    if halting_sum[[r, 0]] < 1.0 - halt_eps {
+                        active_rows.push(r);
+                    }
+                }
+
+                // If nothing is active, the model has fully halted.
+                if active_rows.is_empty() {
+                    y = prev_y;
+                    break;
+                }
+
+                // Gather active rows for compute.
+                let active_n = active_rows.len();
+                let mut prev_y_active = Array2::<f32>::zeros((active_n, embed_dim));
+                let mut z_active = Array2::<f32>::zeros((active_n, embed_dim));
+                for (i, &r) in active_rows.iter().enumerate() {
+                    prev_y_active.row_mut(i).assign(&prev_y.row(r));
+                    z_active.row_mut(i).assign(&z.row(r));
+                }
+
+                // Run recursions on active rows only.
+                let mut scratch_active = Array2::<f32>::zeros((active_n, embed_dim));
+                let _ = self.run_recursions_with_guard(
+                    &mut block_guard,
+                    &prev_y_active,
+                    &mut z_active,
+                    &mut scratch_active,
+                    false,
+                );
+
+                // Final answer step on active rows only.
+                scratch_active.assign(&prev_y_active);
+                scratch_active += &z_active;
+                Self::sanitize(&mut scratch_active);
+                let new_y_active = block_guard.forward_step(&scratch_active, 0);
+
+                // ACT halting weights for active rows only.
+                let mut w = Array2::<f32>::zeros((bsz, 1));
+                if halting_enabled {
+                    let thr = self.config.halting.threshold.max(0.0);
+                    let slope = self.config.halting.slope.max(0.0);
+                    let last_step = t + 1 == max_steps;
+
+                    for (i, &r) in active_rows.iter().enumerate() {
+                        let remaining = (1.0 - halting_sum[[r, 0]]).max(0.0);
+                        if remaining <= 0.0 {
+                            w[[r, 0]] = 0.0;
+                            continue;
+                        }
+
+                        if last_step {
+                            w[[r, 0]] = remaining;
+                            continue;
+                        }
+
+                        // rel(token) = sum|dy| / (sum|y| + eps)
+                        let mut diff_r = 0.0f32;
+                        let mut ny_r = 0.0f32;
+                        for c in 0..embed_dim {
+                            let a = new_y_active[[i, c]];
+                            let b = prev_y_active[[i, c]];
+                            diff_r += (a - b).abs();
+                            ny_r += a.abs();
+                        }
+                        let rel_r = diff_r / (ny_r + 1e-6);
+
+                        let p = Self::sigmoid((thr - rel_r) * slope);
+                        let will_finish = halting_sum[[r, 0]] + p >= 1.0 - halt_eps;
+                        w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
+                    }
+
+                    if self.config.halting.act_weighted_output {
+                        for (i, &r) in active_rows.iter().enumerate() {
+                            let wr = w[[r, 0]];
+                            if wr == 0.0 {
+                                continue;
+                            }
+                            for c in 0..embed_dim {
+                                y_accum[[r, c]] += wr * new_y_active[[i, c]];
+                            }
+                        }
+                    }
+
+                    // Update halting sums for active rows.
+                    for &r in active_rows.iter() {
+                        halting_sum[[r, 0]] = (halting_sum[[r, 0]] + w[[r, 0]]).min(1.0);
+                    }
+                }
+
+                // Scatter active results back into full tensors.
+                let mut new_y_full = prev_y;
+                for (i, &r) in active_rows.iter().enumerate() {
+                    new_y_full.row_mut(r).assign(&new_y_active.row(i));
+                    z.row_mut(r).assign(&z_active.row(i));
+                }
+                y = new_y_full;
+                Self::sanitize(&mut y);
+
+                // Early stop once all tokens have halted.
+                let mut all_halted = true;
+                for r in 0..bsz {
+                    if halting_sum[[r, 0]] < 1.0 - halt_eps {
+                        all_halted = false;
+                        break;
+                    }
+                }
+                if all_halted {
+                    break;
+                }
+
+                // Sparse inference path fully handled this step.
+                continue;
+            }
 
             // Run recursions (don't capture caches during forward pass to save memory).
             let _ = self.run_recursions_with_guard(

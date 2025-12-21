@@ -8,8 +8,13 @@ use crate::{
 /// Architecture type for model configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArchitectureType {
-    /// Standard Transformer with self-attention mechanism
-    Transformer,
+    /// Autoregressive sequence model (Transformer-style residual stack).
+    ///
+    /// Important: the *temporal mixing* inside each block is configured separately via
+    /// `temporal_mixing` (Attention/RG-LRU/Mamba/Mamba2). This variant describes the
+    /// outer training/generation paradigm (next-token prediction), not the mixer.
+    #[serde(alias = "Transformer")]
+    Autoregressive,
 
     /// Tiny Recursive Model (LRM) - recursive reasoning with shared weights
     TRM,
@@ -27,7 +32,6 @@ pub enum WindowAdaptationStrategy {
     /// Adapt based on sequence length: window_size = min(max, max(min, seq_len / 2))
     /// Simple and stable, scales window with input length
     SequenceLengthBased,
-
     /// Adapt based on attention entropy: larger windows when attention is diffuse
     /// More sophisticated, responds to attention patterns
     /// - Used in LLaMA, PaLM, GPT-NeoX, Mistral
@@ -71,18 +75,14 @@ impl Default for TemporalMixingType {
 /// Strategy for sampling diffusion timesteps during training
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffusionTimestepStrategy {
-    /// Uniform sampling across the noise schedule
+    /// Uniformly sample timesteps
     Uniform,
-    /// Min-SNR weighted sampling (Karras et al., 2022)
+    /// Min-SNR weighting/sampling strategy
     MinSnr,
-
-    /// EDM-style log-normal sampling in sigma-space (Karras et al., 2022).
-    ///
-    /// Recommended when using `NoiseSchedule::Karras` and/or `DiffusionPredictionTarget::EdmX0`.
+    /// EDM-style log-normal sigma sampling
     EdmLogNormal,
 }
 
-/// Configuration for model architecture and hyperparameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Type of architecture to use
@@ -224,7 +224,30 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Create a new autoregressive configuration with modern defaults.
+    ///
+    /// Backward compatibility: `transformer(...)` remains as an alias.
+    pub fn autoregressive(
+        embedding_dim: usize,
+        hidden_dim: usize,
+        num_layers: usize,
+        max_seq_len: usize,
+        hypernetwork_hidden_dim: Option<usize>,
+        num_heads: Option<usize>,
+    ) -> Self {
+        Self::transformer(
+            embedding_dim,
+            hidden_dim,
+            num_layers,
+            max_seq_len,
+            hypernetwork_hidden_dim,
+            num_heads,
+        )
+    }
+
     /// Create a new Transformer configuration with modern defaults
+    ///
+    /// Note: this constructs an `ArchitectureType::Autoregressive` model.
     pub fn transformer(
         embedding_dim: usize,
         hidden_dim: usize,
@@ -234,7 +257,7 @@ impl ModelConfig {
         num_heads: Option<usize>,
     ) -> Self {
         Self {
-            architecture: ArchitectureType::Transformer,
+            architecture: ArchitectureType::Autoregressive,
             embedding_dim,
             hidden_dim,
             num_layers,

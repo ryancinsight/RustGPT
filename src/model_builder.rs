@@ -35,7 +35,7 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 
     // Build architecture-specific layers
     match config.architecture {
-        ArchitectureType::Transformer => {
+        ArchitectureType::Autoregressive => {
             build_transformer_layers(&mut layers, config);
         }
         ArchitectureType::TRM => {
@@ -175,7 +175,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("  Hidden Dimension: {}", config.hidden_dim);
 
     match config.architecture {
-        ArchitectureType::Transformer => {
+        ArchitectureType::Autoregressive => {
             println!("  Number of Layers: {}", config.num_layers);
         }
         ArchitectureType::TRM => {
@@ -210,6 +210,9 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     println!("  Max Sequence Length: {}", config.max_seq_len);
 
+    // Temporal mixing (applies to Transformer/Diffusion blocks and TRM internals).
+    println!("  Temporal Mixing: {:?}", config.temporal_mixing);
+
     // Modern LLM Enhancements
     println!("\n🚀 Modern LLM Enhancements:");
 
@@ -231,28 +234,64 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     println!("  ✓ CoPE (Contextual Position Encoding)");
     println!("    - Max Position (derived): {}", cope_max_pos);
 
-    println!("\n🧠 Attention:");
-    use crate::model_config::AttentionType;
-    match &config.attention {
-        AttentionType::PolyAttention { degree_p } => {
-            println!("  ✓ Polynomial Attention (p = {})", degree_p);
-            println!("    - Grouped-query heads: {}", config.get_num_heads());
-            println!(
-                "    - Sliding window: {}",
-                config
-                    .window_size
-                    .map(|w: usize| w.to_string())
-                    .unwrap_or_else(|| "disabled".to_string())
-            );
-        }
-        AttentionType::SelfAttention => {
-            println!("  ✓ Scaled Dot-Product Self-Attention");
+    // Only print the attention configuration when attention is actually the temporal mixer.
+    // When temporal mixing is Mamba/RG-LRU, the attention-specific config is not the primary path.
+    if matches!(config.temporal_mixing, crate::model_config::TemporalMixingType::Attention) {
+        println!("\n🧠 Attention:");
+        use crate::model_config::AttentionType;
+        match &config.attention {
+            AttentionType::PolyAttention { degree_p } => {
+                println!("  ✓ Polynomial Attention (p = {})", degree_p);
+                println!("    - Grouped-query heads: {}", config.get_num_heads());
+                println!(
+                    "    - Sliding window: {}",
+                    config
+                        .window_size
+                        .map(|w: usize| w.to_string())
+                        .unwrap_or_else(|| "disabled".to_string())
+                );
+            }
+            AttentionType::SelfAttention => {
+                println!("  ✓ Scaled Dot-Product Self-Attention");
+            }
         }
     }
 
     println!("\n🧱 Layer Stack:");
     for (i, layer) in layers.iter().enumerate() {
-        println!("  {}: {}", i, layer.layer_type());
+        match layer {
+            LayerEnum::TransformerBlock(tb) => {
+                let tm = match &tb.temporal_mixing {
+                    crate::layers::components::common::TemporalMixingLayer::Attention(_) => {
+                        "Attention"
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
+                        "RgLruMoH"
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLru(_) => "RgLru",
+                    crate::layers::components::common::TemporalMixingLayer::Mamba(_) => "Mamba",
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
+                };
+                println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
+            }
+            LayerEnum::DiffusionBlock(db) => {
+                let tm = match &db.temporal_mixing {
+                    crate::layers::components::common::TemporalMixingLayer::Attention(_) => {
+                        "Attention"
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
+                        "RgLruMoH"
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLru(_) => "RgLru",
+                    crate::layers::components::common::TemporalMixingLayer::Mamba(_) => "Mamba",
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
+                };
+                println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
+            }
+            _ => {
+                println!("  {}: {}", i, layer.layer_type());
+            }
+        }
     }
 
     // Parameter count summary
