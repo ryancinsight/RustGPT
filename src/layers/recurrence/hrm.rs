@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::sync::RwLock;
 
-use ndarray::Array2;
+use ndarray::{Array2, Zip};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -50,7 +50,8 @@ struct HRMCache {
     pooled: Array2<f32>,
     coarse_input: Array2<f32>,
     coarse_out: Array2<f32>,
-    fine_projected: Array2<f32>,
+    /// Output of the upsample linear projection (before repeat).
+    upsample_linear_out: Array2<f32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -219,12 +220,11 @@ impl HRM {
         (grad_input, grad_w, grad_b)
     }
 
-    fn upsample_backward(
+    fn upsample_repeat_backward(
         &self,
         grad_output: &Array2<f32>,
-        _projected: &Array2<f32>,
         coarse_len: usize,
-    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+    ) -> Array2<f32> {
         // grad_output: (target_len, dim)
         // projected: (coarse_len, dim) (input to upsample repeat)
 
@@ -242,30 +242,9 @@ impl HRM {
             }
         }
 
-        // Backprop through linear
-        // dL/dW = input_to_proj^T * grad_projected
-        // But wait, we don't have input_to_proj here (it's coarse_out).
-        // We need to return grad w.r.t weights and input.
-        // Let's assume the caller provides the input to the forward pass (coarse_out).
-        // Actually, `projected` is the OUTPUT of the linear layer.
-        // We need the INPUT to the linear layer to compute dW.
-        // Let's adjust the signature or cache usage.
-
-        // We will compute dW/db in the main backward function where we have access to coarse_out.
-        // Here we just return grad_projected (dL/dLinearOutput).
-
-        // Wait, I put linear BEFORE repeat in forward.
-        // forward: input -> linear -> projected -> repeat -> output
-        // backward: grad_output -> un-repeat -> grad_projected -> linear_backward -> grad_input
-
-        // So this function should return grad_projected.
-        // And then we do linear backward outside.
-
-        (
-            grad_projected,
-            Array2::<f32>::zeros((0, 0)),
-            Array2::<f32>::zeros((0, 0)),
-        ) // Placeholders
+        // This returns dL/d(upsample_linear_out) (i.e., grad wrt the linear output).
+        // Linear backward is performed by the caller where coarse_out is available.
+        grad_projected
     }
 }
 
@@ -285,10 +264,10 @@ impl Layer for HRM {
         let coarse_out = self.top_block.forward(&coarse_input);
 
         // 4. Upsample
-        let (fine_projected, fine_linear_out) = self.upsample(&coarse_out, input.nrows());
+        let (fine_upsampled, upsample_linear_out) = self.upsample(&coarse_out, input.nrows());
 
         // 5. Combine (Residual)
-        let output = &bottom_out + &fine_projected;
+        let output = &bottom_out + &fine_upsampled;
 
         self.cached_intermediates = Some(HRMCache {
             input: input.clone(),
@@ -296,7 +275,7 @@ impl Layer for HRM {
             pooled,
             coarse_input,
             coarse_out,
-            fine_projected: fine_linear_out, // Store the output of linear layer (before repeat)
+            upsample_linear_out, // Store linear output (before repeat)
         });
 
         output
@@ -320,28 +299,22 @@ impl Layer for HRM {
             // Output = bottom_out + fine_projected
             // Gradients split
             let d_bottom_out_1 = output_grads.clone();
-            let d_fine_projected = output_grads.clone();
 
             // 4. Upsample Backward
             // forward: coarse_out -> linear -> fine_linear_out -> repeat -> fine_projected
             // backward: d_fine_projected -> un-repeat -> d_fine_linear_out -> linear_backward ->
             // d_coarse_out
 
-            let (d_fine_linear_out, _, _) = self.upsample_backward(
-                &d_fine_projected,
-                &cache.fine_projected,
-                cache.coarse_out.nrows(),
-            );
+            let d_fine_linear_out =
+                self.upsample_repeat_backward(output_grads, cache.coarse_out.nrows());
 
             // Linear backward
             // dL/dW_up = coarse_out^T * d_fine_linear_out
             let d_upsample_w = cache.coarse_out.t().dot(&d_fine_linear_out);
             // dL/db_up = sum(d_fine_linear_out)
             let mut d_upsample_b = Array2::<f32>::zeros((1, self.config.embed_dim));
-            for i in 0..d_fine_linear_out.nrows() {
-                for j in 0..d_fine_linear_out.ncols() {
-                    d_upsample_b[[0, j]] += d_fine_linear_out[[i, j]];
-                }
+            for (j, col) in d_fine_linear_out.columns().into_iter().enumerate() {
+                d_upsample_b[[0, j]] = col.sum();
             }
             // dL/d_coarse_out = d_fine_linear_out * W_up^T
             let d_coarse_out = d_fine_linear_out.dot(&self.upsample_w.t());
@@ -355,36 +328,8 @@ impl Layer for HRM {
             // forward: bottom_out -> pool -> pooled -> linear -> coarse_input
             // backward: d_coarse_input -> linear_backward -> d_pooled -> un-pool -> d_bottom_out_2
 
-            // Linear backward
-            // dL/dW_down = pooled^T * d_coarse_input
-            let d_downsample_w = cache.pooled.t().dot(&d_coarse_input);
-            // dL/db_down = sum(d_coarse_input)
-            let mut d_downsample_b = Array2::<f32>::zeros((1, self.config.embed_dim));
-            for i in 0..d_coarse_input.nrows() {
-                for j in 0..d_coarse_input.ncols() {
-                    d_downsample_b[[0, j]] += d_coarse_input[[i, j]];
-                }
-            }
-            // dL/d_pooled = d_coarse_input * W_down^T
-            let d_pooled = d_coarse_input.dot(&self.downsample_w.t());
-
-            // Un-pool
-            // Reimplementing un-pool logic here properly since helper was weird
-            let mut d_bottom_out_2_real =
-                Array2::<f32>::zeros((cache.bottom_out.nrows(), self.config.embed_dim));
-            let stride = self.config.stride;
-            let (out_len, dim) = d_pooled.dim();
-            for i in 0..out_len {
-                let start = i * stride;
-                let end = (start + stride).min(cache.bottom_out.nrows());
-                let count = (end - start) as f32;
-                let scale = 1.0 / count;
-                for k in start..end {
-                    for j in 0..dim {
-                        d_bottom_out_2_real[[k, j]] += d_pooled[[i, j]] * scale;
-                    }
-                }
-            }
+            let (d_bottom_out_2_real, d_downsample_w, d_downsample_b) =
+                self.downsample_backward(&d_coarse_input, &cache.pooled, cache.bottom_out.nrows());
 
             // Combine bottom gradients
             let d_bottom_out_total = d_bottom_out_1 + d_bottom_out_2_real;
@@ -393,6 +338,10 @@ impl Layer for HRM {
             let (d_input, bottom_grads) = self
                 .bottom_block
                 .compute_gradients(&cache.input, &d_bottom_out_total);
+
+            // Cache exact gradient vector counts for apply_gradients.
+            let bottom_count = bottom_grads.len();
+            let top_count = top_grads.len();
 
             // Collect all gradients
             // Order: bottom, top, downsample, upsample
@@ -403,32 +352,7 @@ impl Layer for HRM {
             all_grads.push(d_upsample_w);
             all_grads.push(d_upsample_b);
 
-            // Update partitions
-            if let Ok(mut guard) = self.param_partitions.write() {
-                *guard = Some(HRMPartitions {
-                    bottom: self.bottom_block.parameters(), /* Approximation, actually need grad
-                                                             * counts */
-                    top: self.top_block.parameters(),
-                    downsample: 2,
-                    upsample: 2,
-                });
-                // Correct counts based on actual returned vectors
-                // We need to know how many grads bottom/top return.
-                // compute_gradients returns a Vec.
-                // Let's recalculate.
-            }
-            // We need exact counts for apply_gradients
-            let bottom_count = self
-                .bottom_block
-                .compute_gradients(&cache.input, &d_bottom_out_total)
-                .1
-                .len();
-            let top_count = self
-                .top_block
-                .compute_gradients(&cache.coarse_input, &d_coarse_out)
-                .1
-                .len();
-
+            // Cache exact gradient vector counts for apply_gradients.
             if let Ok(mut guard) = self.param_partitions.write() {
                 *guard = Some(HRMPartitions {
                     bottom: bottom_count,
@@ -472,16 +396,24 @@ impl Layer for HRM {
         if downsample_grads.len() == 2 {
             let dw = &downsample_grads[0];
             let db = &downsample_grads[1];
-            self.downsample_w = &self.downsample_w - &(dw * lr);
-            self.downsample_b = &self.downsample_b - &(db * lr);
+            Zip::from(&mut self.downsample_w)
+                .and(dw)
+                .for_each(|w, &g| *w -= lr * g);
+            Zip::from(&mut self.downsample_b)
+                .and(db)
+                .for_each(|b, &g| *b -= lr * g);
         }
 
         // Apply upsample grads
         if upsample_grads.len() == 2 {
             let dw = &upsample_grads[0];
             let db = &upsample_grads[1];
-            self.upsample_w = &self.upsample_w - &(dw * lr);
-            self.upsample_b = &self.upsample_b - &(db * lr);
+            Zip::from(&mut self.upsample_w)
+                .and(dw)
+                .for_each(|w, &g| *w -= lr * g);
+            Zip::from(&mut self.upsample_b)
+                .and(db)
+                .for_each(|b, &g| *b -= lr * g);
         }
 
         Ok(())

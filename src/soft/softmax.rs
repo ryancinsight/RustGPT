@@ -116,23 +116,18 @@ impl Softmax {
     ) -> Array2<f32> {
         let mut input_grads = Array2::zeros(output.raw_dim());
 
-        // Compute gradients for each row (assuming axis=1, last dimension)
-        for i in 0..output.nrows() {
-            let probs = output.row(i);
-            let grads = output_grads.row(i);
+        for (mut input_row, (prob_row, grad_row)) in input_grads
+            .outer_iter_mut()
+            .zip(output.outer_iter().zip(output_grads.outer_iter()))
+        {
+            let sum_grad_prob: f32 = prob_row
+                .iter()
+                .zip(grad_row.iter())
+                .map(|(&p, &g)| p * g)
+                .sum();
 
-            // For each position j, compute: sum over k of (grad_k * ∂y_k/∂x_j)
-            for j in 0..output.ncols() {
-                let mut grad_sum = 0.0;
-                for k in 0..output.ncols() {
-                    let dy_dx = if j == k {
-                        probs[k] * (1.0 - probs[k])
-                    } else {
-                        -probs[j] * probs[k]
-                    };
-                    grad_sum += grads[k] * dy_dx;
-                }
-                input_grads[[i, j]] = grad_sum;
+            for (j, (&p, &g)) in prob_row.iter().zip(grad_row.iter()).enumerate() {
+                input_row[j] = p * (g - sum_grad_prob);
             }
         }
 
