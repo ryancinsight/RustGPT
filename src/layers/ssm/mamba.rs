@@ -360,7 +360,7 @@ impl Mamba {
         let mut a = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                a[[ti, j]] = (-dt[[ti, j]] * a_scale[j]).exp().clamp(0.0, 1.0);
+                a[[ti, j]] = crate::pade::exp_f32(-dt[[ti, j]] * a_scale[j]).clamp(0.0, 1.0);
             }
         }
 

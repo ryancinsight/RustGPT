@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use ndarray::Array2;
+use ndarray::{Array2, Zip};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,8 +15,62 @@ use crate::{
         },
     },
     model_config::ModelConfig,
+    mixtures::MixtureOfDepthsConfig,
     network::Layer,
 };
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HaltingConfig {
+    /// Enable ACT-style halting / mixture-of-depth behavior.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// If true, the output is the ACT-weighted average across refinement steps.
+    /// If false, the output is the final step state (still uses halting for early stop).
+    #[serde(default = "default_true")]
+    pub act_weighted_output: bool,
+
+    /// Halting epsilon: treat tokens as halted once cumulative weight >= 1 - epsilon.
+    #[serde(default = "default_halting_epsilon")]
+    pub epsilon: f32,
+
+    /// Convergence threshold used to derive a halting probability per token.
+    /// Smaller rel-change => higher stop probability.
+    #[serde(default = "default_halting_threshold")]
+    pub threshold: f32,
+
+    /// Slope for the sigmoid used to map (threshold - rel) to a halting probability.
+    #[serde(default = "default_halting_slope")]
+    pub slope: f32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_halting_epsilon() -> f32 {
+    0.01
+}
+
+fn default_halting_threshold() -> f32 {
+    5e-4
+}
+
+fn default_halting_slope() -> f32 {
+    12.0
+}
+
+impl Default for HaltingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            act_weighted_output: true,
+            epsilon: default_halting_epsilon(),
+            threshold: default_halting_threshold(),
+            slope: default_halting_slope(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum BlockTypeConfig {
@@ -34,6 +88,12 @@ pub struct LRMConfig {
     pub latent_update_alpha: f32,
     pub min_alpha: f32,
     pub adapt_scale: f32,
+
+    #[serde(default)]
+    pub halting: HaltingConfig,
+
+    #[serde(default)]
+    pub mixture_of_depths: MixtureOfDepthsConfig,
 }
 
 impl Default for LRMConfig {
@@ -65,6 +125,8 @@ impl Default for LRMConfig {
             latent_update_alpha: 0.05,
             min_alpha: 0.02,
             adapt_scale: 20.0,
+            halting: HaltingConfig::default(),
+            mixture_of_depths: MixtureOfDepthsConfig::default(),
         }
     }
 }
@@ -195,14 +257,24 @@ struct SupervisionStepCache {
     answer_cache: CoreCache,
     initial_z: Array2<f32>,
     y: Array2<f32>,
+
+    /// ACT-style output weight for this refinement step (shape: (seq_len, 1)).
+    /// Present when dynamic halting is enabled.
+    halt_weight: Option<Array2<f32>>,
 }
 
 impl SupervisionStepCache {
-    fn new(answer_cache: CoreCache, initial_z: Array2<f32>, y: Array2<f32>) -> Self {
+    fn new(
+        answer_cache: CoreCache,
+        initial_z: Array2<f32>,
+        y: Array2<f32>,
+        halt_weight: Option<Array2<f32>>,
+    ) -> Self {
         Self {
             answer_cache,
             initial_z,
             y,
+            halt_weight,
         }
     }
 }
@@ -324,6 +396,8 @@ impl LRM {
             latent_update_alpha: config.trm_latent_update_alpha.unwrap_or(0.05),
             min_alpha: 0.01,
             adapt_scale: 10.0,
+            halting: HaltingConfig::default(),
+            mixture_of_depths: MixtureOfDepthsConfig::default(),
         };
         Self::new(c)
     }
@@ -380,6 +454,17 @@ impl LRM {
         }
     }
 
+    fn sigmoid(x: f32) -> f32 {
+        // Numerically stable-ish sigmoid for typical ACT ranges.
+        if x >= 0.0 {
+            let z = (-x).exp();
+            1.0 / (1.0 + z)
+        } else {
+            let z = x.exp();
+            z / (1.0 + z)
+        }
+    }
+
     pub fn forward_recursive(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
         if self.config.num_recursions == 0 {
             let out = self.block.write().unwrap().forward_step(input, 0);
@@ -419,11 +504,16 @@ impl LRM {
         self.cached_mean_input = Some(mean);
         Self::sanitize(&mut z);
 
-        let max_steps = self.get_max_steps();
+        let mut max_steps = self.get_max_steps();
+        // Mixture-of-Depths: sample a shallower cap during training.
+        if self.is_training {
+            max_steps = self.config.mixture_of_depths.sample_depth_cap(max_steps).max(1);
+        }
         self.cached_supervision_outputs.clear();
         self.cached_step_states.clear();
 
         // Reuse buffers to reduce per-step allocations.
+        // `ans_in` is also used as a scratch buffer for recursion input (combined = y + z).
         let mut ans_in = Array2::<f32>::zeros((bsz, embed_dim));
 
         // Hold a single write guard across the entire iterative solve.
@@ -431,17 +521,40 @@ impl LRM {
         // operate on data many times.
         let mut block_guard = self.block.write().unwrap();
 
-        for _t in 0..max_steps {
+        // ACT-style halting state (per token).
+        let halting_enabled = self.config.halting.enabled;
+        let mut halting_sum = if halting_enabled {
+            Array2::<f32>::zeros((bsz, 1))
+        } else {
+            Array2::<f32>::zeros((0, 0))
+        };
+        let mut y_accum = if halting_enabled && self.config.halting.act_weighted_output {
+            Array2::<f32>::zeros((bsz, embed_dim))
+        } else {
+            Array2::<f32>::zeros((0, 0))
+        };
+
+        for t in 0..max_steps {
             // Move the previous y instead of cloning it; this is reused for:
             // - recursion input
             // - step-cache (training)
             // - convergence check
             // Replace y with a tiny placeholder to avoid allocating a full-sized buffer.
             let prev_y = std::mem::replace(&mut y, Array2::<f32>::zeros((0, 0)));
-            let initial_z = z.clone();
+            let initial_z = if self.is_training {
+                Some(z.clone())
+            } else {
+                None
+            };
 
-            // Run recursions (don't capture caches during forward pass to save memory)
-            let _ = self.run_recursions_with_guard(&mut block_guard, &prev_y, &mut z, false);
+            // Run recursions (don't capture caches during forward pass to save memory).
+            let _ = self.run_recursions_with_guard(
+                &mut block_guard,
+                &prev_y,
+                &mut z,
+                &mut ans_in,
+                false,
+            );
 
             ans_in.assign(&prev_y);
             ans_in += &z;
@@ -451,7 +564,72 @@ impl LRM {
             let new_y = block_guard.forward_step(&ans_in, 0);
             let answer_cache = block_guard.get_cache();
 
-            // Compute convergence metric without allocating temporaries.
+            // Optional ACT-style halting weights derived from per-token convergence.
+            // We intentionally keep this parameter-free and deterministic.
+            let mut step_weight: Option<Array2<f32>> = None;
+            if halting_enabled {
+                let eps = self.config.halting.epsilon.clamp(1e-6, 0.5);
+                let thr = self.config.halting.threshold.max(0.0);
+                let slope = self.config.halting.slope.max(0.0);
+
+                let mut w = Array2::<f32>::zeros((bsz, 1));
+                let last_step = t + 1 == max_steps;
+
+                // Compute per-token rel change and map to a halting probability.
+                // rel(token) = sum|dy| / (sum|y| + eps)
+                for r in 0..bsz {
+                    let mut diff_r = 0.0f32;
+                    let mut ny_r = 0.0f32;
+                    for c in 0..embed_dim {
+                        let a = new_y[[r, c]];
+                        let b = prev_y[[r, c]];
+                        diff_r += (a - b).abs();
+                        ny_r += a.abs();
+                    }
+                    let rel_r = diff_r / (ny_r + 1e-6);
+
+                    let remaining = (1.0 - halting_sum[[r, 0]]).max(0.0);
+                    if remaining <= 0.0 {
+                        w[[r, 0]] = 0.0;
+                        continue;
+                    }
+
+                    // On the last step, force remainder so weights sum to 1.
+                    if last_step {
+                        w[[r, 0]] = remaining;
+                        continue;
+                    }
+
+                    // Higher stop probability when rel_r is below threshold.
+                    let p = Self::sigmoid((thr - rel_r) * slope);
+                    let will_finish = halting_sum[[r, 0]] + p >= 1.0 - eps;
+                    w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
+                }
+
+                // Apply weights to the ACT accumulator.
+                if self.config.halting.act_weighted_output {
+                    for r in 0..bsz {
+                        let wr = w[[r, 0]];
+                        if wr == 0.0 {
+                            continue;
+                        }
+                        for c in 0..embed_dim {
+                            y_accum[[r, c]] += wr * new_y[[r, c]];
+                        }
+                    }
+                }
+
+                // Update halting sums.
+                Zip::from(halting_sum.rows_mut())
+                    .and(w.rows())
+                    .for_each(|mut hs, wr| {
+                        hs[0] = (hs[0] + wr[0]).min(1.0);
+                    });
+
+                step_weight = Some(w);
+            }
+
+            // Compute a scalar convergence metric (used as a backstop when halting is disabled).
             let mut diff = 0.0f32;
             let mut ny = 0.0f32;
             for (a, b) in new_y.iter().zip(prev_y.iter()) {
@@ -463,9 +641,9 @@ impl LRM {
             if self.is_training {
                 // Store initial_z and prev_y instead of full recursion caches (Gradient
                 // Checkpointing)
-                if let Some(cache) = answer_cache {
+                if let (Some(cache), Some(initial_z)) = (answer_cache, initial_z) {
                     self.cached_step_states
-                        .push(SupervisionStepCache::new(cache, initial_z, prev_y));
+                    .push(SupervisionStepCache::new(cache, initial_z, prev_y, step_weight));
                 } else {
                     // Keep semantics consistent: still advance y even if cache is missing.
                     // prev_y is dropped here.
@@ -475,12 +653,29 @@ impl LRM {
 
             y = new_y;
             Self::sanitize(&mut y);
-            if rel < 1e-4 {
+            if halting_enabled {
+                // Early stop once all tokens have halted.
+                let mut all_halted = true;
+                let eps = self.config.halting.epsilon.clamp(1e-6, 0.5);
+                for r in 0..bsz {
+                    if halting_sum[[r, 0]] < 1.0 - eps {
+                        all_halted = false;
+                        break;
+                    }
+                }
+                if all_halted {
+                    break;
+                }
+            } else if rel < 1e-4 {
                 break;
             }
         }
 
-        Ok(y)
+        if halting_enabled && self.config.halting.act_weighted_output {
+            Ok(y_accum)
+        } else {
+            Ok(y)
+        }
     }
 
     fn latent_init_gradients(&self, z_grads: &Array2<f32>) -> Option<(Array2<f32>, Array2<f32>)> {
@@ -534,9 +729,15 @@ impl LRM {
         // Gradient Checkpointing: Re-run forward pass to generate caches
         let mut z_replay = step_cache.initial_z.clone();
 
-        // No unsafe needed anymore!
-        let recs =
-            self.run_recursions_with_guard(&mut block_guard, &step_cache.y, &mut z_replay, true);
+        // Replay the forward recursion to regenerate caches (checkpointing) AND
+        // capture the exact per-step adaptive alpha used in the z-update.
+        let mut scratch_combined = Array2::<f32>::zeros(step_cache.y.raw_dim());
+        let rec_trace = self.run_recursions_trace_with_guard(
+            &mut block_guard,
+            &step_cache.y,
+            &mut z_replay,
+            &mut scratch_combined,
+        );
 
         // d_ans_in flows back to y and z.
         // d_y = d_ans_in, d_z = d_ans_in
@@ -547,16 +748,17 @@ impl LRM {
         let mut d_block_out = Array2::<f32>::zeros(d_z.raw_dim());
 
         // 3) Backprop through replayed recursion caches.
-        for rec in recs.iter().rev() {
+        for (rec, alpha) in rec_trace.iter().rev() {
             block_guard.set_cache(Some(rec.clone()));
             let rec_input = match rec {
                 CoreCache::Transformer(c) => &c.0,
                 CoreCache::Diffusion(c) => &c.input,
             };
 
-            // Gradient of z update: z_new = (1-a)z + a*block_out
+            // Gradient of z update (treat alpha as a detached step-size):
+            // z_new = (1-a)z + a*block_out
             // d_block_out = d_z * a
-            let a = self.config.latent_update_alpha;
+            let a = *alpha;
             d_block_out.assign(&d_z);
             d_block_out.mapv_inplace(|x| x * a);
 
@@ -588,7 +790,7 @@ impl LRM {
 
         // Normalize accumulated gradients by the number of contributions (1 final + N recursions)
         // This prevents gradient magnitude from scaling linearly with recursion depth
-        let num_contributions = 1.0 + recs.len() as f32;
+        let num_contributions = 1.0 + rec_trace.len() as f32;
         if num_contributions > 1.0 {
             for g in all.iter_mut() {
                 g.mapv_inplace(|x| x / num_contributions);
@@ -631,11 +833,65 @@ impl LRM {
                 .compute_gradients(_input, output_grads);
         }
 
-        // Use the last step state for the main backward pass
-        if let Some(last_step) = self.cached_step_states.last() {
-            self.compute_gradients_from_cache(last_step, output_grads)
+        if self.is_training && self.config.halting.enabled && self.config.halting.act_weighted_output {
+            // Full BPTT across outer refinement steps.
+            // Output is a weighted sum of step outputs, and later steps depend on earlier y.
+            if self.cached_step_states.is_empty() {
+                return (output_grads.clone(), Vec::new());
+            }
+
+            let mut d_next = Array2::<f32>::zeros(output_grads.raw_dim());
+            let mut accumulated_param_grads: Option<Vec<Array2<f32>>> = None;
+
+            for step in self.cached_step_states.iter().rev() {
+                let fallback_w;
+                let w = match step.halt_weight.as_ref() {
+                    Some(w) => w,
+                    None => {
+                        fallback_w = Array2::<f32>::ones((output_grads.nrows(), 1));
+                        &fallback_w
+                    }
+                };
+
+                // local_grad = output_grads * w (row-wise broadcast)
+                let mut local_grad = output_grads.clone();
+                for r in 0..local_grad.nrows() {
+                    let wr = w[[r, 0]];
+                    for c in 0..local_grad.ncols() {
+                        local_grad[[r, c]] *= wr;
+                    }
+                }
+                local_grad += &d_next;
+
+                let (d_y, step_param_grads) = self.compute_gradients_from_cache(step, &local_grad);
+                d_next = d_y;
+
+                match &mut accumulated_param_grads {
+                    None => {
+                        accumulated_param_grads = Some(step_param_grads);
+                    }
+                    Some(acc) => {
+                        if acc.len() == step_param_grads.len() {
+                            for (a, b) in acc.iter_mut().zip(step_param_grads.iter()) {
+                                a.zip_mut_with(b, |x, &y| *x += y);
+                            }
+                        } else {
+                            tracing::warn!(
+                                "LRM param gradient length mismatch across refinement steps"
+                            );
+                        }
+                    }
+                }
+            }
+
+            (d_next, accumulated_param_grads.unwrap_or_default())
         } else {
-            (output_grads.clone(), Vec::new())
+            // Legacy / faster path: only backprop through the last refinement step.
+            if let Some(last_step) = self.cached_step_states.last() {
+                self.compute_gradients_from_cache(last_step, output_grads)
+            } else {
+                (output_grads.clone(), Vec::new())
+            }
         }
     }
 
@@ -698,12 +954,12 @@ impl LRM {
             if parts.latent_w > 0 {
                 let gw = &param_grads[_idx];
                 _idx += 1;
-                li.w = &li.w - &(gw * lr);
+                Zip::from(&mut li.w).and(gw).for_each(|w, &g| *w -= lr * g);
             }
             if parts.latent_b > 0 {
                 let gb = &param_grads[_idx];
                 _idx += 1;
-                li.b = &li.b - &(gb * lr);
+                Zip::from(&mut li.b).and(gb).for_each(|b, &g| *b -= lr * g);
             }
         }
 
@@ -723,7 +979,8 @@ impl LRM {
         capture_caches: bool,
     ) -> Vec<CoreCache> {
         let mut block_guard = self.block.write().unwrap();
-        self.run_recursions_with_guard(&mut block_guard, y, z, capture_caches)
+        let mut scratch_combined = Array2::<f32>::zeros(y.raw_dim());
+        self.run_recursions_with_guard(&mut block_guard, y, z, &mut scratch_combined, capture_caches)
     }
 
     fn run_recursions_with_guard(
@@ -731,16 +988,19 @@ impl LRM {
         block_guard: &mut RecursiveBlockVariant,
         y: &Array2<f32>,
         z: &mut Array2<f32>,
+        scratch_combined: &mut Array2<f32>,
         capture_caches: bool,
     ) -> Vec<CoreCache> {
         let mut caches = Vec::new();
-        let mut combined = Array2::<f32>::zeros(y.raw_dim());
+        if scratch_combined.raw_dim() != y.raw_dim() {
+            *scratch_combined = Array2::<f32>::zeros(y.raw_dim());
+        }
 
         for r_step in 0..self.config.num_recursions {
-            combined.assign(y);
-            combined += &*z;
-            Self::sanitize(&mut combined);
-            let block_out = block_guard.forward_step(&combined, r_step);
+            scratch_combined.assign(y);
+            *scratch_combined += &*z;
+            Self::sanitize(scratch_combined);
+            let block_out = block_guard.forward_step(scratch_combined, r_step);
 
             if capture_caches {
                 if let Some(cache) = block_guard.get_cache() {
@@ -771,6 +1031,54 @@ impl LRM {
         }
 
         caches
+    }
+
+    fn run_recursions_trace_with_guard(
+        &self,
+        block_guard: &mut RecursiveBlockVariant,
+        y: &Array2<f32>,
+        z: &mut Array2<f32>,
+        scratch_combined: &mut Array2<f32>,
+    ) -> Vec<(CoreCache, f32)> {
+        let mut trace = Vec::new();
+        if scratch_combined.raw_dim() != y.raw_dim() {
+            *scratch_combined = Array2::<f32>::zeros(y.raw_dim());
+        }
+
+        for r_step in 0..self.config.num_recursions {
+            scratch_combined.assign(y);
+            *scratch_combined += &*z;
+            Self::sanitize(scratch_combined);
+            let block_out = block_guard.forward_step(scratch_combined, r_step);
+
+            let mut new_z = block_out;
+            Self::sanitize(&mut new_z);
+
+            let a_base = self.config.latent_update_alpha;
+            let mut diff = 0.0f32;
+            let mut nz = 0.0f32;
+            for (a, b) in new_z.iter().zip(z.iter()) {
+                diff += (*a - *b).abs();
+                nz += b.abs();
+            }
+            let rel = if nz > 0.0 { diff / nz } else { diff };
+            let a = (a_base / (1.0 + rel * self.config.adapt_scale))
+                .max(self.config.min_alpha)
+                .min(a_base);
+
+            if let Some(cache) = block_guard.get_cache() {
+                trace.push((cache, a));
+            }
+
+            let r = 1.0 - a;
+            if (r - 1.0).abs() > f32::EPSILON {
+                z.mapv_inplace(|v| v * r);
+            }
+            z.scaled_add(a, &new_z);
+            Self::sanitize(z);
+        }
+
+        trace
     }
 }
 
@@ -871,5 +1179,28 @@ mod tests {
         if !param_grads.is_empty() {
             let _ = lrm.apply_gradients(&param_grads, 1e-3);
         }
+    }
+
+    #[test]
+    fn test_lrm_training_act_halting_bptt_runs() {
+        let mut cfg = LRMConfig::default();
+        cfg.max_supervision_steps = 4;
+        cfg.max_inference_steps = 2;
+        cfg.halting.enabled = true;
+        cfg.halting.act_weighted_output = true;
+        cfg.mixture_of_depths.enabled = false; // keep test deterministic
+
+        let mut lrm = LRM::new(cfg);
+        lrm.set_training_mode(true);
+
+        let input = Array2::<f32>::zeros((4, 64));
+        let out = lrm.forward(&input);
+        assert_eq!(out.shape(), input.shape());
+
+        let grads = Array2::<f32>::ones(out.raw_dim());
+        let (in_grad, param_grads) = lrm.compute_gradients(&input, &grads);
+        assert_eq!(in_grad.shape(), input.shape());
+        assert!(!param_grads.is_empty());
+        lrm.apply_gradients(&param_grads, 1e-3).unwrap();
     }
 }

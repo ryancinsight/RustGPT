@@ -108,16 +108,13 @@ pub struct UnifiedAdaptiveResiduals {
 
 #[inline]
 fn softplus_beta(z: f32, beta: f32) -> f32 {
-    // Numerically-stable softplus: softplus(z) = ln(1 + exp(beta*z)) / beta
-    // Piecewise to avoid overflow/underflow. Smooth everywhere.
-    let x = z * beta;
-    if x > 20.0 {
-        z
-    } else if x < -20.0 {
-        x.exp() / beta
-    } else {
-        (1.0 + x.exp()).ln() / beta
+    // Numerically-stable softplus with temperature:
+    // softplus_beta(z) = log(1 + exp(beta*z)) / beta
+    // Uses the centralized `crate::soft` implementation (Pad backed exp).
+    if beta <= 0.0 {
+        return z.max(0.0);
     }
+    crate::soft::softplus_f32(z * beta) / beta
 }
 
 #[inline]
@@ -865,5 +862,19 @@ mod tests {
             "Recomputed matrix should have same values, diff: {}",
             diff
         );
+    }
+
+    #[test]
+    fn test_softplus_beta_extremes_are_finite() {
+        let beta = 10.0;
+
+        let hi = softplus_beta(1_000.0, beta);
+        assert!(hi.is_finite());
+        assert!((hi - 1_000.0).abs() < 1e-3);
+
+        let lo = softplus_beta(-1_000.0, beta);
+        assert!(lo.is_finite());
+        assert!(lo >= 0.0);
+        assert!(lo < 1e-6);
     }
 }
