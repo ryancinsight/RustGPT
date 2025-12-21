@@ -12,7 +12,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     } else if args.diffusion {
         ArchitectureType::Diffusion
     } else {
-        ArchitectureType::Transformer
+        ArchitectureType::Autoregressive
     };
 
     let use_dynamic_tanh_norm = true;

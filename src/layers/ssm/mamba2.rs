@@ -44,7 +44,7 @@ impl Layer for Mamba2 {
     }
 
     fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
-        self.inner.forward(input)
+        self.inner.forward_mamba2(input)
     }
 
     fn backward(&mut self, grads: &ndarray::Array2<f32>, lr: f32) -> ndarray::Array2<f32> {

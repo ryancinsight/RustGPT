@@ -299,16 +299,108 @@ impl LLM {
 
     /// Get the architecture name for metadata
     fn get_architecture_name(&self) -> String {
-        // In PolyAttention-only refactor, any presence of PolyAttention implies Transformer
-        let has_poly_attention = self
+        // Architecture is the *outer* model form (Transformer/TRM/Diffusion), while
+        // temporal mixing is an *internal* choice (Attention/RG-LRU/Mamba/etc.).
+        let has_diffusion = self
             .network
             .iter()
-            .any(|l| matches!(l, crate::LayerEnum::PolyAttention(_)));
+            .any(|l| matches!(l, crate::LayerEnum::DiffusionBlock(_)));
+        let has_trm = self.network.iter().any(|l| matches!(l, crate::LayerEnum::LRM(_)));
+        let has_transformer = self
+            .network
+            .iter()
+            .any(|l| matches!(l, crate::LayerEnum::TransformerBlock(_)));
 
-        if has_poly_attention {
-            "Transformer".to_string()
+        let base = if has_diffusion {
+            "Diffusion"
+        } else if has_trm {
+            "TRM"
+        } else if has_transformer {
+            "Transformer"
         } else {
-            "Unknown".to_string()
+            "Unknown"
+        };
+
+        // Try to infer the temporal-mixing variant actually present in the saved weights.
+        // If mixed, include a generic label.
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        enum TM {
+            Attention,
+            RgLruMoH,
+            RgLru,
+            Mamba,
+            Mamba2,
+        }
+
+        let mut tm_seen: Option<TM> = None;
+        let mut mixed = false;
+
+        for layer in &self.network {
+            let tm = match layer {
+                crate::LayerEnum::TransformerBlock(tb) => match &tb.temporal_mixing {
+                    crate::layers::components::common::TemporalMixingLayer::Attention(_) => {
+                        Some(TM::Attention)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
+                        Some(TM::RgLruMoH)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLru(_) => {
+                        Some(TM::RgLru)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Mamba(_) => {
+                        Some(TM::Mamba)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => {
+                        Some(TM::Mamba2)
+                    }
+                },
+                crate::LayerEnum::DiffusionBlock(db) => match &db.temporal_mixing {
+                    crate::layers::components::common::TemporalMixingLayer::Attention(_) => {
+                        Some(TM::Attention)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
+                        Some(TM::RgLruMoH)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::RgLru(_) => {
+                        Some(TM::RgLru)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Mamba(_) => {
+                        Some(TM::Mamba)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => {
+                        Some(TM::Mamba2)
+                    }
+                },
+                _ => None,
+            };
+
+            if let Some(tm) = tm {
+                if let Some(prev) = tm_seen {
+                    if prev != tm {
+                        mixed = true;
+                    }
+                } else {
+                    tm_seen = Some(tm);
+                }
+            }
+        }
+
+        let tm_suffix = if mixed {
+            Some("MixedTM")
+        } else {
+            match tm_seen {
+                Some(TM::Attention) => Some("Attention"),
+                Some(TM::RgLruMoH) => Some("RgLruMoH"),
+                Some(TM::RgLru) => Some("RgLru"),
+                Some(TM::Mamba) => Some("Mamba"),
+                Some(TM::Mamba2) => Some("Mamba2"),
+                None => None,
+            }
+        };
+
+        match tm_suffix {
+            Some(sfx) => format!("{}({})", base, sfx),
+            None => base.to_string(),
         }
     }
 
