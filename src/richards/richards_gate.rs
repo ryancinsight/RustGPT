@@ -114,6 +114,12 @@ pub struct RichardsGate {
     pub temperature: f32,
     /// Optimizer for temperature parameter
     pub temperature_optimizer: Adam,
+
+    /// Cache the last forward input so `Layer::backward` can be correct.
+    ///
+    /// Skipped in serialization to keep checkpoint compatibility.
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_input: Option<Array2<f32>>,
 }
 
 impl RichardsGate {
@@ -133,17 +139,7 @@ impl RichardsGate {
 
     #[inline]
     fn softplus(u: f32) -> f32 {
-        super::richards_curve::softplus_f32_richards(u)
-    }
-
-    #[inline]
-    fn inv_softplus(t: f32) -> f32 {
-        super::richards_curve::inv_softplus_f32_richards(t)
-    }
-
-    #[inline]
-    fn sigmoid_from_softplus(t: f32) -> f32 {
-        super::richards_curve::unit_from_softplus_f32_richards(t)
+        crate::richards::curve::numerics::softplus_f32_richards(u)
     }
 
     /// Create a new Richards gate with learned parameters
@@ -158,7 +154,7 @@ impl RichardsGate {
         curve.k_learnable = true;
         curve.m_learnable = true;
         curve.beta_learnable = false; // Fixed for stability
-        curve.temperature_learnable = false; // We handle temperature separately
+        curve.temperature_learnable = true; // Learn temperature inside RichardsCurve
         curve.output_gain_learnable = false; // Fixed to 1.0 for [0,1] range
         curve.output_bias_learnable = false; // Fixed to 0.0 for [0,1] range
         curve.scale_learnable = false; // Fixed for stability
@@ -169,26 +165,45 @@ impl RichardsGate {
         let log_temp_std = 0.1;
         let log_temp_dist = Normal::new(0.0, log_temp_std).unwrap();
         let log_temp: f32 = log_temp_dist.sample(&mut rng);
-        let temp_sample: f32 = super::richards_curve::exp_f32_richards(log_temp);
+        let temp_sample: f32 = crate::richards::curve::numerics::exp_f32_richards(log_temp);
+
+        // Seed the curve's learnable temperature.
+        curve.temperature = None;
+        curve.learned_temperature = Some(temp_sample as f64);
 
         Self {
             curve,
             temperature: temp_sample,
             temperature_optimizer: Adam::new((1, 1)),
+            cached_input: None,
         }
+    }
+
+    /// Set gate temperature (legacy mirror + curve-backed value).
+    ///
+    /// Temperature is conceptually a RichardsCurve parameter; this method keeps the legacy
+    /// `temperature` field in sync for backward compatibility.
+    pub fn set_temperature(&mut self, temperature: f32) {
+        let t = if temperature.is_finite() && temperature > 0.0 {
+            temperature
+        } else {
+            1.0
+        };
+        let t = Self::smooth_clamp(t, 0.1, 10.0, 10.0);
+        self.curve.learned_temperature = Some(t as f64);
+        self.temperature = t;
     }
 
     /// Create Richards gate with specific temperature
     pub fn with_temperature(temperature: f32) -> Self {
         let mut gate = Self::new();
-        gate.temperature = if temperature > 0.0 { temperature } else { 1.0 };
+        gate.set_temperature(temperature);
         gate
     }
 
     /// Forward pass: compute gating values (const version for immutable access)
     pub fn forward_const(&self, input: &Array2<f32>) -> Array2<f32> {
         let mut output = Array2::zeros(input.raw_dim());
-        let temp_reciprocal = 1.0 / self.temperature;
 
         // Reuse a per-row scratch buffer to avoid allocating Array1/Array2<f64>.
         let mut scratch_in: Vec<f32> = Vec::new();
@@ -202,7 +217,7 @@ impl RichardsGate {
             }
 
             for (j, &x) in row.iter().enumerate() {
-                scratch_in[j] = x * temp_reciprocal;
+                scratch_in[j] = x;
             }
 
             self.curve.forward_into_f32(&scratch_in, &mut scratch_out);
@@ -217,76 +232,32 @@ impl RichardsGate {
 
     /// Forward pass: compute gating values
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.cached_input = Some(input.clone());
         self.forward_const(input)
     }
 
-    /// Compute gradients for gating
-    /// Uses RichardsCurve's matrix gradient computation for proper batch processing
+    /// Compute gradients for gating.
+    ///
+    /// Delegates to RichardsCurve's matrix gradient computation.
+    /// Gate is configured so the curve learnable scalars are exactly: nu, k, m, temperature.
     pub fn compute_gradients(
         &self,
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let (batch_size, feature_dim) = input.dim();
+        let input_f64 = input.mapv(|x| x as f64);
+        let output_grads_f64 = output_grads.mapv(|x| x as f64);
 
-        // No explicit clamping: let the curve provide a smooth gate.
-        let temp_recip_f32 = 1.0 / self.temperature;
-        let temp_recip = temp_recip_f32 as f64;
-        let temp_recip_sq = temp_recip * temp_recip;
+        let grad_input_f64 = self.curve.backward_matrix(&input_f64, &output_grads_f64);
+        let grad_input = grad_input_f64.mapv(|x| x as f32);
 
-        // Scratch buffer for row-wise derivative.
-        let mut scaled_row: Vec<f32> = vec![0.0; feature_dim];
-        let mut dy_row: Vec<f32> = vec![0.0; feature_dim];
+        let scalar_grads = self.curve.grad_weights_matrix(&input_f64, &output_grads_f64);
+        let param_grads: Vec<Array2<f32>> = scalar_grads
+            .into_iter()
+            .map(|g| Array2::from_elem((1, 1), g as f32))
+            .collect();
 
-        // Accumulate grads.
-        let mut nu_grad = 0.0f64;
-        let mut k_grad = 0.0f64;
-        let mut m_grad = 0.0f64;
-        let mut temp_grad = 0.0f64;
-        let mut input_grads = Array2::zeros(input.raw_dim());
-
-        for sample_idx in 0..batch_size {
-            // x_scaled = x / T
-            for j in 0..feature_dim {
-                scaled_row[j] = input[[sample_idx, j]] * temp_recip_f32;
-            }
-
-            // dy_raw w.r.t x_scaled
-            self.curve.derivative_into_f32(&scaled_row, &mut dy_row);
-
-            for j in 0..feature_dim {
-                let grad_out = output_grads[[sample_idx, j]] as f64;
-                if grad_out == 0.0 {
-                    continue;
-                }
-
-                let grad_raw = grad_out;
-                let x = input[[sample_idx, j]] as f64;
-                let x_scaled = scaled_row[j] as f64;
-                let dy_dx_scaled = dy_row[j] as f64;
-
-                // Parameter grads (ν,k,m)
-                let param_grads = self.curve.grad_weights_scalar(x_scaled, grad_raw);
-                nu_grad += param_grads[0];
-                k_grad += param_grads[1];
-                m_grad += param_grads[2];
-
-                // Input grad: grad_raw * dy/dx_scaled * (1/T)
-                input_grads[[sample_idx, j]] = (grad_raw * dy_dx_scaled * temp_recip) as f32;
-
-                // Temperature grad: grad_raw * dy/dx_scaled * (-x/T^2)
-                temp_grad += grad_raw * dy_dx_scaled * (-x * temp_recip_sq);
-            }
-        }
-
-        let param_grads: Vec<Array2<f32>> = vec![
-            Array2::from_elem((1, 1), nu_grad as f32),
-            Array2::from_elem((1, 1), k_grad as f32),
-            Array2::from_elem((1, 1), m_grad as f32),
-            Array2::from_elem((1, 1), temp_grad as f32),
-        ];
-
-        (input_grads, param_grads)
+        (grad_input, param_grads)
     }
 
     /// Apply gradients to parameters
@@ -295,42 +266,32 @@ impl RichardsGate {
         gradients: &[Array2<f32>],
         learning_rate: f32,
     ) -> Result<(), crate::errors::ModelError> {
-        if gradients.len() != 4 {
-            // nu, k, m, temperature
+        if gradients.len() != self.curve.scalar_weights_len() {
             return Err(crate::errors::ModelError::GradientError {
-                message: format!("RichardsGate expected 4 gradients, got {}", gradients.len()),
+                message: format!(
+                    "RichardsGate expected {} gradients, got {}",
+                    self.curve.scalar_weights_len(),
+                    gradients.len()
+                ),
             });
         }
 
-        // Apply gradients to Richards curve parameters
-        let nu_grad = gradients[0][[0, 0]] as f64;
-        let k_grad = gradients[1][[0, 0]] as f64;
-        let m_grad = gradients[2][[0, 0]] as f64;
-        let curve_grads = vec![nu_grad, k_grad, m_grad];
+        // Flatten scalar gradients in the curve's internal order and step the curve.
+        let mut curve_grads: Vec<f64> = Vec::with_capacity(gradients.len());
+        for g in gradients {
+            curve_grads.push(g[[0, 0]] as f64);
+        }
         self.curve.step(&curve_grads, learning_rate as f64);
 
-        // Apply temperature gradient
-        let temp_grad = gradients[3][[0, 0]];
-        // Update temperature using softplus parameterization:
-        // T = softplus(u) ensures T > 0 without hard clipping.
-        // dT/du = sigmoid(u). If we only have T, sigmoid(u) = 1 - exp(-T).
-        let t = if self.temperature > 0.0 {
-            self.temperature
-        } else {
-            1e-6
-        };
-        let u = Self::inv_softplus(t);
-        let d_t_d_u = Self::sigmoid_from_softplus(t);
-        let grad_u = temp_grad * d_t_d_u;
+        // Keep the curve temperature in a stable operating range.
+        if self.curve.temperature_learnable {
+            let t = self.curve.effective_temperature() as f32;
+            let t = Self::smooth_clamp(t, 0.1, 10.0, 10.0);
+            self.curve.learned_temperature = Some(t as f64);
+        }
 
-        let mut u_arr = Array2::from_elem((1, 1), u);
-        let grad_u_arr = Array2::from_elem((1, 1), grad_u);
-        self.temperature_optimizer
-            .step(&mut u_arr, &grad_u_arr, learning_rate);
-        self.temperature = Self::softplus(u_arr[[0, 0]]);
-
-        // Keep temperature in a stable operating range without hard clipping.
-        self.temperature = Self::smooth_clamp(self.temperature, 0.1, 10.0, 10.0);
+        // Maintain legacy mirror field for compatibility/debugging.
+        self.temperature = self.curve.effective_temperature() as f32;
 
         Ok(())
     }
@@ -338,26 +299,24 @@ impl RichardsGate {
     /// Get parameter count for RichardsGate
     /// Richards curve scalars (nu, k, m) + temperature parameter
     pub fn parameters(&self) -> usize {
-        self.curve.scalar_weights_len() + 1 // Richards curve scalars + temperature
+        self.curve.scalar_weights_len()
     }
 
     /// Get weight norm for regularization
     pub fn weight_norm(&self) -> f32 {
-        // Calculate weight norm from curve weights and temperature
+        // Calculate weight norm from curve weights (includes temperature when learnable)
         let curve_weights = self.curve.weights();
         let curve_norm = curve_weights
             .iter()
             .map(|&w| (w as f32) * (w as f32))
             .sum::<f32>()
             .sqrt();
-        curve_norm + self.temperature.powi(2)
+        curve_norm
     }
 
     /// Get weights as a vector (for compatibility with RichardsCurve interface)
     pub fn weights(&self) -> Vec<f64> {
-        let mut weights = self.curve.weights();
-        weights.push(self.temperature as f64);
-        weights
+        self.curve.weights()
     }
 
     /// Check if parameters have been trained (always true for RichardsGate)
@@ -425,12 +384,20 @@ impl Layer for RichardsGate {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        // For RichardsGate, backward pass computes gradients and applies them
-        let dummy_input = Array2::zeros(grads.raw_dim());
-        let (_, param_grads) = self.compute_gradients(&dummy_input, grads);
+        // For RichardsGate, backward pass computes gradients w.r.t the last forward input.
+        // If called without a prior forward, fall back to a zero input to avoid panics.
+        let mut fallback_input: Option<Array2<f32>> = None;
+        let input = match self.cached_input.as_ref() {
+            Some(x) => x,
+            None => {
+                fallback_input = Some(Array2::zeros(grads.raw_dim()));
+                fallback_input.as_ref().unwrap()
+            }
+        };
+
+        let (input_grads, param_grads) = self.compute_gradients(input, grads);
         let _ = self.apply_gradients(&param_grads, lr);
-        // Return input gradients (simplified - would need proper computation)
-        Array2::zeros(grads.raw_dim())
+        input_grads
     }
 
     fn weight_norm(&self) -> f32 {
@@ -614,17 +581,14 @@ mod tests {
         // Numerical gradient check for temperature parameter
         // f32 forward path: use a larger epsilon to avoid numerical cancellation.
         let eps = 1e-3;
-        let temp_orig = gate.temperature;
+        let temp_orig = gate.curve.effective_temperature() as f32;
 
         // Forward pass with original temperature
         let output_orig = gate.forward(&input);
 
         // Forward pass with perturbed temperature
-        let mut gate_pert = RichardsGate {
-            curve: gate.curve.clone(),
-            temperature: temp_orig + eps,
-            temperature_optimizer: gate.temperature_optimizer.clone(),
-        };
+        let mut gate_pert = gate.clone();
+        gate_pert.set_temperature(temp_orig + eps);
         let output_pert = gate_pert.forward(&input);
 
         // Numerical gradient
@@ -661,7 +625,7 @@ mod tests {
         let mut gate = RichardsGate::new();
 
         // Test parameter clamping
-        gate.temperature = 100.0; // Way outside bounds
+        gate.set_temperature(100.0); // Way outside bounds
         let _ = gate.apply_gradients(
             &vec![
                 Array2::zeros((1, 1)), // nu grad

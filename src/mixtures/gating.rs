@@ -38,6 +38,18 @@ pub enum GatingStrategy {
         sparsity_weight: f32,
         /// Weight for complexity alignment loss (aligns usage with predicted complexity)
         complexity_loss_weight: f32,
+    
+        /// Weight for importance loss (balances soft routing mass across components).
+        ///
+        /// Uses MixtureMetrics.active_sum_per_component rather than token counts.
+        #[serde(default)]
+        importance_loss_weight: f32,
+    
+        /// Weight for Switch/GShard-style combined load+importance loss.
+        ///
+        /// This is often a robust default for MoE routers.
+        #[serde(default)]
+        switch_balance_weight: f32,
     },
     /// Soft top-p gating: Differentiable top-p selection using AutoDeco-inspired soft sampling
     ///
@@ -80,6 +92,14 @@ pub struct GatingConfig {
     pub sparsity_weight: f32,
     /// Weight for complexity alignment loss
     pub complexity_loss_weight: f32,
+    
+    /// Weight for importance loss (balances routing probability mass)
+    #[serde(default)]
+    pub importance_loss_weight: f32,
+    
+    /// Weight for Switch/GShard-style combined balance loss
+    #[serde(default)]
+    pub switch_balance_weight: f32,
     /// Shared metrics for tracking activation patterns
     pub metrics: MixtureMetrics,
 }
@@ -95,6 +115,8 @@ impl Default for GatingConfig {
             load_balance_weight: 0.0,
             sparsity_weight: 0.0,
             complexity_loss_weight: 0.0,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
             metrics: MixtureMetrics::default(),
         }
     }
@@ -109,6 +131,8 @@ impl GatingConfig {
                 load_balance_weight,
                 sparsity_weight,
                 complexity_loss_weight,
+                importance_loss_weight,
+                switch_balance_weight,
             } => Self {
                 use_learned_predictor: true,
                 use_soft_top_p: false,
@@ -118,6 +142,8 @@ impl GatingConfig {
                 load_balance_weight: *load_balance_weight,
                 sparsity_weight: *sparsity_weight,
                 complexity_loss_weight: *complexity_loss_weight,
+                importance_loss_weight: *importance_loss_weight,
+                switch_balance_weight: *switch_balance_weight,
                 metrics: MixtureMetrics::new(num_components),
             },
             GatingStrategy::SoftTopP {
@@ -132,6 +158,8 @@ impl GatingConfig {
                 load_balance_weight: 0.0,
                 sparsity_weight: 0.0,
                 complexity_loss_weight: 0.0,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
                 metrics: MixtureMetrics::new(num_components),
             },
             GatingStrategy::Fixed { num_active } => Self {
@@ -143,9 +171,21 @@ impl GatingConfig {
                 load_balance_weight: 0.0,
                 sparsity_weight: 0.0,
                 complexity_loss_weight: 0.0,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
                 metrics: MixtureMetrics::new(num_components),
             },
         }
+    }
+
+    /// Importance loss for training (balances soft routing mass)
+    pub fn compute_importance_loss(&self) -> f32 {
+        self.metrics.compute_importance_loss()
+    }
+
+    /// Switch/GShard-style combined balance loss
+    pub fn compute_switch_balance_loss(&self) -> f32 {
+        self.metrics.compute_switch_balance_loss()
     }
 
     /// Reset metrics when strategy changes
@@ -157,14 +197,11 @@ impl GatingConfig {
     /// gate_values: shape (num_tokens, num_components) - gating values for each token-component
     /// pair
     pub fn update_metrics(&mut self, gate_values: &ndarray::ArrayView2<f32>) {
-        // Validate that the number of components matches our configuration
+        // Ensure metrics are properly sized. A default-constructed config starts with 0
+        // components and is expected to be resized on first use.
         let num_components = gate_values.ncols();
         if self.metrics.active_sum_per_component.len() != num_components {
-            eprintln!(
-                "Warning: GatingConfig component count mismatch. Expected {}, got {}. This may indicate improper initialization.",
-                self.metrics.active_sum_per_component.len(),
-                num_components
-            );
+            self.metrics.resize(num_components);
         }
         self.metrics.update(gate_values);
     }
@@ -257,6 +294,8 @@ mod tests {
         assert!(!config.use_learned_predictor);
         assert_eq!(config.num_active, 2);
         assert_eq!(config.load_balance_weight, 0.0);
+        assert_eq!(config.importance_loss_weight, 0.0);
+        assert_eq!(config.switch_balance_weight, 0.0);
     }
 
     #[test]
@@ -266,6 +305,8 @@ mod tests {
             load_balance_weight: 0.1,
             sparsity_weight: 0.01,
             complexity_loss_weight: 0.05,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
         };
 
         let config = GatingConfig::from_strategy(&strategy, 8);

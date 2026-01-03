@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use super::{RichardsCurve, Variant};
+use crate::richards::{RichardsCurve, Variant};
 use crate::network::Layer;
 
 // EMA smoothing factor for gradient norm tracking inside RichardsNorm
@@ -31,6 +31,12 @@ pub struct RichardsNorm {
     /// Cached input for backward
     cached_input: Option<Array2<f32>>,
 
+    /// Cached Richards curve with dynamic adjustments applied during the last `forward`.
+    ///
+    /// This ensures gradients are computed against the exact curve used in the forward pass.
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_adjusted_richards: Option<RichardsCurve>,
+
     /// Richards curve for tanh-like computation with learnable parameters and per-feature
     /// transformations
     richards: RichardsCurve,
@@ -42,43 +48,52 @@ pub struct RichardsNorm {
 impl RichardsNorm {
     /// Create a new RichardsNorm layer
     pub fn new(embedding_dim: usize) -> Self {
-        // Start with learnable Richards for Tanh variant
+        // Start with a Richards curve in Tanh variant.
+        //
+        // DynamicTanh-style normalization assumes an odd, symmetric squashing function.
+        // To preserve this property, we keep the symmetry-critical params fixed:
+        // - nu = 1 and beta = 1 so the underlying logistic satisfies σ(-x)=1-σ(x)
+        // - m = 0 and shift = 0 so the curve remains centered/odd
+        //
+        // The *dynamic* part is expressed via temperature/scale (input sharpness), and
+        // the learned per-feature affine (gamma/bias).
         let mut richards = RichardsCurve::new_learnable(Variant::Tanh);
 
-        // Set fixed parameter values for tanh approximation (keep zero-mean properties)
-        richards.nu = None; // Learnable
-        richards.k = None; // Learnable
-        richards.m = Some(0.0); // Fixed to maintain odd function (zero-mean)
-        richards.beta = None; // Learnable
-        richards.output_gain = Some(1.0); // Fixed to maintain scale
-        richards.output_bias = Some(0.0); // Fixed to maintain zero-mean
-        richards.scale = None; // Learnable
-        richards.shift = Some(0.0); // Fixed to maintain odd function
+        // Fix symmetry/oddness-critical params.
+        richards.nu = Some(1.0);
+        richards.beta = Some(1.0);
+        richards.m = Some(0.0);
+        richards.shift = Some(0.0);
+        richards.output_gain = Some(1.0);
+        richards.output_bias = Some(0.0);
 
-        // Initialize learned parameters
-        richards.learned_nu = Some(1.0);
-        richards.learned_k = Some(1.0);
-        richards.learned_beta = Some(1.0);
-        richards.learned_temperature = Some(1.0);
-        richards.learned_scale = Some(1.0);
-
-        // Set learnability: nu, k, beta, temperature, scale learnable; shift fixed
-        richards.nu_learnable = true;
-        richards.k_learnable = true;
+        richards.nu_learnable = false;
+        richards.beta_learnable = false;
         richards.m_learnable = false;
-        richards.beta_learnable = true;
-        richards.temperature_learnable = true;
+        richards.shift_learnable = false;
         richards.output_gain_learnable = false;
         richards.output_bias_learnable = false;
-        richards.scale_learnable = true; // RichardsNorm allows RichardsCurve to learn input scaling
-        richards.shift_learnable = false;
+
+        // Keep sharpness learnable/dynamic.
+        richards.k = None;
+        richards.temperature = None;
+        richards.scale = None;
+        richards.k_learnable = true;
+        richards.temperature_learnable = true;
+        richards.scale_learnable = true;
+
+        // Initialize learned parameters (only the learnable subset matters).
+        richards.learned_k = Some(1.0);
+        richards.learned_temperature = Some(1.0);
+        richards.learned_scale = Some(1.0);
 
         // Enable per-feature transformations (gamma, bias) for normalization
         richards.enable_per_feature_transform(embedding_dim);
 
-        // Validate that RichardsCurve has exactly the expected learnable parameters
-        // RichardsNorm expects: nu, k, beta, temperature, scale (5 parameters)
-        let expected_learnable = [true, true, false, true, true, false, false, true, false]; // nu, k, m, beta, temp, gain, bias, scale, shift
+        // Validate that RichardsCurve has exactly the expected learnable parameters.
+        // RichardsNorm expects: k, temperature, scale (3 scalar parameters), plus per-feature
+        // gamma/bias.
+        let expected_learnable = [false, true, false, false, true, false, false, true, false]; // nu, k, m, beta, temp, gain, bias, scale, shift
         let actual_learnable = [
             richards.nu_learnable,
             richards.k_learnable,
@@ -98,6 +113,7 @@ impl RichardsNorm {
 
         Self {
             cached_input: None,
+            cached_adjusted_richards: None,
             richards,
             grad_norm_ema: None,
         }
@@ -112,7 +128,7 @@ impl RichardsNorm {
         // Compute Frobenius norm for scale-aware adjustments
         let frob_norm = (input.iter().map(|&x| (x as f64).powi(2)).sum::<f64>()).sqrt();
 
-        // Compute activation statistics
+        // Compute activation statistics (variance used for gentle damping).
         let mean = input.iter().map(|&x| x as f64).sum::<f64>() / (input.len() as f64);
         let variance = input
             .iter()
@@ -131,28 +147,18 @@ impl RichardsNorm {
         let grad_ema = self.grad_norm_ema.unwrap_or(1.0) as f64;
         // Stability factor reduces temperature when gradients are high
         let stability_factor = 1.0 / (1.0 + 0.25 * grad_ema.max(1e-6));
-        let temp_adjustment = scale_ratio.powf(0.5) * stability_factor; // Square root for smoother scaling + gradient-aware damping
-        let adjusted_temp = self.richards.temperature.map(|t| t * temp_adjustment);
+        // Use a gentle power to avoid extreme sharpness when activations are small.
+        // In this codebase, larger temperature => softer curve (input divided by T).
+        let temp_adjustment = scale_ratio.powf(0.25) * stability_factor;
+        let curr_temp = self.richards.effective_temperature();
+        let adjusted_temp = Some((curr_temp * temp_adjustment).clamp(0.25, 5.0));
 
-        // Dynamic midpoint adjustment to center around data distribution
-        // Reduce midpoint shifting when gradients are high for stability
-        let midpoint_shift = mean * 0.1 * stability_factor; // Small, gradient-aware adjustment
-        let adjusted_m = self.richards.m.map(|m| m + midpoint_shift);
-
-        // Adaptive asymmetry based on variance
-        // Higher variance → more symmetric curve (beta → 1.0)
-        // Lower variance → preserve learned asymmetry
-        let adjusted_beta = if self.richards.beta_learnable {
-            if let Some(learned_beta) = self.richards.learned_beta {
-                let symmetry_factor = (std_dev / target_scale).max(0.1).min(2.0);
-                let adaptive_beta = 1.0 + (learned_beta - 1.0) / symmetry_factor;
-                Some(adaptive_beta.max(1e-6).min(10.0))
-            } else {
-                self.richards.beta
-            }
-        } else {
-            self.richards.beta
-        };
+        // For DynamicTanh-style normalization we keep the curve centered/odd and symmetric.
+        // So we do NOT dynamically shift the midpoint (m) and we do NOT change asymmetry (beta).
+        // We return the fixed values for clarity.
+        let _ = (mean, std_dev); // keep stats available for future refinement
+        let adjusted_m = Some(0.0);
+        let adjusted_beta = Some(1.0);
 
         (adjusted_temp, adjusted_m, adjusted_beta)
     }
@@ -162,7 +168,17 @@ impl RichardsNorm {
         // Cache input for backward (needed for gradient computation)
         self.cached_input = Some(input.clone());
 
-        self.normalize_impl(input)
+        // Compute dynamic parameter adjustments and cache the exact curve used.
+        let (adjusted_temp, adjusted_m, adjusted_beta) = self.compute_dynamic_adjustments(input);
+        let mut temp_richards = self.richards.clone();
+        temp_richards.temperature = adjusted_temp;
+        temp_richards.m = adjusted_m;
+        temp_richards.beta = adjusted_beta;
+        self.cached_adjusted_richards = Some(temp_richards.clone());
+
+        let mut out = Array2::<f32>::zeros(input.dim());
+        temp_richards.forward_matrix_f32_into(input, &mut out);
+        out
     }
 
     /// Forward normalization with dynamic parameter adjustments (immutable for inference)
@@ -207,18 +223,23 @@ impl Layer for RichardsNorm {
             .as_ref()
             .expect("forward must be called before compute_gradients");
 
+        // Use the adjusted curve from the last forward (training path) when available.
+        // This keeps gradients consistent with dynamic parameter adjustments.
+        let richards = self
+            .cached_adjusted_richards
+            .as_ref()
+            .unwrap_or(&self.richards);
+
         // Convert to f64 for RichardsCurve computation
         let input_f64 = input.mapv(|x| x as f64);
         let output_grads_f64 = output_grads.mapv(|x| x as f64);
 
         // Compute gradients through RichardsCurve with per-feature transformations
         // This will handle gamma/bias gradients internally
-        let richards_grads = self
-            .richards
-            .grad_weights_matrix(&input_f64, &output_grads_f64);
+        let richards_grads = richards.grad_weights_matrix(&input_f64, &output_grads_f64);
 
         // Compute input gradients: chain rule through RichardsCurve
-        let grad_input_f64 = self.richards.backward_matrix(&input_f64, &output_grads_f64);
+        let grad_input_f64 = richards.backward_matrix(&input_f64, &output_grads_f64);
         let grad_input = grad_input_f64.mapv(|x| x as f32);
 
         // Extract gradients by parameter type (nu, k, beta, temperature, scale, gamma, bias)
@@ -226,47 +247,47 @@ impl Layer for RichardsNorm {
         let mut pos = 0;
 
         // Scalar parameters
-        if self.richards.nu_learnable {
+        if richards.nu_learnable {
             grad_vecs
                 .push(Array2::from_shape_vec((1, 1), vec![richards_grads[pos] as f32]).unwrap());
             pos += 1;
         }
-        if self.richards.k_learnable {
+        if richards.k_learnable {
             grad_vecs
                 .push(Array2::from_shape_vec((1, 1), vec![richards_grads[pos] as f32]).unwrap());
             pos += 1;
         }
-        if self.richards.m_learnable {
+        if richards.m_learnable {
             pos += 1; // Skip m gradient
         }
-        if self.richards.beta_learnable {
+        if richards.beta_learnable {
             grad_vecs
                 .push(Array2::from_shape_vec((1, 1), vec![richards_grads[pos] as f32]).unwrap());
             pos += 1;
         }
-        if self.richards.temperature_learnable {
+        if richards.temperature_learnable {
             grad_vecs
                 .push(Array2::from_shape_vec((1, 1), vec![richards_grads[pos] as f32]).unwrap());
             pos += 1;
         }
-        if self.richards.output_gain_learnable {
+        if richards.output_gain_learnable {
             pos += 1; // Skip output_gain gradient
         }
-        if self.richards.output_bias_learnable {
+        if richards.output_bias_learnable {
             pos += 1; // Skip output_bias gradient
         }
-        if self.richards.scale_learnable {
+        if richards.scale_learnable {
             grad_vecs
                 .push(Array2::from_shape_vec((1, 1), vec![richards_grads[pos] as f32]).unwrap());
             pos += 1;
         }
-        if self.richards.shift_learnable {
+        if richards.shift_learnable {
             pos += 1; // Skip shift gradient
         }
 
         // Array parameters (gamma, bias)
-        if self.richards.gamma_learnable {
-            let gamma_size = self.richards.gamma.as_ref().unwrap().len();
+        if richards.gamma_learnable {
+            let gamma_size = richards.gamma.as_ref().unwrap().len();
             let gamma_grads: Vec<f32> = richards_grads[pos..pos + gamma_size]
                 .iter()
                 .map(|&x| x as f32)
@@ -274,8 +295,8 @@ impl Layer for RichardsNorm {
             grad_vecs.push(Array2::from_shape_vec((1, gamma_size), gamma_grads).unwrap());
             pos += gamma_size;
         }
-        if self.richards.bias_learnable {
-            let bias_size = self.richards.bias.as_ref().unwrap().len();
+        if richards.bias_learnable {
+            let bias_size = richards.bias.as_ref().unwrap().len();
             let bias_grads: Vec<f32> = richards_grads[pos..pos + bias_size]
                 .iter()
                 .map(|&x| x as f32)
@@ -294,22 +315,12 @@ impl Layer for RichardsNorm {
         param_grads: &[Array2<f32>],
         lr: f32,
     ) -> crate::errors::Result<()> {
-        // Collect all gradients into a flat vector for RichardsCurve step method
-        let mut all_grads = Vec::new();
-
-        // Add scalar parameter gradients
-        for grad_array in param_grads.iter().take(5) {
-            all_grads.push(grad_array[[0, 0]] as f64);
-        }
-
-        // Add gamma array gradients (flattened)
-        if let Some(gamma_grads) = param_grads.get(5) {
-            all_grads.extend(gamma_grads.iter().map(|&x| x as f64));
-        }
-
-        // Add bias array gradients (flattened)
-        if let Some(bias_grads) = param_grads.get(6) {
-            all_grads.extend(bias_grads.iter().map(|&x| x as f64));
+        // Collect all gradients into a flat vector for RichardsCurve step method.
+        // `param_grads` is already ordered to match the `RichardsCurve`'s internal
+        // learnable parameter order.
+        let mut all_grads = Vec::with_capacity(self.richards.weights_len());
+        for g in param_grads {
+            all_grads.extend(g.iter().map(|&x| x as f64));
         }
 
         // Apply gradients to RichardsCurve (which now includes gamma/bias)

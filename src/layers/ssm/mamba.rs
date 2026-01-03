@@ -2,7 +2,13 @@ use ndarray::{Array1, Array2, Axis};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{adam::Adam, errors::Result, network::Layer, rng::get_rng};
+use crate::{
+    adam::Adam,
+    errors::Result,
+    network::Layer,
+    richards::{dsilu_f32, sigmoid_f32, silu_f32},
+    rng::get_rng,
+};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MambaCachedKind {
@@ -11,28 +17,8 @@ enum MambaCachedKind {
 }
 
 #[inline]
-fn sigmoid(x: f32) -> f32 {
-    use std::sync::OnceLock;
-    static CURVE: OnceLock<crate::richards::RichardsCurve> = OnceLock::new();
-    let curve = CURVE.get_or_init(|| crate::richards::RichardsCurve::sigmoid(false));
-    curve.forward_scalar(x as f64) as f32
-}
-
-#[inline]
 fn softplus(x: f32) -> f32 {
-    crate::soft::softplus_f32(x)
-}
-
-#[inline]
-fn silu(x: f32) -> f32 {
-    x * sigmoid(x)
-}
-
-#[inline]
-fn dsilu(x: f32) -> f32 {
-    // d/dx (x * sigmoid(x)) = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))
-    let s = sigmoid(x);
-    s + x * s * (1.0 - s)
+    crate::soft::softplus(x)
 }
 
 /// A more complete Mamba-style selective SSM layer.
@@ -536,8 +522,8 @@ impl Mamba {
         let u_pre = in2.slice(ndarray::s![.., 0..d]).to_owned();
         let gate_logits = in2.slice(ndarray::s![.., d..2 * d]).to_owned();
 
-        let u_act = u_pre.mapv(silu);
-        let gate = gate_logits.mapv(sigmoid);
+        let u_act = u_pre.mapv(silu_f32);
+        let gate = gate_logits.mapv(sigmoid_f32);
 
         // Canonical-style dt: learned via the in-projection stream (u_pre), not via an extra D×D projection.
         // This keeps parameter count unchanged while allowing per-token/per-channel dt.
@@ -588,7 +574,7 @@ impl Mamba {
                     state_prev[[ti, idx]] = prev;
 
                     let a_scale = a_scale_state[[j, k]];
-                    let aj = crate::pade::exp_f32(-dtj * a_scale).clamp(0.0, 1.0);
+                    let aj = crate::pade::exp(-dtj * a_scale).clamp(0.0, 1.0);
                     let inp = b_t[[ti, k]] * uj;
                     let kk = (1.0 - aj) / a_scale;
                     let sj = aj * prev + kk * inp;
@@ -655,8 +641,8 @@ impl Mamba {
         let u_pre = in2.slice(ndarray::s![.., 0..d]).to_owned();
         let gate_logits = in2.slice(ndarray::s![.., d..2 * d]).to_owned();
 
-        let u_act = u_pre.mapv(silu);
-        let gate = gate_logits.mapv(sigmoid);
+        let u_act = u_pre.mapv(silu_f32);
+        let gate = gate_logits.mapv(sigmoid_f32);
 
         // dt (matches current Mamba impl here: derived from u_pre)
         let dt_logits = u_pre.clone();
@@ -722,7 +708,7 @@ impl Mamba {
         for ti in 0..t {
             for h in 0..num_heads {
                 a_head[[ti, h]] =
-                    crate::pade::exp_f32(-dt_head[[ti, h]] * a_scale_head[[0, h]]).clamp(0.0, 1.0);
+                    crate::pade::exp(-dt_head[[ti, h]] * a_scale_head[[0, h]]).clamp(0.0, 1.0);
             }
         }
 
@@ -947,7 +933,8 @@ impl Mamba {
             let he = head_offsets[h + 1];
             let denom = (he - hs).max(1) as f32;
             for j in hs..he {
-                grad_a_log[[0, j]] += (d_a_scale_head[h] / denom) * sigmoid(self.a_log[[0, j]]);
+                grad_a_log[[0, j]] +=
+                    (d_a_scale_head[h] / denom) * sigmoid_f32(self.a_log[[0, j]]);
             }
         }
 
@@ -955,7 +942,7 @@ impl Mamba {
         let mut d_dt_logits = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                d_dt_logits[[ti, j]] = d_dt[[ti, j]] * sigmoid(dt_logits[[ti, j]]);
+                d_dt_logits[[ti, j]] = d_dt[[ti, j]] * sigmoid_f32(dt_logits[[ti, j]]);
             }
         }
 
@@ -994,7 +981,7 @@ impl Mamba {
         let mut d_u_pre = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                d_u_pre[[ti, j]] = d_u_act[[ti, j]] * dsilu(u_pre[[ti, j]]);
+                d_u_pre[[ti, j]] = d_u_act[[ti, j]] * dsilu_f32(u_pre[[ti, j]]);
             }
         }
 
@@ -1245,7 +1232,7 @@ impl Layer for Mamba {
 
                     let prev = state_prev[[ti, idx]];
                     let a_scale = a_scale_state[[j, k]];
-                    let aj = crate::pade::exp_f32(-dtj * a_scale).clamp(0.0, 1.0);
+                    let aj = crate::pade::exp(-dtj * a_scale).clamp(0.0, 1.0);
                     let inp = b_t[[ti, k]] * uj;
                     let kk = (1.0 - aj) / a_scale;
 
@@ -1272,7 +1259,8 @@ impl Layer for Mamba {
         let mut d_a_logits_state = Array2::<f32>::zeros((d, n));
         for j in 0..d {
             for k in 0..n {
-                d_a_logits_state[[j, k]] = d_a_scale[[j, k]] * sigmoid(a_logits_state[[j, k]]);
+                d_a_logits_state[[j, k]] =
+                    d_a_scale[[j, k]] * sigmoid_f32(a_logits_state[[j, k]]);
             }
         }
 
@@ -1293,7 +1281,7 @@ impl Layer for Mamba {
         let mut d_dt_logits = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                d_dt_logits[[ti, j]] = d_dt[[ti, j]] * sigmoid(dt_logits[[ti, j]]);
+                d_dt_logits[[ti, j]] = d_dt[[ti, j]] * sigmoid_f32(dt_logits[[ti, j]]);
             }
         }
 
@@ -1333,7 +1321,7 @@ impl Layer for Mamba {
         let mut d_u_pre = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                d_u_pre[[ti, j]] = d_u_act[[ti, j]] * dsilu(u_pre[[ti, j]]);
+                d_u_pre[[ti, j]] = d_u_act[[ti, j]] * dsilu_f32(u_pre[[ti, j]]);
             }
         }
 

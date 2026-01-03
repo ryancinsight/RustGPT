@@ -9,7 +9,7 @@ use crate::{
     errors::Result,
     layers::{
         components::{
-            adaptive_residuals::{AdaptiveResidualStrategy, UnifiedAdaptiveResiduals},
+            adaptive_residuals::AdaptiveResiduals,
             common::{
                 CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
                 apply_adaptive_gradients, sanitize_and_clip_gradients,
@@ -658,7 +658,7 @@ pub struct DiffusionBlock {
     #[serde(skip)]
     pub param_partitions: RwLock<Option<DiffusionParamPartitions>>,
     #[serde(skip)]
-    pub adaptive_residuals: Option<UnifiedAdaptiveResiduals>,
+    pub adaptive_residuals: Option<AdaptiveResiduals>,
 }
 
 impl DiffusionBlock {
@@ -726,7 +726,7 @@ impl DiffusionBlock {
             current_timestep: 0,
             param_partitions: RwLock::new(None),
             adaptive_residuals: if config.use_advanced_adaptive_residuals {
-                let mut residuals = UnifiedAdaptiveResiduals::new(config.embed_dim);
+                let mut residuals = AdaptiveResiduals::new_minimal(config.embed_dim);
                 residuals.max_seq_len = config.num_timesteps.min(2048);
                 Some(residuals)
             } else {
@@ -995,7 +995,7 @@ impl DiffusionBlock {
             Self::apply_dropout_inplace(&mut ffn_out, self.dropout_rate);
         }
         // Apply advanced adaptive residuals for FFN residual connection if enabled
-        let output = if let Some(ref adaptive_residuals) = self.adaptive_residuals {
+        let output = if let Some(ref mut adaptive_residuals) = self.adaptive_residuals {
             adaptive_residuals.apply_ffn_residual(&residual1, &ffn_out)
         } else {
             // Standard residual connection
@@ -1730,7 +1730,7 @@ mod tests {
         let embed_dim = 64;
         let num_timesteps = 1000;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
         residuals.max_seq_len = num_timesteps.min(2048);
 
         assert_eq!(
@@ -1746,7 +1746,7 @@ mod tests {
         let seq_len = 8;
         let num_timesteps = 100;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
         residuals.max_seq_len = num_timesteps.min(2048);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
@@ -1768,7 +1768,7 @@ mod tests {
         let seq_len = 4;
         let num_timesteps = 100;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
         residuals.max_seq_len = num_timesteps.min(2048);
 
         let input = Array2::from_elem((seq_len, embed_dim), 0.1);
@@ -1798,7 +1798,7 @@ mod tests {
         let seq_len = 2;
         let num_timesteps = 100;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
         residuals.max_seq_len = num_timesteps.min(2048);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
@@ -1827,7 +1827,7 @@ mod tests {
     #[test]
     fn test_residual_parameter_count() {
         let embed_dim = 16;
-        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         let param_count = residuals.parameter_count();
         let expected_base = embed_dim * embed_dim

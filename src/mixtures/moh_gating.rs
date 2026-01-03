@@ -13,6 +13,187 @@ use crate::{
     rng::get_rng,
 };
 
+fn enforce_min_max_heads_inplace(
+    g_mat: &Array2<f32>,
+    m_mat: &mut Array2<f32>,
+    min_heads: usize,
+    max_heads: usize,
+    always_on_heads: &[usize],
+    renormalize_to_k: Option<usize>,
+) {
+    let n = g_mat.nrows();
+    let h_total = g_mat.ncols();
+    if n == 0 || h_total == 0 {
+        return;
+    }
+    if m_mat.dim() != g_mat.dim() {
+        return;
+    }
+
+    // Sanitize always-on head indices once.
+    let mut always: Vec<usize> = Vec::new();
+    for &h in always_on_heads {
+        if h < h_total && !always.contains(&h) {
+            always.push(h);
+        }
+    }
+
+    let mut min_h = min_heads.min(h_total);
+    if always.len() > min_h {
+        min_h = always.len();
+    }
+
+    let mut max_h = max_heads.min(h_total);
+    max_h = max_h.max(min_h.max(1));
+
+    // If misconfigured (always_on > max), truncate always-on to max.
+    if always.len() > max_h {
+        always.truncate(max_h);
+        min_h = min_h.min(max_h);
+    }
+
+    // For each token: keep only top max_h heads by g_mat; also ensure at least min_h are on.
+    for i in 0..n {
+        // Pick top max_h heads by gate score.
+        let mut best: Vec<(f32, usize)> = Vec::with_capacity(max_h);
+        for h in 0..h_total {
+            let v = g_mat[[i, h]];
+            let score = if v.is_finite() { v } else { f32::NEG_INFINITY };
+            if best.len() < max_h {
+                best.push((score, h));
+                continue;
+            }
+
+            let mut min_pos = 0usize;
+            let mut min_score = best[0].0;
+            for (p, (s, _)) in best.iter().enumerate().skip(1) {
+                if *s < min_score {
+                    min_score = *s;
+                    min_pos = p;
+                }
+            }
+            if score > min_score {
+                best[min_pos] = (score, h);
+            }
+        }
+
+        // Ensure always-on heads are included.
+        for &ah in &always {
+            let mut found = false;
+            for &(_s, bh) in &best {
+                if bh == ah {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                continue;
+            }
+
+            if best.len() < max_h {
+                let v = g_mat[[i, ah]];
+                let score = if v.is_finite() { v } else { f32::NEG_INFINITY };
+                best.push((score, ah));
+            } else if !best.is_empty() {
+                let mut min_pos = 0usize;
+                let mut min_score = best[0].0;
+                for (p, (s, _)) in best.iter().enumerate().skip(1) {
+                    if *s < min_score {
+                        min_score = *s;
+                        min_pos = p;
+                    }
+                }
+                let v = g_mat[[i, ah]];
+                let score = if v.is_finite() { v } else { f32::NEG_INFINITY };
+                best[min_pos] = (score, ah);
+            }
+        }
+
+        // Zero out everything not in best.
+        for h in 0..h_total {
+            let mut keep_h = false;
+            for &(_s, bh) in &best {
+                if bh == h {
+                    keep_h = true;
+                    break;
+                }
+            }
+            if !keep_h {
+                m_mat[[i, h]] = 0.0;
+            }
+        }
+
+        // Force always-on heads to be active.
+        for &ah in &always {
+            m_mat[[i, ah]] = 1.0;
+        }
+
+        // Ensure at least min_h heads are "on" by forcing the top heads among best.
+        if min_h > 0 {
+            best.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut need = min_h.saturating_sub(always.len());
+            for &(_s, h) in &best {
+                if always.contains(&h) {
+                    continue;
+                }
+                m_mat[[i, h]] = 1.0;
+                need = need.saturating_sub(1);
+                if need == 0 {
+                    break;
+                }
+            }
+        }
+
+        // Strictly enforce the max-heads cap even after forcing always-on heads.
+        // If we exceed the cap, drop the lowest-score non-always heads.
+        let mut active = 0usize;
+        for h in 0..h_total {
+            if m_mat[[i, h]] > 0.0 {
+                active += 1;
+            }
+        }
+        if active > max_h {
+            let mut candidates: Vec<(f32, usize)> = Vec::with_capacity(active.saturating_sub(always.len()));
+            for h in 0..h_total {
+                if m_mat[[i, h]] > 0.0 && !always.contains(&h) {
+                    let v = g_mat[[i, h]];
+                    let score = if v.is_finite() { v } else { f32::NEG_INFINITY };
+                    candidates.push((score, h));
+                }
+            }
+            candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut to_drop = active - max_h;
+            for &(_s, h) in &candidates {
+                m_mat[[i, h]] = 0.0;
+                to_drop = to_drop.saturating_sub(1);
+                if to_drop == 0 {
+                    break;
+                }
+            }
+        }
+
+        // Optional renormalization to preserve sum=k semantics (used for learned predictor).
+        if let Some(k) = renormalize_to_k {
+            let k = k.max(1) as f32;
+            let mut sum = 0.0f32;
+            for h in 0..h_total {
+                let v = m_mat[[i, h]];
+                sum += if v.is_finite() { v.max(0.0) } else { 0.0 };
+            }
+            // Guard against division by a tiny sum which can create huge scales/gradients.
+            let eps = 1e-6f32;
+            if sum > eps && sum.is_finite() {
+                let s = k / sum;
+                for h in 0..h_total {
+                    let v = m_mat[[i, h]];
+                    let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+                    m_mat[[i, h]] = v * s;
+                }
+            }
+        }
+    }
+}
+
 /// Shared Mixture-of-Heads (MoH) gating module.
 ///
 /// This owns the gating parameters and metrics used to produce per-token per-head
@@ -111,6 +292,13 @@ impl MoHGating {
         }
     }
 
+    /// Set heads that should always remain active.
+    ///
+    /// This is applied on top of the configured selection strategy.
+    pub fn set_always_on_heads(&mut self, heads: Vec<usize>) {
+        self.head_selection_config.always_on_heads = heads;
+    }
+
     /// Compute per-token per-head weights (tokens x heads) and update MoH metrics.
     ///
     /// Returns weights in [0,1] (not necessarily summing to 1).
@@ -182,25 +370,45 @@ impl MoHGating {
                 );
 
                 let m = self.head_selection_config.threshold_modulation;
-                t.mapv_inplace(|v| v * m);
+                t.mapv_inplace(|v| {
+                    let v = if v.is_finite() { v } else { 0.0 };
+                    (v * m).max(0.0)
+                });
 
                 // Normalize each row to sum=k (like the attention implementation).
-                let k = self.head_selection_config.gating.num_active as f32;
+                // Epsilon guard prevents huge amplification when the predictor collapses.
+                let k = self.head_selection_config.gating.num_active.max(1) as f32;
+                let eps = 1e-6f32;
+                let uniform = k / num_heads.max(1) as f32;
                 for i in 0..n {
                     let mut sum = 0.0f32;
                     for h in 0..num_heads {
                         sum += t[[i, h]];
                     }
-                    if sum > 0.0 {
+                    if sum > eps && sum.is_finite() {
                         let s = k / sum;
                         for h in 0..num_heads {
                             t[[i, h]] *= s;
+                        }
+                    } else {
+                        for h in 0..num_heads {
+                            t[[i, h]] = uniform;
                         }
                     }
                 }
 
                 m_mat.assign(&t);
             }
+
+            // Enforce min/max heads consistently (and keep sum=k semantics for predictor output).
+            enforce_min_max_heads_inplace(
+                &g_mat,
+                &mut m_mat,
+                self.head_selection_config.min_heads,
+                self.head_selection_config.max_heads,
+                &self.head_selection_config.always_on_heads,
+                Some(self.head_selection_config.gating.num_active),
+            );
 
             // Update tau metrics based on mask.
             self.head_selection_config.metrics_tau_count += n;
@@ -246,6 +454,16 @@ impl MoHGating {
             self.cached_soft_top_p_mask = Some(weights.clone());
             m_mat.assign(&weights);
 
+            // Enforce min/max heads (SoftTopP doesn't require sum=k semantics).
+            enforce_min_max_heads_inplace(
+                &g_mat,
+                &mut m_mat,
+                self.head_selection_config.min_heads,
+                self.head_selection_config.max_heads,
+                &self.head_selection_config.always_on_heads,
+                None,
+            );
+
             // Update tau metrics based on mask.
             self.head_selection_config.metrics_tau_count += n;
             for v in m_mat.iter() {
@@ -258,6 +476,20 @@ impl MoHGating {
                 }
                 self.head_selection_config.metrics_tau_sum += vv;
             }
+        }
+
+        // Fixed strategy (and any other non-predictor, non-SoftTopP path): enforce min/max.
+        if !self.head_selection_config.gating.use_learned_predictor
+            && !self.head_selection_config.gating.use_soft_top_p
+        {
+            enforce_min_max_heads_inplace(
+                &g_mat,
+                &mut m_mat,
+                self.head_selection_config.min_heads,
+                self.head_selection_config.max_heads,
+                &self.head_selection_config.always_on_heads,
+                None,
+            );
         }
 
         // Effective weights.
@@ -288,7 +520,13 @@ impl MoHGating {
     pub fn compute_moh_aux_weighted_total(&self, target_avg_components: f32) -> f32 {
         let (lb, cx, sp) = self.compute_moh_aux_losses(target_avg_components);
         let g = &self.head_selection_config.gating;
-        (lb * g.load_balance_weight) + (cx * g.complexity_loss_weight) + (sp * g.sparsity_weight)
+        let imp = g.compute_importance_loss();
+        let sw = g.compute_switch_balance_loss();
+        (lb * g.load_balance_weight)
+            + (cx * g.complexity_loss_weight)
+            + (sp * g.sparsity_weight)
+            + (imp * g.importance_loss_weight)
+            + (sw * g.switch_balance_weight)
     }
 
     pub fn peek_tau_metrics(&self) -> Option<(f32, f32)> {
@@ -420,7 +658,7 @@ impl MoHGating {
                 let mod_f = self.head_selection_config.threshold_modulation;
                 p.mapv_inplace(|v| {
                     let v = if v.is_finite() { v } else { 0.0 };
-                    v * mod_f
+                    (v * mod_f).max(0.0)
                 });
 
                 // Save pre-normalized output for correct normalization backward.
@@ -428,19 +666,21 @@ impl MoHGating {
 
                 // Normalize each row to sum=k.
                 let k = self.head_selection_config.gating.num_active.max(1) as f32;
+                let eps = 1e-6f32;
+                let uniform = k / num_heads.max(1) as f32;
                 for i in 0..n {
                     let mut sum = 0.0f32;
                     for h in 0..num_heads {
-                        sum += p[[i, h]].max(0.0);
+                        sum += p[[i, h]];
                     }
-                    if sum > 0.0 {
+                    if sum > eps && sum.is_finite() {
                         let s = k / sum;
                         for h in 0..num_heads {
                             p[[i, h]] *= s;
                         }
                     } else {
                         for h in 0..num_heads {
-                            p[[i, h]] = 0.0;
+                            p[[i, h]] = uniform;
                         }
                     }
                 }
@@ -448,6 +688,15 @@ impl MoHGating {
                 pred_output = Some(p.clone());
                 m_mat.assign(&p);
             }
+
+            enforce_min_max_heads_inplace(
+                &g_mat,
+                &mut m_mat,
+                self.head_selection_config.min_heads,
+                self.head_selection_config.max_heads,
+                &self.head_selection_config.always_on_heads,
+                Some(self.head_selection_config.gating.num_active),
+            );
         } else if self.head_selection_config.gating.use_soft_top_p {
             let cfg = RoutingConfig {
                 algorithm: SelectionAlgorithm::SoftTopP {
@@ -464,6 +713,28 @@ impl MoHGating {
             let m = self.head_selection_config.threshold_modulation;
             weights.mapv_inplace(|v| (v * m).clamp(0.0, 1.0));
             m_mat.assign(&weights);
+
+            enforce_min_max_heads_inplace(
+                &g_mat,
+                &mut m_mat,
+                self.head_selection_config.min_heads,
+                self.head_selection_config.max_heads,
+                &self.head_selection_config.always_on_heads,
+                None,
+            );
+        }
+
+        if !self.head_selection_config.gating.use_learned_predictor
+            && !self.head_selection_config.gating.use_soft_top_p
+        {
+            enforce_min_max_heads_inplace(
+                &g_mat,
+                &mut m_mat,
+                self.head_selection_config.min_heads,
+                self.head_selection_config.max_heads,
+                &self.head_selection_config.always_on_heads,
+                None,
+            );
         }
 
         for h in 0..num_heads {
@@ -534,19 +805,24 @@ impl MoHGating {
                 for i in 0..n {
                     let mut sum_u = 0.0f32;
                     for h in 0..num_heads {
-                        sum_u += u[[i, h]];
+                        sum_u += u[[i, h]].max(0.0);
                     }
-                    if sum_u <= 0.0 || !sum_u.is_finite() {
+                    // Match the forward epsilon guard: if the normalization is effectively
+                    // uniform/degenerate, treat it as a stop-gradient path.
+                    let eps = 1e-6f32;
+                    if sum_u <= eps || !sum_u.is_finite() {
                         continue;
                     }
                     let c = k / sum_u;
                     let mut dot = 0.0f32;
                     for h in 0..num_heads {
-                        dot += d_m[[i, h]] * u[[i, h]];
+                        dot += d_m[[i, h]] * u[[i, h]].max(0.0);
                     }
                     let common = -(k * dot) / (sum_u * sum_u);
                     for h in 0..num_heads {
-                        d_u[[i, h]] = c * d_m[[i, h]] + common;
+                        if u[[i, h]] > 0.0 {
+                            d_u[[i, h]] = c * d_m[[i, h]] + common;
+                        }
                     }
                 }
 
@@ -698,5 +974,72 @@ impl MoHGating {
             n += 6;
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn fixed_strategy_enforces_exact_num_active_heads() {
+        let embed_dim = 16;
+        let num_heads = 8;
+        let mut g = MoHGating::new(embed_dim, num_heads);
+        g.set_head_selection_config(&HeadSelectionStrategy::Fixed { num_active: 3 });
+
+        // Deterministic-ish input.
+        let n = 5;
+        let mut x = Array2::<f32>::zeros((n, embed_dim));
+        for i in 0..n {
+            for j in 0..embed_dim {
+                x[[i, j]] = ((i * embed_dim + j) as f32 * 0.0017).sin();
+            }
+        }
+
+        let eff = g.forward_weights(&x, None, None);
+        assert_eq!(eff.dim(), (n, num_heads));
+
+        for i in 0..n {
+            let mut active = 0usize;
+            for h in 0..num_heads {
+                if eff[[i, h]] > 0.0 {
+                    active += 1;
+                }
+            }
+            assert_eq!(active, 3);
+        }
+    }
+
+    #[test]
+    fn always_on_heads_are_always_active_under_fixed() {
+        let embed_dim = 16;
+        let num_heads = 8;
+        let mut g = MoHGating::new(embed_dim, num_heads);
+        g.set_head_selection_config(&HeadSelectionStrategy::Fixed { num_active: 3 });
+        g.set_always_on_heads(vec![0, 1]);
+
+        let n = 6;
+        let mut x = Array2::<f32>::zeros((n, embed_dim));
+        for i in 0..n {
+            for j in 0..embed_dim {
+                x[[i, j]] = (((i + 1) * (j + 3)) as f32 * 0.0009).cos();
+            }
+        }
+
+        let eff = g.forward_weights(&x, None, None);
+        for i in 0..n {
+            assert!(eff[[i, 0]] > 0.0);
+            assert!(eff[[i, 1]] > 0.0);
+
+            let mut active = 0usize;
+            for h in 0..num_heads {
+                if eff[[i, h]] > 0.0 {
+                    active += 1;
+                }
+            }
+            assert_eq!(active, 3);
+        }
     }
 }

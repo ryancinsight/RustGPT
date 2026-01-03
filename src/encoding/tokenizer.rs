@@ -8,47 +8,136 @@
 #[derive(Clone, Debug)]
 pub struct SimpleTokenizer;
 
+#[inline]
+fn is_ascii_ws(b: u8) -> bool {
+    b.is_ascii_whitespace()
+}
+
+#[inline]
+fn is_ascii_punct(b: u8) -> bool {
+    b.is_ascii_punctuation()
+}
+
+/// Scan `text` and emit tokens as `&str` slices.
+///
+/// Token definition:
+/// - Skip ASCII whitespace
+/// - ASCII punctuation becomes its own 1-byte token
+/// - Otherwise emit maximal spans of non-ws, non-punct bytes
+/// - If a substring beginning with '<' matches a vocab entry up to the next '>', emit it as a
+///   single token (to support special tokens like `</s>`, `<unk>`, `<mask>`).
+fn for_each_token_with_vocab<'a>(text: &'a str, vocab: &super::Vocab, mut emit: impl FnMut(&'a str)) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    'outer: while i < bytes.len() {
+        let b = bytes[i];
+        if is_ascii_ws(b) {
+            i += 1;
+            continue;
+        }
+
+        // Special-token fast path: if we see '<', try to match a vocab token like "</s>".
+        if b == b'<' {
+            let mut j = i + 1;
+            // Bound the scan to avoid pathological long searches.
+            // Typical special tokens are tiny (e.g. "<unk>", "</s>").
+            let max_len = 32usize;
+            while j < bytes.len() && (j - i) <= max_len {
+                if bytes[j] == b'>' {
+                    let candidate = &text[i..=j];
+                    if vocab.contains(candidate) {
+                        emit(candidate);
+                        i = j + 1;
+                        // We consumed a token; restart from the new position.
+                        continue 'outer;
+                    }
+                    // Not a known special token: fall through and treat '<' as punctuation.
+                    break;
+                }
+                if is_ascii_ws(bytes[j]) {
+                    break;
+                }
+                j += 1;
+            }
+        }
+
+        if is_ascii_punct(b) {
+            emit(&text[i..i + 1]);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < bytes.len() {
+            let nb = bytes[i];
+            if is_ascii_ws(nb) || is_ascii_punct(nb) || nb == b'<' {
+                break;
+            }
+            i += 1;
+        }
+        emit(&text[start..i]);
+    }
+}
+
+/// Scan `text` and emit tokens as `&str` slices without consulting a vocabulary.
+///
+/// This is the canonical segmentation used for vocabulary building.
+pub(crate) fn for_each_token<'a>(text: &'a str, mut emit: impl FnMut(&'a str)) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if is_ascii_ws(b) {
+            i += 1;
+            continue;
+        }
+        if is_ascii_punct(b) {
+            emit(&text[i..i + 1]);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < bytes.len() {
+            let nb = bytes[i];
+            if is_ascii_ws(nb) || is_ascii_punct(nb) {
+                break;
+            }
+            i += 1;
+        }
+        emit(&text[start..i]);
+    }
+}
+
 impl SimpleTokenizer {
     /// Create a new simple tokenizer
     pub fn new() -> Self {
         Self
     }
 
-    /// Tokenize text into words by splitting on whitespace and punctuation
+    /// Tokenize text into token IDs.
+    ///
+    /// This is allocation-minimal: it does not allocate per-token strings and only grows `Vec` for
+    /// the returned token IDs.
     pub fn tokenize(&self, text: &str, vocab: &super::Vocab) -> Vec<usize> {
-        let mut tokens = Vec::new();
-
-        for word in text.split_whitespace() {
-            // Special case for end token
-            if word == "</s>" {
-                if let Some(token_id) = vocab.encode(word) {
-                    tokens.push(token_id);
-                }
-                continue;
-            }
-
-            // Split on punctuation and keep both the word parts and punctuation
-            let word_tokens = word
-                .split(|c: char| c.is_ascii_punctuation())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .chain(
-                    word.chars()
-                        .filter(|c| c.is_ascii_punctuation())
-                        .map(|c| c.to_string()),
-                );
-
-            for token in word_tokens {
-                if let Some(token_id) = vocab.encode(&token) {
-                    tokens.push(token_id);
-                } else if let Some(unk_id) = vocab.unknown_token().and_then(|unk| vocab.encode(unk))
-                {
-                    tokens.push(unk_id);
-                }
-            }
-        }
-
+        let mut tokens = Vec::with_capacity((text.len() / 8).saturating_add(8));
+        self.tokenize_into(text, vocab, &mut tokens);
         tokens
+    }
+
+    /// In-place variant of [`Self::tokenize`], useful for reusing buffers.
+    pub fn tokenize_into(&self, text: &str, vocab: &super::Vocab, out: &mut Vec<usize>) {
+        out.clear();
+        let unknown_id = vocab.unknown_id();
+        for_each_token_with_vocab(text, vocab, |tok| {
+            if let Some(id) = vocab.encode(tok) {
+                out.push(id);
+            } else if let Some(unk) = unknown_id {
+                out.push(unk);
+            }
+        });
     }
 }
 
@@ -84,6 +173,18 @@ mod tests {
         assert_eq!(vocab.decode(tokens[0]), Some("hello"));
         assert_eq!(vocab.decode(tokens[1]), Some(","));
         assert_eq!(vocab.decode(tokens[2]), Some("world"));
+    }
+
+    #[test]
+    fn test_punctuation_order_within_word() {
+        let tokenizer = SimpleTokenizer::new();
+        let vocab = Vocab::new(vec!["a", ",", "b", "</s>", "<unk>"]);
+
+        let tokens = tokenizer.tokenize("a,b", &vocab);
+        assert_eq!(tokens.len(), 3); // a, ,, b (in order)
+        assert_eq!(vocab.decode(tokens[0]), Some("a"));
+        assert_eq!(vocab.decode(tokens[1]), Some(","));
+        assert_eq!(vocab.decode(tokens[2]), Some("b"));
     }
 
     #[test]

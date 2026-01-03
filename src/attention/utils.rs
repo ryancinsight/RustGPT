@@ -106,15 +106,19 @@ pub fn apply_softmax_attention(weights: &mut Array2<f32>) {
     for mut row in weights.outer_iter_mut() {
         let mut argmax = 0usize;
         let mut max_val = f32::NEG_INFINITY;
+        let mut any_finite = false;
         for (i, &v) in row.iter().enumerate() {
-            if v > max_val {
-                max_val = v;
-                argmax = i;
+            if v.is_finite() {
+                any_finite = true;
+                if v > max_val {
+                    max_val = v;
+                    argmax = i;
+                }
             }
         }
 
         // If the whole row is masked (all -inf) or non-finite, yield all zeros.
-        if !max_val.is_finite() {
+        if !any_finite {
             for x in row.iter_mut() {
                 *x = 0.0;
             }
@@ -123,9 +127,11 @@ pub fn apply_softmax_attention(weights: &mut Array2<f32>) {
 
         let mut sum = 0.0f64;
         for &v in row.iter() {
-            let z = (v - max_val) as f64;
-            let e = PadeExp::exp(z);
-            sum += e;
+            // Treat masked / non-finite entries as probability 0.
+            if !v.is_finite() {
+                continue;
+            }
+            sum += PadeExp::exp((v - max_val) as f64);
         }
 
         if !sum.is_finite() || sum <= 0.0 {
@@ -138,8 +144,11 @@ pub fn apply_softmax_attention(weights: &mut Array2<f32>) {
 
         let inv_sum = (1.0 / sum) as f32;
         for x in row.iter_mut() {
-            let z = (*x - max_val) as f64;
-            *x = (PadeExp::exp(z) as f32) * inv_sum;
+            if !x.is_finite() {
+                *x = 0.0;
+                continue;
+            }
+            *x = (PadeExp::exp((*x - max_val) as f64) as f32) * inv_sum;
         }
     }
 }

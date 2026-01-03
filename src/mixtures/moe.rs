@@ -33,6 +33,7 @@ use crate::{
         threshold::ThresholdPredictor,
     },
     network::Layer,
+    richards::sigmoid_f32,
     rng::get_rng,
 };
 
@@ -41,13 +42,6 @@ fn default_true() -> bool {
     true
 }
 
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    use std::sync::OnceLock;
-    static CURVE: OnceLock<crate::richards::RichardsCurve> = OnceLock::new();
-    let curve = CURVE.get_or_init(|| crate::richards::RichardsCurve::sigmoid(false));
-    curve.forward_scalar(x as f64) as f32
-}
 
 /// Strategy for selecting which experts to activate
 ///
@@ -70,6 +64,28 @@ pub enum ExpertRouter {
         /// Weight for diversity loss (encourages expert specialization)
         diversity_weight: f32,
 
+        /// Routing mode (token-choice vs expert-choice).
+        #[serde(default)]
+        routing_mode: ExpertRoutingMode,
+
+        /// Capacity factor used when routing mode applies capacity (Switch-style).
+        ///
+        /// Typical values: 1.0–2.0. 0.0 disables capacity limiting.
+        #[serde(default)]
+        capacity_factor: f32,
+
+        /// Minimum capacity per expert (guards tiny batches).
+        #[serde(default)]
+        min_expert_capacity: usize,
+
+        /// Renormalize per-token routing probabilities after capacity drops.
+        #[serde(default = "default_true")]
+        renormalize_after_capacity: bool,
+
+        /// Router z-loss weight (stabilizes router logits).
+        #[serde(default)]
+        z_loss_weight: f32,
+
         /// If true, route experts using an extra conditioning feature derived from
         /// Mixture-of-Heads activity (e.g. avg active heads / num_heads).
         ///
@@ -84,7 +100,38 @@ pub enum ExpertRouter {
         /// routing uncertainty (entropy) and MoH head activity.
         #[serde(default = "default_true")]
         use_learned_k_adaptation: bool,
+
+        /// Indices of "shared" experts that are always executed and added to the routed output.
+        ///
+        /// This implements the common "routed + shared" pattern: the router selects sparse
+        /// experts per token, while a small set of experts are always-on to provide a stable
+        /// baseline path.
+        #[serde(default)]
+        shared_experts: Vec<usize>,
+
+        /// Scale applied to the mean output of shared experts.
+        ///
+        /// If 0.0 (default), shared experts are disabled.
+        #[serde(default)]
+        shared_expert_scale: f32,
     },
+}
+
+/// Routing mode for sparse Mixture-of-Experts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExpertRoutingMode {
+    /// Token chooses its top-k experts.
+    TokenChoiceTopK,
+    /// Token chooses its top-k experts and a per-expert capacity is enforced.
+    TokenChoiceTopKWithCapacity,
+    /// Each expert chooses its top tokens (then tokens may be top-k filtered).
+    ExpertChoice,
+}
+
+impl Default for ExpertRoutingMode {
+    fn default() -> Self {
+        Self::TokenChoiceTopK
+    }
 }
 
 /// Configuration for expert routing metrics and learned parameters
@@ -107,6 +154,42 @@ pub struct ExpertRouterConfig {
     #[serde(default = "default_true")]
     pub use_learned_k_adaptation: bool,
 
+    /// Routing mode.
+    #[serde(default)]
+    pub routing_mode: ExpertRoutingMode,
+
+    /// Capacity factor (Switch-style). 0.0 disables capacity limiting.
+    #[serde(default)]
+    pub capacity_factor: f32,
+
+    /// Minimum capacity per expert.
+    #[serde(default)]
+    pub min_expert_capacity: usize,
+
+    /// Renormalize per-token routing probabilities after capacity drops.
+    #[serde(default = "default_true")]
+    pub renormalize_after_capacity: bool,
+
+    /// Router z-loss weight.
+    #[serde(default)]
+    pub z_loss_weight: f32,
+
+    /// Indices of "shared" experts that are always executed and added to the routed output.
+    #[serde(default)]
+    pub shared_experts: Vec<usize>,
+
+    /// Scale applied to the mean output of shared experts. If 0.0, shared experts are disabled.
+    #[serde(default)]
+    pub shared_expert_scale: f32,
+
+    /// Metrics: accumulated router z-loss (sum of squared logsumexp).
+    #[serde(default)]
+    pub metrics_z_loss_sum_sq: f32,
+
+    /// Metrics: number of router z-loss samples accumulated.
+    #[serde(default)]
+    pub metrics_z_loss_count: usize,
+
     /// Weight for diversity loss (encourages expert specialization)
     pub diversity_weight: f32,
     /// Metrics: average routing probability per expert
@@ -123,6 +206,15 @@ impl Default for ExpertRouterConfig {
             expert_hidden_dim: 64,
             use_head_conditioning: false,
             use_learned_k_adaptation: true,
+            routing_mode: ExpertRoutingMode::default(),
+            capacity_factor: 0.0,
+            min_expert_capacity: 0,
+            renormalize_after_capacity: true,
+            z_loss_weight: 0.0,
+            shared_experts: Vec::new(),
+            shared_expert_scale: 0.0,
+            metrics_z_loss_sum_sq: 0.0,
+            metrics_z_loss_count: 0,
             diversity_weight: 0.005,
             metrics_avg_routing_prob: vec![0.0; 4],
             metrics_diversity_score: 0.0,
@@ -141,8 +233,15 @@ impl ExpertRouterConfig {
                 load_balance_weight,
                 sparsity_weight,
                 diversity_weight,
+                routing_mode,
+                capacity_factor,
+                min_expert_capacity,
+                renormalize_after_capacity,
+                z_loss_weight,
                 use_head_conditioning,
                 use_learned_k_adaptation,
+                shared_experts,
+                shared_expert_scale,
             } => Self {
                 gating: GatingConfig::from_strategy(
                     &GatingStrategy::Learned {
@@ -150,6 +249,8 @@ impl ExpertRouterConfig {
                         load_balance_weight: *load_balance_weight,
                         sparsity_weight: *sparsity_weight,
                         complexity_loss_weight: 0.005, // Default
+                        importance_loss_weight: 0.0,
+                        switch_balance_weight: 0.0,
                     },
                     *num_experts,
                 ),
@@ -157,6 +258,15 @@ impl ExpertRouterConfig {
                 expert_hidden_dim: *expert_hidden_dim,
                 use_head_conditioning: *use_head_conditioning,
                 use_learned_k_adaptation: *use_learned_k_adaptation,
+                routing_mode: *routing_mode,
+                capacity_factor: *capacity_factor,
+                min_expert_capacity: *min_expert_capacity,
+                renormalize_after_capacity: *renormalize_after_capacity,
+                z_loss_weight: *z_loss_weight,
+                shared_experts: shared_experts.clone(),
+                shared_expert_scale: *shared_expert_scale,
+                metrics_z_loss_sum_sq: 0.0,
+                metrics_z_loss_count: 0,
                 diversity_weight: *diversity_weight,
                 metrics_avg_routing_prob: vec![0.0; *num_experts],
                 metrics_diversity_score: 0.0,
@@ -205,7 +315,7 @@ impl LearnedKAdapter {
             0.0
         };
         let z = self.w[[0, 0]] * e + self.w[[1, 0]] * h + self.b[[0, 0]];
-        sigmoid(z)
+        sigmoid_f32(z)
     }
 }
 
@@ -217,6 +327,8 @@ impl ExpertRouterConfig {
             self.metrics_avg_routing_prob[e] = 0.0;
         }
         self.metrics_diversity_score = 0.0;
+        self.metrics_z_loss_sum_sq = 0.0;
+        self.metrics_z_loss_count = 0;
     }
 
     /// Update routing metrics for training optimization
@@ -255,6 +367,25 @@ impl ExpertRouterConfig {
     /// Get complexity alignment loss for training (aligns expert usage with predicted complexity)
     pub fn compute_complexity_loss(&self, target_avg_experts: f32) -> f32 {
         self.gating.compute_complexity_loss(target_avg_experts)
+    }
+
+    /// Importance loss for training (balances soft routing probability mass)
+    pub fn compute_importance_loss(&self) -> f32 {
+        self.gating.compute_importance_loss()
+    }
+
+    /// Switch/GShard-style balance loss combining load and importance.
+    pub fn compute_switch_balance_loss(&self) -> f32 {
+        self.gating.compute_switch_balance_loss()
+    }
+
+    /// Router z-loss (mean of squared logsumexp(router_logits)).
+    pub fn compute_z_loss(&self) -> f32 {
+        if self.metrics_z_loss_count == 0 {
+            return 0.0;
+        }
+        let v = self.metrics_z_loss_sum_sq / self.metrics_z_loss_count as f32;
+        if v.is_finite() { v.max(0.0) } else { 0.0 }
     }
 
     /// Get diversity loss for training (encourages expert specialization)
@@ -306,9 +437,15 @@ impl ExpertRouterConfig {
     pub fn compute_moe_aux_weighted_total(&self, target_avg_experts: f32) -> f32 {
         let (lb, cx, sp, dv) = self.compute_moe_aux_losses(target_avg_experts);
         let g = &self.gating;
+        let imp = self.compute_importance_loss();
+        let sw = self.compute_switch_balance_loss();
+        let z = self.compute_z_loss();
         (lb * g.load_balance_weight)
             + (cx * g.complexity_loss_weight)
             + (sp * g.sparsity_weight)
+            + (imp * g.importance_loss_weight)
+            + (sw * g.switch_balance_weight)
+            + (z * self.z_loss_weight)
             + (dv * self.diversity_weight)
     }
 
@@ -694,26 +831,37 @@ impl ExpertSelector {
     ) -> Vec<Vec<usize>> {
         let mut selections = Vec::new();
 
+        let n_experts = routing_probs.ncols();
+        if routing_probs.nrows() == 0 || n_experts == 0 {
+            return selections;
+        }
+        let k = k.clamp(1, n_experts);
+
         for row in routing_probs.outer_iter() {
-            let mut expert_probs: Vec<(usize, f32)> = row
-                .iter()
-                .enumerate()
-                .map(|(idx, &prob)| {
-                    let p = if prob.is_finite() { prob } else { 0.0 };
-                    (idx, p)
-                })
-                .collect();
+            // Maintain a small set of best (score, idx) pairs (O(E*k), avoids full sort).
+            let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
+            for (idx, &prob) in row.iter().enumerate() {
+                let score = if prob.is_finite() { prob } else { 0.0 };
+                if best.len() < k {
+                    best.push((score, idx));
+                    continue;
+                }
 
-            // Sort by probability (descending)
-            expert_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut min_pos = 0usize;
+                let mut min_score = best[0].0;
+                for (p, (s, _)) in best.iter().enumerate().skip(1) {
+                    if *s < min_score {
+                        min_score = *s;
+                        min_pos = p;
+                    }
+                }
 
-            // Take top-k experts
-            let selected: Vec<usize> = expert_probs
-                .into_iter()
-                .take(k)
-                .map(|(idx, _)| idx)
-                .collect();
+                if score > min_score {
+                    best[min_pos] = (score, idx);
+                }
+            }
 
+            let selected: Vec<usize> = best.into_iter().map(|(_s, idx)| idx).collect();
             selections.push(selected);
         }
 
@@ -1186,105 +1334,167 @@ impl MixtureOfExperts {
             .as_ref()
             .expect("router logits must be cached by predict()");
 
+        // Track router z-loss statistics (mean of squared logsumexp(router_logits)).
+        // This can be weighted into the training loss via config.z_loss_weight.
+        update_router_z_loss_metrics(&mut self.config, cached_logits);
+
         // Clear learned-k caches by default; we'll fill them only when learned adaptation is used.
         self.cached_k_alpha = None;
         self.cached_k_features = None;
         self.cached_k_delta_probs = None;
 
-        let (masked_probs, active_mask) = if self.config.use_learned_k_adaptation
-            && head_activity.is_some()
-        {
-            if self.k_adapter.is_none() {
-                self.k_adapter = Some(LearnedKAdapter::new());
+        let (mut masked_probs, mut active_mask) = match self.config.routing_mode {
+            ExpertRoutingMode::ExpertChoice => {
+                // Expert-choice routing: each expert selects its top tokens.
+                expert_choice_routing(
+                    &routing_probs_full,
+                    base_k,
+                    self.config.capacity_factor,
+                    self.config.min_expert_capacity,
+                )
             }
-            let h = head_activity.unwrap_or(0.0);
-            let h = if h.is_finite() { h } else { 0.0 };
-            let h = h.clamp(0.0, 1.0);
-
-            // Mean routing entropy across tokens (from full softmax probs), normalized by log(E).
-            let n_tok = routing_probs_full.nrows().max(1) as f32;
-            let denom = (self.config.num_experts.max(2) as f32).ln();
-            let mut entropy_sum = 0.0f32;
-            for t in 0..routing_probs_full.nrows() {
-                let mut ent = 0.0f32;
-                for e in 0..self.config.num_experts {
-                    let mut p = routing_probs_full[[t, e]];
-                    p = if p.is_finite() { p.max(0.0) } else { 0.0 };
-                    if p > 0.0 {
-                        ent -= p * p.ln();
+            ExpertRoutingMode::TokenChoiceTopK | ExpertRoutingMode::TokenChoiceTopKWithCapacity => {
+                // Token-choice routing with optional MoH coupling (existing behavior).
+                if self.config.use_learned_k_adaptation && head_activity.is_some() {
+                    if self.k_adapter.is_none() {
+                        self.k_adapter = Some(LearnedKAdapter::new());
                     }
+                    let h = head_activity.unwrap_or(0.0);
+                    let h = if h.is_finite() { h } else { 0.0 };
+                    let h = h.clamp(0.0, 1.0);
+
+                    // Mean routing entropy across tokens (from full softmax probs), normalized by log(E).
+                    let n_tok = routing_probs_full.nrows().max(1) as f32;
+                    let denom = (self.config.num_experts.max(2) as f32).ln();
+                    let mut entropy_sum = 0.0f32;
+                    for t in 0..routing_probs_full.nrows() {
+                        let mut ent = 0.0f32;
+                        for e in 0..self.config.num_experts {
+                            let mut p = routing_probs_full[[t, e]];
+                            p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+                            if p > 0.0 {
+                                ent -= p * p.ln();
+                            }
+                        }
+                        entropy_sum += ent;
+                    }
+                    let entropy = entropy_sum / n_tok;
+                    let entropy_norm = if denom.is_finite() && denom > 0.0 {
+                        (entropy / denom).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+
+                    let alpha = self
+                        .k_adapter
+                        .as_ref()
+                        .expect("k_adapter must exist")
+                        .alpha(entropy_norm, h);
+
+                    // Blend between top-1 and configured top-k.
+                    let (p_top1, m_top1) = masked_top_k_from_logits_and_active(cached_logits, 1);
+                    let (p_topk, m_topk) = masked_top_k_from_logits_and_active(cached_logits, base_k);
+
+                    let mut p = p_top1.clone();
+                    p.zip_mut_with(&p_topk, |a, &b| {
+                        *a = (1.0 - alpha) * (*a) + alpha * b;
+                    });
+
+                    let mut delta = p_topk;
+                    delta.zip_mut_with(&p_top1, |a, &b| {
+                        *a = *a - b;
+                    });
+
+                    let mut m = m_top1;
+                    for i in 0..m.len().min(m_topk.len()) {
+                        m[i] = m[i] || m_topk[i];
+                    }
+
+                    self.cached_k_alpha = Some(alpha);
+                    self.cached_k_features = Some((entropy_norm, h));
+                    self.cached_k_delta_probs = Some(delta);
+
+                    (p, m)
+                } else if let Some(h) = head_activity {
+                    // Heuristic smooth coupling (no cliff): interpolate between k=floor(kf) and k=ceil(kf).
+                    let h = if h.is_finite() { h } else { 0.0 };
+                    let h = h.clamp(0.0, 1.0);
+                    let kf = 1.0 + (base_k.saturating_sub(1) as f32) * h;
+
+                    let k_low = (kf.floor() as usize).clamp(1, base_k);
+                    let k_high = (kf.ceil() as usize).clamp(1, base_k);
+                    let alpha = (kf - k_low as f32).clamp(0.0, 1.0);
+
+                    if k_low == k_high || alpha == 0.0 {
+                        masked_top_k_from_logits_and_active(cached_logits, k_low)
+                    } else {
+                        let (p_low, m_low) = masked_top_k_from_logits_and_active(cached_logits, k_low);
+                        let (p_high, m_high) = masked_top_k_from_logits_and_active(cached_logits, k_high);
+
+                        // Blend probabilities; both are already per-row renormalized.
+                        let mut p = p_low;
+                        p.zip_mut_with(&p_high, |a, &b| {
+                            *a = (1.0 - alpha) * (*a) + alpha * b;
+                        });
+
+                        // Union the expert-activity masks so we compute any expert needed by either path.
+                        let mut m = m_low;
+                        for i in 0..m.len().min(m_high.len()) {
+                            m[i] = m[i] || m_high[i];
+                        }
+                        (p, m)
+                    }
+                } else {
+                    masked_top_k_from_logits_and_active(cached_logits, base_k)
                 }
-                entropy_sum += ent;
             }
-            let entropy = entropy_sum / n_tok;
-            let entropy_norm = if denom.is_finite() && denom > 0.0 {
-                (entropy / denom).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let alpha = self
-                .k_adapter
-                .as_ref()
-                .expect("k_adapter must exist")
-                .alpha(entropy_norm, h);
-
-            // Blend between top-1 and configured top-k.
-            let (p_top1, m_top1) = masked_top_k_from_logits_and_active(cached_logits, 1);
-            let (p_topk, m_topk) = masked_top_k_from_logits_and_active(cached_logits, base_k);
-
-            let mut p = p_top1.clone();
-            p.zip_mut_with(&p_topk, |a, &b| {
-                *a = (1.0 - alpha) * (*a) + alpha * b;
-            });
-
-            let mut delta = p_topk;
-            delta.zip_mut_with(&p_top1, |a, &b| {
-                *a = *a - b;
-            });
-
-            let mut m = m_top1;
-            for i in 0..m.len().min(m_topk.len()) {
-                m[i] = m[i] || m_topk[i];
-            }
-
-            self.cached_k_alpha = Some(alpha);
-            self.cached_k_features = Some((entropy_norm, h));
-            self.cached_k_delta_probs = Some(delta);
-
-            (p, m)
-        } else if let Some(h) = head_activity {
-            // Heuristic smooth coupling (no cliff): interpolate between k=floor(kf) and k=ceil(kf).
-            let h = if h.is_finite() { h } else { 0.0 };
-            let h = h.clamp(0.0, 1.0);
-            let kf = 1.0 + (base_k.saturating_sub(1) as f32) * h;
-
-            let k_low = (kf.floor() as usize).clamp(1, base_k);
-            let k_high = (kf.ceil() as usize).clamp(1, base_k);
-            let alpha = (kf - k_low as f32).clamp(0.0, 1.0);
-
-            if k_low == k_high || alpha == 0.0 {
-                masked_top_k_from_logits_and_active(cached_logits, k_low)
-            } else {
-                let (p_low, m_low) = masked_top_k_from_logits_and_active(cached_logits, k_low);
-                let (p_high, m_high) = masked_top_k_from_logits_and_active(cached_logits, k_high);
-
-                // Blend probabilities; both are already per-row renormalized.
-                let mut p = p_low;
-                p.zip_mut_with(&p_high, |a, &b| {
-                    *a = (1.0 - alpha) * (*a) + alpha * b;
-                });
-
-                // Union the expert-activity masks so we compute any expert needed by either path.
-                let mut m = m_low;
-                for i in 0..m.len().min(m_high.len()) {
-                    m[i] = m[i] || m_high[i];
-                }
-                (p, m)
-            }
-        } else {
-            masked_top_k_from_logits_and_active(cached_logits, base_k)
         };
+
+        // Routed + shared experts: mark shared experts as active (they must be executed even if
+        // routing probability is zero after masking/capacity).
+        let shared_scale = if self.config.shared_expert_scale.is_finite() {
+            self.config.shared_expert_scale
+        } else {
+            0.0
+        };
+        let mut shared_experts: Vec<usize> = Vec::new();
+        if shared_scale != 0.0 {
+            let mut seen = vec![false; self.config.num_experts];
+            for &idx in &self.config.shared_experts {
+                if idx < self.config.num_experts && !seen[idx] {
+                    seen[idx] = true;
+                    shared_experts.push(idx);
+                }
+            }
+            for &e in &shared_experts {
+                if e < active_mask.len() {
+                    active_mask[e] = true;
+                }
+            }
+        }
+        let shared_per_expert = if !shared_experts.is_empty() {
+            shared_scale / (shared_experts.len() as f32)
+        } else {
+            0.0
+        };
+
+        // Optional Switch-style per-expert capacity limiting.
+        if self.config.routing_mode == ExpertRoutingMode::TokenChoiceTopKWithCapacity
+            && self.config.capacity_factor > 0.0
+        {
+            let cap = compute_expert_capacity(
+                masked_probs.nrows(),
+                base_k,
+                self.config.num_experts,
+                self.config.capacity_factor,
+                self.config.min_expert_capacity,
+            );
+            active_mask = apply_capacity_limit_inplace(
+                &mut masked_probs,
+                cap,
+                self.config.renormalize_after_capacity,
+            );
+        }
 
         self.cached_active_expert_mask = Some(active_mask);
         self.cached_routing_probs = Some(masked_probs);
@@ -1342,6 +1552,22 @@ impl MixtureOfExperts {
                         out_row.scaled_add(ws, &expert_row);
                     }
                 });
+        }
+
+        // Add shared experts as an always-on path.
+        if shared_per_expert != 0.0 {
+            for &e in &shared_experts {
+                if e >= self.config.num_experts {
+                    continue;
+                }
+                let expert_out = &expert_outputs[e];
+                output
+                    .outer_iter_mut()
+                    .zip(expert_out.outer_iter())
+                    .for_each(|(mut out_row, expert_row)| {
+                        out_row.scaled_add(shared_per_expert, &expert_row);
+                    });
+            }
         }
 
         output
@@ -1409,6 +1635,27 @@ impl Layer for MixtureOfExperts {
             .as_ref()
             .map(|m| m.as_slice());
 
+        let shared_scale = if self.config.shared_expert_scale.is_finite() {
+            self.config.shared_expert_scale
+        } else {
+            0.0
+        };
+        let mut shared_flags = vec![false; self.config.num_experts];
+        let mut shared_count = 0usize;
+        if shared_scale != 0.0 {
+            for &idx in &self.config.shared_experts {
+                if idx < shared_flags.len() && !shared_flags[idx] {
+                    shared_flags[idx] = true;
+                    shared_count += 1;
+                }
+            }
+        }
+        let shared_per_expert = if shared_count > 0 {
+            shared_scale / (shared_count as f32)
+        } else {
+            0.0
+        };
+
         // Reuse weighted gradient buffers per expert.
         let mut weighted_buffers = self.cached_weighted_grads.take().unwrap_or_default();
         if weighted_buffers.len() != self.experts.len() {
@@ -1431,10 +1678,20 @@ impl Layer for MixtureOfExperts {
             let weighted_grads_2d = &mut weighted_buffers[expert_idx];
             weighted_grads_2d.fill(0.0);
 
+            let shared_bonus = if expert_idx < shared_flags.len() && shared_flags[expert_idx] {
+                shared_per_expert
+            } else {
+                0.0
+            };
+
             for (token_idx, (grad_row, &weight)) in
                 grads.outer_iter().zip(routing_col.iter()).enumerate()
             {
-                let w = if weight.is_finite() { weight } else { 0.0 };
+                let mut w = if weight.is_finite() { weight } else { 0.0 };
+                w += shared_bonus;
+                if !w.is_finite() {
+                    w = 0.0;
+                }
                 if w == 0.0 {
                     continue;
                 }
@@ -1455,7 +1712,11 @@ impl Layer for MixtureOfExperts {
                 .zip(routing_col.iter())
                 .zip(total_grad_input.outer_iter_mut())
             {
-                let w = if weight.is_finite() { weight } else { 0.0 };
+                let mut w = if weight.is_finite() { weight } else { 0.0 };
+                w += shared_bonus;
+                if !w.is_finite() {
+                    w = 0.0;
+                }
                 if w != 0.0 {
                     total_row.scaled_add(w, &grad_row);
                 }
@@ -1524,6 +1785,27 @@ impl Layer for MixtureOfExperts {
             .as_ref()
             .map(|m| m.as_slice());
 
+        let shared_scale = if self.config.shared_expert_scale.is_finite() {
+            self.config.shared_expert_scale
+        } else {
+            0.0
+        };
+        let mut shared_flags = vec![false; self.config.num_experts];
+        let mut shared_count = 0usize;
+        if shared_scale != 0.0 {
+            for &idx in &self.config.shared_experts {
+                if idx < shared_flags.len() && !shared_flags[idx] {
+                    shared_flags[idx] = true;
+                    shared_count += 1;
+                }
+            }
+        }
+        let shared_per_expert = if shared_count > 0 {
+            shared_scale / (shared_count as f32)
+        } else {
+            0.0
+        };
+
         // 1. Route gradients to experts weighted by (post-mask) routing probabilities.
         // Only build grads for experts that were active for at least one token.
         let mut expert_output_grads =
@@ -1534,9 +1816,18 @@ impl Layer for MixtureOfExperts {
                     continue;
                 }
             }
+            let shared_bonus = if expert_idx < shared_flags.len() && shared_flags[expert_idx] {
+                shared_per_expert
+            } else {
+                0.0
+            };
             for token_idx in 0..output_grads.nrows() {
                 let mut w = cached_routing_probs[[token_idx, expert_idx]];
                 w = if w.is_finite() { w } else { 0.0 };
+                w += shared_bonus;
+                if !w.is_finite() {
+                    w = 0.0;
+                }
                 if w == 0.0 {
                     continue;
                 }
@@ -1579,9 +1870,20 @@ impl Layer for MixtureOfExperts {
             let (expert_input_grad, expert_param_grads) =
                 expert.compute_gradients(cached_input, expert_grads);
 
+            let shared_bonus = if expert_idx < shared_flags.len() && shared_flags[expert_idx] {
+                shared_per_expert
+            } else {
+                0.0
+            };
+
             // Weight input gradients by routing probabilities
             for token_idx in 0..expert_input_grad.nrows() {
-                let routing_weight = cached_routing_probs[[token_idx, expert_idx]];
+                let mut routing_weight = cached_routing_probs[[token_idx, expert_idx]];
+                routing_weight = if routing_weight.is_finite() { routing_weight } else { 0.0 };
+                routing_weight += shared_bonus;
+                if !routing_weight.is_finite() {
+                    routing_weight = 0.0;
+                }
                 grad_input
                     .row_mut(token_idx)
                     .scaled_add(routing_weight, &expert_input_grad.row(token_idx));
@@ -2047,9 +2349,297 @@ fn masked_top_k_from_logits_and_active(
     (masked, active)
 }
 
+fn update_router_z_loss_metrics(config: &mut ExpertRouterConfig, logits: &ndarray::Array2<f32>) {
+    if logits.nrows() == 0 || logits.ncols() == 0 {
+        return;
+    }
+
+    for row in logits.outer_iter() {
+        // Stable logsumexp.
+        let mut max_v = f32::NEG_INFINITY;
+        let mut any = false;
+        for &v in row.iter() {
+            if v.is_finite() {
+                any = true;
+                max_v = max_v.max(v);
+            }
+        }
+        if !any {
+            continue;
+        }
+
+        let mut sum_exp: f64 = 0.0;
+        for &v in row.iter() {
+            if v.is_finite() {
+                sum_exp += crate::pade::PadeExp::exp((v - max_v) as f64);
+            }
+        }
+        if sum_exp <= 0.0 || !sum_exp.is_finite() {
+            continue;
+        }
+
+        let z = (sum_exp.ln() as f32) + max_v;
+        if z.is_finite() {
+            config.metrics_z_loss_sum_sq += z * z;
+            config.metrics_z_loss_count += 1;
+        }
+    }
+}
+
+fn compute_expert_capacity(
+    n_tokens: usize,
+    k: usize,
+    n_experts: usize,
+    capacity_factor: f32,
+    min_capacity: usize,
+) -> usize {
+    if n_tokens == 0 || n_experts == 0 {
+        return 0;
+    }
+    if !(capacity_factor.is_finite()) || capacity_factor <= 0.0 {
+        return usize::MAX;
+    }
+
+    let k = k.max(1);
+    let n_experts = n_experts.max(1);
+    let expected = (n_tokens as f32) * (k as f32) / (n_experts as f32);
+    let cap = (capacity_factor * expected).ceil() as usize;
+    cap.max(min_capacity).max(1)
+}
+
+fn apply_capacity_limit_inplace(
+    masked_probs: &mut ndarray::Array2<f32>,
+    capacity: usize,
+    renormalize: bool,
+) -> Vec<bool> {
+    let n_tokens = masked_probs.nrows();
+    let n_experts = masked_probs.ncols();
+
+    if n_tokens == 0 || n_experts == 0 {
+        return vec![false; n_experts];
+    }
+    if capacity == 0 {
+        masked_probs.fill(0.0);
+        return vec![false; n_experts];
+    }
+    if capacity == usize::MAX {
+        // Just compute active mask.
+        let mut active = vec![false; n_experts];
+        for e in 0..n_experts {
+            for t in 0..n_tokens {
+                let w = masked_probs[[t, e]];
+                let w = if w.is_finite() { w } else { 0.0 };
+                if w > 0.0 {
+                    active[e] = true;
+                    break;
+                }
+            }
+        }
+        return active;
+    }
+
+    // Drop lowest-weight assignments per expert.
+    // Use partial selection to avoid O(T log T) sorts when capacity is active.
+    let mut candidates: Vec<(f32, usize)> = Vec::with_capacity(n_tokens);
+    for e in 0..n_experts {
+        candidates.clear();
+        for t in 0..n_tokens {
+            let w = masked_probs[[t, e]];
+            let w = if w.is_finite() { w } else { 0.0 };
+            if w > 0.0 {
+                candidates.push((w, t));
+            }
+        }
+
+        if candidates.len() <= capacity {
+            continue;
+        }
+
+        let nth = capacity.saturating_sub(1);
+        candidates.select_nth_unstable_by(nth, |a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &(_w, t) in candidates.iter().skip(capacity) {
+            masked_probs[[t, e]] = 0.0;
+        }
+    }
+
+    if renormalize {
+        let eps = 1e-6f32;
+        for t in 0..n_tokens {
+            let mut sum = 0.0f32;
+            for e in 0..n_experts {
+                let w = masked_probs[[t, e]];
+                let w = if w.is_finite() { w } else { 0.0 };
+                sum += w;
+            }
+            // Guard against division by a tiny sum which can create huge scales/gradients.
+            if sum > eps && sum.is_finite() {
+                let inv = 1.0 / sum;
+                for e in 0..n_experts {
+                    let w = masked_probs[[t, e]];
+                    masked_probs[[t, e]] = if w.is_finite() { w * inv } else { 0.0 };
+                }
+            } else {
+                // At minimum, keep the row finite.
+                for e in 0..n_experts {
+                    if !masked_probs[[t, e]].is_finite() {
+                        masked_probs[[t, e]] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Active mask after drops.
+    let mut active = vec![false; n_experts];
+    for e in 0..n_experts {
+        for t in 0..n_tokens {
+            let w = masked_probs[[t, e]];
+            let w = if w.is_finite() { w } else { 0.0 };
+            if w > 0.0 {
+                active[e] = true;
+                break;
+            }
+        }
+    }
+    active
+}
+
+fn expert_choice_routing(
+    routing_probs_full: &ndarray::Array2<f32>,
+    token_top_k: usize,
+    capacity_factor: f32,
+    min_capacity: usize,
+) -> (ndarray::Array2<f32>, Vec<bool>) {
+    let n_tokens = routing_probs_full.nrows();
+    let n_experts = routing_probs_full.ncols();
+
+    if n_tokens == 0 || n_experts == 0 {
+        return (
+            ndarray::Array2::<f32>::zeros((n_tokens, n_experts)),
+            vec![false; n_experts],
+        );
+    }
+
+    let k = token_top_k.max(1).min(n_experts);
+    let cap = compute_expert_capacity(n_tokens, k, n_experts, capacity_factor, min_capacity)
+        .min(n_tokens)
+        .max(1);
+
+    // Step 1: experts select top-cap tokens by probability.
+    let mut w = ndarray::Array2::<f32>::zeros((n_tokens, n_experts));
+    let mut best: Vec<(f32, usize)> = Vec::with_capacity(n_tokens);
+    for e in 0..n_experts {
+        best.clear();
+        for t in 0..n_tokens {
+            let p = routing_probs_full[[t, e]];
+            let p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+            best.push((p, t));
+        }
+
+        if cap < best.len() {
+            let nth = cap.saturating_sub(1);
+            best.select_nth_unstable_by(nth, |a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        for &(p, t) in best.iter().take(cap) {
+            if p > 0.0 {
+                w[[t, e]] = p;
+            }
+        }
+    }
+
+    // Step 2: enforce per-token top-k (optional but keeps compute bounded and consistent).
+    for t in 0..n_tokens {
+        // Track top-k by weight.
+        let mut best: Vec<(f32, usize)> = Vec::with_capacity(k);
+        for e in 0..n_experts {
+            let p = w[[t, e]];
+            let p = if p.is_finite() { p } else { 0.0 };
+            if p <= 0.0 {
+                continue;
+            }
+            if best.len() < k {
+                best.push((p, e));
+                continue;
+            }
+            let mut min_pos = 0usize;
+            let mut min_score = best[0].0;
+            for (pos, (s, _)) in best.iter().enumerate().skip(1) {
+                if *s < min_score {
+                    min_score = *s;
+                    min_pos = pos;
+                }
+            }
+            if p > min_score {
+                best[min_pos] = (p, e);
+            }
+        }
+
+        // Zero out everything not in best (avoid allocating a full keep mask).
+        if best.is_empty() {
+            continue;
+        }
+        for e in 0..n_experts {
+            let mut keep_e = false;
+            for &(_p, be) in &best {
+                if be == e {
+                    keep_e = true;
+                    break;
+                }
+            }
+            if !keep_e {
+                w[[t, e]] = 0.0;
+            }
+        }
+
+        // Renormalize row.
+        let mut sum = 0.0f32;
+        for e in 0..n_experts {
+            sum += w[[t, e]];
+        }
+        // Same epsilon guard as other normalization sites to prevent rare amplification
+        // when the kept mass collapses.
+        let eps = 1e-6f32;
+        if sum > eps && sum.is_finite() {
+            let inv = 1.0 / sum;
+            for e in 0..n_experts {
+                let v = w[[t, e]];
+                w[[t, e]] = if v.is_finite() { v * inv } else { 0.0 };
+            }
+        } else {
+            for e in 0..n_experts {
+                if !w[[t, e]].is_finite() {
+                    w[[t, e]] = 0.0;
+                }
+            }
+        }
+    }
+
+    // Active mask.
+    let mut active = vec![false; n_experts];
+    for e in 0..n_experts {
+        for t in 0..n_tokens {
+            if w[[t, e]] > 0.0 {
+                active[e] = true;
+                break;
+            }
+        }
+    }
+
+    (w, active)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol
+    }
 
     #[test]
     fn test_expert_router_config_default() {
@@ -2069,8 +2659,15 @@ mod tests {
             load_balance_weight: 0.1,
             sparsity_weight: 0.01,
             diversity_weight: 0.005,
+            routing_mode: ExpertRoutingMode::TokenChoiceTopK,
+            capacity_factor: 0.0,
+            min_expert_capacity: 0,
+            renormalize_after_capacity: true,
+            z_loss_weight: 0.0,
             use_head_conditioning: true,
             use_learned_k_adaptation: false,
+            shared_experts: vec![],
+            shared_expert_scale: 0.0,
         };
 
         let config = ExpertRouterConfig::from_router(&router);
@@ -2286,5 +2883,227 @@ mod tests {
             .zip(original_expert_w1s.iter())
             .any(|(e, w1)| e.glu.w1 != *w1);
         assert!(any_expert_updated, "At least one expert should be updated");
+    }
+
+    #[test]
+    fn test_apply_capacity_limit_inplace_respects_capacity() {
+        // 5 tokens, 2 experts.
+        let mut probs = ndarray::Array2::from_shape_vec(
+            (5, 2),
+            vec![
+                0.90, 0.10, // t0
+                0.80, 0.20, // t1
+                0.10, 0.30, // t2
+                0.05, 0.40, // t3
+                0.01, 0.50, // t4
+            ],
+        )
+        .unwrap();
+
+        let active = apply_capacity_limit_inplace(&mut probs, 2, false);
+        assert_eq!(active.len(), 2);
+
+        // Expert 0 should keep t0,t1 only.
+        let mut kept0 = 0usize;
+        for t in 0..5 {
+            if probs[[t, 0]] > 0.0 {
+                kept0 += 1;
+            }
+        }
+        assert_eq!(kept0, 2);
+        assert!(probs[[0, 0]] > 0.0);
+        assert!(probs[[1, 0]] > 0.0);
+        assert_eq!(probs[[2, 0]], 0.0);
+        assert_eq!(probs[[3, 0]], 0.0);
+        assert_eq!(probs[[4, 0]], 0.0);
+
+        // Expert 1 should keep t4,t3 only (0.5 and 0.4).
+        let mut kept1 = 0usize;
+        for t in 0..5 {
+            if probs[[t, 1]] > 0.0 {
+                kept1 += 1;
+            }
+        }
+        assert_eq!(kept1, 2);
+        assert!(probs[[4, 1]] > 0.0);
+        assert!(probs[[3, 1]] > 0.0);
+        assert_eq!(probs[[0, 1]], 0.0);
+        assert_eq!(probs[[1, 1]], 0.0);
+        assert_eq!(probs[[2, 1]], 0.0);
+
+        // Active mask should reflect both experts still active.
+        assert!(active[0]);
+        assert!(active[1]);
+    }
+
+    #[test]
+    fn test_apply_capacity_limit_inplace_renormalizes_rows() {
+        // 3 tokens, 2 experts.
+        let mut probs = ndarray::Array2::from_shape_vec(
+            (3, 2),
+            vec![
+                0.60, 0.40, // t0 sum=1
+                0.90, 0.10, // t1 sum=1
+                0.20, 0.80, // t2 sum=1
+            ],
+        )
+        .unwrap();
+
+        // Capacity=1 per expert will drop some assignments.
+        let _active = apply_capacity_limit_inplace(&mut probs, 1, true);
+
+        // For any row with any non-zero entries, the row should sum to ~1.
+        for t in 0..3 {
+            let mut sum = 0.0f32;
+            for e in 0..2 {
+                sum += probs[[t, e]];
+            }
+            if sum > 0.0 {
+                assert!(approx_eq(sum, 1.0, 1e-6));
+            }
+        }
+    }
+
+    #[test]
+    fn test_expert_choice_routing_invariants() {
+        // 4 tokens, 3 experts.
+        let probs = ndarray::Array2::from_shape_vec(
+            (4, 3),
+            vec![
+                0.70, 0.20, 0.10, // t0
+                0.10, 0.80, 0.10, // t1
+                0.20, 0.20, 0.60, // t2
+                0.34, 0.33, 0.33, // t3
+            ],
+        )
+        .unwrap();
+
+        let (w, active) = expert_choice_routing(&probs, 2, 1.0, 1);
+        assert_eq!(w.dim(), (4, 3));
+        assert_eq!(active.len(), 3);
+
+        // Per-token nonzeros should be <= k.
+        for t in 0..4 {
+            let mut nz = 0usize;
+            let mut sum = 0.0f32;
+            for e in 0..3 {
+                let v = w[[t, e]];
+                if v > 0.0 {
+                    nz += 1;
+                }
+                sum += v;
+            }
+            assert!(nz <= 2);
+            if nz > 0 {
+                assert!(approx_eq(sum, 1.0, 1e-5));
+            }
+        }
+
+        // Active flags match presence of nonzero weights.
+        for e in 0..3 {
+            let mut any = false;
+            for t in 0..4 {
+                if w[[t, e]] > 0.0 {
+                    any = true;
+                    break;
+                }
+            }
+            assert_eq!(active[e], any);
+        }
+    }
+
+    #[test]
+    fn test_router_z_loss_metrics_accumulate() {
+        let mut cfg = ExpertRouterConfig::default();
+        let logits = ndarray::Array2::<f32>::zeros((4, 3));
+        update_router_z_loss_metrics(&mut cfg, &logits);
+
+        // logsumexp(0,0,0) = ln(3)
+        let z = (3.0f32).ln();
+        let expected = 4.0 * z * z;
+        assert_eq!(cfg.metrics_z_loss_count, 4);
+        assert!(approx_eq(cfg.metrics_z_loss_sum_sq, expected, 1e-5));
+    }
+
+    #[test]
+    fn test_non_finite_logits_do_not_produce_nan_routing() {
+        // Construct logits with NaN and -inf; selection should still produce finite weights.
+        let logits = ndarray::Array2::from_shape_vec(
+            (3, 4),
+            vec![
+                f32::NAN,
+                f32::NEG_INFINITY,
+                -1.0,
+                0.0,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                5.0,
+                f32::NAN,
+                1.0,
+                f32::NEG_INFINITY,
+            ],
+        )
+        .unwrap();
+
+        let (mut masked, _active) = masked_top_k_from_logits_and_active(&logits, 2);
+
+        // Apply a tight capacity to force drops and renormalization.
+        let _active2 = apply_capacity_limit_inplace(&mut masked, 1, true);
+
+        for v in masked.iter() {
+            assert!(v.is_finite());
+            assert!(*v >= 0.0);
+        }
+
+        // Rows should sum to ~1 for any row that has any mass.
+        for t in 0..masked.nrows() {
+            let mut sum = 0.0f32;
+            for e in 0..masked.ncols() {
+                sum += masked[[t, e]];
+            }
+            if sum > 0.0 {
+                assert!(approx_eq(sum, 1.0, 1e-5));
+            }
+        }
+
+        // z-loss metrics should ignore non-finite logits and remain finite.
+        let mut cfg = ExpertRouterConfig::default();
+        update_router_z_loss_metrics(&mut cfg, &logits);
+        assert!(cfg.metrics_z_loss_sum_sq.is_finite());
+        // At least rows with any finite values should be counted.
+        assert!(cfg.metrics_z_loss_count >= 2);
+    }
+
+    #[test]
+    fn test_shared_experts_change_output() {
+        let base_cfg = ExpertRouterConfig {
+            num_experts: 2,
+            expert_hidden_dim: 16,
+            diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut moe_base = MixtureOfExperts::new(32, 8, base_cfg);
+        let mut moe_shared = moe_base.clone();
+
+        moe_shared.config.shared_experts = vec![1];
+        moe_shared.config.shared_expert_scale = 1.0;
+
+        let input = ndarray::Array2::<f32>::from_shape_vec((4, 32), vec![0.1; 128]).unwrap();
+        let out_base = moe_base.forward(&input);
+        let out_shared = moe_shared.forward(&input);
+
+        // Shared experts add an extra always-on path, so output should differ.
+        let mut l1 = 0.0f32;
+        for (a, b) in out_base.iter().zip(out_shared.iter()) {
+            l1 += (a - b).abs();
+        }
+        assert!(l1 > 1e-6);
     }
 }

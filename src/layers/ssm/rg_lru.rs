@@ -7,20 +7,13 @@ use crate::{
     errors::Result,
     mixtures::{HeadSelectionStrategy, MoHGating},
     network::Layer,
+    richards::sigmoid_f32,
     rng::get_rng,
 };
 
 #[inline]
-fn sigmoid(x: f32) -> f32 {
-    use std::sync::OnceLock;
-    static CURVE: OnceLock<crate::richards::RichardsCurve> = OnceLock::new();
-    let curve = CURVE.get_or_init(|| crate::richards::RichardsCurve::sigmoid(false));
-    curve.forward_scalar(x as f64) as f32
-}
-
-#[inline]
 fn softplus(x: f32) -> f32 {
-    crate::soft::softplus_f32(x)
+    crate::soft::softplus(x)
 }
 
 /// Real-Gated Linear Recurrent Unit (RG-LRU) layer.
@@ -249,8 +242,8 @@ impl RgLru {
             z_i += &self.b_x.broadcast((t, d)).unwrap();
         }
 
-        let r = z_r.mapv(sigmoid);
-        let i = z_i.mapv(sigmoid);
+        let r = z_r.mapv(sigmoid_f32);
+        let i = z_i.mapv(sigmoid_f32);
 
         // log_base_a = log(sigmoid(lambda)) = -softplus(-lambda)
         // a_t = exp(c * r_t * log_base_a)
@@ -261,7 +254,7 @@ impl RgLru {
         for ti in 0..t {
             for j in 0..d {
                 let lt = (c * r[[ti, j]] * log_base_a[j]).max(-80.0).min(0.0);
-                a[[ti, j]] = crate::pade::exp_f32(lt);
+                a[[ti, j]] = crate::pade::exp(lt);
             }
         }
 
@@ -428,7 +421,8 @@ impl Layer for RgLru {
         // log(sigmoid(lambda)) = -softplus(-lambda)
         let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
         // d/dlambda log(sigmoid(lambda)) = sigmoid(-lambda) = 1 - sigmoid(lambda)
-        let dlogsig_dlambda: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| sigmoid(-x));
+        let dlogsig_dlambda: Array1<f32> =
+            self.lambda.row(0).to_owned().mapv(|x| sigmoid_f32(-x));
 
         // Full BPTT through diagonal recurrence: dh_next carries gradients to h_{t-1}.
         let mut dh_next = Array1::<f32>::zeros(d);

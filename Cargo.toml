@@ -30,6 +30,22 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "llm"
 path = "src/lib.rs"
 
+[[bench]]
+name = "encoding"
+harness = false
+
+[[bench]]
+name = "attention_parallel"
+harness = false
+
+[[bench]]
+name = "diffusion_block_bench"
+harness = false
+
+[[bench]]
+name = "transformer_block"
+harness = false
+
 [[bin]]
 name = "main"
 path = "src/main.rs"

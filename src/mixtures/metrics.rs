@@ -88,11 +88,15 @@ impl MixtureMetrics {
         // Defensive programming: ensure metrics are properly sized
         let num_components = gate_values.ncols();
         if self.active_sum_per_component.len() != num_components {
-            eprintln!(
-                "Warning: MixtureMetrics component count mismatch. Expected {}, got {}. Resizing metrics.",
-                self.active_sum_per_component.len(),
-                num_components
-            );
+            // If we were default-constructed (0 components), this resize is expected on first use.
+            // Only warn when the metrics were already tracking some other component count.
+            if !self.active_sum_per_component.is_empty() {
+                eprintln!(
+                    "Warning: MixtureMetrics component count mismatch. Expected {}, got {}. Resizing metrics.",
+                    self.active_sum_per_component.len(),
+                    num_components
+                );
+            }
             self.resize(num_components);
         }
 
@@ -165,6 +169,97 @@ impl MixtureMetrics {
 
         let std_dev = variance.sqrt();
         std_dev / mean_count // Coefficient of variation
+    }
+
+    /// Importance loss based on the *soft* routing mass per component.
+    ///
+    /// This complements token-count load balancing by penalizing collapse where a few
+    /// components receive most probability mass even if token counts look balanced.
+    ///
+    /// Returns coefficient-of-variation (std/mean) of per-component importance.
+    pub fn compute_importance_loss(&self) -> f32 {
+        if self.active_sum_per_component.is_empty() || self.total_decisions == 0 {
+            return 0.0;
+        }
+
+        let total: f32 = self
+            .active_sum_per_component
+            .iter()
+            .map(|&v| if v.is_finite() { v.max(0.0) } else { 0.0 })
+            .sum();
+        if !total.is_finite() || total <= 0.0 {
+            return 0.0;
+        }
+
+        let k = self.active_sum_per_component.len() as f32;
+        let importances: Vec<f32> = self
+            .active_sum_per_component
+            .iter()
+            .map(|&v| {
+                let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+                v / total
+            })
+            .collect();
+
+        let mean = 1.0 / k;
+        if !mean.is_finite() || mean <= 0.0 {
+            return 0.0;
+        }
+        let variance = importances
+            .iter()
+            .map(|&p| (p - mean).powi(2))
+            .sum::<f32>()
+            / k;
+        let std = variance.sqrt();
+        let cv = std / mean;
+        if cv.is_finite() { cv.max(0.0) } else { 0.0 }
+    }
+
+    /// Switch/GShard-style balancing loss combining load and importance.
+    ///
+    /// Following the common formulation: L = N * sum_i (load_i * importance_i), where
+    /// load_i is the fraction of tokens routed to i (based on token_count_per_component)
+    /// and importance_i is the fraction of routing probability mass assigned to i.
+    pub fn compute_switch_balance_loss(&self) -> f32 {
+        if self.active_sum_per_component.is_empty() || self.total_decisions == 0 {
+            return 0.0;
+        }
+
+        let n = self.active_sum_per_component.len();
+        if n == 0 {
+            return 0.0;
+        }
+
+        let total_importance: f32 = self
+            .active_sum_per_component
+            .iter()
+            .map(|&v| if v.is_finite() { v.max(0.0) } else { 0.0 })
+            .sum();
+        let total_load: f32 = self
+            .token_count_per_component
+            .iter()
+            .map(|&c| c as f32)
+            .sum();
+
+        if !total_importance.is_finite() || total_importance <= 0.0 {
+            return 0.0;
+        }
+        if !total_load.is_finite() || total_load <= 0.0 {
+            return 0.0;
+        }
+
+        let mut sum = 0.0f32;
+        for i in 0..n {
+            let imp = self.active_sum_per_component[i];
+            let imp = if imp.is_finite() { imp.max(0.0) } else { 0.0 };
+            let load = self.token_count_per_component[i] as f32;
+            let pi = imp / total_importance;
+            let li = load / total_load;
+            sum += pi * li;
+        }
+
+        let loss = (n as f32) * sum;
+        if loss.is_finite() { loss.max(0.0) } else { 0.0 }
     }
 
     /// Get sparsity loss for training (encourages minimal component usage)

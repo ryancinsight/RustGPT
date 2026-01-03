@@ -295,10 +295,7 @@ impl AdaptiveSurrogate {
         // Compute spike efficiency
         let avg_surrogate = surrogate_grad.mean().unwrap_or(0.0);
         let spike_efficiency = if avg_surrogate > 0.0 {
-            use std::sync::OnceLock;
-            static CURVE: OnceLock<crate::richards::RichardsCurve> = OnceLock::new();
-            let curve = CURVE.get_or_init(|| crate::richards::RichardsCurve::sigmoid(false));
-            curve.forward_scalar(avg_surrogate as f64) as f32
+            crate::richards::sigmoid::<f32>(avg_surrogate)
         } else {
             0.0
         };
