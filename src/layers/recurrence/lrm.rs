@@ -454,16 +454,6 @@ impl LRM {
         }
     }
 
-    fn sigmoid(x: f32) -> f32 {
-        // Numerically stable-ish sigmoid for typical ACT ranges.
-        if x >= 0.0 {
-            let z = (-x).exp();
-            1.0 / (1.0 + z)
-        } else {
-            let z = x.exp();
-            z / (1.0 + z)
-        }
-    }
 
     pub fn forward_recursive(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
         if self.config.num_recursions == 0 {
@@ -622,7 +612,7 @@ impl LRM {
                         }
                         let rel_r = diff_r / (ny_r + 1e-6);
 
-                        let p = Self::sigmoid((thr - rel_r) * slope);
+                        let p = crate::richards::sigmoid_f32((thr - rel_r) * slope);
                         let will_finish = halting_sum[[r, 0]] + p >= 1.0 - halt_eps;
                         w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
                     }
@@ -724,7 +714,7 @@ impl LRM {
                     }
 
                     // Higher stop probability when rel_r is below threshold.
-                    let p = Self::sigmoid((thr - rel_r) * slope);
+                    let p = crate::richards::sigmoid_f32((thr - rel_r) * slope);
                     let will_finish = halting_sum[[r, 0]] + p >= 1.0 - eps;
                     w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
                 }

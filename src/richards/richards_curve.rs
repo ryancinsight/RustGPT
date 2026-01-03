@@ -5,29 +5,29 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::adam::Adam;
-use crate::pade::exp_f64 as pade_exp_f64;
+
 
 // Shared internal numerics for the richards module.
 // Kept non-public to prevent namespace bleeding into the rest of the codebase.
 
 #[inline]
 pub(super) fn exp_f64_richards(x: f64) -> f64 {
-    pade_exp_f64(x)
+    crate::pade::exp(x)
 }
 
 #[inline]
-pub(super) fn exp_f32_richards(x: f32) -> f32 {
-    pade_exp_f64(x as f64) as f32
+pub fn exp_f32_richards(x: f32) -> f32 {
+    crate::pade::exp(x as f64) as f32
 }
 
 #[inline]
 pub(super) fn softplus_f64_richards(x: f64) -> f64 {
-    crate::soft::softplus_f64(x)
+    crate::soft::softplus(x)
 }
 
 #[inline]
-pub(super) fn softplus_f32_richards(x: f32) -> f32 {
-    crate::soft::softplus_f32(x)
+pub fn softplus_f32_richards(x: f32) -> f32 {
+    crate::soft::softplus(x)
 }
 
 #[inline]
@@ -38,13 +38,8 @@ pub(super) fn inv_softplus_f64_richards(t: f64) -> f64 {
     if t > 20.0 {
         t
     } else {
-        (pade_exp_f64(t) - 1.0).ln()
+        (crate::pade::exp(t) - 1.0).ln()
     }
-}
-
-#[inline]
-pub(super) fn inv_softplus_f32_richards(t: f32) -> f32 {
-    inv_softplus_f64_richards(t as f64) as f32
 }
 
 #[inline]
@@ -58,12 +53,7 @@ pub(super) fn unit_from_softplus_f64_richards(t: f64) -> f64 {
     if t == f64::NEG_INFINITY {
         return 0.0;
     }
-    1.0 - pade_exp_f64(-t)
-}
-
-#[inline]
-pub(super) fn unit_from_softplus_f32_richards(t: f32) -> f32 {
-    unit_from_softplus_f64_richards(t as f64) as f32
+    1.0 - crate::pade::exp(-t)
 }
 
 // Rayon parallelism has overhead for small slices; avoid it on tiny tensors.
@@ -372,6 +362,7 @@ pub struct RichardsCurve {
     pub beta: Option<f64>, // Asymmetry factor for extended Richards
 
     // Temperature parameter (controls curve sharpness/softness)
+    #[serde(default)]
     pub temperature: Option<f64>, // Temperature scaling factor
 
     // Affine parameter values (Some for fixed, None for learnable)
@@ -415,6 +406,7 @@ pub struct RichardsCurve {
     pub learned_k: Option<f64>,
     pub learned_m: Option<f64>,
     pub learned_beta: Option<f64>,
+    #[serde(default)]
     pub learned_temperature: Option<f64>,
     #[serde(rename = "learned_a")]
     pub learned_output_gain: Option<f64>,
@@ -428,6 +420,7 @@ pub struct RichardsCurve {
     pub k_learnable: bool,
     pub m_learnable: bool,
     pub beta_learnable: bool,
+    #[serde(default)]
     pub temperature_learnable: bool,
     #[serde(rename = "a_learnable")]
     pub output_gain_learnable: bool,
@@ -439,7 +432,7 @@ pub struct RichardsCurve {
     pub bias_learnable: bool,  // Whether bias parameters are learnable
 
     // Variant configuration
-    pub variant: super::Variant, // Sigmoid, Tanh, or Gompertz mode
+    pub variant: crate::richards::Variant, // Sigmoid, Tanh, or Gompertz mode
 
     // Adaptive normalization (used by Adaptive variant)
     #[serde(skip_serializing, skip_deserializing)]
@@ -530,7 +523,7 @@ impl RichardsCurve {
         assert_eq!(x.len(), y.len(), "Input and output lengths must match");
         assert_eq!(x.len(), dy.len(), "Input and derivative lengths must match");
         match self.variant {
-            super::Variant::Tanh => self.eval_kernel_into_f32::<TanhLike>(x, y, dy),
+            crate::richards::Variant::Tanh => self.eval_kernel_into_f32::<TanhLike>(x, y, dy),
             _ => self.eval_kernel_into_f32::<SigmoidLike>(x, y, dy),
         }
     }
@@ -539,7 +532,7 @@ impl RichardsCurve {
     #[inline]
     pub fn eval_scalar(&self, x: f64) -> (f64, f64) {
         match self.variant {
-            super::Variant::Tanh => RichardsKernel::<TanhLike>::from_curve(self).eval_one_f64(x),
+            crate::richards::Variant::Tanh => RichardsKernel::<TanhLike>::from_curve(self).eval_one_f64(x),
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).eval_one_f64(x),
         }
     }
@@ -564,7 +557,7 @@ impl RichardsCurve {
         assert_eq!(x.len(), y.len(), "Input and output lengths must match");
         assert_eq!(x.len(), dy.len(), "Input and derivative lengths must match");
         match self.variant {
-            super::Variant::Tanh => self.eval_kernel_into_f64::<TanhLike>(x, y, dy),
+            crate::richards::Variant::Tanh => self.eval_kernel_into_f64::<TanhLike>(x, y, dy),
             _ => self.eval_kernel_into_f64::<SigmoidLike>(x, y, dy),
         }
     }
@@ -612,14 +605,14 @@ impl RichardsCurve {
     }
 
     /// Constructor with learnable params based on variant.
-    pub fn new_learnable(variant: super::Variant) -> Self {
+    pub fn new_learnable(variant: crate::richards::Variant) -> Self {
         // Set output_gain/output_bias coefficients based on variant (Some for fixed, None for
         // learnable)
         let (output_gain_val, output_bias_val) = match variant {
-            super::Variant::Sigmoid | super::Variant::Gompertz => (Some(1.0), Some(0.0)), /* [0, 1] range, fixed */
-            super::Variant::Tanh => (Some(1.0), Some(0.0)), // [-1, 1] via 2σ(2x) - 1 transform,
+            crate::richards::Variant::Sigmoid | crate::richards::Variant::Gompertz => (Some(1.0), Some(0.0)), /* [0, 1] range, fixed */
+            crate::richards::Variant::Tanh => (Some(1.0), Some(0.0)), // [-1, 1] via 2σ(2x) - 1 transform,
             // fixed
-            super::Variant::Adaptive | super::Variant::None | super::Variant::Polynomial => {
+            crate::richards::Variant::Adaptive | crate::richards::Variant::None | crate::richards::Variant::Polynomial => {
                 (None, None)
             } // Fully learnable including output_gain/output_bias
         };
@@ -631,13 +624,13 @@ impl RichardsCurve {
             + if output_bias_val.is_none() { 1 } else { 0 };
 
         let (adaptive_initialized, momentum) = match variant {
-            super::Variant::Adaptive => (true, 0.01), // Enable adaptive normalization with
+            crate::richards::Variant::Adaptive => (true, 0.01), // Enable adaptive normalization with
             // default momentum
             _ => (false, 0.0), // Disable adaptive for other variants
         };
 
         let polynomial_initialized = match variant {
-            super::Variant::Polynomial => true, // Enable polynomial transformation
+            crate::richards::Variant::Polynomial => true, // Enable polynomial transformation
             _ => false,                         // Disable polynomial for other variants
         };
 
@@ -645,7 +638,7 @@ impl RichardsCurve {
         // usage (helps ensure exponential behavior in the left tail across nu values).
         // Keep it disabled for Tanh, where the notion of “small size” growth is less aligned.
         let birch_exponential_tail = match variant {
-            super::Variant::Tanh => false,
+            crate::richards::Variant::Tanh => false,
             _ => true,
         };
 
@@ -769,7 +762,7 @@ impl RichardsCurve {
             shift_learnable: false,
             gamma_learnable: false, // Not learnable in default RichardsCurve
             bias_learnable: false,  // Not learnable in default RichardsCurve
-            variant: super::Variant::Sigmoid,
+            variant: crate::richards::Variant::Sigmoid,
             poly_power: None, // Not polynomial variant
             poly_coeffs: None,
             gamma: None,       // Not used in default RichardsCurve
@@ -790,7 +783,7 @@ impl RichardsCurve {
     /// Sigmoid builder: fixed params, or learnable.
     pub fn sigmoid(learnable: bool) -> Self {
         if learnable {
-            Self::new_learnable(super::Variant::Sigmoid)
+            Self::new_learnable(crate::richards::Variant::Sigmoid)
         } else {
             Self {
                 nu: Some(1.0),
@@ -824,7 +817,7 @@ impl RichardsCurve {
                 shift_learnable: false,
                 gamma_learnable: false, // Not learnable in sigmoid RichardsCurve
                 bias_learnable: false,  // Not learnable in sigmoid RichardsCurve
-                variant: super::Variant::Sigmoid,
+                variant: crate::richards::Variant::Sigmoid,
                 poly_power: None, // Not polynomial variant
                 poly_coeffs: None,
                 gamma: None, // Not used in sigmoid RichardsCurve
@@ -846,7 +839,7 @@ impl RichardsCurve {
     /// Tanh builder: fixed (ν=1, k=2, m=0 for exact match), or learnable.
     pub fn tanh(learnable: bool) -> Self {
         if learnable {
-            Self::new_learnable(super::Variant::Tanh)
+            Self::new_learnable(crate::richards::Variant::Tanh)
         } else {
             Self {
                 nu: Some(1.0),
@@ -880,7 +873,7 @@ impl RichardsCurve {
                 shift_learnable: false,
                 gamma_learnable: false, // Not learnable in tanh RichardsCurve
                 bias_learnable: false,  // Not learnable in tanh RichardsCurve
-                variant: super::Variant::Tanh,
+                variant: crate::richards::Variant::Tanh,
                 poly_power: None, // Not polynomial variant
                 poly_coeffs: None,
                 gamma: None, // Not used in tanh RichardsCurve
@@ -902,7 +895,7 @@ impl RichardsCurve {
     /// Gompertz builder: low ν fixed (0.01 approx), or learnable.
     pub fn gompertz(learnable: bool) -> Self {
         if learnable {
-            Self::new_learnable(super::Variant::Gompertz)
+            Self::new_learnable(crate::richards::Variant::Gompertz)
         } else {
             Self {
                 nu: Some(0.01),
@@ -936,7 +929,7 @@ impl RichardsCurve {
                 shift_learnable: false,
                 gamma_learnable: false, // Not learnable in gompertz RichardsCurve
                 bias_learnable: false,  // Not learnable in gompertz RichardsCurve
-                variant: super::Variant::Gompertz,
+                variant: crate::richards::Variant::Gompertz,
                 poly_power: None, // Not polynomial variant
                 poly_coeffs: None,
                 gamma: None, // Not used in gompertz RichardsCurve
@@ -959,7 +952,7 @@ impl RichardsCurve {
     /// All parameters are learnable and no input/output transformations are applied
     /// This is equivalent to new_learnable(Variant::None)
     pub fn new_fully_learnable() -> Self {
-        Self::new_learnable(super::Variant::None)
+        Self::new_learnable(crate::richards::Variant::None)
     }
 
     /// Enable per-feature transformations for normalization layers
@@ -1057,6 +1050,81 @@ impl RichardsCurve {
         (nu, k, m, beta, temp, output_gain, output_bias, scale, shift)
     }
 
+    /// Returns the effective (clamped) parameter tuple used for forward/derivative.
+    ///
+    /// This is the safest way for other modules to read the “current” parameters because it:
+    /// - prefers fixed params (`Some`) over learned params (`learned_*`)
+    /// - applies the same positivity / finiteness constraints as the compute kernels
+    #[inline]
+    pub fn effective_params(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+        self.get_all_params()
+    }
+
+    #[inline]
+    pub fn effective_nu(&self) -> f64 {
+        let (nu, _, _, _, _, _, _, _, _) = self.get_all_params();
+        nu
+    }
+
+    #[inline]
+    pub fn effective_k(&self) -> f64 {
+        let (_, k, _, _, _, _, _, _, _) = self.get_all_params();
+        k
+    }
+
+    #[inline]
+    pub fn effective_m(&self) -> f64 {
+        let (_, _, m, _, _, _, _, _, _) = self.get_all_params();
+        m
+    }
+
+    #[inline]
+    pub fn effective_beta(&self) -> f64 {
+        let (_, _, _, beta, _, _, _, _, _) = self.get_all_params();
+        beta
+    }
+
+    #[inline]
+    pub fn effective_temperature(&self) -> f64 {
+        let (_, _, _, _, temp, _, _, _, _) = self.get_all_params();
+        temp
+    }
+
+    #[inline]
+    pub fn effective_output_gain(&self) -> f64 {
+        let (_, _, _, _, _, a, _, _, _) = self.get_all_params();
+        a
+    }
+
+    #[inline]
+    pub fn effective_output_bias(&self) -> f64 {
+        let (_, _, _, _, _, _, b, _, _) = self.get_all_params();
+        b
+    }
+
+    #[inline]
+    pub fn effective_scale(&self) -> f64 {
+        let (_, _, _, _, _, _, _, s, _) = self.get_all_params();
+        s
+    }
+
+    #[inline]
+    pub fn effective_shift(&self) -> f64 {
+        let (_, _, _, _, _, _, _, _, sh) = self.get_all_params();
+        sh
+    }
+
+    /// Effective input multiplier combining `scale` and `temperature`.
+    ///
+    /// In the current parameterization, the pre-activation uses `scale * (x / temperature)`.
+    /// This means `scale` and `temperature` are partially non-identifiable if both are learnable;
+    /// most call sites should prefer learning only one of them.
+    #[inline]
+    pub fn effective_scale_over_temperature(&self) -> f64 {
+        let (_, _, _, _, temp, _, _, scale, _) = self.get_all_params();
+        scale / temp
+    }
+
     /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise), writing
     /// to output slice. Optimized for zero-copy usage. Uses extended Richards with beta and
     /// temperature parameters.
@@ -1065,7 +1133,7 @@ impl RichardsCurve {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
         match self.variant {
-            super::Variant::Tanh => self.forward_kernel_into_f64::<TanhLike>(x, out),
+            crate::richards::Variant::Tanh => self.forward_kernel_into_f64::<TanhLike>(x, out),
             _ => self.forward_kernel_into_f64::<SigmoidLike>(x, out),
         }
     }
@@ -1075,7 +1143,7 @@ impl RichardsCurve {
     pub fn forward_into_f32(&self, x: &[f32], out: &mut [f32]) {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
         match self.variant {
-            super::Variant::Tanh => self.forward_kernel_into_f32::<TanhLike>(x, out),
+            crate::richards::Variant::Tanh => self.forward_kernel_into_f32::<TanhLike>(x, out),
             _ => self.forward_kernel_into_f32::<SigmoidLike>(x, out),
         }
     }
@@ -1158,7 +1226,7 @@ impl RichardsCurve {
     /// Forward for a single scalar x
     pub fn forward_scalar(&self, x: f64) -> f64 {
         match self.variant {
-            super::Variant::Tanh => RichardsKernel::<TanhLike>::from_curve(self).forward_one_f64(x),
+            crate::richards::Variant::Tanh => RichardsKernel::<TanhLike>::from_curve(self).forward_one_f64(x),
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).forward_one_f64(x),
         }
     }
@@ -1344,7 +1412,7 @@ impl RichardsCurve {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
         match self.variant {
-            super::Variant::Tanh => self.derivative_kernel_into_f64::<TanhLike>(x, out),
+            crate::richards::Variant::Tanh => self.derivative_kernel_into_f64::<TanhLike>(x, out),
             _ => self.derivative_kernel_into_f64::<SigmoidLike>(x, out),
         }
     }
@@ -1353,7 +1421,7 @@ impl RichardsCurve {
     #[inline]
     pub fn derivative_scalar(&self, x: f64) -> f64 {
         match self.variant {
-            super::Variant::Tanh => {
+            crate::richards::Variant::Tanh => {
                 RichardsKernel::<TanhLike>::from_curve(self).derivative_one_f64(x)
             }
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).derivative_one_f64(x),
@@ -1364,7 +1432,7 @@ impl RichardsCurve {
     pub fn derivative_into_f32(&self, x: &[f32], out: &mut [f32]) {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
         match self.variant {
-            super::Variant::Tanh => self.derivative_kernel_into_f32::<TanhLike>(x, out),
+            crate::richards::Variant::Tanh => self.derivative_kernel_into_f32::<TanhLike>(x, out),
             _ => self.derivative_kernel_into_f32::<SigmoidLike>(x, out),
         }
     }
@@ -1490,7 +1558,7 @@ impl RichardsCurve {
     /// slice
     pub fn grad_weights_scalar_into(&self, x: f64, grad_output: f64, out: &mut [f64]) {
         match self.variant {
-            super::Variant::Tanh => {
+            crate::richards::Variant::Tanh => {
                 self.grad_weights_scalar_into_kernel::<TanhLike>(x, grad_output, out)
             }
             _ => self.grad_weights_scalar_into_kernel::<SigmoidLike>(x, grad_output, out),
@@ -1904,7 +1972,7 @@ impl RichardsCurve {
     /// Update running statistics from input batch (for Adaptive variant)
     /// This tracks mean and variance to automatically adapt scale/shift parameters
     pub fn update_running_stats(&mut self, x: &Array1<f64>) {
-        if self.variant != super::Variant::Adaptive {
+        if self.variant != crate::richards::Variant::Adaptive {
             return; // Only Adaptive variant uses running statistics
         }
 
@@ -1954,7 +2022,7 @@ impl RichardsCurve {
 
     /// Get adaptive scaling parameters (or default to (1.0, 0.0) if not adaptive)
     fn get_adaptive_scaling(&self) -> (f64, f64) {
-        if self.variant == super::Variant::Adaptive {
+        if self.variant == crate::richards::Variant::Adaptive {
             (
                 self.adaptive_scale.unwrap_or(1.0),
                 self.adaptive_shift.unwrap_or(0.0),
@@ -1966,7 +2034,7 @@ impl RichardsCurve {
 
     /// Reset running statistics (useful for new training epochs)
     pub fn reset_running_stats(&mut self) {
-        if self.variant == super::Variant::Adaptive {
+        if self.variant == crate::richards::Variant::Adaptive {
             self.running_sum = Some(0.0);
             self.running_sq_sum = Some(0.0);
             self.count = Some(0);
@@ -1979,7 +2047,7 @@ impl RichardsCurve {
     /// Coefficients are [coeff_0, coeff_1, coeff_2, ..., coeff_power]
     /// defining polynomial: coeff_0 + coeff_1*x + coeff_2*x^2 + ... + coeff_power*x^power
     pub fn set_polynomial(&mut self, power: usize, coeffs: Vec<f64>) -> Result<(), String> {
-        if self.variant != super::Variant::Polynomial {
+        if self.variant != crate::richards::Variant::Polynomial {
             return Err("Can only set polynomial coefficients for Polynomial variant".to_string());
         }
         if power < 1 || power > 5 {
@@ -2019,7 +2087,7 @@ impl RichardsCurve {
 
     /// Get polynomial-input scaling (applied before Richards activation)
     fn get_polynomial_scaling(&self) -> f64 {
-        if self.variant == super::Variant::Polynomial {
+        if self.variant == crate::richards::Variant::Polynomial {
             self.evaluate_polynomial(1.0) // Evaluate at x=1 for scaling check
         } else {
             1.0 // Identity scaling for non-polynomial variants
@@ -2187,7 +2255,7 @@ mod tests {
     #[test]
     fn test_gradient_numerical_check() {
         // Numerical gradient checking using finite differences
-        let mut curve = RichardsCurve::new_learnable(super::super::Variant::Sigmoid);
+        let mut curve = RichardsCurve::new_learnable(crate::richards::Variant::Sigmoid);
 
         // Initialize with standard Richards parameters (beta=1, temp=1)
         curve.learned_nu = Some(1.5);
@@ -2395,7 +2463,7 @@ mod tests {
 
     #[test]
     fn test_no_nan_inf_in_gradients() {
-        let curve = RichardsCurve::new_learnable(super::super::Variant::Sigmoid);
+        let curve = RichardsCurve::new_learnable(crate::richards::Variant::Sigmoid);
         // Test with extreme inputs
         let extreme_inputs = vec![-100.0, -10.0, 0.0, 10.0, 100.0];
 

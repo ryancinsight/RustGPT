@@ -69,8 +69,15 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
             load_balance_weight: 0.01,
             sparsity_weight: 0.001,
             diversity_weight: 0.005,
+            routing_mode: crate::mixtures::moe::ExpertRoutingMode::TokenChoiceTopK,
+            capacity_factor: 0.0,
+            min_expert_capacity: 0,
+            renormalize_after_capacity: true,
+            z_loss_weight: 0.0,
             use_head_conditioning: true,
             use_learned_k_adaptation: true,
+            shared_experts: vec![],
+            shared_expert_scale: 0.0,
         });
     }
 

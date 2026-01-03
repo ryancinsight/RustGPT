@@ -1,6 +1,8 @@
 use std::fs;
 
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array2, Axis, s};
+#[cfg(test)]
+use ndarray::Array1;
 use rand::Rng;
 use rand_distr::Distribution;
 use rayon::prelude::*;
@@ -97,6 +99,10 @@ pub struct LLM {
     speculative_config: Option<SpeculativeSamplingConfig>,
     #[serde(default)]
     speculative_mode: SpeculativeMode,
+
+    // Scratch buffers (not serialized) for allocation-free tokenization on repeated inference calls.
+    #[serde(skip, default)]
+    tokenize_scratch: Vec<usize>,
 }
 
 impl std::fmt::Debug for LLM {
@@ -126,6 +132,7 @@ impl Default for LLM {
             speculative_config: None,
             speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
                                                            * backward compatibility */
+            tokenize_scratch: Vec::new(),
         }
     }
 }
@@ -142,6 +149,7 @@ impl LLM {
             speculative_config: None,
             speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
                                                            * backward compatibility */
+            tokenize_scratch: Vec::new(),
         }
     }
 
@@ -156,6 +164,7 @@ impl LLM {
             speculative_config: None,
             speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
                                                            * backward compatibility */
+            tokenize_scratch: Vec::new(),
         }
     }
 
@@ -267,11 +276,10 @@ impl LLM {
 
         // Get probabilities for last position from draft model
         let last_row = draft_logits.row(draft_logits.shape()[0] - 1);
-        let draft_probs = crate::soft::Softmax::new()
-            .forward_immutable(&last_row.to_owned().insert_axis(Axis(0)).view());
+        let draft_probs = crate::soft::Softmax::new().forward_immutable_row(&last_row);
 
         // Get top-γ candidates from draft model
-        let candidates = self.get_top_k_tokens(&draft_probs, gamma);
+        let candidates = self.get_top_k_tokens_from_probs(&draft_probs, gamma);
 
         if candidates.is_empty() {
             // Fallback to greedy from draft
@@ -285,8 +293,8 @@ impl LLM {
 
         // Get full model probabilities for verification
         // Run through all layers (full model)
-        let full_logits = self.get_sequence_logit(current_tokens);
-        let target_probs = crate::soft::Softmax::new().forward_immutable(&full_logits.view());
+        let full_logits = self.get_sequence_logit_row(current_tokens);
+        let target_probs = crate::soft::Softmax::new().forward_immutable_row(&full_logits.view());
 
         // Speculative decoding acceptance with rejection sampling
         // Accept token i with probability min(1, p_target(i) / p_draft(i))
@@ -297,8 +305,8 @@ impl LLM {
                 continue; // Skip invalid tokens
             }
 
-            let q_draft = draft_probs[[0, candidate_token]].max(1e-10);
-            let q_target = target_probs[[0, candidate_token]].max(1e-10);
+            let q_draft = draft_probs[candidate_token].max(1e-10);
+            let q_target = target_probs[candidate_token].max(1e-10);
 
             // Rejection sampling: accept with probability min(1, q_target/q_draft)
             let acceptance_prob = (q_target / q_draft).min(1.0);
@@ -317,22 +325,9 @@ impl LLM {
         // No candidates accepted - sample from adjusted distribution
         // p_adjusted = max(0, p_target - p_draft) normalized
         // This ensures we sample from the "residual" of the target distribution
-        let mut adjusted_probs = Vec::with_capacity(vocab_size);
         let mut sum = 0.0f32;
-
         for i in 0..vocab_size {
-            let p_target = if i < target_probs.len() {
-                target_probs[[0, i]]
-            } else {
-                0.0
-            };
-            let p_draft = if i < draft_probs.len() {
-                draft_probs[[0, i]]
-            } else {
-                0.0
-            };
-            let p_adj = (p_target - p_draft).max(0.0);
-            adjusted_probs.push(p_adj);
+            let p_adj = (target_probs[i] - draft_probs[i]).max(0.0);
             sum += p_adj;
         }
 
@@ -340,8 +335,8 @@ impl LLM {
             // Sample from adjusted distribution
             let r: f32 = rng.random::<f32>() * sum;
             let mut cumsum = 0.0f32;
-            for (i, &p) in adjusted_probs.iter().enumerate() {
-                cumsum += p;
+            for i in 0..vocab_size {
+                cumsum += (target_probs[i] - draft_probs[i]).max(0.0);
                 if cumsum >= r {
                     return i;
                 }
@@ -358,11 +353,11 @@ impl LLM {
     }
 
     /// Get logit for the last position of a sequence
-    fn get_sequence_logit(&mut self, tokens: &[usize]) -> Array2<f32> {
-        use ndarray::Array2;
+    fn get_sequence_logit_row(&mut self, tokens: &[usize]) -> ndarray::Array1<f32> {
+        use ndarray::{Array1, Array2};
 
         if tokens.is_empty() {
-            return Array2::zeros((1, self.vocab.size()));
+            return Array1::zeros(self.vocab.size());
         }
 
         // Convert tokens to embeddings (convert to f32)
@@ -407,20 +402,68 @@ impl LLM {
         };
 
         // Return logits for the last position
-        logits
-            .row(logits.shape()[0] - 1)
-            .to_owned()
-            .insert_axis(Axis(0))
+        logits.row(logits.shape()[0] - 1).to_owned()
     }
 
-    /// Get top-k tokens from probability distribution
-    fn get_top_k_tokens(&self, probs: &Array2<f32>, k: usize) -> Vec<usize> {
-        let mut token_probs: Vec<(usize, f32)> =
-            probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+    /// Get top-k token IDs from a probability row.
+    ///
+    /// Uses a fixed-size min-heap so this is $O(V \log k)$ rather than sorting the whole vocab.
+    fn get_top_k_tokens_from_probs(&self, probs: &ndarray::Array1<f32>, k: usize) -> Vec<usize> {
+        use std::cmp::{Ordering, Reverse};
+        use std::collections::BinaryHeap;
 
-        token_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        token_probs.truncate(k);
-        token_probs.into_iter().map(|(i, _)| i).collect()
+        #[derive(Copy, Clone, Debug)]
+        struct Score(f32);
+        impl PartialEq for Score {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.to_bits() == other.0.to_bits()
+            }
+        }
+        impl Eq for Score {}
+        impl PartialOrd for Score {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Score {
+            fn cmp(&self, other: &Self) -> Ordering {
+                match (self.0.is_nan(), other.0.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => self
+                        .0
+                        .partial_cmp(&other.0)
+                        .unwrap_or(Ordering::Equal),
+                }
+            }
+        }
+
+        if k == 0 {
+            return Vec::new();
+        }
+
+        let mut heap: BinaryHeap<(Reverse<Score>, usize)> = BinaryHeap::with_capacity(k + 1);
+
+        for (i, &p) in probs.iter().enumerate() {
+            let score = Score(p);
+            if heap.len() < k {
+                heap.push((Reverse(score), i));
+                continue;
+            }
+            let Some((Reverse(min_score), _)) = heap.peek() else {
+                continue;
+            };
+            if score > *min_score {
+                heap.pop();
+                heap.push((Reverse(score), i));
+            }
+        }
+
+        let mut out: Vec<(Score, usize)> =
+            heap.into_iter().map(|(Reverse(s), i)| (s, i)).collect();
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out.into_iter().map(|(_, i)| i).collect()
     }
 }
 
@@ -563,27 +606,22 @@ impl LLM {
             return String::new();
         }
 
-        // Convert token_ids to strings
-        output_tokens
-            .iter()
-            .map(|&t| self.vocab.decode(t).unwrap())
-            .fold(String::new(), |mut acc, token_str| {
-                if !acc.is_empty() {
-                    acc.push(' ');
-                }
-                acc.push_str(token_str);
-                acc
-            })
+        // Convert token_ids to a string (pre-alloc + robust unknown fallback)
+        self.vocab.decode_tokens_to_string(&output_tokens)
     }
 
     #[inline]
     fn forward(&mut self, text: &str) -> Vec<usize> {
-        // Tokenize the input text
-        let mut tokenized = self.tokenize(text);
+        // Tokenize the input text (reuse a scratch Vec to avoid repeated allocations).
+        // We `take` the buffer out of `self` so we don't hold a mutable borrow of `self` across
+        // calls that also require `&mut self`.
+        let mut tokenized = std::mem::take(&mut self.tokenize_scratch);
+        self.vocab.tokenize_into(text, &mut tokenized);
         let mut output_tokens: Vec<usize> = Vec::new();
 
         // Safety check: ensure we have at least one token
         if tokenized.is_empty() {
+            self.tokenize_scratch = tokenized;
             return output_tokens;
         }
 
@@ -591,6 +629,7 @@ impl LLM {
 
         // Prevent overflow if input_len >= MAX_SEQ_LEN
         if input_len >= MAX_SEQ_LEN {
+            self.tokenize_scratch = tokenized;
             return output_tokens;
         }
 
@@ -650,10 +689,7 @@ impl LLM {
                 break;
             }
 
-            let last_logit = logits
-                .row(logits.shape()[0] - 1)
-                .to_owned()
-                .insert_axis(Axis(0));
+            let last_logit_row = logits.row(logits.shape()[0] - 1);
 
             // Get hidden states for the last position
             let _last_hidden = hidden_states.row(hidden_states.shape()[0] - 1).to_owned();
@@ -663,7 +699,7 @@ impl LLM {
             {
                 // Use speculative sampling for transformers
                 self.generate_speculative_transformer(
-                    &tokenized,
+                    tokenized.as_slice(),
                     cfg.gamma,
                     cfg.tau,
                     cfg.draft_layers,
@@ -672,11 +708,8 @@ impl LLM {
                 // Use regular decoding
                 match &mut self.decoder {
                     DecoderType::Greedy(decoder) => {
-                        // Simple greedy decoding
-                        let probs =
-                            crate::soft::Softmax::new().forward_immutable(&last_logit.view());
-                        let tokens = decoder.decode(&probs);
-                        tokens[0]
+                        // Simple greedy decoding: argmax directly from logits (no softmax needed)
+                        decoder.decode_row(last_logit_row)
                     }
                 }
             };
@@ -684,11 +717,16 @@ impl LLM {
             output_tokens.push(next_token);
             tokenized.push(next_token);
 
-            if next_token == self.vocab.encode("</s>").unwrap() {
+            if self
+                .vocab
+                .encode("</s>")
+                .is_some_and(|eos| next_token == eos)
+            {
                 break;
             }
         }
 
+        self.tokenize_scratch = tokenized;
         output_tokens
     }
 
@@ -734,8 +772,6 @@ impl LLM {
         let mut prev_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
 
         for epoch in 0..epochs {
-            let _t_epoch_start = std::time::Instant::now();
-            let _t_epoch_start = std::time::Instant::now();
             let t_epoch_start = std::time::Instant::now();
             let mut total_loss = 0.0;
             let mut total_base_loss = 0.0;
@@ -2033,12 +2069,13 @@ impl LLM {
                             grad_y_in_opt = Some(grad_y_in);
                         }
                         if let Some(grad_y_in) = grad_y_in_opt {
-                            let (_in_grad_unused, lrm_param_grads_step) = match &self.network[t_idx]
-                            {
+                            let lrm_param_grads_step = match &self.network[t_idx] {
                                 LayerEnum::LRM(layer) => {
-                                    layer.compute_gradients_at_step(si, &grad_y_in)
+                                    let (_in_grad_unused, param_grads) =
+                                        layer.compute_gradients_at_step(si, &grad_y_in);
+                                    param_grads
                                 }
-                                _ => (grad_y_in.clone(), Vec::new()),
+                                _ => Vec::new(),
                             };
                             if !lrm_param_grads_step.is_empty() {
                                 if accumulated_param_grads[t_idx].is_empty() {
@@ -2517,6 +2554,12 @@ impl LLM {
         self.vocab.tokenize(text)
     }
 
+    /// In-place tokenization to reuse a caller-provided buffer.
+    #[inline]
+    pub fn tokenize_into(&self, text: &str, out: &mut Vec<usize>) {
+        self.vocab.tokenize_into(text, out)
+    }
+
     /// Save model to JSON format (human-readable, larger file size)
     pub fn save_json(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(|e| ModelError::Serialization {
@@ -2687,10 +2730,7 @@ impl LLM {
             let sigma = (0.15 * total).max(1.0);
             let capped_t = t.min(num_timesteps.saturating_sub(1)) as f32;
             let x = (center - capped_t) / sigma;
-            use std::sync::OnceLock;
-            static CURVE: OnceLock<crate::richards::RichardsCurve> = OnceLock::new();
-            let curve = CURVE.get_or_init(|| crate::richards::RichardsCurve::sigmoid(false));
-            let s = curve.forward_scalar(x as f64) as f32;
+            let s = crate::richards::sigmoid::<f32>(x);
             s.clamp(0.5, 1.0)
         };
         let log_dir = std::path::Path::new("training_logs");
@@ -2835,9 +2875,16 @@ impl LLM {
                         };
                     let mut noise = Array2::<f32>::zeros(x0.raw_dim());
                     if let Some(slice) = noise.as_slice_mut() {
-                        slice.par_iter_mut().for_each(|v| {
-                            *v = normal.sample(&mut get_rng()) as f32;
-                        });
+                        if crate::rng::is_seeded() {
+                            // Deterministic mode: avoid parallel RNG call-order sensitivity.
+                            for v in slice.iter_mut() {
+                                *v = normal.sample(&mut rng) as f32;
+                            }
+                        } else {
+                            slice.par_iter_mut().for_each(|v| {
+                                *v = normal.sample(&mut get_rng()) as f32;
+                            });
+                        }
                     } else {
                         for v in noise.iter_mut() {
                             *v = normal.sample(&mut rng) as f32;
@@ -2856,7 +2903,7 @@ impl LLM {
                     let candidate = if sampling_cdf.is_empty() {
                         rng.random_range(0..active_steps)
                     } else {
-                        let r: f32 = rand::random();
+                        let r: f32 = rng.random();
                         let mut lo = 0usize;
                         let mut hi = sampling_cdf.len();
                         while lo < hi {
@@ -3965,8 +4012,8 @@ impl LLM {
         Ok((b1, b2))
     }
 
-    /// Get token embedding vector (helper method)
-    #[allow(dead_code)]
+    /// Get token embedding vector (test helper method)
+    #[cfg(test)]
     fn get_token_embedding(&self, token_id: usize, embedding_dim: usize) -> Array1<f32> {
         // Access TokenEmbeddings layer directly
         if let Some(LayerEnum::TokenEmbeddings(embeddings)) = self.network.first() {

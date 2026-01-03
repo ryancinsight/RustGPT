@@ -182,7 +182,9 @@ fn apply_soft_top_p_selection(
             let w = if v.is_finite() { v.max(0.0) } else { 0.0 };
             sum_w += w;
         }
-        if sum_w <= 0.0 {
+        // Guard against division by a tiny sum which can amplify gradients.
+        let eps = 1e-6f32;
+        if sum_w <= eps {
             // Fallback: uniform distribution.
             let w = 1.0 / n as f32;
             for i in 0..n {
@@ -254,7 +256,7 @@ fn apply_soft_top_p_selection(
         }
 
         let sum_masked: f32 = masked_probs.iter().sum();
-        if sum_masked > 0.0 {
+        if sum_masked > eps && sum_masked.is_finite() {
             for (i, prob) in masked_probs.into_iter().enumerate() {
                 result[[token_idx, i]] = prob / sum_masked;
             }

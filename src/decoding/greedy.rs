@@ -17,7 +17,7 @@
 //! - **Simple**: Easy to understand and implement
 //! - **Limited Diversity**: No exploration of alternative sequences
 
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 
 /// Greedy decoder that always selects the most probable token
@@ -39,19 +39,23 @@ impl GreedyDecoder {
     /// Vector of selected token indices, one per batch element
     #[inline]
     pub fn decode(&self, probs: &Array2<f32>) -> Vec<usize> {
-        probs
-            .map_axis(ndarray::Axis(1), |row| {
-                let mut max_val = f32::NEG_INFINITY;
-                let mut max_idx = 0;
-                for (i, &val) in row.iter().enumerate() {
-                    if val > max_val || (val == max_val && i < max_idx) {
-                        max_val = val;
-                        max_idx = i;
-                    }
-                }
-                max_idx
-            })
-            .to_vec()
+        probs.outer_iter().map(|row| self.decode_row(row)).collect()
+    }
+
+    /// Decode a single probability/logit row using greedy selection.
+    ///
+    /// This is the hot-path for inference (select top-1 token) and does not allocate.
+    #[inline]
+    pub fn decode_row(&self, row: ArrayView1<'_, f32>) -> usize {
+        let mut max_val = f32::NEG_INFINITY;
+        let mut max_idx = 0usize;
+        for (i, &val) in row.iter().enumerate() {
+            if val > max_val || (val == max_val && i < max_idx) {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+        max_idx
     }
 }
 
@@ -68,6 +72,10 @@ mod tests {
 
         let result = decoder.decode(&probs);
         assert_eq!(result, vec![1]); // Should select index 1 (highest probability)
+
+        // Also test row decode (no allocation)
+        let row = probs.row(0);
+        assert_eq!(decoder.decode_row(row), 1);
     }
 
     #[test]
@@ -93,6 +101,9 @@ mod tests {
 
         let result = decoder.decode(&probs);
         assert_eq!(result, vec![0]); // Should select first occurrence of max (index 0)
+
+        let row = probs.row(0);
+        assert_eq!(decoder.decode_row(row), 0);
     }
 
     #[test]

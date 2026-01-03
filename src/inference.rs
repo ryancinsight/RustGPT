@@ -28,4 +28,9 @@ impl InferenceEngine {
     pub fn tokenize(llm: &LLM, text: &str) -> Vec<usize> {
         llm.tokenize(text)
     }
+
+    /// In-place tokenization to reuse a caller-provided buffer.
+    pub fn tokenize_into(llm: &LLM, text: &str, out: &mut Vec<usize>) {
+        llm.tokenize_into(text, out)
+    }
 }

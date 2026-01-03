@@ -21,6 +21,16 @@ use crate::{
     richards::RichardsNorm,
 };
 
+// Import the new modular components
+use crate::layers::transformer::components::{
+    attention_context::AttentionContext,
+    feedforward_processor::FeedforwardProcessor,
+    normalization_layer::NormalizationLayer,
+    residual_connection::ResidualConnection,
+    temporal_mixing_wrapper::TemporalMixingWrapper,
+    window_adaptation::{WindowAdaptation, WindowAdaptationConfig},
+};
+
 fn default_similarity_context_strength() -> Array2<f32> {
     Array2::zeros((1, 1))
 }
@@ -877,8 +887,8 @@ impl Layer for TransformerBlock {
                 for &val in grad.iter() {
                     if val.is_nan() || val.is_infinite() {
                         // Replace NaN/inf with small random noise to break symmetry
-                        use rand::prelude::*;
-                        let mut rng = rand::rng();
+                        use rand::Rng;
+                        let mut rng = crate::rng::get_rng();
                         clipped.mapv_inplace(|_| 0.01 * (rng.random::<f32>() - 0.5));
                         break;
                     }
@@ -995,7 +1005,7 @@ mod tests {
     use super::*;
     use crate::{
         layers::components::adaptive_residuals::{
-            AdaptiveResidualStrategy, UnifiedAdaptiveResiduals,
+            AdaptiveResiduals,
         },
         model_config::ModelConfig,
     };
@@ -1223,7 +1233,7 @@ mod tests {
     #[test]
     fn test_optimized_adaptive_residuals_creation() {
         let embed_dim = 64;
-        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         // Check parameter counts
         let param_count = residuals.parameter_count();
@@ -1245,11 +1255,11 @@ mod tests {
         );
         assert_eq!(residuals.layer_affinity_scores.shape(), [embed_dim, 1]);
         assert_eq!(
-            residuals.residual_attention_qkv.shape(),
+            residuals.positional_residual_qkv.shape(),
             [embed_dim, embed_dim * 3]
         );
         assert_eq!(
-            residuals.channel_affinity_matrix.shape(),
+            residuals.activation_similarity_matrix.shape(),
             [embed_dim, embed_dim]
         );
         assert_eq!(residuals.attention_residual_scales.shape(), [embed_dim, 1]);
@@ -1261,7 +1271,7 @@ mod tests {
         let embed_dim = 32;
         let seq_len = 8;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         let input = Array2::from_elem((seq_len, embed_dim), 1.0);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.5);
@@ -1282,7 +1292,7 @@ mod tests {
         let embed_dim = 16;
         let seq_len = 4;
 
-        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         let residual1 = Array2::from_elem((seq_len, embed_dim), 1.0);
         let ffn_out = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1299,7 +1309,7 @@ mod tests {
         let embed_dim = 16;
         let seq_len = 8;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         let attention_weights = Array2::from_shape_fn((seq_len, embed_dim), |(i, j)| {
             (i * embed_dim + j) as f32 * 0.1
@@ -1326,7 +1336,7 @@ mod tests {
         let embed_dim = 8;
         let seq_len = 4;
 
-        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         let input = Array2::from_elem((seq_len, embed_dim), 0.1);
         let attn_out = Array2::from_elem((seq_len, embed_dim), 0.2);
@@ -1350,7 +1360,7 @@ mod tests {
     fn test_gradient_application() {
         let embed_dim = 8;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         // Create dummy gradients
         let param_grads = vec![
@@ -1382,7 +1392,7 @@ mod tests {
     fn test_performance_metrics() {
         let embed_dim = 16;
 
-        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let residuals = AdaptiveResiduals::new_minimal(embed_dim);
         let (affinity_entropy, similarity_std, scale_stability) =
             residuals.get_performance_metrics();
 
@@ -1402,7 +1412,7 @@ mod tests {
     fn test_memory_usage_reporting() {
         let embed_dim = 16;
 
-        let residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let residuals = AdaptiveResiduals::new_minimal(embed_dim);
         let memory_bytes = residuals.memory_usage_bytes();
 
         // Check that memory usage is reasonable and non-zero
@@ -1450,7 +1460,7 @@ mod tests {
         traditional_residual_2_0 += &(2.0f32 * &attn_output);
 
         // Method 4: Adaptive Residual Learning
-        let mut adaptive_residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut adaptive_residuals = AdaptiveResiduals::new_minimal(embed_dim);
         let mut adaptive_output = adaptive_residuals.apply_attention_residual(&input, &attn_output);
 
         // Training loop: Update adaptive residuals to match target pattern
@@ -1577,7 +1587,7 @@ mod tests {
         target: &Array2<f32>,
         input: &Array2<f32>,
         attn_out: &Array2<f32>,
-        residuals: &UnifiedAdaptiveResiduals,
+        residuals: &AdaptiveResiduals,
     ) -> Vec<Array2<f32>> {
         let seq_len = output.nrows();
         let embed_dim = output.ncols();
@@ -1609,7 +1619,7 @@ mod tests {
         let embed_dim = 16;
         let seq_len = 8;
 
-        let mut residuals = UnifiedAdaptiveResiduals::new(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         // Test 1: Zero input stability
         let zero_input = Array2::zeros((seq_len, embed_dim));
@@ -1683,4 +1693,412 @@ mod tests {
 
         println!("✅ Stability tests passed: Adaptive residuals handle edge cases robustly!");
     }
+}
+
+/// Modular Transformer Block using component-based architecture
+///
+/// This is a more modular version of TransformerBlock that uses focused components
+/// for better maintainability and testability.
+#[derive(Serialize, Debug)]
+pub struct ModularTransformerBlock {
+    /// Pre-attention normalization component
+    pre_attention_norm: NormalizationLayer,
+
+    /// Temporal mixing component with window adaptation
+    temporal_mixing: TemporalMixingWrapper,
+
+    /// Window adaptation component
+    window_adaptation: WindowAdaptation,
+
+    /// Pre-feedforward normalization component
+    pre_ffn_norm: NormalizationLayer,
+
+    /// Feedforward processor component
+    feedforward: FeedforwardProcessor,
+
+    /// Attention context component
+    attention_context: AttentionContext,
+
+    /// Residual connection component
+    residual_connection: ResidualConnection,
+
+    /// Configuration for this block
+    config: TransformerBlockConfig,
+
+    /// Cached intermediate states from forward pass (for gradient computation)
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_intermediates: RwLock<Option<CachedIntermediates>>,
+
+    /// Cached gradient partition sizes so apply_gradients can route slices correctly
+    #[serde(skip_serializing, skip_deserializing)]
+    param_partitions: RwLock<Option<ParamPartitions>>,
+}
+
+impl ModularTransformerBlock {
+    /// Create a new modular transformer block with the given configuration
+    pub fn new_modular(config: TransformerBlockConfig) -> Self {
+        let embed_dim = config.embed_dim;
+        let common_config = CommonLayerConfig::from(&config);
+        let layers = CommonLayers::new(&common_config);
+
+        // Create modular components
+        let pre_attention_norm = NormalizationLayer::new(layers.pre_attention_norm);
+        let temporal_mixing = TemporalMixingWrapper::new(layers.temporal_mixing);
+        let pre_ffn_norm = NormalizationLayer::new(layers.pre_ffn_norm);
+        let feedforward = FeedforwardProcessor::new(layers.feedforward);
+        
+        // Create window adaptation component
+        let window_adaptation = WindowAdaptation::new(WindowAdaptationConfig::new(
+            config.use_adaptive_window,
+            config.window_adaptation_strategy,
+            config.window_size.unwrap_or(config.max_pos.saturating_add(1)),
+            config.min_window_size,
+            config.max_window_size,
+            config.entropy_ema_alpha,
+        ));
+
+        // Create attention context and residual connection components
+        let attention_context = AttentionContext::new();
+        let residual_connection = ResidualConnection::new(embed_dim);
+
+        Self {
+            pre_attention_norm,
+            temporal_mixing,
+            window_adaptation,
+            pre_ffn_norm,
+            feedforward,
+            attention_context,
+            residual_connection,
+            config,
+            cached_intermediates: RwLock::new(None),
+            param_partitions: RwLock::new(None),
+        }
+    }
+
+    /// Forward pass using modular components
+    pub fn forward_modular(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        // Apply incoming similarity context from the previous transformer layer
+        let input_original_arc = Arc::new(input.clone());
+        let input_used_arc: Arc<Array2<f32>> = 
+            if self.attention_context.has_context() {
+                let context = self.attention_context.get_incoming_context().unwrap();
+                Arc::new(self.residual_connection.apply_similarity_context(
+                    input_original_arc.as_ref(), 
+                    context
+                ))
+            } else {
+                input_original_arc.clone()
+            };
+
+        // Pre-attention normalization using modular component
+        let norm1_out = self.pre_attention_norm.forward(input_used_arc.as_ref());
+
+        // Calculate adaptive window size using window adaptation component
+        let seq_len = input_used_arc.nrows();
+        let temporal_mixing_ref = &self.temporal_mixing.temporal_mixing;
+        let dynamic_w = self.window_adaptation.calculate_window_size(seq_len, temporal_mixing_ref);
+        
+        // Set window size for attention-based temporal mixing
+        self.temporal_mixing.set_window_size(Some(dynamic_w));
+
+        // Temporal mixing forward using modular component
+        let mix_out = self.temporal_mixing.forward(&norm1_out);
+
+        // Update similarity matrix using residual connection component
+        self.residual_connection.update_activation_similarity_matrix(
+            input_used_arc.as_ref(), 
+            &mix_out
+        );
+
+        // In-place residual connection
+        let mut residual1 = mix_out;
+        residual1 += input_used_arc.as_ref();
+
+        // Pre-feedforward normalization using modular component
+        let norm2_out = self.pre_ffn_norm.forward(&residual1);
+
+        // Get head activity metrics from temporal mixing component
+        let head_activity_ratio = self.temporal_mixing.get_head_activity_ratio();
+        let head_activity_vec = self.temporal_mixing.get_head_activity_vec();
+
+        // Feedforward processing using modular component
+        let ffn_out = self.feedforward.forward(
+            &norm2_out,
+            head_activity_ratio,
+            head_activity_vec
+        );
+
+        // In-place final residual
+        let mut output = ffn_out;
+        output += &residual1;
+
+        // Cache intermediates with Arc for zero-copy backward pass access
+        *self.cached_intermediates.write().unwrap() = Some((
+            input_original_arc,
+            input_used_arc,
+            norm1_out,
+            residual1,
+            norm2_out,
+        ));
+
+        output
+    }
+
+    /// Get activation similarity matrix from residual connection component
+    pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
+        self.residual_connection.activation_similarity_matrix()
+    }
+
+    /// Set incoming similarity context using attention context component
+    pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
+        self.attention_context.set_incoming_context(context);
+    }
+
+    /// Get window entropy EMA from window adaptation component
+    pub fn window_entropy_ema(&self) -> f32 {
+        self.window_adaptation.window_entropy_ema()
+    }
+
+    /// Reset window adaptation state
+    pub fn reset_window_adaptation(&mut self) {
+        self.window_adaptation.reset_state();
+    }
+
+    /// Get parameter count from all components
+    pub fn parameter_count(&self) -> usize {
+        self.pre_attention_norm.parameters()
+            + self.temporal_mixing.parameters()
+            + self.pre_ffn_norm.parameters()
+            + self.feedforward.parameters()
+    }
+
+    /// Get weight norm from all components
+    pub fn weight_norm(&self) -> f32 {
+        let sum_sq = self.pre_attention_norm.weight_norm().powi(2)
+            + self.temporal_mixing.weight_norm().powi(2)
+            + self.pre_ffn_norm.weight_norm().powi(2)
+            + self.feedforward.weight_norm().powi(2);
+        sum_sq.sqrt()
+    }
+
+    /// Get layer type name
+    pub fn layer_type(&self) -> &str {
+        "ModularTransformerBlock"
+    }
+
+    /// Create from model config (similar to original TransformerBlock)
+    pub fn from_model_config_modular(config: &ModelConfig, _layer_idx: usize) -> Self {
+        // Create TransformerBlockConfig from ModelConfig
+        let block_config = TransformerBlockConfig {
+            embed_dim: config.embedding_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.get_num_heads(),
+            poly_degree: config.get_poly_degree_p(),
+            max_pos: if config.use_adaptive_window {
+                config.max_window_size
+            } else if let Some(w) = config.window_size {
+                w
+            } else {
+                config.max_seq_len
+            }
+            .saturating_sub(1), // CoPE max_pos = window_size - 1
+            window_size: config.window_size,
+            use_moe: config.moe_router.is_some(),
+            moe_config: config
+                .moe_router
+                .as_ref()
+                .map(|router| ExpertRouterConfig::from_router(router)),
+            head_selection: config.head_selection.clone(),
+            temporal_mixing: config.temporal_mixing,
+            use_adaptive_window: config.use_adaptive_window,
+            min_window_size: config.min_window_size,
+            max_window_size: config.max_window_size,
+            window_adaptation_strategy: config.window_adaptation_strategy,
+            entropy_ema_alpha: config.entropy_ema_alpha,
+            use_advanced_adaptive_residuals: true, // Enable by default
+        };
+        
+        Self::new_modular(block_config)
+    }
+}
+
+impl Layer for ModularTransformerBlock {
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.forward_modular(input)
+    }
+
+    fn compute_gradients(&self, input: &Array2<f32>, _output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+        // For now, use a simplified gradient computation
+        // In a full implementation, this would compute gradients for each component
+        let input_grads = Array2::zeros(input.raw_dim());
+        let param_grads = Vec::new();
+        (input_grads, param_grads)
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
+        // For now, implement a simplified backward pass
+        // In a full implementation, this would compute gradients through each component
+        Array2::zeros(grads.raw_dim())
+    }
+
+    fn apply_gradients(&mut self, _param_grads: &[Array2<f32>], _lr: f32) -> Result<()> {
+        // For now, implement a basic gradient application
+        // In a full implementation, this would distribute gradients to each component
+        Ok(())
+    }
+
+    fn parameters(&self) -> usize {
+        self.parameter_count()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        self.weight_norm()
+    }
+
+    fn zero_gradients(&mut self) {
+        // Zero gradients in all components
+        self.pre_attention_norm.zero_gradients();
+        self.temporal_mixing.zero_gradients();
+        self.pre_ffn_norm.zero_gradients();
+        self.feedforward.zero_gradients();
+    }
+
+    fn layer_type(&self) -> &str {
+        self.layer_type()
+    }
+}
+
+impl<'de> Deserialize<'de> for ModularTransformerBlock {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // For now, deserialize as regular TransformerBlock and convert
+        // In a full implementation, this would handle the modular structure properly
+        let regular_block = TransformerBlock::deserialize(deserializer)?;
+        
+        // Convert to modular block (simplified conversion)
+        let config = regular_block.config.clone();
+        let mut modular_block = Self::new_modular(config);
+        
+        // Copy over the similarity context strength
+        modular_block.attention_context.set_strength(
+            regular_block.similarity_context_strength[[0, 0]]
+        );
+        
+        Ok(modular_block)
+    }
+}
+
+/// Test the modular transformer block
+#[test]
+fn test_modular_transformer_block_creation() {
+    let config = TransformerBlockConfig {
+        embed_dim: 64,
+        hidden_dim: 128,
+        num_heads: 4,
+        poly_degree: 3,
+        max_pos: 64,
+        window_size: Some(32),
+        use_moe: false,
+        moe_config: None,
+        head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+        temporal_mixing: TemporalMixingType::Attention,
+        use_adaptive_window: false,
+        min_window_size: 16,
+        max_window_size: 64,
+        window_adaptation_strategy: WindowAdaptationStrategy::Fixed,
+        entropy_ema_alpha: 0.1,
+        use_advanced_adaptive_residuals: false,
+    };
+
+    let block = ModularTransformerBlock::new_modular(config);
+    assert_eq!(block.config.embed_dim, 64);
+    assert_eq!(block.config.num_heads, 4);
+    assert!(block.parameter_count() > 0);
+}
+
+#[test]
+fn test_modular_transformer_block_forward() {
+    let config = TransformerBlockConfig {
+        embed_dim: 32,
+        hidden_dim: 64,
+        num_heads: 2,
+        poly_degree: 3,
+        max_pos: 32,
+        window_size: Some(16),
+        use_moe: false,
+        moe_config: None,
+        head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+        temporal_mixing: TemporalMixingType::Attention,
+        use_adaptive_window: false,
+        min_window_size: 8,
+        max_window_size: 32,
+        window_adaptation_strategy: WindowAdaptationStrategy::Fixed,
+        entropy_ema_alpha: 0.1,
+        use_advanced_adaptive_residuals: false,
+    };
+
+    let mut block = ModularTransformerBlock::new_modular(config);
+    let input = Array2::ones((4, 32)); // 4 tokens, 32 dimensions
+    
+    let output = block.forward_modular(&input);
+    
+    assert_eq!(output.nrows(), 4);
+    assert_eq!(output.ncols(), 32);
+    
+    // Check that output is not all zeros (indicating forward pass worked)
+    let sum: f32 = output.iter().sum();
+    assert!(sum != 0.0, "Output should not be all zeros");
+    
+    // Check that values are reasonable (not NaN or infinite)
+    for &val in output.iter() {
+        assert!(val.is_finite(), "Output should contain only finite values");
+    }
+}
+
+#[test]
+fn test_modular_transformer_block_components() {
+    let config = TransformerBlockConfig {
+        embed_dim: 16,
+        hidden_dim: 32,
+        num_heads: 2,
+        poly_degree: 3,
+        max_pos: 16,
+        window_size: Some(8),
+        use_moe: false,
+        moe_config: None,
+        head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+        temporal_mixing: TemporalMixingType::Attention,
+        use_adaptive_window: true,
+        min_window_size: 4,
+        max_window_size: 16,
+        window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
+        entropy_ema_alpha: 0.1,
+        use_advanced_adaptive_residuals: false,
+    };
+
+    let mut block = ModularTransformerBlock::new_modular(config);
+    
+    // Test window adaptation
+    let seq_len = 10;
+    let dynamic_w = block
+        .window_adaptation
+        .calculate_window_size(seq_len, &block.temporal_mixing.temporal_mixing);
+    assert!(dynamic_w >= 4 && dynamic_w <= 16);
+    
+    // Test attention context
+    block.attention_context.set_strength(0.5);
+    assert_eq!(block.attention_context.get_strength(), 0.5);
+    
+    // Test similarity matrix
+    let similarity_matrix = block.activation_similarity_matrix();
+    assert_eq!(similarity_matrix.nrows(), 16);
+    assert_eq!(similarity_matrix.ncols(), 16);
+    
+    // Test component parameter counts
+    assert!(block.pre_attention_norm.parameters() > 0);
+    assert!(block.temporal_mixing.parameters() > 0);
+    assert!(block.pre_ffn_norm.parameters() > 0);
+    assert!(block.feedforward.parameters() > 0);
 }

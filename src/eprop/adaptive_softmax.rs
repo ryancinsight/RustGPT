@@ -409,10 +409,12 @@ impl SampledSoftmaxImpl {
             }
         }
         
-        let rng = if let Some(seed) = config.seed {
-            StdRng::seed_from_u64(seed)
+        let rng = if let Some(seed) = config.seed.or_else(|| crate::rng::get_seed()) {
+            // Mix in a constant so this stream is stable but doesn't exactly match other
+            // modules' streams for the same base seed.
+            StdRng::seed_from_u64(seed.wrapping_add(0xA3B1_C2D3_E4F5_0617))
         } else {
-            StdRng::from_seed(rand::random())
+            StdRng::from_os_rng()
         };
         
         Self {

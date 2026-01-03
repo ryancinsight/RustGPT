@@ -18,6 +18,12 @@ fn main() -> crate::Result<()> {
     // Set random seed for reproducibility if provided
     if let Some(seed) = args.seed {
         set_seed(seed);
+
+        // Rayon's parallel scheduling changes RNG call ordering and floating-point
+        // reduction order, which can cause large run-to-run variability in MoE routing
+        // even with a fixed seed. When the user requests determinism (by setting a seed),
+        // force a single-thread pool.
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
     }
 
     // Initialize tracing subscriber

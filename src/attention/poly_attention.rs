@@ -181,7 +181,7 @@ pub struct DegreeAdaptationMetrics {
 /// - **Dynamic Selection**: Threshold predictor for computational efficiency
 /// - **Stability Bounds**: Mathematically proven bounded gradients and convergence
 /// - **Efficiency Gains**: Sub-quadratic attention with maintained expressiveness
-
+///
 /// Type alias for threshold predictor gradients to improve readability
 type ThresholdPredictorGrads = (
     Option<Array2<f32>>,
@@ -298,6 +298,7 @@ impl PolyAttention {
             gating: crate::mixtures::gating::GatingConfig::default(),
             min_heads: 1,
             max_heads: num_heads,
+            always_on_heads: Vec::new(),
             threshold_modulation: 1.0,
             metrics_tau_min: f32::INFINITY,
             metrics_tau_max: f32::NEG_INFINITY,
@@ -2315,6 +2316,8 @@ mod tests {
             load_balance_weight: 0.1,
             complexity_loss_weight: 0.05,
             sparsity_weight: 0.01,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
         };
         pa.set_head_selection_config(&strategy);
         let n = 6;

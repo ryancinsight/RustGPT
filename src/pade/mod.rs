@@ -697,7 +697,6 @@ impl PadeExp {
     ///       Q₁₁(x) = 1330243200 - 665121600x + ... + 2x⁸
 
     /// Range reduction using binary exponent decomposition
-    ///
     /// **Theorem (Binary Range Reduction)**: For any real x, exp(x) = exp(r + k·ln(2)) · 2^k
     /// where k = round(x / ln(2)) and r = x - k·ln(2) satisfies |r| < ln(2)/2 ≈ 0.3466.
     ///
@@ -1583,16 +1582,14 @@ impl PadeExp {
         results
     }
 
-    /// Compute the true derivative of the Pade exponential approximation
+    /// Compute a stable derivative for exp(x).
     ///
-    /// This implements the mathematically correct backward pass for the Pade approximant,
-    /// computing d/dx [P(x)/Q(x)] = [P'(x)Q(x) - P(x)Q'(x)] / Q(x)^2
+    /// In this project we treat `PadeExp::exp(x)` as a drop-in replacement for `x.exp()`.
+    /// Since $\frac{d}{dx}\exp(x)=\exp(x)$, the stable/consistent gradient is to evaluate
+    /// the same approximation again.
     ///
-    /// Unlike the trivial case where d/dx exp(x) = exp(x), this computes the actual
-    /// derivative of whichever Pade approximant was selected for the forward pass.
-    ///
-    /// **Mathematical Foundation**: For rational approximation R(x) = P(x)/Q(x),
-    /// the derivative is R'(x) = [P'(x)Q(x) - P(x)Q'(x)] / Q(x)^2
+    /// Note: this returns the derivative of the *target function* exp(x), not the exact
+    /// analytic derivative of the internal rational approximant.
     ///
     /// # Arguments
     /// * `x` - Input value (f64)
@@ -1601,19 +1598,12 @@ impl PadeExp {
     /// True derivative of the Pade approximation at x
     #[inline]
     pub fn exp_grad(x: f64) -> f64 {
-        // Since d/dx exp(x) = exp(x), we use the high-accuracy Pade approximation
-        // instead of differentiating the Pade approximation itself
         Self::exp(x)
     }
 
-    /// Compute both value and true Pade derivative in a single call for AD frameworks
+    /// Compute both value and gradient for exp(x).
     ///
-    /// **Enhanced AD Support**: Returns the actual Pade approximation derivative
-    /// rather than assuming d/dx exp(x) = exp(x), providing mathematically correct
-    /// gradients for automatic differentiation systems.
-    ///
-    /// **Mathematical Foundation**: For Pade approximant R(x) = P(x)/Q(x),
-    /// returns (R(x), R'(x)) where R'(x) = (P'(x)Q(x) - P(x)Q'(x)) / Q(x)²
+    /// Returns `(exp(x), exp(x))` using the same stable approximation for both.
     ///
     /// # Arguments
     /// * `x` - Input value (f64)
@@ -1630,17 +1620,60 @@ impl PadeExp {
 
 // --- Lightweight numeric helpers ---
 //
-// Pad e9 is the project-wide replacement for `exp`.
+// PadeExp is the project-wide replacement for `exp`.
 // Derived "soft" transforms (softplus/logsumexp/softmax, etc.) live in `crate::soft`.
 
-#[inline]
-pub fn exp_f64(x: f64) -> f64 {
-    PadeExp::exp(x)
+/// Scalar types supported by Padé exp helpers.
+///
+/// This keeps the crate dependency-free (no `num-traits`) while still allowing
+/// ergonomic generic call sites: `pade::exp(x)` for both `f32` and `f64`.
+pub trait ExpScalar: Copy {
+    fn to_f64(self) -> f64;
+    fn from_f64(x: f64) -> Self;
 }
 
+impl ExpScalar for f64 {
+    #[inline]
+    fn to_f64(self) -> f64 {
+        self
+    }
+
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        x
+    }
+}
+
+impl ExpScalar for f32 {
+    #[inline]
+    fn to_f64(self) -> f64 {
+        self as f64
+    }
+
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        x as f32
+    }
+}
+
+/// Generic, stable exponential approximation.
+///
+/// Prefer this over `exp_f32`/`exp_f64`.
+#[inline]
+pub fn exp<T: ExpScalar>(x: T) -> T {
+    T::from_f64(PadeExp::exp(x.to_f64()))
+}
+
+#[deprecated(note = "use crate::pade::exp(x) (generic) instead")]
+#[inline]
+pub fn exp_f64(x: f64) -> f64 {
+    exp(x)
+}
+
+#[deprecated(note = "use crate::pade::exp(x) (generic) instead")]
 #[inline]
 pub fn exp_f32(x: f32) -> f32 {
-    PadeExp::exp(x as f64) as f32
+    exp(x)
 }
 
 #[cfg(test)]

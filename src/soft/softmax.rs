@@ -11,7 +11,7 @@
 //! - Caching for efficient gradient computation
 //! - Configurable axis for softmax computation
 
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 
 use crate::pade::PadeExp;
@@ -82,6 +82,13 @@ impl Softmax {
         self.softmax(input)
     }
 
+    /// Forward pass for a single logits row (immutable).
+    ///
+    /// This avoids the common pattern of `row.to_owned().insert_axis(Axis(0))`.
+    pub fn forward_immutable_row(&self, row: &ArrayView1<f32>) -> Array1<f32> {
+        self.softmax_row(row)
+    }
+
     /// Backward pass - computes gradients
     ///
     /// # Arguments
@@ -116,18 +123,48 @@ impl Softmax {
     ) -> Array2<f32> {
         let mut input_grads = Array2::zeros(output.raw_dim());
 
-        for (mut input_row, (prob_row, grad_row)) in input_grads
-            .outer_iter_mut()
-            .zip(output.outer_iter().zip(output_grads.outer_iter()))
-        {
-            let sum_grad_prob: f32 = prob_row
-                .iter()
-                .zip(grad_row.iter())
-                .map(|(&p, &g)| p * g)
-                .sum();
+        match self.axis {
+            // Axis 1: row-wise softmax (default)
+            1 => {
+                for (mut input_row, (prob_row, grad_row)) in input_grads
+                    .outer_iter_mut()
+                    .zip(output.outer_iter().zip(output_grads.outer_iter()))
+                {
+                    let sum_grad_prob: f32 = prob_row
+                        .iter()
+                        .zip(grad_row.iter())
+                        .map(|(&p, &g)| p * g)
+                        .sum();
 
-            for (j, (&p, &g)) in prob_row.iter().zip(grad_row.iter()).enumerate() {
-                input_row[j] = p * (g - sum_grad_prob);
+                    for (j, (&p, &g)) in prob_row.iter().zip(grad_row.iter()).enumerate() {
+                        input_row[j] = p * (g - sum_grad_prob);
+                    }
+                }
+            }
+
+            // Axis 0: column-wise softmax
+            0 => {
+                let nrows = output.nrows();
+                let ncols = output.ncols();
+
+                for j in 0..ncols {
+                    let mut sum_grad_prob: f32 = 0.0;
+                    for i in 0..nrows {
+                        sum_grad_prob += output[[i, j]] * output_grads[[i, j]];
+                    }
+
+                    for i in 0..nrows {
+                        let p = output[[i, j]];
+                        let g = output_grads[[i, j]];
+                        input_grads[[i, j]] = p * (g - sum_grad_prob);
+                    }
+                }
+            }
+
+            _ => {
+                // Unsupported axis for 2D: behave like axis=1.
+                let s = Softmax::with_axis(1);
+                return s.compute_gradients(output, output_grads);
             }
         }
 
@@ -142,53 +179,229 @@ impl Softmax {
     fn softmax(&self, logits: &ArrayView2<f32>) -> Array2<f32> {
         let mut result = Array2::zeros(logits.raw_dim());
 
-        // Compute softmax for each row
-        for (i, row) in logits.outer_iter().enumerate() {
-            // Find max value for numerical stability
-            let mut max_val = f32::NEG_INFINITY;
-            let mut any_finite = false;
-            for &x in row.iter() {
-                if x.is_finite() {
-                    any_finite = true;
-                    max_val = max_val.max(x);
-                }
-            }
-            if !any_finite {
-                max_val = 0.0;
-            }
+        match self.axis {
+            // Axis 1: row-wise (default)
+            1 => {
+                for (i, row) in logits.outer_iter().enumerate() {
+                    let mut max_val = f32::NEG_INFINITY;
+                    let mut any_finite = false;
+                    let mut argmax = 0usize;
 
-            // Compute exp(x - max) in f64 so extremely small values don't underflow to 0.
-            let mut exp_sum: f64 = 0.0;
-            for &x in row.iter() {
-                if x.is_finite() {
-                    exp_sum += PadeExp::exp((x - max_val) as f64);
-                }
-            }
+                    for (j, &x) in row.iter().enumerate() {
+                        if x.is_finite() {
+                            any_finite = true;
+                            if x > max_val {
+                                max_val = x;
+                                argmax = j;
+                            }
+                        }
+                    }
 
-            if exp_sum == 0.0 || !exp_sum.is_finite() {
-                // Degenerate case (extremely wide logits). Fall back to argmax = 1.0.
-                let mut argmax = 0usize;
-                let mut best = f32::NEG_INFINITY;
-                for (j, &x) in row.iter().enumerate() {
-                    if x.is_finite() && x > best {
-                        best = x;
-                        argmax = j;
+                    if !any_finite {
+                        // Match historical behavior: if everything is non-finite, fall back to a
+                        // deterministic one-hot at index 0.
+                        if row.len() > 0 {
+                            result[[i, 0]] = 1.0;
+                        }
+                        continue;
+                    }
+
+                    // Small vectors (e.g., routing/gating) are sensitive to rounding.
+                    // Use the classic two-pass f64-normalized computation to preserve
+                    // historical behavior and reduce threshold-crossing jitter.
+                    let use_two_pass = row.len() <= 64;
+
+                    if use_two_pass {
+                        let mut exp_sum: f64 = 0.0;
+                        for &x in row.iter() {
+                            if x.is_finite() {
+                                exp_sum += PadeExp::exp((x - max_val) as f64);
+                            }
+                        }
+
+                        if exp_sum <= 0.0 || !exp_sum.is_finite() {
+                            for j in 0..row.len() {
+                                result[[i, j]] = if j == argmax { 1.0 } else { 0.0 };
+                            }
+                            continue;
+                        }
+
+                        let inv_sum = 1.0 / exp_sum;
+                        for (j, &x) in row.iter().enumerate() {
+                            result[[i, j]] = if x.is_finite() {
+                                (PadeExp::exp((x - max_val) as f64) * inv_sum) as f32
+                            } else {
+                                0.0
+                            };
+                        }
+                    } else {
+                        // Fast path: one exp() per element.
+                        let mut exp_sum: f64 = 0.0;
+                        for (j, &x) in row.iter().enumerate() {
+                            if x.is_finite() {
+                                let e = PadeExp::exp((x - max_val) as f64);
+                                exp_sum += e;
+                                result[[i, j]] = e as f32;
+                            } else {
+                                result[[i, j]] = 0.0;
+                            }
+                        }
+
+                        if exp_sum <= 0.0 || !exp_sum.is_finite() {
+                            for j in 0..row.len() {
+                                result[[i, j]] = if j == argmax { 1.0 } else { 0.0 };
+                            }
+                            continue;
+                        }
+
+                        let inv_sum = (1.0 / exp_sum) as f32;
+                        for j in 0..row.len() {
+                            result[[i, j]] *= inv_sum;
+                        }
                     }
                 }
-                for j in 0..row.len() {
-                    result[[i, j]] = if j == argmax { 1.0 } else { 0.0 };
-                }
-                continue;
             }
 
-            let inv_sum = 1.0 / exp_sum;
-            for (j, &val) in row.iter().enumerate() {
-                result[[i, j]] = if val.is_finite() {
-                    (PadeExp::exp((val - max_val) as f64) * inv_sum) as f32
-                } else {
-                    0.0
-                };
+            // Axis 0: column-wise
+            0 => {
+                let nrows = logits.nrows();
+                let ncols = logits.ncols();
+                for j in 0..ncols {
+                    let mut max_val = f32::NEG_INFINITY;
+                    let mut any_finite = false;
+                    let mut argmax = 0usize;
+
+                    for i in 0..nrows {
+                        let x = logits[[i, j]];
+                        if x.is_finite() {
+                            any_finite = true;
+                            if x > max_val {
+                                max_val = x;
+                                argmax = i;
+                            }
+                        }
+                    }
+
+                    if !any_finite {
+                        if nrows > 0 {
+                            result[[0, j]] = 1.0;
+                        }
+                        continue;
+                    }
+
+                    let use_two_pass = nrows <= 64;
+
+                    if use_two_pass {
+                        let mut exp_sum: f64 = 0.0;
+                        for i in 0..nrows {
+                            let x = logits[[i, j]];
+                            if x.is_finite() {
+                                exp_sum += PadeExp::exp((x - max_val) as f64);
+                            }
+                        }
+
+                        if exp_sum <= 0.0 || !exp_sum.is_finite() {
+                            for i in 0..nrows {
+                                result[[i, j]] = if i == argmax { 1.0 } else { 0.0 };
+                            }
+                            continue;
+                        }
+
+                        let inv_sum = 1.0 / exp_sum;
+                        for i in 0..nrows {
+                            let x = logits[[i, j]];
+                            result[[i, j]] = if x.is_finite() {
+                                (PadeExp::exp((x - max_val) as f64) * inv_sum) as f32
+                            } else {
+                                0.0
+                            };
+                        }
+                    } else {
+                        let mut exp_sum: f64 = 0.0;
+                        for i in 0..nrows {
+                            let x = logits[[i, j]];
+                            if x.is_finite() {
+                                let e = PadeExp::exp((x - max_val) as f64);
+                                exp_sum += e;
+                                result[[i, j]] = e as f32;
+                            } else {
+                                result[[i, j]] = 0.0;
+                            }
+                        }
+
+                        if exp_sum <= 0.0 || !exp_sum.is_finite() {
+                            for i in 0..nrows {
+                                result[[i, j]] = if i == argmax { 1.0 } else { 0.0 };
+                            }
+                            continue;
+                        }
+
+                        let inv_sum = (1.0 / exp_sum) as f32;
+                        for i in 0..nrows {
+                            result[[i, j]] *= inv_sum;
+                        }
+                    }
+                }
             }
+
+            _ => {
+                // For 2D tensors we only support axis 0 or 1.
+                // Default to row-wise behavior for safety.
+                let s = Softmax::with_axis(1);
+                return s.softmax(logits);
+            }
+        }
+
+        result
+    }
+
+    fn softmax_row(&self, row: &ArrayView1<f32>) -> Array1<f32> {
+        let mut result = Array1::zeros(row.raw_dim());
+
+        // Find max value for numerical stability
+        let mut max_val = f32::NEG_INFINITY;
+        let mut any_finite = false;
+        for &x in row.iter() {
+            if x.is_finite() {
+                any_finite = true;
+                max_val = max_val.max(x);
+            }
+        }
+        if !any_finite {
+            max_val = 0.0;
+        }
+
+        // Compute exp(x - max) once into output, accumulate in f64, then normalize.
+        let mut exp_sum: f64 = 0.0;
+        for (j, &x) in row.iter().enumerate() {
+            if x.is_finite() {
+                let e = PadeExp::exp((x - max_val) as f64);
+                exp_sum += e;
+                result[j] = e as f32;
+            } else {
+                result[j] = 0.0;
+            }
+        }
+
+        if exp_sum <= 0.0 || !exp_sum.is_finite() {
+            // Degenerate case (extremely wide logits). Fall back to argmax = 1.0.
+            let mut argmax = 0usize;
+            let mut best = f32::NEG_INFINITY;
+            for (j, &x) in row.iter().enumerate() {
+                if x.is_finite() && x > best {
+                    best = x;
+                    argmax = j;
+                }
+            }
+            for j in 0..row.len() {
+                result[j] = if j == argmax { 1.0 } else { 0.0 };
+            }
+            return result;
+        }
+
+        let inv_sum = (1.0 / exp_sum) as f32;
+        for j in 0..row.len() {
+            result[j] *= inv_sum;
         }
 
         result
@@ -213,9 +426,54 @@ impl Softmax {
 
 #[cfg(test)]
 mod tests {
-    use ndarray::Array2;
+    use ndarray::{Array1, Array2, Axis};
 
     use super::*;
+
+    fn assert_allclose(a: &Array1<f32>, b: &Array1<f32>, tol: f32) {
+        assert_eq!(a.len(), b.len());
+        for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (x - y).abs();
+            assert!(
+                diff <= tol,
+                "mismatch at {i}: {x} vs {y} (diff={diff})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_row_matches_2d_for_finite_logits() {
+        let s = Softmax::new();
+        let row = Array1::from_vec(vec![1.0, 2.0, 3.0, -4.0]);
+        let two_d = Array2::from_shape_vec((1, row.len()), row.to_vec()).unwrap();
+
+        let out_row = s.forward_immutable_row(&row.view());
+        let out_2d = s.forward_immutable(&two_d.view());
+        assert_allclose(&out_row, &out_2d.index_axis(Axis(0), 0).to_owned(), 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_row_matches_2d_with_non_finite_values() {
+        let s = Softmax::new();
+        let row = Array1::from_vec(vec![f32::NAN, 0.5, f32::INFINITY, -1.0]);
+        let two_d = Array2::from_shape_vec((1, row.len()), row.to_vec()).unwrap();
+
+        let out_row = s.forward_immutable_row(&row.view());
+        let out_2d = s.forward_immutable(&two_d.view());
+        assert_allclose(&out_row, &out_2d.index_axis(Axis(0), 0).to_owned(), 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_row_degenerate_all_non_finite_falls_back_to_one_hot() {
+        let s = Softmax::new();
+        let row = Array1::from_vec(vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+
+        let out_row = s.forward_immutable_row(&row.view());
+        assert_eq!(out_row.len(), 3);
+        assert!(out_row.iter().all(|x| x.is_finite()));
+        let ones = out_row.iter().filter(|&&x| x == 1.0).count();
+        assert_eq!(ones, 1);
+    }
 
     #[test]
     fn test_softmax_forward() {
@@ -253,5 +511,18 @@ mod tests {
 
         assert!((input_grads[[0, 0]] - 0.5).abs() < 1e-6);
         assert!((input_grads[[0, 1]] - (-0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_axis0_columnwise_sums_to_one() {
+        let s = Softmax::with_axis(0);
+        let input = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]).unwrap();
+        let out = s.forward_immutable(&input.view());
+
+        // Column 0 should sum to 1, column 1 should sum to 1.
+        let col0_sum: f32 = out.column(0).iter().sum();
+        let col1_sum: f32 = out.column(1).iter().sum();
+        assert!((col0_sum - 1.0).abs() < 1e-6);
+        assert!((col1_sum - 1.0).abs() < 1e-6);
     }
 }

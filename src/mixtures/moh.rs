@@ -67,6 +67,12 @@ pub struct HeadSelectionConfig {
     pub min_heads: usize,
     /// Maximum number of heads to activate (efficiency constraint)
     pub max_heads: usize,
+
+    /// Heads that are always active (paper-aligned "some heads always open").
+    ///
+    /// Indices outside [0, num_heads) are ignored at runtime.
+    #[serde(default)]
+    pub always_on_heads: Vec<usize>,
     /// Modulation factor for thresholds (conditioning)
     pub threshold_modulation: f32,
     /// Threshold predictor metrics: min threshold value seen
@@ -89,6 +95,7 @@ impl Default for HeadSelectionConfig {
             gating: GatingConfig::default(),
             min_heads: 1,
             max_heads: 8,
+            always_on_heads: Vec::new(),
             threshold_modulation: 1.0,
             metrics_tau_min: f32::INFINITY,
             metrics_tau_max: f32::NEG_INFINITY,
@@ -109,10 +116,13 @@ impl HeadSelectionConfig {
                 complexity_loss_weight: _complexity_loss_weight,
                 load_balance_weight: _load_balance_weight,
                 sparsity_weight: _sparsity_weight,
+                importance_loss_weight: _importance_loss_weight,
+                switch_balance_weight: _switch_balance_weight,
             } => Self {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1, // Default min, could be parameterized
                 max_heads: *num_active,
+                always_on_heads: Vec::new(),
                 threshold_modulation: 1.0,
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
@@ -128,6 +138,7 @@ impl HeadSelectionConfig {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1,         // Allow flexible selection with soft top-p
                 max_heads: num_heads, // All heads available for selection
+                always_on_heads: Vec::new(),
                 threshold_modulation: 1.0,
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
@@ -140,6 +151,7 @@ impl HeadSelectionConfig {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: *num_active,
                 max_heads: *num_active,
+                always_on_heads: Vec::new(),
                 threshold_modulation: 1.0,
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
@@ -300,6 +312,8 @@ mod tests {
             load_balance_weight: 0.1,
             complexity_loss_weight: 0.05,
             sparsity_weight: 0.01,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
         };
 
         let config = HeadSelectionConfig::from_strategy(&strategy, 8);

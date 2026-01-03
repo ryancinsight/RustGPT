@@ -73,6 +73,7 @@ pub fn init_head_selection_config(num_heads: usize) -> HeadSelectionConfig {
         gating: crate::mixtures::gating::GatingConfig::default(),
         min_heads: 1,
         max_heads: num_heads,
+        always_on_heads: Vec::new(),
         threshold_modulation: 1.0,
         metrics_tau_min: f32::INFINITY,
         metrics_tau_max: f32::NEG_INFINITY,

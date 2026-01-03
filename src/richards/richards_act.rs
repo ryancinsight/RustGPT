@@ -1,7 +1,7 @@
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 
-use super::{RichardsCurve, Variant};
+use crate::richards::{RichardsCurve, Variant};
 
 /// RichardsActivation: Multiplies input by Richards curve output (x * Richards(x))
 /// This creates swish-like activations and other gated activations
@@ -23,11 +23,8 @@ impl RichardsActivation {
 
     /// Create fully learnable Richards activation without variant constraints
     pub fn new_fully_learnable() -> Self {
-        let mut richards = RichardsCurve::new_learnable(Variant::None);
-        // Disable temperature learning for compatibility with existing training code
-        richards.temperature_learnable = false;
         Self {
-            richards_curve: richards,
+            richards_curve: RichardsCurve::new_learnable(Variant::None),
         }
     }
 
