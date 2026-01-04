@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{f32::consts::PI, sync::RwLock};
+use std::{f32::consts::PI, sync::{Arc, RwLock}};
 
 use ndarray::{Array1, Array2, Axis, parallel::prelude::*, s};
 use rand_distr::{Distribution, Normal};
@@ -500,7 +500,7 @@ impl TimeConditioner {
         let h_pre = input.view().to_shape((1, input.len())).unwrap().dot(w1) + b1.t();
 
         let mut h = h_pre;
-        h.mapv_inplace(|v| v.tanh());
+        h.mapv_inplace(crate::richards::tanh_f32);
 
         let output = h.dot(w2) + b2.t();
         (output, h)
@@ -585,22 +585,22 @@ impl TimeConditioner {
 
 #[derive(Clone, Debug)]
 pub struct DiffusionCachedIntermediates {
-    pub input: Array2<f32>,
-    pub time_embed: Array1<f32>,
-    pub gamma_beta: Array2<f32>,
-    pub norm1_out: Array2<f32>,
-    pub norm1_mod: Array2<f32>,
-    pub attn_out: Array2<f32>,
-    pub residual1: Array2<f32>,
-    pub norm2_out: Array2<f32>,
-    pub norm2_mod: Array2<f32>,
-    pub ffn_out: Array2<f32>,
-    pub output: Array2<f32>,
-    pub h_vec: Array1<f32>,
-    pub gamma_attn: Array2<f32>,
-    pub beta_attn: Array2<f32>,
-    pub gamma_ffn: Array2<f32>,
-    pub beta_ffn: Array2<f32>,
+    pub input: Arc<Array2<f32>>,
+    pub time_embed: Arc<Array1<f32>>,
+    pub gamma_beta: Arc<Array2<f32>>,
+    pub norm1_out: Arc<Array2<f32>>,
+    pub norm1_mod: Arc<Array2<f32>>,
+    pub attn_out: Arc<Array2<f32>>,
+    pub residual1: Arc<Array2<f32>>,
+    pub norm2_out: Arc<Array2<f32>>,
+    pub norm2_mod: Arc<Array2<f32>>,
+    pub ffn_out: Arc<Array2<f32>>,
+    pub output: Arc<Array2<f32>>,
+    pub h_vec: Arc<Array1<f32>>,
+    pub gamma_attn: Arc<Array2<f32>>,
+    pub beta_attn: Arc<Array2<f32>>,
+    pub gamma_ffn: Arc<Array2<f32>>,
+    pub beta_ffn: Arc<Array2<f32>>,
     pub timestep: usize,
 }
 
@@ -940,10 +940,10 @@ impl DiffusionBlock {
             .slice(s![.., 3 * embed..4 * embed])
             .row(0)
             .to_owned();
-        let g_attn = raw_gamma_attn.mapv(|x| x.tanh());
-        let b_attn = raw_beta_attn.mapv(|x| x.tanh());
-        let g_ffn = raw_gamma_ffn.mapv(|x| x.tanh());
-        let b_ffn = raw_beta_ffn.mapv(|x| x.tanh());
+        let g_attn = raw_gamma_attn.mapv(crate::richards::tanh_f32);
+        let b_attn = raw_beta_attn.mapv(crate::richards::tanh_f32);
+        let g_ffn = raw_gamma_ffn.mapv(crate::richards::tanh_f32);
+        let b_ffn = raw_beta_ffn.mapv(crate::richards::tanh_f32);
         let gamma_attn_vec = g_attn
             .mapv(|v| 1.0 + self.film_scale_gamma * v)
             .insert_axis(Axis(0));
@@ -1006,34 +1006,35 @@ impl DiffusionBlock {
 
         let mut prediction = if edm_on {
             // EDM-preconditioned x0_hat in original x_t space.
-            let mut x0_hat = (x_t * c_skip) + (output.clone() * c_out);
+            let mut x0_hat = (x_t * c_skip) + (&output * c_out);
             Self::sanitize_tensor("edm_x0_hat", &mut x0_hat);
             x0_hat
         } else {
-            output.clone()
+            output
         };
         Self::sanitize_tensor("diffusion_prediction", &mut prediction);
 
-        // Move owned intermediates into the cache to avoid extra cloning.
+        // Store intermediates Arc-backed so cache clones are shallow (important for LRM replay).
         let h_vec = Array1::from_vec(h.row(0).to_vec());
+        let cached_output = prediction.clone();
 
         *self.cached_intermediates.write().unwrap() = Some(DiffusionCachedIntermediates {
-            input: x_model_in,
-            time_embed,
-            norm1_out,
-            norm1_mod,
-            residual1,
-            norm2_out,
-            norm2_mod,
-            h_vec,
-            gamma_attn: gamma_attn_vec,
-            beta_attn: beta_attn_vec,
-            gamma_ffn: gamma_ffn_vec,
-            beta_ffn: beta_ffn_vec,
-            gamma_beta,
-            attn_out,
-            ffn_out,
-            output: prediction.clone(),
+            input: Arc::new(x_model_in),
+            time_embed: Arc::new(time_embed),
+            norm1_out: Arc::new(norm1_out),
+            norm1_mod: Arc::new(norm1_mod),
+            residual1: Arc::new(residual1),
+            norm2_out: Arc::new(norm2_out),
+            norm2_mod: Arc::new(norm2_mod),
+            h_vec: Arc::new(h_vec),
+            gamma_attn: Arc::new(gamma_attn_vec),
+            beta_attn: Arc::new(beta_attn_vec),
+            gamma_ffn: Arc::new(gamma_ffn_vec),
+            beta_ffn: Arc::new(beta_ffn_vec),
+            gamma_beta: Arc::new(gamma_beta),
+            attn_out: Arc::new(attn_out),
+            ffn_out: Arc::new(ffn_out),
+            output: Arc::new(cached_output),
             timestep: t,
         });
         if self.adaptive_window_on {
@@ -1326,18 +1327,18 @@ impl Layer for DiffusionBlock {
         }
         let cache_guard = self.cached_intermediates.read().unwrap();
         if let Some(cache) = &*cache_guard {
-            let input_cache = &cache.input;
-            let time_embed = &cache.time_embed;
-            let norm1_out = &cache.norm1_out;
-            let norm1_mod = &cache.norm1_mod;
-            let residual1 = &cache.residual1;
-            let norm2_out = &cache.norm2_out;
-            let norm2_mod = &cache.norm2_mod;
-            let h_vec = &cache.h_vec;
-            let gamma_attn_vec = &cache.gamma_attn;
-            let beta_attn_vec = &cache.beta_attn;
-            let gamma_ffn_vec = &cache.gamma_ffn;
-            let beta_ffn_vec = &cache.beta_ffn;
+            let input_cache: &Array2<f32> = cache.input.as_ref();
+            let time_embed: &Array1<f32> = cache.time_embed.as_ref();
+            let norm1_out: &Array2<f32> = cache.norm1_out.as_ref();
+            let norm1_mod: &Array2<f32> = cache.norm1_mod.as_ref();
+            let residual1: &Array2<f32> = cache.residual1.as_ref();
+            let norm2_out: &Array2<f32> = cache.norm2_out.as_ref();
+            let norm2_mod: &Array2<f32> = cache.norm2_mod.as_ref();
+            let h_vec: &Array1<f32> = cache.h_vec.as_ref();
+            let gamma_attn_vec: &Array2<f32> = cache.gamma_attn.as_ref();
+            let beta_attn_vec: &Array2<f32> = cache.beta_attn.as_ref();
+            let gamma_ffn_vec: &Array2<f32> = cache.gamma_ffn.as_ref();
+            let beta_ffn_vec: &Array2<f32> = cache.beta_ffn.as_ref();
             let timestep = cache.timestep;
             let mut all_param_grads = Vec::new();
 
@@ -1380,23 +1381,22 @@ impl Layer for DiffusionBlock {
                     (output_grads * block_grads_scale, None, None)
                 };
             // Sanitize after scaling to catch any NaN from the scaling operation
-            let mut safe_scaled_grads = scaled_output_grads.clone();
+            let mut safe_scaled_grads = scaled_output_grads;
             Self::sanitize_tensor("scaled_output_grads", &mut safe_scaled_grads);
 
             // Compute gradients through the transformer block layers
             // This follows the same pattern as TransformerBlock but with timestep conditioning
 
-            // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out
-            let ffn_grads = safe_scaled_grads.clone();
-            let residual1_grads = safe_scaled_grads.clone();
+            // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out.
+            // Both branches receive the same upstream grads; avoid cloning.
 
             // Get feedforward gradients
             let (ffn_input_grad_mod, ffn_param_grads) = match &self.feedforward {
                 FeedForwardVariant::RichardsGlu(layer) => {
-                    layer.compute_gradients(norm2_mod, &ffn_grads)
+                    layer.compute_gradients(norm2_mod, &safe_scaled_grads)
                 }
                 FeedForwardVariant::MixtureOfExperts(layer) => {
-                    layer.compute_gradients(norm2_mod, &ffn_grads)
+                    layer.compute_gradients(norm2_mod, &safe_scaled_grads)
                 }
             };
 
@@ -1407,15 +1407,14 @@ impl Layer for DiffusionBlock {
                 self.pre_ffn_norm.compute_gradients(residual1, &norm2_grad);
 
             // Combine residual gradients
-            let residual1_total_grads = residual1_grads + residual1_from_ffn;
+            let residual1_total_grads = &safe_scaled_grads + &residual1_from_ffn;
 
             // residual1 = input + attn_out: propagate full upstream gradient to both branches
-            let input_grads = residual1_total_grads.clone();
-            let attn_out_grads = residual1_total_grads.clone();
+            let attn_out_grads = &residual1_total_grads;
 
             let (attn_input_grad_mod, attn_param_grads) = self
                 .temporal_mixing
-                .compute_gradients(norm1_mod, &attn_out_grads);
+                .compute_gradients(norm1_mod, attn_out_grads);
 
             let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
                 Self::film_backward(&attn_input_grad_mod, norm1_out, &gamma_attn_vec);
@@ -1426,7 +1425,7 @@ impl Layer for DiffusionBlock {
 
             // The final input gradients are the gradients w.r.t. the transformer input
             // (combining gradients from residual and attention path)
-            let mut final_input_grads = &input_grads + &input_from_norm;
+            let mut final_input_grads = &residual1_total_grads + &input_from_norm;
 
             if let Some(extra_scale) = input_extra_scale {
                 final_input_grads = final_input_grads + &(output_grads * extra_scale);

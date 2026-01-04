@@ -1,5 +1,4 @@
 use ndarray::{Array1, Array2, Axis, s};
-use rayon::prelude::*;
 
 use crate::{
     attention::{
@@ -69,19 +68,26 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
     // Pre-compute threshold predictor or soft top-p selection
     let thresholds_global = if ctx.head_selection_config.gating.use_learned_predictor {
         if let Some(predictor) = ctx.threshold_predictor {
-            let mut cond_input = ctx.input.to_owned();
-            if let Some(scale) = ctx.token_threshold_scale.as_ref() {
-                let n = cond_input.nrows();
-                let d = cond_input.ncols();
+            // Avoid allocating a scaled copy unless per-token scaling is requested.
+            let mut scaled_input: Option<Array2<f32>> = None;
+            let input_view = if let Some(scale) = ctx.token_threshold_scale.as_ref() {
+                let mut tmp = ctx.input.to_owned();
+                let n = tmp.nrows();
+                let d = tmp.ncols();
                 for i in 0..n {
                     let s = scale[[i, 0]];
                     for j in 0..d {
-                        cond_input[[i, j]] *= s;
+                        tmp[[i, j]] *= s;
                     }
                 }
-            }
+                scaled_input = Some(tmp);
+                scaled_input.as_ref().unwrap().view()
+            } else {
+                ctx.input.view()
+            };
+
             let mut t = predictor.predict_with_condition(
-                &cond_input.view(),
+                &input_view,
                 ctx.token_latent_features.as_ref().map(|f| f.view()),
             );
             let m = ctx.head_selection_config.threshold_modulation;
@@ -107,47 +113,31 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         }
     } else if ctx.head_selection_config.gating.use_soft_top_p {
         // For SoftTopP, compute gating values for all heads and apply soft top-p selection
-        let mut all_gates = Vec::new();
+        // Build gate_matrix directly to avoid allocating Vec<Array2> + a flattened Vec.
+        let mut gate_matrix = ndarray::Array2::<f32>::zeros((n, ctx.num_heads));
+        let mut z_col = ndarray::Array2::<f32>::zeros((n, 1));
+        let mut g_col = ndarray::Array2::<f32>::zeros((n, 1));
 
-        // Compute gating values for all heads
         for h_idx in 0..ctx.num_heads {
             let w_g_col = ctx.w_g.slice(s![.., h_idx..h_idx + 1]);
             let xw_col = ctx.input.dot(&w_g_col);
             let a_h = ctx.alpha_g[[0, h_idx]];
             let b_h = ctx.beta_g[[0, h_idx]];
 
-            let max_abs_z = xw_col
-                .iter()
-                .map(|&v| (a_h * v + b_h) as f64)
-                .fold(0.0_f64, |m, z| m.max(z.abs()));
+            let mut max_abs_z = 0.0f32;
+            for i in 0..n {
+                let z = a_h * xw_col[[i, 0]] + b_h;
+                z_col[[i, 0]] = z;
+                max_abs_z = max_abs_z.max(z.abs());
+            }
 
-            let _gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
-            let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
-            let g_col_data: Vec<f32> = gate_input
-                .iter()
-                .map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32)
-                .collect();
-            let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
+            gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
 
-            all_gates.push(g_col);
+            for i in 0..n {
+                gate_matrix[[i, h_idx]] = g_col[[i, 0]];
+            }
         }
-
-        // Concatenate all gating values: shape (n_tokens, n_heads)
-        let gate_matrix = if !all_gates.is_empty() {
-            let n_tokens = all_gates[0].nrows();
-            let gate_data: Vec<f32> = (0..n_tokens)
-                .flat_map(|token_idx| {
-                    all_gates
-                        .iter()
-                        .map(move |gate_col| gate_col[[token_idx, 0]])
-                })
-                .collect();
-
-            ndarray::Array2::from_shape_vec((n_tokens, ctx.num_heads), gate_data)
-                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n, ctx.num_heads)))
-        } else {
-            ndarray::Array2::<f32>::zeros((n, ctx.num_heads))
-        };
 
         // Apply soft top-p selection using PadeExp and Richards activation
         let mut soft_weights = apply_soft_top_p_with_richards(
@@ -183,7 +173,6 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         _token_counts_tmp,
         (tau_min_local, tau_max_local, tau_sum_local, tau_count_local),
         (g_sq_sum_local, g_count_local),
-        gate_values_acc,
         projections_acc,
     ) = ctx
         .heads
@@ -204,24 +193,20 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             // Compute gate values and metrics using iterator chains
             let max_abs_z = xw_col
                 .iter()
-                .map(|&v| (a_h * v + b_h) as f64)
-                .fold(0.0_f64, |m, z| m.max(z.abs()));
+                .fold(0.0_f32, |m, &v| m.max((a_h * v + b_h).abs()));
 
-            let _gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
 
-            let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
-            let g_col_data: Vec<f32> = gate_input
-                .iter()
-                .map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32)
-                .collect();
-            let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
+            let gate_input = xw_col.mapv(|xw| a_h * xw + b_h);
+            let mut g_col = ndarray::Array2::<f32>::zeros(gate_input.raw_dim());
+            gate_poly.forward_matrix_f32_into(&gate_input, &mut g_col);
 
             // RMS tracking for gating predictor
             let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
             let g_count = n;
 
             // Learned threshold predictor or soft top-p selection
-            let (_m_col, tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
+            let (tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
                 if ctx.head_selection_config.gating.use_learned_predictor {
                     // Use learned thresholds per head (n_tokens x n_heads)
                     let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
@@ -233,8 +218,13 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                         .iter()
                         .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
                     let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
-                    let eff_col = &g_col * &head_thresholds;
-                    (head_thresholds.to_owned(), tau_metrics, eff_col)
+                    let mut eff_col = g_col;
+                    ndarray::Zip::from(&mut eff_col)
+                        .and(&head_thresholds)
+                        .for_each(|e, &t| {
+                            *e *= t;
+                        });
+                    (tau_metrics, eff_col)
                 } else if ctx.head_selection_config.gating.use_soft_top_p {
                     // Use soft top-p selection (2D array: n_tokens x n_heads)
                     let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
@@ -246,30 +236,32 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                         .iter()
                         .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
                     let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
-                    let eff_col = &g_col * &head_thresholds;
-                    (head_thresholds.to_owned(), tau_metrics, eff_col)
+                    let mut eff_col = g_col;
+                    ndarray::Zip::from(&mut eff_col)
+                        .and(&head_thresholds)
+                        .for_each(|e, &t| {
+                            *e *= t;
+                        });
+                    (tau_metrics, eff_col)
                 } else {
                     // Fallback
                     let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
-                    let eff_col = g_col.clone();
-                    (Array2::<f32>::ones((n, 1)), tau_metrics, eff_col)
+                    (tau_metrics, g_col)
                 }
             } else {
                 // No learned thresholds: m = 1, so eff = g
                 let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
-                let eff_col = g_col.clone();
-                (Array2::<f32>::ones((n, 1)), tau_metrics, eff_col)
+                (tau_metrics, g_col)
             };
             let active_sum = eff_col.sum();
             let token_count = n;
 
             // Return (projections, gates, metrics) for this head
             (
-                (q, k, v, g_col.clone(), eff_col.clone()),
+                (q, k, v, eff_col),
                 (active_sum, token_count),
                 (g_sq_sum, g_count),
                 tau_metrics,
-                eff_col,
             )
         })
         .fold(
@@ -279,22 +271,19 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
                 (0.0, 0),
                 vec![],
-                vec![],
             ),
             |(
                 mut active_acc,
                 mut token_acc,
                 mut tau_acc,
                 mut g_acc,
-                mut gate_values_acc,
                 mut projections_acc,
             ),
              (
-                (q, k, v, g_col, eff_col),
+                (q, k, v, eff_col),
                 (active_sum, token_count),
                 (g_sq_sum, g_count),
                 tau_metrics,
-                gate_col,
             )| {
                 active_acc.push(active_sum);
                 token_acc.push(token_count);
@@ -305,45 +294,27 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                     tau_acc.3 + tau_metrics.3,
                 );
                 g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
-                gate_values_acc.push(gate_col);
-                projections_acc.push((q, k, v, g_col, eff_col));
-                (
-                    active_acc,
-                    token_acc,
-                    tau_acc,
-                    g_acc,
-                    gate_values_acc,
-                    projections_acc,
-                )
+                projections_acc.push((q, k, v, eff_col));
+                (active_acc, token_acc, tau_acc, g_acc, projections_acc)
             },
         );
 
     // Extract projections for the attention computation loop
     let head_projections = projections_acc;
 
-    // Create gate values array for metrics update.
-    // Build directly into an Array2 to avoid an intermediate Vec allocation.
-    let gate_values = if !gate_values_acc.is_empty() {
-        let n_tokens = gate_values_acc[0].nrows();
-        let n_heads = gate_values_acc.len();
-        let mut gate_values = ndarray::Array2::<f32>::zeros((n_tokens, n_heads));
-
-        for (h, gate_col) in gate_values_acc.iter().enumerate() {
-            for t in 0..n_tokens {
-                gate_values[[t, h]] = gate_col[[t, 0]];
-            }
+    // Build gate values directly from the per-head eff columns (avoid storing a second copy).
+    let mut gate_values = ndarray::Array2::<f32>::zeros((n, ctx.num_heads));
+    for (h_idx, (_q, _k, _v, eff_col)) in head_projections.iter().enumerate() {
+        for t in 0..n {
+            gate_values[[t, h_idx]] = eff_col[[t, 0]];
         }
-
-        gate_values
-    } else {
-        ndarray::Array2::<f32>::zeros((0, 0))
-    };
+    }
 
     // Reuse a single head-output buffer across heads to reduce allocations.
     let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
 
     // Process attention computation for each head
-    for (h_idx, (q, k, v, _g_col, eff_col)) in head_projections.into_iter().enumerate() {
+    for (h_idx, (q, k, v, eff_col)) in head_projections.into_iter().enumerate() {
         {
             let a = ctx.a[[0, 0]];
             let b = ctx.b[[0, 0]];
@@ -503,7 +474,6 @@ pub fn compute_poly_attention_forward_baseline(
         _t_c,
         (tau_min_local, tau_max_local, tau_sum_local, tau_count_local),
         (g_sq_sum_local, g_count_local),
-        gate_values_acc,
         projections_acc,
     ) = ctx
         .heads
@@ -519,25 +489,21 @@ pub fn compute_poly_attention_forward_baseline(
             let b_h = ctx.beta_g[[0, h_idx]];
             let max_abs_z = xw_col
                 .iter()
-                .map(|&v| (a_h * v + b_h) as f64)
-                .fold(0.0_f64, |m, z| m.max(z.abs()));
-            let _gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z);
-            let gate_input = xw_col.mapv(|xw| (a_h * xw + b_h) as f32);
-            let g_col_data: Vec<f32> = gate_input
-                .iter()
-                .map(|&x| ctx.gate.curve.forward_scalar(x as f64) as f32)
-                .collect();
-            let g_col = ndarray::Array2::from_shape_vec((gate_input.len(), 1), g_col_data).unwrap();
+                .fold(0.0_f32, |m, &v| m.max((a_h * v + b_h).abs()));
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
+            let gate_input = xw_col.mapv(|xw| a_h * xw + b_h);
+            let mut g_col = ndarray::Array2::<f32>::zeros(gate_input.raw_dim());
+            gate_poly.forward_matrix_f32_into(&gate_input, &mut g_col);
             let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
             let g_count = n;
             let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
-            let eff_col = g_col.clone();
+            let eff_col = g_col;
+            let active_sum = eff_col.sum();
             (
-                (q, k, v, g_col.clone(), eff_col.clone()),
-                (eff_col.sum(), n),
+                (q, k, v, eff_col),
+                (active_sum, n),
                 (g_sq_sum, g_count),
                 tau_metrics,
-                eff_col,
             )
         })
         .fold(
@@ -547,22 +513,19 @@ pub fn compute_poly_attention_forward_baseline(
                 (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
                 (0.0, 0),
                 vec![],
-                vec![],
             ),
             |(
                 mut active_acc,
                 mut token_acc,
                 mut tau_acc,
                 mut g_acc,
-                mut gate_values_acc,
                 mut projections_acc,
             ),
              (
-                (q, k, v, g_col, eff_col),
+                (q, k, v, eff_col),
                 (active_sum, token_count),
                 (g_sq_sum, g_count),
                 tau_metrics,
-                gate_col,
             )| {
                 active_acc.push(active_sum);
                 token_acc.push(token_count);
@@ -573,34 +536,22 @@ pub fn compute_poly_attention_forward_baseline(
                     tau_acc.3 + tau_metrics.3,
                 );
                 g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
-                gate_values_acc.push(gate_col);
-                projections_acc.push((q, k, v, g_col, eff_col));
-                (
-                    active_acc,
-                    token_acc,
-                    tau_acc,
-                    g_acc,
-                    gate_values_acc,
-                    projections_acc,
-                )
+                projections_acc.push((q, k, v, eff_col));
+                (active_acc, token_acc, tau_acc, g_acc, projections_acc)
             },
         );
 
-    let gate_values = if !gate_values_acc.is_empty() {
-        let n_tokens = gate_values_acc[0].nrows();
-        let n_heads = gate_values_acc.len();
-        let mut gate_values = ndarray::Array2::<f32>::zeros((n_tokens, n_heads));
-        for (h, gate_col) in gate_values_acc.iter().enumerate() {
-            for t in 0..n_tokens {
-                gate_values[[t, h]] = gate_col[[t, 0]];
-            }
+    let mut gate_values = ndarray::Array2::<f32>::zeros((n, ctx.num_heads));
+    for (h_idx, (_q, _k, _v, eff_col)) in projections_acc.iter().enumerate() {
+        for t in 0..n {
+            gate_values[[t, h_idx]] = eff_col[[t, 0]];
         }
-        gate_values
-    } else {
-        ndarray::Array2::<f32>::zeros((0, 0))
-    };
+    }
 
-    for (h_idx, (q, k, v, _g_col, eff_col)) in projections_acc.into_iter().enumerate() {
+    // Reuse a single head-output buffer across heads (avoids allocating N small row buffers).
+    let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
+
+    for (h_idx, (q, k, v, eff_col)) in projections_acc.into_iter().enumerate() {
         let a = ctx.a[[0, 0]];
         let b = ctx.b[[0, 0]];
         let scale = ctx.scale[[0, 0]];
@@ -608,12 +559,17 @@ pub fn compute_poly_attention_forward_baseline(
         let start = h_idx * ctx.head_dim;
         let end = start + ctx.head_dim;
         let w_block = ctx.w_out.slice(s![start..end, ..]);
-        let row_buffers: Vec<(usize, Array2<f32>)> = (0..n)
+
+        y_head.fill(0.0);
+        use rayon::prelude::*;
+        y_head
+            .axis_iter_mut(ndarray::Axis(0))
             .into_par_iter()
-            .map(|i| {
+            .enumerate()
+            .for_each(|(i, mut y_row)| {
                 let eff_i = eff_col[[i, 0]];
                 if eff_i <= ctx.eff_skip_threshold {
-                    return (i, Array2::<f32>::zeros((1, ctx.head_dim)));
+                    return;
                 }
                 let j_start = match ctx.window_size {
                     Some(w) => i.saturating_sub(w - 1),
@@ -630,56 +586,51 @@ pub fn compute_poly_attention_forward_baseline(
                     let k_slice = k.slice(s![j_start..j_end_excl, ..]);
                     let k_slice_t = k_slice.t();
                     let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
-                    let m = j_end_excl.saturating_sub(j_start);
-                    let mut phi_row = ndarray::Array1::<f32>::zeros(m);
-                    for idx in 0..m {
-                        let j = j_start + idx;
-                        let mut s_val = scores_row[idx];
-                        let pos = i.saturating_sub(j);
-                        if pos < q_pe.len() {
-                            s_val += q_pe[pos];
-                        }
-                        let s_stable = smooth_clip_tanh(s_val, 8.0);
-                        let sp = if p_i32 <= 3 {
-                            match p_i32 {
-                                1 => s_stable,
-                                2 => s_stable * s_stable,
-                                3 => s_stable * s_stable * s_stable,
-                                _ => unreachable!(),
+                    let mlen = j_end_excl.saturating_sub(j_start);
+                    with_tls_phi(mlen, |phi_row| {
+                        for idx in 0..mlen {
+                            let j = j_start + idx;
+                            let mut s_val = scores_row[idx];
+                            let pos = i.saturating_sub(j);
+                            if pos < q_pe.len() {
+                                s_val += q_pe[pos];
                             }
-                        } else {
-                            let mut result: f32 = 1.0;
-                            let current = s_stable;
-                            for _ in 0..p_i32 {
-                                result *= current;
-                                if !result.is_finite() {
-                                    result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
-                                    break;
+                            let s_stable = smooth_clip_tanh(s_val, 8.0);
+                            let sp = if p_i32 <= 3 {
+                                match p_i32 {
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                let mut result: f32 = 1.0;
+                                for _ in 0..p_i32 {
+                                    result *= s_stable;
+                                }
+                                result
+                            };
+                            phi_row[idx] = scale * (a * sp + b);
+                        }
+
+                        let v_slice = v.slice(s![j_start..j_end_excl, ..]);
+                        with_tls_acc_f64(ctx.head_dim, |acc| {
+                            acc.fill(0.0);
+                            let eff = eff_i as f64;
+                            for idx in 0..mlen {
+                                let phi = (phi_row[idx] as f64) * eff;
+                                for h in 0..ctx.head_dim {
+                                    acc[h] += phi * (v_slice[[idx, h]] as f64);
                                 }
                             }
-                            result
-                        };
-                        phi_row[idx] = scale * (a * sp + b);
-                    }
-                    let v_slice = v.slice(s![j_start..j_end_excl, ..]);
-                    let mut row_buf = Array2::<f32>::zeros((1, ctx.head_dim));
-                    ndarray::linalg::general_mat_mul(
-                        1.0,
-                        &phi_row.view().insert_axis(ndarray::Axis(0)),
-                        &v_slice,
-                        0.0,
-                        &mut row_buf,
-                    );
-                    row_buf.mapv_inplace(|x| x * eff_i);
-                    (i, row_buf)
-                })
-            })
-            .collect();
-        let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
-        for (i, buf) in row_buffers {
-            let mut y_row = y_head.slice_mut(s![i..i + 1, ..]);
-            y_row.assign(&buf);
-        }
+                            for h in 0..ctx.head_dim {
+                                y_row[h] = acc[h] as f32;
+                            }
+                        });
+                    });
+                });
+            });
+
         ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 1.0, &mut out);
     }
 
@@ -741,11 +692,17 @@ fn apply_soft_top_p_with_richards(
     // Use non-learning Richards sigmoid for smooth activation
     let smooth_sigmoid = crate::richards::RichardsCurve::sigmoid(false);
 
+    // Reuse per-token scratch buffers to reduce allocation churn.
+    let mut prob_indices: Vec<usize> = Vec::new();
+    let mut soft_mask: Vec<f32> = Vec::new();
+    let mut unsorted_mask: Vec<f32> = Vec::new();
+
     // Process each token
     for (token_idx, token_gates) in gates.outer_iter().enumerate() {
         // Sort probabilities and compute cumulative sum (following AutoDeco approach)
         let token_len = token_gates.len();
-        let mut prob_indices: Vec<usize> = (0..token_len).collect();
+        prob_indices.clear();
+        prob_indices.extend(0..token_len);
         prob_indices.sort_by(|&i, &j| {
             let a = token_gates[i];
             let b = token_gates[j];
@@ -755,49 +712,41 @@ fn apply_soft_top_p_with_richards(
             b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let mut sorted_probs = Vec::with_capacity(token_len);
-        for &idx in &prob_indices {
-            sorted_probs.push(token_gates[idx]);
-        }
-
-        // Compute cumulative sum
-        let mut cumulative = Vec::with_capacity(sorted_probs.len());
-        let mut sum = 0.0;
-        for &val in &sorted_probs {
-            sum += val;
-            cumulative.push(sum);
-        }
-
         // Apply soft mask using Richards sigmoid for smooth activation
         // Richards sigmoid is a non-learning activation that provides smooth, well-behaved
         // gradients
-        let mut soft_mask = Vec::with_capacity(cumulative.len());
-        for &c in &cumulative {
-            let diff = c - top_p;
+        soft_mask.clear();
+        soft_mask.reserve(token_len);
+        let mut cum = 0.0f32;
+        for &idx in &prob_indices {
+            cum += token_gates[idx];
+            let diff = cum - top_p;
             // Richards sigmoid: smooth activation with better gradient properties than standard
             // sigmoid
-            let activation = smooth_sigmoid.forward_scalar((alpha * diff) as f64) as f32;
+            let activation = smooth_sigmoid.forward_scalar_f32(alpha * diff);
 
             // Apply PadeExp directly for numerical stability
             soft_mask.push(crate::pade::PadeExp::exp(activation as f64) as f32);
         }
 
         // Unsort the mask
-        let mut unsorted_mask = vec![0.0; token_len];
+        unsorted_mask.clear();
+        unsorted_mask.resize(token_len, 0.0);
         for (i, &idx) in prob_indices.iter().enumerate() {
             unsorted_mask[idx] = soft_mask[i];
         }
 
-        // Apply mask and renormalize
-        let mut masked_probs = Vec::with_capacity(token_len);
+        // Apply mask directly into the output row and renormalize.
+        let mut sum_masked: f32 = 0.0;
         for (i, &prob) in token_gates.iter().enumerate() {
-            masked_probs.push(prob * unsorted_mask[i]);
+            let v = prob * unsorted_mask[i];
+            result[[token_idx, i]] = v;
+            sum_masked += v;
         }
-
-        let sum_masked: f32 = masked_probs.iter().sum();
         if sum_masked > 0.0 {
-            for (i, prob) in masked_probs.into_iter().enumerate() {
-                result[[token_idx, i]] = prob / sum_masked;
+            let inv = 1.0f32 / sum_masked;
+            for i in 0..token_len {
+                result[[token_idx, i]] *= inv;
             }
         } else {
             // Fallback to original if all masked

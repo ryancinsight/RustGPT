@@ -80,27 +80,32 @@ pub fn dsilu<T: RichardsScalar>(x: T) -> T {
 
 #[inline]
 pub fn sigmoid_f32(x: f32) -> f32 {
-    sigmoid(x)
+    let curve = SIGMOID_CURVE.get_or_init(|| RichardsCurve::sigmoid(false));
+    curve.forward_scalar_f32(x)
 }
 
 #[inline]
 pub fn dsigmoid_f32(x: f32) -> f32 {
-    dsigmoid(x)
+    let curve = SIGMOID_CURVE.get_or_init(|| RichardsCurve::sigmoid(false));
+    curve.derivative_scalar_f32(x)
 }
 
 #[inline]
 pub fn tanh_f32(x: f32) -> f32 {
-    tanh(x)
+    let curve = TANH_CURVE.get_or_init(|| RichardsCurve::tanh(false));
+    curve.forward_scalar_f32(x)
 }
 
 #[inline]
 pub fn dtanh_f32(x: f32) -> f32 {
-    dtanh(x)
+    let curve = TANH_CURVE.get_or_init(|| RichardsCurve::tanh(false));
+    curve.derivative_scalar_f32(x)
 }
 
 #[inline]
 pub fn silu_f32(x: f32) -> f32 {
-    silu(x)
+    // SiLU(x) = x * sigmoid(x)
+    x * sigmoid_f32(x)
 }
 
 #[inline]

@@ -198,24 +198,16 @@ impl Layer for RichardsGlu {
         // Parameter gradients vector
         let mut param_grads = vec![grad_w1, grad_w2, grad_w_out];
 
-        // Compute RichardsActivation gradients (value function)
-        let mut value_grads_sum =
-            Array2::<f32>::zeros((1, self.richards_activation.weights().len()));
-
-        // Accumulate gradients for richards_activation (value function)
-        for (i, x1_row) in x1.outer_iter().enumerate() {
-            for (j, &x1_val) in x1_row.iter().enumerate() {
-                let grad_output = grad_value[[i, j]] as f64;
-                if grad_output != 0.0 {
-                    let value_grads = self
-                        .richards_activation
-                        .richards_curve
-                        .grad_weights_scalar(x1_val as f64, grad_output);
-                    for (k, &grad) in value_grads.iter().enumerate() {
-                        value_grads_sum[[0, k]] += grad as f32;
-                    }
-                }
-            }
+        // Compute RichardsActivation gradients (value function) in one shot.
+        // value(x) = x * curve(x) => dL/d(curve(x)) = x * dL/d(value).
+        let curve_output_grads = &x1 * &grad_value;
+        let value_grads = self
+            .richards_activation
+            .richards_curve
+            .grad_weights_matrix_f32(&x1, &curve_output_grads);
+        let mut value_grads_sum = Array2::<f32>::zeros((1, value_grads.len()));
+        for (k, &g) in value_grads.iter().enumerate() {
+            value_grads_sum[[0, k]] = g as f32;
         }
 
         // Compute RichardsGate gradients using the gate's own gradient computation

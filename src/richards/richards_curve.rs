@@ -56,8 +56,26 @@ pub(super) fn unit_from_softplus_f64_richards(t: f64) -> f64 {
     1.0 - crate::pade::exp(-t)
 }
 
+#[inline]
+pub(super) fn unit_from_softplus_f32_richards(t: f32) -> f32 {
+    if t.is_nan() {
+        return f32::NAN;
+    }
+    if t == f32::INFINITY {
+        return 1.0;
+    }
+    if t == f32::NEG_INFINITY {
+        return 0.0;
+    }
+    1.0 - exp_f32_richards(-t)
+}
+
 // Rayon parallelism has overhead for small slices; avoid it on tiny tensors.
 const PAR_THRESHOLD: usize = 1024;
+
+// Max number of scalar weights supported by RichardsCurve.
+// Order: nu, k, m, beta, temperature, output_gain, output_bias, scale, shift.
+const MAX_SCALAR_PARAMS: usize = 9;
 
 // --- Zero-cost (compile-time) variant specialization ---
 
@@ -65,6 +83,12 @@ trait VariantMarker: Sync + Send {
     const INPUT_SCALE: f64;
     const OUTER_SCALE: f64;
     fn gate(sigma: f64) -> f64;
+}
+
+trait VariantMarkerF32: Sync + Send {
+    const INPUT_SCALE: f32;
+    const OUTER_SCALE: f32;
+    fn gate(sigma: f32) -> f32;
 }
 
 struct SigmoidLike;
@@ -80,12 +104,32 @@ impl VariantMarker for SigmoidLike {
     }
 }
 
+impl VariantMarkerF32 for SigmoidLike {
+    const INPUT_SCALE: f32 = 1.0;
+    const OUTER_SCALE: f32 = 1.0;
+
+    #[inline]
+    fn gate(sigma: f32) -> f32 {
+        sigma
+    }
+}
+
 impl VariantMarker for TanhLike {
     const INPUT_SCALE: f64 = 2.0;
     const OUTER_SCALE: f64 = 2.0;
 
     #[inline]
     fn gate(sigma: f64) -> f64 {
+        2.0 * sigma - 1.0
+    }
+}
+
+impl VariantMarkerF32 for TanhLike {
+    const INPUT_SCALE: f32 = 2.0;
+    const OUTER_SCALE: f32 = 2.0;
+
+    #[inline]
+    fn gate(sigma: f32) -> f32 {
         2.0 * sigma - 1.0
     }
 }
@@ -184,6 +228,98 @@ impl<V: VariantMarker> RichardsKernel<V> {
 
         let nu_eff = self.nu_eff;
         let sigma = exp_f64_richards(self.inv_nu * ln_base);
+        let dinput_dx = V::INPUT_SCALE * self.scale * self.adaptive_scale * self.temp_reciprocal;
+        (sigma, r, ln_base, nu_eff, dinput_dx)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RichardsKernelF32<V: VariantMarkerF32> {
+    nu_eff: f32,
+    k_eff: f32,
+    m: f32,
+    beta: f32,
+    temp_reciprocal: f32,
+    output_gain: f32,
+    output_bias: f32,
+    scale: f32,
+    shift: f32,
+    adaptive_scale: f32,
+    adaptive_shift: f32,
+    inv_nu: f32,
+    _variant: PhantomData<V>,
+}
+
+impl<V: VariantMarkerF32> RichardsKernelF32<V> {
+    #[inline]
+    fn from_curve(curve: &RichardsCurve) -> Self {
+        let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = curve.get_all_params();
+        let (adaptive_scale, adaptive_shift) = curve.get_adaptive_scaling();
+
+        let nu_eff = nu as f32;
+        let k = k as f32;
+        let k_eff = if curve.birch_exponential_tail {
+            k * nu_eff
+        } else {
+            k
+        };
+
+        Self {
+            nu_eff,
+            k_eff,
+            m: m as f32,
+            beta: beta as f32,
+            temp_reciprocal: 1.0f32 / (temp as f32),
+            output_gain: output_gain as f32,
+            output_bias: output_bias as f32,
+            scale: scale as f32,
+            shift: shift as f32,
+            adaptive_scale: adaptive_scale as f32,
+            adaptive_shift: adaptive_shift as f32,
+            inv_nu: -(1.0f32 / (nu as f32)),
+            _variant: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn forward_one_f32(&self, xi: f32) -> f32 {
+        let (sigma, _r, _ln_base, _nu_eff, _dinput_dx) = self.common_terms(xi);
+        let gate = V::gate(sigma);
+        self.output_gain * gate + self.output_bias
+    }
+
+    #[inline]
+    fn derivative_one_f32(&self, xi: f32) -> f32 {
+        let (sigma, r, _ln_base, nu_eff, dinput_dx) = self.common_terms(xi);
+        let dsig_dinput = (sigma * self.k_eff * r) / nu_eff;
+        self.output_gain * V::OUTER_SCALE * dsig_dinput * dinput_dx
+    }
+
+    #[inline]
+    fn eval_one_f32(&self, xi: f32) -> (f32, f32) {
+        let (sigma, r, _ln_base, nu_eff, dinput_dx) = self.common_terms(xi);
+        let gate = V::gate(sigma);
+        let y = self.output_gain * gate + self.output_bias;
+
+        let dsig_dinput = (sigma * self.k_eff * r) / nu_eff;
+        let dy_dx = self.output_gain * V::OUTER_SCALE * dsig_dinput * dinput_dx;
+        (y, dy_dx)
+    }
+
+    #[inline]
+    fn common_terms(&self, xi: f32) -> (f32, f32, f32, f32, f32) {
+        let adaptive_normalized = self.adaptive_scale * xi + self.adaptive_shift;
+        let temp_scaled = adaptive_normalized * self.temp_reciprocal;
+        let input = V::INPUT_SCALE * (self.scale * temp_scaled + self.shift);
+
+        let exponent: f32 = -self.k_eff * (input - self.m);
+
+        let t = self.beta.ln() + exponent;
+        let ln_base = softplus_f32_richards(t);
+        let r = unit_from_softplus_f32_richards(ln_base);
+
+        let nu_eff = self.nu_eff;
+        let sigma = exp_f32_richards(self.inv_nu * ln_base);
         let dinput_dx = V::INPUT_SCALE * self.scale * self.adaptive_scale * self.temp_reciprocal;
         (sigma, r, ln_base, nu_eff, dinput_dx)
     }
@@ -496,24 +632,24 @@ impl RichardsCurve {
     }
 
     #[inline]
-    fn eval_kernel_into_f32<V: VariantMarker>(&self, x: &[f32], y: &mut [f32], dy: &mut [f32]) {
+    fn eval_kernel_into_f32<V: VariantMarkerF32>(&self, x: &[f32], y: &mut [f32], dy: &mut [f32]) {
         debug_assert_eq!(x.len(), y.len());
         debug_assert_eq!(x.len(), dy.len());
-        let k = RichardsKernel::<V>::from_curve(self);
+        let k = RichardsKernelF32::<V>::from_curve(self);
         if x.len() < PAR_THRESHOLD {
             for i in 0..x.len() {
-                let (yi, dyi) = k.eval_one_f64(x[i] as f64);
-                y[i] = yi as f32;
-                dy[i] = dyi as f32;
+                let (yi, dyi) = k.eval_one_f32(x[i]);
+                y[i] = yi;
+                dy[i] = dyi;
             }
         } else {
             y.par_iter_mut()
                 .zip(dy.par_iter_mut())
                 .zip(x.par_iter())
                 .for_each(|((yo, dyo), &xi)| {
-                    let (yi, dyi) = k.eval_one_f64(xi as f64);
-                    *yo = yi as f32;
-                    *dyo = dyi as f32;
+                    let (yi, dyi) = k.eval_one_f32(xi);
+                    *yo = yi;
+                    *dyo = dyi;
                 });
         }
     }
@@ -563,15 +699,15 @@ impl RichardsCurve {
     }
 
     #[inline]
-    fn forward_kernel_into_f32<V: VariantMarker>(&self, x: &[f32], out: &mut [f32]) {
-        let k = RichardsKernel::<V>::from_curve(self);
+    fn forward_kernel_into_f32<V: VariantMarkerF32>(&self, x: &[f32], out: &mut [f32]) {
+        let k = RichardsKernelF32::<V>::from_curve(self);
         if x.len() < PAR_THRESHOLD {
             for (xi, o) in x.iter().copied().zip(out.iter_mut()) {
-                *o = k.forward_one_f64(xi as f64) as f32;
+                *o = k.forward_one_f32(xi);
             }
         } else {
             x.par_iter().zip(out.par_iter_mut()).for_each(|(&xi, o)| {
-                *o = k.forward_one_f64(xi as f64) as f32;
+                *o = k.forward_one_f32(xi);
             });
         }
     }
@@ -591,15 +727,15 @@ impl RichardsCurve {
     }
 
     #[inline]
-    fn derivative_kernel_into_f32<V: VariantMarker>(&self, x: &[f32], out: &mut [f32]) {
-        let k = RichardsKernel::<V>::from_curve(self);
+    fn derivative_kernel_into_f32<V: VariantMarkerF32>(&self, x: &[f32], out: &mut [f32]) {
+        let k = RichardsKernelF32::<V>::from_curve(self);
         if x.len() < PAR_THRESHOLD {
             for (xi, o) in x.iter().copied().zip(out.iter_mut()) {
-                *o = k.derivative_one_f64(xi as f64) as f32;
+                *o = k.derivative_one_f32(xi);
             }
         } else {
             x.par_iter().zip(out.par_iter_mut()).for_each(|(&xi, o)| {
-                *o = k.derivative_one_f64(xi as f64) as f32;
+                *o = k.derivative_one_f32(xi);
             });
         }
     }
@@ -1231,6 +1367,17 @@ impl RichardsCurve {
         }
     }
 
+    /// Allocation-free scalar forward for f32 inputs (avoids f32->f64 conversion).
+    #[inline]
+    pub fn forward_scalar_f32(&self, x: f32) -> f32 {
+        match self.variant {
+            crate::richards::Variant::Tanh => {
+                RichardsKernelF32::<TanhLike>::from_curve(self).forward_one_f32(x)
+            }
+            _ => RichardsKernelF32::<SigmoidLike>::from_curve(self).forward_one_f32(x),
+        }
+    }
+
     /// Matrix backward pass: df/dx for matrix input with per-feature transformations
     pub fn backward_matrix(&self, x: &Array2<f64>, output_grads: &Array2<f64>) -> Array2<f64> {
         let mut grad_input = Array2::<f64>::zeros(x.raw_dim());
@@ -1318,26 +1465,21 @@ impl RichardsCurve {
         if (self.gamma_learnable || self.bias_learnable)
             && (self.gamma.is_some() || self.bias.is_some())
         {
-            // Compute raw Richards output (without gamma/bias) as a flat buffer.
-            // Use standard iteration order so this works for non-contiguous arrays too.
-            let mut raw_out = vec![0.0f64; x.len()];
-            let mut xi = 0;
-            for &xv in x.iter() {
-                raw_out[xi] = self.forward_scalar(xv);
-                xi += 1;
-            }
-
-            // Accumulate per-feature sums in a cache-friendly way.
-            let (sum_gamma, sum_bias) = if let Some(grad_slice) = output_grads.as_slice() {
-                raw_out
+            // Accumulate per-feature sums without materializing raw_out (saves O(N*D) memory).
+            // raw = forward_scalar(x); out = raw*gamma + bias.
+            let (sum_gamma, sum_bias) = if let (Some(x_slice), Some(grad_slice)) =
+                (x.as_slice(), output_grads.as_slice())
+            {
+                x_slice
                     .par_chunks_exact(embedding_dim)
                     .zip(grad_slice.par_chunks_exact(embedding_dim))
                     .fold(
                         || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
-                        |mut acc, (raw_row, grad_row)| {
+                        |mut acc, (x_row, grad_row)| {
                             if self.gamma_learnable {
                                 for j in 0..embedding_dim {
-                                    acc.0[j] += raw_row[j] * grad_row[j];
+                                    let raw = self.forward_scalar(x_row[j]);
+                                    acc.0[j] += raw * grad_row[j];
                                 }
                             }
                             if self.bias_learnable {
@@ -1368,13 +1510,11 @@ impl RichardsCurve {
                 let mut sum_gamma = vec![0.0f64; embedding_dim];
                 let mut sum_bias = vec![0.0f64; embedding_dim];
 
-                for (raw_row, grad_row) in raw_out
-                    .chunks_exact(embedding_dim)
-                    .zip(output_grads.outer_iter())
-                {
+                for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
                     if self.gamma_learnable {
                         for j in 0..embedding_dim {
-                            sum_gamma[j] += raw_row[j] * grad_row[j];
+                            let raw = self.forward_scalar(x_row[j]);
+                            sum_gamma[j] += raw * grad_row[j];
                         }
                     }
                     if self.bias_learnable {
@@ -1406,6 +1546,286 @@ impl RichardsCurve {
         grads_accum
     }
 
+    /// Matrix backward pass for f32 inputs without materializing f64 matrices.
+    /// Writes df/dx * dy into `grad_input`.
+    pub fn backward_matrix_f32_into(
+        &self,
+        x: &Array2<f32>,
+        output_grads: &Array2<f32>,
+        grad_input: &mut Array2<f32>,
+    ) {
+        if x.dim() != output_grads.dim() || x.dim() != grad_input.dim() {
+            grad_input.fill(0.0);
+            return;
+        }
+
+        // Use the f32 derivative kernel (conversion-free after RichardsKernelF32).
+        match self.variant {
+            crate::richards::Variant::Tanh => {
+                let k = RichardsKernelF32::<TanhLike>::from_curve(self);
+                ndarray::Zip::from(grad_input)
+                    .and(x)
+                    .and(output_grads)
+                    .for_each(|gi, &xi, &dy| {
+                        *gi = k.derivative_one_f32(xi) * dy;
+                    });
+            }
+            _ => {
+                let k = RichardsKernelF32::<SigmoidLike>::from_curve(self);
+                ndarray::Zip::from(grad_input)
+                    .and(x)
+                    .and(output_grads)
+                    .for_each(|gi, &xi, &dy| {
+                        *gi = k.derivative_one_f32(xi) * dy;
+                    });
+            }
+        }
+    }
+
+    /// Matrix gradient computation for all learnable parameters from f32 inputs.
+    /// Avoids allocating intermediate f64 matrices by iterating and casting per element.
+    pub fn grad_weights_matrix_f32(&self, x: &Array2<f32>, output_grads: &Array2<f32>) -> Vec<f64> {
+        let (batch_size, embedding_dim) = x.dim();
+
+        if x.dim() != output_grads.dim() {
+            return vec![0.0f64; self.weights_len()];
+        }
+
+        let scalar_param_count = self.scalar_weights_len();
+        let total_elements = (batch_size * embedding_dim) as f64;
+
+        debug_assert!(scalar_param_count <= MAX_SCALAR_PARAMS);
+        let grads_accum = if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
+            match self.variant {
+                crate::richards::Variant::Tanh => x_slice
+                    .par_iter()
+                    .zip(grad_slice.par_iter())
+                    .fold(
+                        || vec![0.0f32; scalar_param_count],
+                        |mut acc, (&xi, &dy)| {
+                            let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+                            self.grad_weights_scalar_into_kernel_f32::<TanhLike>(xi, dy, &mut buf[..scalar_param_count]);
+                            for i in 0..scalar_param_count {
+                                acc[i] += buf[i];
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0f32; scalar_param_count],
+                        |mut a, b| {
+                            for i in 0..scalar_param_count {
+                                a[i] += b[i];
+                            }
+                            a
+                        },
+                    ),
+                _ => x_slice
+                    .par_iter()
+                    .zip(grad_slice.par_iter())
+                    .fold(
+                        || vec![0.0f32; scalar_param_count],
+                        |mut acc, (&xi, &dy)| {
+                            let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+                            self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(xi, dy, &mut buf[..scalar_param_count]);
+                            for i in 0..scalar_param_count {
+                                acc[i] += buf[i];
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0f32; scalar_param_count],
+                        |mut a, b| {
+                            for i in 0..scalar_param_count {
+                                a[i] += b[i];
+                            }
+                            a
+                        },
+                    ),
+            }
+        } else {
+            let mut acc = vec![0.0f32; scalar_param_count];
+            match self.variant {
+                crate::richards::Variant::Tanh => {
+                    for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
+                        let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+                        self.grad_weights_scalar_into_kernel_f32::<TanhLike>(xi, dy, &mut buf[..scalar_param_count]);
+                        for i in 0..scalar_param_count {
+                            acc[i] += buf[i];
+                        }
+                    }
+                }
+                _ => {
+                    for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
+                        let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+                        self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(xi, dy, &mut buf[..scalar_param_count]);
+                        for i in 0..scalar_param_count {
+                            acc[i] += buf[i];
+                        }
+                    }
+                }
+            }
+            acc
+        };
+
+        let mut grads_accum_f64: Vec<f64> = Vec::with_capacity(self.weights_len());
+        for i in 0..scalar_param_count {
+            let mut g = (grads_accum[i] as f64) / total_elements;
+            if !g.is_finite() {
+                g = 0.0;
+            }
+            grads_accum_f64.push(g);
+        }
+
+        let extra_params_len = self.weights_len().saturating_sub(scalar_param_count);
+        if extra_params_len > 0 {
+            grads_accum_f64.reserve(extra_params_len);
+        }
+
+        if (self.gamma_learnable || self.bias_learnable)
+            && (self.gamma.is_some() || self.bias.is_some())
+        {
+            let (sum_gamma, sum_bias) = if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
+                match self.variant {
+                    crate::richards::Variant::Tanh => {
+                        let k = RichardsKernelF32::<TanhLike>::from_curve(self);
+                        x_slice
+                            .par_chunks_exact(embedding_dim)
+                            .zip(grad_slice.par_chunks_exact(embedding_dim))
+                            .fold(
+                                || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
+                                |mut acc, (x_row, grad_row)| {
+                                    if self.gamma_learnable {
+                                        for j in 0..embedding_dim {
+                                            let raw = k.forward_one_f32(x_row[j]);
+                                            acc.0[j] += raw * grad_row[j];
+                                        }
+                                    }
+                                    if self.bias_learnable {
+                                        for j in 0..embedding_dim {
+                                            acc.1[j] += grad_row[j];
+                                        }
+                                    }
+                                    acc
+                                },
+                            )
+                            .reduce(
+                                || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
+                                |mut a, b| {
+                                    if self.gamma_learnable {
+                                        for j in 0..embedding_dim {
+                                            a.0[j] += b.0[j];
+                                        }
+                                    }
+                                    if self.bias_learnable {
+                                        for j in 0..embedding_dim {
+                                            a.1[j] += b.1[j];
+                                        }
+                                    }
+                                    a
+                                },
+                            )
+                    }
+                    _ => {
+                        let k = RichardsKernelF32::<SigmoidLike>::from_curve(self);
+                        x_slice
+                            .par_chunks_exact(embedding_dim)
+                            .zip(grad_slice.par_chunks_exact(embedding_dim))
+                            .fold(
+                                || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
+                                |mut acc, (x_row, grad_row)| {
+                                    if self.gamma_learnable {
+                                        for j in 0..embedding_dim {
+                                            let raw = k.forward_one_f32(x_row[j]);
+                                            acc.0[j] += raw * grad_row[j];
+                                        }
+                                    }
+                                    if self.bias_learnable {
+                                        for j in 0..embedding_dim {
+                                            acc.1[j] += grad_row[j];
+                                        }
+                                    }
+                                    acc
+                                },
+                            )
+                            .reduce(
+                                || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
+                                |mut a, b| {
+                                    if self.gamma_learnable {
+                                        for j in 0..embedding_dim {
+                                            a.0[j] += b.0[j];
+                                        }
+                                    }
+                                    if self.bias_learnable {
+                                        for j in 0..embedding_dim {
+                                            a.1[j] += b.1[j];
+                                        }
+                                    }
+                                    a
+                                },
+                            )
+                    }
+                }
+            } else {
+                let mut sum_gamma = vec![0.0f32; embedding_dim];
+                let mut sum_bias = vec![0.0f32; embedding_dim];
+
+                match self.variant {
+                    crate::richards::Variant::Tanh => {
+                        let k = RichardsKernelF32::<TanhLike>::from_curve(self);
+                        for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
+                            if self.gamma_learnable {
+                                for j in 0..embedding_dim {
+                                    let raw = k.forward_one_f32(x_row[j]);
+                                    sum_gamma[j] += raw * grad_row[j];
+                                }
+                            }
+                            if self.bias_learnable {
+                                for j in 0..embedding_dim {
+                                    sum_bias[j] += grad_row[j];
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        let k = RichardsKernelF32::<SigmoidLike>::from_curve(self);
+                        for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
+                            if self.gamma_learnable {
+                                for j in 0..embedding_dim {
+                                    let raw = k.forward_one_f32(x_row[j]);
+                                    sum_gamma[j] += raw * grad_row[j];
+                                }
+                            }
+                            if self.bias_learnable {
+                                for j in 0..embedding_dim {
+                                    sum_bias[j] += grad_row[j];
+                                }
+                            }
+                        }
+                    }
+                }
+                (sum_gamma, sum_bias)
+            };
+
+            let denom_f32 = batch_size as f32;
+            if self.gamma_learnable {
+                grads_accum_f64.extend(sum_gamma.into_iter().map(|v| {
+                    let g = (v / denom_f32) as f64;
+                    if g.is_finite() { g } else { 0.0 }
+                }));
+            }
+            if self.bias_learnable {
+                grads_accum_f64.extend(sum_bias.into_iter().map(|v| {
+                    let g = (v / denom_f32) as f64;
+                    if g.is_finite() { g } else { 0.0 }
+                }));
+            }
+        }
+
+        grads_accum_f64
+    }
+
     /// Vectorized backward pass: df/dx at x (analytical gradient), writing to output slice.
     pub fn derivative_into(&self, x: &[f64], out: &mut [f64]) {
         // Ensure output size matches input
@@ -1425,6 +1845,17 @@ impl RichardsCurve {
                 RichardsKernel::<TanhLike>::from_curve(self).derivative_one_f64(x)
             }
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).derivative_one_f64(x),
+        }
+    }
+
+    /// Allocation-free scalar derivative for f32 inputs (avoids f32->f64 conversion).
+    #[inline]
+    pub fn derivative_scalar_f32(&self, x: f32) -> f32 {
+        match self.variant {
+            crate::richards::Variant::Tanh => {
+                RichardsKernelF32::<TanhLike>::from_curve(self).derivative_one_f32(x)
+            }
+            _ => RichardsKernelF32::<SigmoidLike>::from_curve(self).derivative_one_f32(x),
         }
     }
 
@@ -1554,6 +1985,112 @@ impl RichardsCurve {
         );
     }
 
+    fn grad_weights_scalar_into_kernel_f32<V: VariantMarkerF32>(
+        &self,
+        x: f32,
+        grad_output: f32,
+        out: &mut [f32],
+    ) {
+        // Forward: f(x) = output_gain * gate(x) + output_bias
+        let (nu, k, m, beta, temp, output_gain, _, scale, shift) = self.get_all_params();
+        let birch_tail = self.birch_exponential_tail;
+        let input_scale = V::INPUT_SCALE;
+        let outer_scale = V::OUTER_SCALE;
+        let (adaptive_scale, adaptive_shift) = self.get_adaptive_scaling();
+
+        let nu = nu as f32;
+        let k = k as f32;
+        let m = m as f32;
+        let beta = beta as f32;
+        let temp = temp as f32;
+        let output_gain = output_gain as f32;
+        let scale = scale as f32;
+        let shift = shift as f32;
+        let adaptive_scale = adaptive_scale as f32;
+        let adaptive_shift = adaptive_shift as f32;
+
+        let adaptive_normalized = adaptive_scale * x + adaptive_shift;
+        let temp_scaled = adaptive_normalized / temp;
+        let input = input_scale * (scale * temp_scaled + shift);
+
+        // `get_all_params` enforces nu>0, beta>0, temp>0.
+        let nu_eff = nu;
+        let k_eff = if birch_tail { k * nu_eff } else { k };
+
+        let exponent = -k_eff * (input - m);
+
+        let t = beta.ln() + exponent;
+        let ln_base = softplus_f32_richards(t);
+        let r = unit_from_softplus_f32_richards(ln_base);
+
+        let sigma = exp_f32_richards(-(ln_base) / nu);
+        let gate = V::gate(sigma);
+
+        let dsigma_dinput = (sigma * k_eff * r) / nu_eff;
+        let pref = grad_output * output_gain * outer_scale;
+
+        let mut pos = 0usize;
+        if self.nu_learnable {
+            let d_ln_sigma_d_nu = if birch_tail {
+                (ln_base / (nu * nu)) + (k * (input - m) * r) / nu
+            } else {
+                ln_base / (nu * nu)
+            };
+            let d_sigma_d_nu = sigma * d_ln_sigma_d_nu;
+            out[pos] = pref * d_sigma_d_nu;
+            pos += 1;
+        }
+        if self.k_learnable {
+            let d_sigma_d_k = if birch_tail {
+                sigma * (input - m) * r
+            } else {
+                (sigma / nu_eff) * (input - m) * r
+            };
+            out[pos] = pref * d_sigma_d_k;
+            pos += 1;
+        }
+        if self.m_learnable {
+            let d_sigma_d_m = if birch_tail {
+                -(sigma) * k * r
+            } else {
+                -(sigma / nu_eff) * k * r
+            };
+            out[pos] = pref * d_sigma_d_m;
+            pos += 1;
+        }
+        if self.beta_learnable {
+            let d_sigma_d_beta = -(sigma / nu_eff) * (r / beta);
+            out[pos] = pref * d_sigma_d_beta;
+            pos += 1;
+        }
+        if self.temperature_learnable {
+            let d_temp_scaled_d_temp = -temp_scaled / temp;
+            let d_input_d_temp = input_scale * scale * d_temp_scaled_d_temp;
+            out[pos] = pref * dsigma_dinput * d_input_d_temp;
+            pos += 1;
+        }
+        if self.output_gain_learnable {
+            out[pos] = grad_output * gate;
+            pos += 1;
+        }
+        if self.output_bias_learnable {
+            out[pos] = grad_output;
+            pos += 1;
+        }
+        if self.scale_learnable {
+            let d_input_d_scale = input_scale * temp_scaled;
+            out[pos] = pref * dsigma_dinput * d_input_d_scale;
+            pos += 1;
+        }
+        if self.shift_learnable {
+            let d_input_d_shift = input_scale;
+            out[pos] = pref * dsigma_dinput * d_input_d_shift;
+            pos += 1;
+        }
+
+        debug_assert_eq!(pos, out.len(), "grad_weights_scalar_into_kernel_f32: slice length mismatch");
+    }
+
     /// Compute gradients w.r.t. learnable parameters for a single scalar input into a preallocated
     /// slice
     pub fn grad_weights_scalar_into(&self, x: f64, grad_output: f64, out: &mut [f64]) {
@@ -1582,6 +2119,35 @@ impl RichardsCurve {
     /// Derivative for a single scalar x (backward compatibility)
     pub fn backward_scalar(&self, x: f64) -> f64 {
         self.derivative_scalar(x)
+    }
+
+    /// Derivative for a single scalar x (f32-friendly, avoids f32->f64 conversion).
+    #[inline]
+    pub fn backward_scalar_f32(&self, x: f32) -> f32 {
+        self.derivative_scalar_f32(x)
+    }
+
+    /// Compute scalar parameter gradients for a single f32 input.
+    ///
+    /// This returns gradients in the same internal order as `weights()` (scalar portion only).
+    pub fn grad_weights_scalar_f32(&self, x: f32, grad_output: f32) -> Vec<f64> {
+        let n = self.scalar_weights_len();
+        debug_assert!(n <= MAX_SCALAR_PARAMS);
+
+        let mut buf = vec![0.0f32; n];
+        match self.variant {
+            crate::richards::Variant::Tanh => {
+                self.grad_weights_scalar_into_kernel_f32::<TanhLike>(x, grad_output, &mut buf)
+            }
+            _ => self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(x, grad_output, &mut buf),
+        }
+
+        buf.into_iter()
+            .map(|g| {
+                let g = g as f64;
+                if g.is_finite() { g } else { 0.0 }
+            })
+            .collect()
     }
 
     /// Update parameters using Adam optimizer

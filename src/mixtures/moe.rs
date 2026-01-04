@@ -811,10 +811,7 @@ impl ExpertSelector {
         let normalized = self.norm.normalize_immutable(&hidden);
 
         // Learned Richards activation
-        let activated = self
-            .activation
-            .forward_matrix(&normalized.mapv(|x| x as f64))
-            .mapv(|x| x as f32);
+        let activated = self.activation.forward_const(&normalized);
 
         // Second layer: W2 * activated + b2
         let logits = activated.dot(&self.weights2) + &self.bias2;
@@ -908,12 +905,10 @@ impl ExpertSelector {
         let d_activated = d_output.dot(&self.weights2.t());
 
         // Gradient through Richards activation (replacing ReLU)
-        let normalized_f64 = cached_normalized.mapv(|x| x as f64);
-        let d_activated_f64 = d_activated.mapv(|x| x as f64);
-        let activation_grad_f64 = self
-            .activation
-            .backward_matrix(&normalized_f64, &d_activated_f64);
-        let d_normalized = activation_grad_f64.mapv(|x| x as f32);
+        let mut d_normalized = ndarray::Array2::<f32>::zeros(cached_normalized.raw_dim());
+        self.activation
+            .curve
+            .backward_matrix_f32_into(cached_normalized, &d_activated, &mut d_normalized);
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -925,7 +920,8 @@ impl ExpertSelector {
         // Activation parameter gradients (Richards curve parameters)
         let activation_grads = self
             .activation
-            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
+            .curve
+            .grad_weights_matrix_f32(cached_normalized, &d_activated);
 
         (
             grad_weights1,
@@ -2039,13 +2035,8 @@ impl Layer for MixtureOfExperts {
         let d_activated = d_logits.dot(&self.router.weights2.t());
 
         // Gradient through Richards activation (replacing ReLU)
-        let normalized_f64 = cached_normalized.mapv(|x| x as f64);
-        let d_activated_f64 = d_activated.mapv(|x| x as f64);
-        let activation_grad_f64 = self
-            .router
-            .activation
-            .backward_matrix(&normalized_f64, &d_activated_f64);
-        let d_normalized = activation_grad_f64.mapv(|x| x as f32);
+        let (d_normalized, activation_param_grads) =
+            self.router.activation.compute_gradients(cached_normalized, &d_activated);
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self
@@ -2071,14 +2062,6 @@ impl Layer for MixtureOfExperts {
         // First layer gradients
         let grad_weights1 = cached_router_input.t().dot(&d_hidden);
         let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
-
-        // Activation parameter gradients
-        let normalized_f32 = normalized_f64.mapv(|x| x as f32);
-        let d_activated_f32 = d_activated_f64.mapv(|x| x as f32);
-        let (_, activation_param_grads) = self
-            .router
-            .activation
-            .compute_gradients(&normalized_f32, &d_activated_f32);
 
         let mut router_grads = vec![
             grad_weights1,
