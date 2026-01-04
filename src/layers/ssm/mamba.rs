@@ -6,7 +6,7 @@ use crate::{
     adam::Adam,
     errors::Result,
     network::Layer,
-    richards::{dsilu_f32, sigmoid_f32, silu_f32},
+    richards::{dsilu_f32, dtanh_f32, sigmoid_f32, silu_f32, tanh_f32},
     rng::get_rng,
 };
 
@@ -533,11 +533,11 @@ impl Mamba {
         // Project input into a smaller (N) space for B/C, without adding parameters.
         let b_full = input.dot(&self.w_b) + self.b_b.broadcast((t, d)).unwrap();
         let b_logits = b_full.dot(proj_state);
-        let b_t = b_logits.mapv(|x| x.tanh());
+        let b_t = b_logits.mapv(tanh_f32);
 
         let c_full = input.dot(&self.w_c) + self.b_c.broadcast((t, d)).unwrap();
         let c_logits = c_full.dot(proj_state);
-        let c_t = c_logits.mapv(|x| x.tanh());
+        let c_t = c_logits.mapv(tanh_f32);
 
         // Build A logits/state scales using w_out (and biases) mapped into (D×N) via a fixed projection.
         // A_scale is positive; we use ZOH discretization with a = exp(-dt * A_scale).
@@ -671,8 +671,8 @@ impl Mamba {
                 .slice_mut(ndarray::s![.., base..base + n])
                 .assign(&c_head);
         }
-        let b_t = b_logits.mapv(|x| x.tanh());
-        let c_t = c_logits.mapv(|x| x.tanh());
+        let b_t = b_logits.mapv(tanh_f32);
+        let c_t = c_logits.mapv(tanh_f32);
 
         let u_conv = self.depthwise_causal_conv(&u_act);
 
@@ -828,23 +828,13 @@ impl Mamba {
         let grad_b_dt = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0));
         let d_y_pre = output_grads.dot(&self.w_dt.t());
 
-        // y_pre = gate * z
-        let mut d_gate = Array2::<f32>::zeros((t, d));
-        let mut d_z = Array2::<f32>::zeros((t, d));
-        for ti in 0..t {
-            for j in 0..d {
-                let g = d_y_pre[[ti, j]];
-                d_gate[[ti, j]] = g * z[[ti, j]];
-                d_z[[ti, j]] = g * gate[[ti, j]];
-            }
-        }
-
         // gate = sigmoid(gate_logits)
+        // d/dgate_logits [ gate * z ] = (d_y_pre * z) * gate * (1-gate)
         let mut d_gate_logits = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
                 let gt = gate[[ti, j]];
-                d_gate_logits[[ti, j]] = d_gate[[ti, j]] * gt * (1.0 - gt);
+                d_gate_logits[[ti, j]] = (d_y_pre[[ti, j]] * z[[ti, j]]) * gt * (1.0 - gt);
             }
         }
 
@@ -853,7 +843,6 @@ impl Mamba {
         let mut grad_d_skip = Array2::<f32>::zeros((1, d));
         let mut d_u_conv = Array2::<f32>::zeros((t, d));
         let mut d_c = Array2::<f32>::zeros((t, num_heads * n));
-        let mut d_state = Array2::<f32>::zeros((t, d * n));
 
         for ti in 0..t {
             for h in 0..num_heads {
@@ -861,13 +850,12 @@ impl Mamba {
                 let he = head_offsets[h + 1];
                 let base = h * n;
                 for j in hs..he {
-                    let dz = d_z[[ti, j]];
+                    let dz = d_y_pre[[ti, j]] * gate[[ti, j]];
                     grad_d_skip[[0, j]] += dz * u_conv[[ti, j]];
                     d_u_conv[[ti, j]] += dz * d_skip_row[j];
                     for k in 0..n {
                         let idx = j * n + k;
                         d_c[[ti, base + k]] += dz * state[[ti, idx]];
-                        d_state[[ti, idx]] += dz * c_t[[ti, base + k]];
                     }
                 }
             }
@@ -895,7 +883,9 @@ impl Mamba {
                     let uj = u_conv[[ti, j]];
                     for k in 0..n {
                         let idx = j * n + k;
-                        let mut ds = d_state[[ti, idx]] + d_state_next[idx];
+                        // Base contribution d_state[t, j, k] = dz * c_t[t, h, k]
+                        let dz = d_y_pre[[ti, j]] * gate[[ti, j]];
+                        let mut ds = dz * c_t[[ti, base + k]] + d_state_next[idx];
                         if !ds.is_finite() {
                             ds = 0.0;
                         }
@@ -951,10 +941,10 @@ impl Mamba {
         let mut d_c_logits = Array2::<f32>::zeros((t, num_heads * n));
         for ti in 0..t {
             for idx in 0..(num_heads * n) {
-                let bt = b_t[[ti, idx]];
-                let ct = c_t[[ti, idx]];
-                d_b_logits[[ti, idx]] = d_b[[ti, idx]] * (1.0 - bt * bt);
-                d_c_logits[[ti, idx]] = d_c[[ti, idx]] * (1.0 - ct * ct);
+                let db = d_b[[ti, idx]];
+                let dc = d_c[[ti, idx]];
+                d_b_logits[[ti, idx]] = db * dtanh_f32(b_logits[[ti, idx]]);
+                d_c_logits[[ti, idx]] = dc * dtanh_f32(c_logits[[ti, idx]]);
             }
         }
 
@@ -1138,9 +1128,9 @@ impl Layer for Mamba {
         let gate = self.cached_gate.as_ref().expect("cache gate");
         let dt_logits = self.cached_dt_logits.as_ref().expect("cache dt_logits");
         let dt = self.cached_dt.as_ref().expect("cache dt");
-        let _b_logits = self.cached_b_logits.as_ref().expect("cache b_logits");
+        let b_logits = self.cached_b_logits.as_ref().expect("cache b_logits");
         let b_t = self.cached_b_t.as_ref().expect("cache b_t");
-        let _c_logits = self.cached_c_logits.as_ref().expect("cache c_logits");
+        let c_logits = self.cached_c_logits.as_ref().expect("cache c_logits");
         let c_t = self.cached_c_t.as_ref().expect("cache c_t");
         let a_logits_state = self
             .cached_a_logits_state
@@ -1174,23 +1164,13 @@ impl Layer for Mamba {
         let grad_b_dt = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0));
         let d_y_pre = output_grads.dot(&self.w_dt.t());
 
-        // y_pre = gate * z
-        let mut d_gate = Array2::<f32>::zeros((t, d));
-        let mut d_z = Array2::<f32>::zeros((t, d));
-        for ti in 0..t {
-            for j in 0..d {
-                let g = d_y_pre[[ti, j]];
-                d_gate[[ti, j]] = g * z[[ti, j]];
-                d_z[[ti, j]] = g * gate[[ti, j]];
-            }
-        }
-
         // gate = sigmoid(gate_logits)
+        // d/dgate_logits [ gate * z ] = (d_y_pre * z) * gate * (1-gate)
         let mut d_gate_logits = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
                 let gt = gate[[ti, j]];
-                d_gate_logits[[ti, j]] = d_gate[[ti, j]] * gt * (1.0 - gt);
+                d_gate_logits[[ti, j]] = (d_y_pre[[ti, j]] * z[[ti, j]]) * gt * (1.0 - gt);
             }
         }
 
@@ -1199,16 +1179,14 @@ impl Layer for Mamba {
         let mut grad_d_skip = Array2::<f32>::zeros((1, d));
         let mut d_u_conv = Array2::<f32>::zeros((t, d));
         let mut d_c = Array2::<f32>::zeros((t, n));
-        let mut d_state = Array2::<f32>::zeros((t, d * n));
         for ti in 0..t {
             for j in 0..d {
-                let dz = d_z[[ti, j]];
+                let dz = d_y_pre[[ti, j]] * gate[[ti, j]];
                 grad_d_skip[[0, j]] += dz * u_conv[[ti, j]];
                 d_u_conv[[ti, j]] += dz * d_skip_row[j];
                 for k in 0..n {
                     let idx = j * n + k;
                     d_c[[ti, k]] += dz * state[[ti, idx]];
-                    d_state[[ti, idx]] += dz * c_t[[ti, k]];
                 }
             }
         }
@@ -1225,7 +1203,9 @@ impl Layer for Mamba {
                 let uj = u_conv[[ti, j]];
                 for k in 0..n {
                     let idx = j * n + k;
-                    let mut ds = d_state[[ti, idx]] + d_state_next[idx];
+                    // Base contribution d_state[t, j, k] = dz * c_t[t, k]
+                    let dz = d_y_pre[[ti, j]] * gate[[ti, j]];
+                    let mut ds = dz * c_t[[ti, k]] + d_state_next[idx];
                     if !ds.is_finite() {
                         ds = 0.0;
                     }
@@ -1290,10 +1270,10 @@ impl Layer for Mamba {
         let mut d_c_logits = Array2::<f32>::zeros((t, n));
         for ti in 0..t {
             for k in 0..n {
-                let bt = b_t[[ti, k]];
-                let ct = c_t[[ti, k]];
-                d_b_logits[[ti, k]] = d_b[[ti, k]] * (1.0 - bt * bt);
-                d_c_logits[[ti, k]] = d_c[[ti, k]] * (1.0 - ct * ct);
+                let db = d_b[[ti, k]];
+                let dc = d_c[[ti, k]];
+                d_b_logits[[ti, k]] = db * dtanh_f32(b_logits[[ti, k]]);
+                d_c_logits[[ti, k]] = dc * dtanh_f32(c_logits[[ti, k]]);
             }
         }
 

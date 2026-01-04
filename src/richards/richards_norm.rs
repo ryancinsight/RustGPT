@@ -230,17 +230,13 @@ impl Layer for RichardsNorm {
             .as_ref()
             .unwrap_or(&self.richards);
 
-        // Convert to f64 for RichardsCurve computation
-        let input_f64 = input.mapv(|x| x as f64);
-        let output_grads_f64 = output_grads.mapv(|x| x as f64);
+        // Compute parameter gradients without materializing f64 matrices.
+        // This significantly reduces peak memory in backward passes.
+        let richards_grads = richards.grad_weights_matrix_f32(input, output_grads);
 
-        // Compute gradients through RichardsCurve with per-feature transformations
-        // This will handle gamma/bias gradients internally
-        let richards_grads = richards.grad_weights_matrix(&input_f64, &output_grads_f64);
-
-        // Compute input gradients: chain rule through RichardsCurve
-        let grad_input_f64 = richards.backward_matrix(&input_f64, &output_grads_f64);
-        let grad_input = grad_input_f64.mapv(|x| x as f32);
+        // Compute input gradients without materializing f64 matrices.
+        let mut grad_input = Array2::<f32>::zeros(input.raw_dim());
+        richards.backward_matrix_f32_into(input, output_grads, &mut grad_input);
 
         // Extract gradients by parameter type (nu, k, beta, temperature, scale, gamma, bias)
         let mut grad_vecs = Vec::new();

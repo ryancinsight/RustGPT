@@ -1,40 +1,38 @@
 use std::sync::OnceLock;
 
-use super::{act::RichardsActivation, curve::RichardsCurve};
+use super::curve::RichardsCurve;
 
 static SIGMOID_CURVE_F32: OnceLock<RichardsCurve> = OnceLock::new();
 static TANH_CURVE_F32: OnceLock<RichardsCurve> = OnceLock::new();
-static SILU_ACT_F32: OnceLock<RichardsActivation> = OnceLock::new();
 
 #[inline]
 pub fn sigmoid_f32(x: f32) -> f32 {
     let curve = SIGMOID_CURVE_F32.get_or_init(|| RichardsCurve::sigmoid(false));
-    curve.forward_scalar(x as f64) as f32
+    curve.forward_scalar_f32(x)
 }
 
 #[inline]
 pub fn dsigmoid_f32(x: f32) -> f32 {
     let curve = SIGMOID_CURVE_F32.get_or_init(|| RichardsCurve::sigmoid(false));
-    curve.derivative_scalar(x as f64) as f32
+    curve.derivative_scalar_f32(x)
 }
 
 #[inline]
 pub fn tanh_f32(x: f32) -> f32 {
     let curve = TANH_CURVE_F32.get_or_init(|| RichardsCurve::tanh(false));
-    curve.forward_scalar(x as f64) as f32
+    curve.forward_scalar_f32(x)
 }
 
 #[inline]
 pub fn dtanh_f32(x: f32) -> f32 {
     let curve = TANH_CURVE_F32.get_or_init(|| RichardsCurve::tanh(false));
-    curve.derivative_scalar(x as f64) as f32
+    curve.derivative_scalar_f32(x)
 }
 
 #[inline]
 pub fn silu_f32(x: f32) -> f32 {
-    // SiLU(x) = x * sigmoid(x). Use RichardsActivation to keep this on the shared path.
-    let act = SILU_ACT_F32.get_or_init(|| RichardsActivation::sigmoid(false));
-    act.forward_scalar(x as f64) as f32
+    // SiLU(x) = x * sigmoid(x)
+    x * sigmoid_f32(x)
 }
 
 #[inline]

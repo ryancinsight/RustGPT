@@ -833,7 +833,7 @@ impl LRM {
 
         let input_to_block = match &step_cache.answer_cache {
             CoreCache::Transformer(c) => &c.0,
-            CoreCache::Diffusion(c) => &c.input,
+            CoreCache::Diffusion(c) => c.input.as_ref(),
         };
 
         let (d_ans_in, mut all) = block_guard.compute_gradients(input_to_block, output_grads);
@@ -865,7 +865,7 @@ impl LRM {
             block_guard.set_cache(Some(rec.clone()));
             let rec_input = match rec {
                 CoreCache::Transformer(c) => &c.0,
-                CoreCache::Diffusion(c) => &c.input,
+                CoreCache::Diffusion(c) => c.input.as_ref(),
             };
 
             // Gradient of z update (treat alpha as a detached step-size):

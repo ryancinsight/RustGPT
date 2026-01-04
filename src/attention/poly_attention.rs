@@ -693,9 +693,10 @@ impl PolyAttention {
             // z = a_h * xw + b_h; g = Richards(z)
             let mut z_col = xw_col.clone();
             z_col.mapv_inplace(|v| a_h * v + b_h);
-            let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-            let _gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z);
-            let g_col = self.moh.gate.forward_const(&z_col);
+            let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
+            let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+            let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
+            gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
 
             // Threshold path forward
             let mut m_col = Array2::<f32>::ones((n, 1));
@@ -789,10 +790,10 @@ impl PolyAttention {
 
                     // Gate Richards path
                     let z_i = a_h * xw_col[[i, 0]] + b_h;
-                    let dphi_dz_i = self.moh.gate.backward_scalar(z_i as f64) as f32;
+                    let dphi_dz_i = self.moh.gate.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
                     // Parameter grads for Richards curve
-                    let gws = self.moh.gate.grad_weights_scalar(z_i as f64, d_g_i as f64);
+                    let gws = self.moh.gate.grad_weights_scalar_f32(z_i, d_g_i);
                     for (wi, &gw) in gws.iter().enumerate() {
                         grad_gate_poly_vec[wi] += gw;
                     }
@@ -1098,10 +1099,11 @@ impl PolyAttention {
                 let b_h = self.moh.beta_g[[0, h]];
                 let mut z_col = xw_col.clone();
                 z_col.mapv_inplace(|v| a_h * v + b_h);
-                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-                max_abs_vec[h] = max_abs_z;
-                let _gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z);
-                let g_col = self.moh.gate.forward_const(&z_col);
+                let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
+                max_abs_vec[h] = max_abs_z as f64;
+                let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
+                gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
                     g_mat[[i, h]] = g_col[[i, 0]];
@@ -1151,7 +1153,7 @@ impl PolyAttention {
                     let a_h = self.moh.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
                     let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
-                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
 
                     // update gating parameter grads
@@ -1446,9 +1448,10 @@ impl PolyAttention {
                 let b_h = self.moh.beta_g[[0, h_idx]];
                 let mut z_col = xw_col.clone();
                 z_col.mapv_inplace(|vv| a_h * vv + b_h);
-                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-                let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z);
-                let g_col = self.moh.gate.forward_const(&z_col);
+                let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
+                let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
+                gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 let mut m_col = Array2::<f32>::ones((n, 1));
                 if self.moh.head_selection_config.gating.use_learned_predictor
                     && let Some(predictor) = &self.moh.threshold_predictor
@@ -1536,9 +1539,9 @@ impl PolyAttention {
                     }
                     let d_g_i = grad_eff_i * m_col[[i, 0]];
                     let z_i = a_h * xw_col[[i, 0]] + b_h;
-                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
-                    let gws = gate_poly.grad_weights_scalar(z_i as f64, d_g_i as f64);
+                    let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
                     for (wi, &gw) in gws.iter().enumerate() {
                         grad_gate_poly_vec[wi] += gw;
                     }
@@ -1794,10 +1797,11 @@ impl PolyAttention {
                 let b_h = self.moh.beta_g[[0, h]];
                 let mut z_col = xw_col.clone();
                 z_col.mapv_inplace(|v| a_h * v + b_h);
-                let max_abs_z = z_col.iter().fold(0.0_f64, |m, &z| m.max((z as f64).abs()));
-                max_abs_vec[h] = max_abs_z;
-                let _gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z);
-                let g_col = self.moh.gate.forward_const(&z_col);
+                let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
+                max_abs_vec[h] = max_abs_z as f64;
+                let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
+                gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 for i in 0..n {
                     z_mat[[i, h]] = z_col[[i, 0]];
                     g_mat[[i, h]] = g_col[[i, 0]];
@@ -1836,7 +1840,7 @@ impl PolyAttention {
                     let a_h = self.moh.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
                     let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
-                    let dphi_dz_i = gate_poly.backward_scalar(z_i as f64) as f32;
+                    let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
                     for d in 0..self.embed_dim {
                         grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i;

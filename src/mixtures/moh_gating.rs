@@ -338,15 +338,15 @@ impl MoHGating {
             // Update Richards gate scaling for this head based on z-range.
             let mut max_abs_z = 0.0_f64;
             for i in 0..n {
-                let z = (a_h * xw[[i, h]] + b_h) as f64;
-                max_abs_z = max_abs_z.max(z.abs());
+                let z = a_h * xw[[i, h]] + b_h;
+                max_abs_z = max_abs_z.max((z as f64).abs());
             }
-            let _ = self.gate.update_scaling_from_max_abs(max_abs_z);
+            let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
 
             // g = Richards(z)
             for i in 0..n {
-                let z = (a_h * xw[[i, h]] + b_h) as f64;
-                g_mat[[i, h]] = self.gate.curve.forward_scalar(z) as f32;
+                let z = a_h * xw[[i, h]] + b_h;
+                g_mat[[i, h]] = gate_poly.forward_scalar_f32(z);
             }
         }
 
@@ -633,14 +633,14 @@ impl MoHGating {
             // Ensure RichardsGate scaling matches the forward path.
             let mut max_abs_z = 0.0_f64;
             for i in 0..n {
-                let z = (a_h * xw[[i, h]] + b_h) as f64;
-                max_abs_z = max_abs_z.max(z.abs());
+                let z = a_h * xw[[i, h]] + b_h;
+                max_abs_z = max_abs_z.max((z as f64).abs());
             }
-            let _ = self.gate.update_scaling_from_max_abs(max_abs_z);
+            let gate_poly = self.gate.update_scaling_from_max_abs(max_abs_z);
 
             for i in 0..n {
-                let z = (a_h * xw[[i, h]] + b_h) as f64;
-                g_mat[[i, h]] = self.gate.curve.forward_scalar(z) as f32;
+                let z = a_h * xw[[i, h]] + b_h;
+                g_mat[[i, h]] = gate_poly.forward_scalar_f32(z);
             }
         }
 
@@ -744,18 +744,18 @@ impl MoHGating {
 
             for i in 0..n {
                 let xw_ih = xw[[i, h]];
-                let z = (a_h * xw_ih + b_h) as f64;
+                let z = a_h * xw_ih + b_h;
                 let m = m_mat[[i, h]];
 
                 let d_eff = eff_grads[[i, h]];
                 let d_eff = if d_eff.is_finite() { d_eff } else { 0.0 };
                 let d_g = d_eff * m;
 
-                let dphi_dz = self.gate.backward_scalar(z) as f32;
+                let dphi_dz = self.gate.backward_scalar_f32(z);
                 let grad_z = d_g * dphi_dz;
 
                 // Richards curve parameter grads (uses upstream d_g).
-                let gws = self.gate.grad_weights_scalar(z, d_g as f64);
+                let gws = self.gate.grad_weights_scalar_f32(z, d_g);
                 for (wi, gw) in gws.iter().enumerate() {
                     grad_gate_poly_vec[wi] += *gw;
                 }

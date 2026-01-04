@@ -41,9 +41,9 @@ fn default_similarity_context_strength() -> Array2<f32> {
 pub type CachedIntermediates = (
     Arc<Array2<f32>>, // input_original - Arc for zero-copy sharing
     Arc<Array2<f32>>, // input_used - Arc for zero-copy sharing
-    Array2<f32>,      // norm1_out
-    Array2<f32>,      // residual1
-    Array2<f32>,      // norm2_out
+    Arc<Array2<f32>>, // norm1_out
+    Arc<Array2<f32>>, // residual1
+    Arc<Array2<f32>>, // norm2_out
 );
 
 /// A complete transformer block containing attention and feedforward components
@@ -434,7 +434,7 @@ impl TransformerBlock {
                 } else {
                     0.0
                 };
-                let sim = if sim.is_finite() { sim.tanh() } else { 0.0 };
+                let sim = if sim.is_finite() { crate::richards::tanh_f32(sim) } else { 0.0 };
 
                 let prev = self.activation_similarity_matrix[[i, j]];
                 self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
@@ -691,9 +691,9 @@ impl Layer for TransformerBlock {
         *self.cached_intermediates.write().unwrap() = Some((
             input_original_arc,
             input_used_arc,
-            norm1_out,
-            residual1,
-            norm2_out,
+            Arc::new(norm1_out),
+            Arc::new(residual1),
+            Arc::new(norm2_out),
         ));
 
         output
@@ -727,11 +727,14 @@ impl Layer for TransformerBlock {
         // Access cached intermediates without cloning the entire tuple.
         // The Arc<Array2> for input enables zero-copy access.
         let guard = self.cached_intermediates.read().unwrap();
-        if let Some((input_original_arc, input_used_arc, norm1_out, residual1, norm2_out)) =
+        if let Some((input_original_arc, input_used_arc, norm1_out_arc, residual1_arc, norm2_out_arc)) =
             guard.as_ref()
         {
             let input_original: &Array2<f32> = input_original_arc.as_ref();
             let input_used: &Array2<f32> = input_used_arc.as_ref();
+            let norm1_out: &Array2<f32> = norm1_out_arc.as_ref();
+            let residual1: &Array2<f32> = residual1_arc.as_ref();
+            let norm2_out: &Array2<f32> = norm2_out_arc.as_ref();
 
             // Compute gradients through the transformer block layers
 
@@ -1836,9 +1839,9 @@ impl ModularTransformerBlock {
         *self.cached_intermediates.write().unwrap() = Some((
             input_original_arc,
             input_used_arc,
-            norm1_out,
-            residual1,
-            norm2_out,
+            Arc::new(norm1_out),
+            Arc::new(residual1),
+            Arc::new(norm2_out),
         ));
 
         output

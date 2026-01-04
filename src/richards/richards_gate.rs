@@ -204,29 +204,7 @@ impl RichardsGate {
     /// Forward pass: compute gating values (const version for immutable access)
     pub fn forward_const(&self, input: &Array2<f32>) -> Array2<f32> {
         let mut output = Array2::zeros(input.raw_dim());
-
-        // Reuse a per-row scratch buffer to avoid allocating Array1/Array2<f64>.
-        let mut scratch_in: Vec<f32> = Vec::new();
-        let mut scratch_out: Vec<f32> = Vec::new();
-
-        for (i, row) in input.outer_iter().enumerate() {
-            let n = row.len();
-            if scratch_in.len() != n {
-                scratch_in.resize(n, 0.0);
-                scratch_out.resize(n, 0.0);
-            }
-
-            for (j, &x) in row.iter().enumerate() {
-                scratch_in[j] = x;
-            }
-
-            self.curve.forward_into_f32(&scratch_in, &mut scratch_out);
-
-            for (j, &val) in scratch_out.iter().enumerate() {
-                output[[i, j]] = val;
-            }
-        }
-
+        self.curve.forward_matrix_f32_into(input, &mut output);
         output
     }
 
@@ -245,13 +223,11 @@ impl RichardsGate {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let input_f64 = input.mapv(|x| x as f64);
-        let output_grads_f64 = output_grads.mapv(|x| x as f64);
+        let mut grad_input = Array2::<f32>::zeros(input.raw_dim());
+        self.curve
+            .backward_matrix_f32_into(input, output_grads, &mut grad_input);
 
-        let grad_input_f64 = self.curve.backward_matrix(&input_f64, &output_grads_f64);
-        let grad_input = grad_input_f64.mapv(|x| x as f32);
-
-        let scalar_grads = self.curve.grad_weights_matrix(&input_f64, &output_grads_f64);
+        let scalar_grads = self.curve.grad_weights_matrix_f32(input, output_grads);
         let param_grads: Vec<Array2<f32>> = scalar_grads
             .into_iter()
             .map(|g| Array2::from_elem((1, 1), g as f32))
@@ -335,9 +311,21 @@ impl RichardsGate {
         self.curve.backward_scalar(x)
     }
 
+    /// f32-friendly scalar derivative for gating (avoids f32->f64 conversion).
+    #[inline]
+    pub fn backward_scalar_f32(&self, x: f32) -> f32 {
+        self.curve.backward_scalar_f32(x)
+    }
+
     /// Compute parameter gradients for scalar input (delegates to underlying curve)
     pub fn grad_weights_scalar(&self, x: f64, grad_output: f64) -> Vec<f64> {
         self.curve.grad_weights_scalar(x, grad_output)
+    }
+
+    /// f32-friendly scalar parameter gradients (avoids f32->f64 conversion).
+    #[inline]
+    pub fn grad_weights_scalar_f32(&self, x: f32, grad_output: f32) -> Vec<f64> {
+        self.curve.grad_weights_scalar_f32(x, grad_output)
     }
 
     /// Forward pass for matrix input (delegates to underlying curve)

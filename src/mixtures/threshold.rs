@@ -149,10 +149,9 @@ impl ThresholdPredictor {
         self.cached_normalized = Some(normalized.clone());
 
         // Learned Richards activation replacing ReLU
-        let activation_output = self
-            .activation
-            .forward_matrix(&normalized.mapv(|x| x as f64))
-            .mapv(|x| x as f32);
+        let mut activation_output = ndarray::Array2::<f32>::zeros(normalized.raw_dim());
+        self.activation
+            .forward_matrix_f32_into(&normalized, &mut activation_output);
         self.cached_activation = Some(activation_output.clone());
 
         // Second layer input (previously activated)
@@ -164,9 +163,9 @@ impl ThresholdPredictor {
         self.cached_output = Some(output.clone());
 
         // Richards sigmoid activation to get values in [0, 1] range
-        self.sigmoid
-            .forward_matrix(&output.mapv(|x| x as f64))
-            .mapv(|x| x as f32)
+        let mut out_sigmoid = ndarray::Array2::<f32>::zeros(output.raw_dim());
+        self.sigmoid.forward_matrix_f32_into(&output, &mut out_sigmoid);
+        out_sigmoid
     }
 
     /// Forward pass for auxiliary computation (immutable)
@@ -181,19 +180,16 @@ impl ThresholdPredictor {
         let normalized = self.norm.normalize_immutable(&hidden);
 
         // Learned Richards activation replacing ReLU
-        let activated = self
-            .activation
-            .forward_matrix(&normalized.mapv(|x| x as f64))
-            .mapv(|x| x as f32);
+        let mut activated = ndarray::Array2::<f32>::zeros(normalized.raw_dim());
+        self.activation.forward_matrix_f32_into(&normalized, &mut activated);
 
         // Second layer: W2 * activated + b2
         let output = activated.dot(&self.weights2) + &self.bias2;
 
         // Richards sigmoid activation to get values in [0, 1] range
-        let sigmoid = crate::richards::RichardsCurve::sigmoid(false);
-        sigmoid
-            .forward_matrix(&output.mapv(|x| x as f64))
-            .mapv(|x| x as f32)
+        let mut out_sigmoid = ndarray::Array2::<f32>::zeros(output.raw_dim());
+        self.sigmoid.forward_matrix_f32_into(&output, &mut out_sigmoid);
+        out_sigmoid
     }
 
     pub fn predict(&mut self, input: &ndarray::ArrayView2<f32>) -> ndarray::Array2<f32> {
@@ -241,10 +237,9 @@ impl ThresholdPredictor {
             .expect("predict must be called before compute_gradients");
 
         // Gradient through Richards sigmoid
-        let output_f64 = cached_output.mapv(|x| x as f64);
-        let output_grads_f64 = output_grads.mapv(|x| x as f64);
-        let sigmoid_grad_f64 = self.sigmoid.backward_matrix(&output_f64, &output_grads_f64);
-        let d_output = sigmoid_grad_f64.mapv(|x| x as f32);
+        let mut d_output = ndarray::Array2::<f32>::zeros(output_grads.raw_dim());
+        self.sigmoid
+            .backward_matrix_f32_into(cached_output, output_grads, &mut d_output);
 
         // Second layer gradients
         let grad_weights2 = cached_activated.t().dot(&d_output);
@@ -254,12 +249,9 @@ impl ThresholdPredictor {
         let d_activated = d_output.dot(&self.weights2.t());
 
         // Gradient through Richards activation (replacing ReLU)
-        let normalized_f64 = cached_normalized.mapv(|x| x as f64);
-        let d_activated_f64 = d_activated.mapv(|x| x as f64);
-        let activation_grad_f64 = self
-            .activation
-            .backward_matrix(&normalized_f64, &d_activated_f64);
-        let d_normalized = activation_grad_f64.mapv(|x| x as f32);
+        let mut d_normalized = ndarray::Array2::<f32>::zeros(cached_normalized.raw_dim());
+        self.activation
+            .backward_matrix_f32_into(cached_normalized, &d_activated, &mut d_normalized);
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -276,7 +268,7 @@ impl ThresholdPredictor {
         // Activation parameter gradients (Richards curve parameters)
         let activation_grads = self
             .activation
-            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
+            .grad_weights_matrix_f32(cached_normalized, &d_activated);
 
         (
             grad_weights1,
@@ -327,10 +319,9 @@ impl ThresholdPredictor {
             .expect("predict must be called before compute_gradients_with_input");
 
         // Gradient through Richards sigmoid
-        let output_f64 = cached_output.mapv(|x| x as f64);
-        let output_grads_f64 = output_grads.mapv(|x| x as f64);
-        let sigmoid_grad_f64 = self.sigmoid.backward_matrix(&output_f64, &output_grads_f64);
-        let d_output = sigmoid_grad_f64.mapv(|x| x as f32);
+        let mut d_output = ndarray::Array2::<f32>::zeros(output_grads.raw_dim());
+        self.sigmoid
+            .backward_matrix_f32_into(cached_output, output_grads, &mut d_output);
 
         // Second layer gradients
         let grad_weights2 = cached_activated.t().dot(&d_output);
@@ -340,12 +331,9 @@ impl ThresholdPredictor {
         let d_activated = d_output.dot(&self.weights2.t());
 
         // Gradient through Richards activation
-        let normalized_f64 = cached_normalized.mapv(|x| x as f64);
-        let d_activated_f64 = d_activated.mapv(|x| x as f64);
-        let activation_grad_f64 = self
-            .activation
-            .backward_matrix(&normalized_f64, &d_activated_f64);
-        let d_normalized = activation_grad_f64.mapv(|x| x as f32);
+        let mut d_normalized = ndarray::Array2::<f32>::zeros(cached_normalized.raw_dim());
+        self.activation
+            .backward_matrix_f32_into(cached_normalized, &d_activated, &mut d_normalized);
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -365,7 +353,7 @@ impl ThresholdPredictor {
         // Activation parameter gradients
         let activation_grads = self
             .activation
-            .grad_weights_matrix(&normalized_f64, &d_activated_f64);
+            .grad_weights_matrix_f32(cached_normalized, &d_activated);
 
         (
             grad_input,
