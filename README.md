@@ -30,8 +30,14 @@ Hybrid architecture combining transformer attention with recurrent components fo
 ### 3. **Diffusion Models**
 Denoising diffusion probabilistic models for text generation with progressive refinement.
 
-### 4. **Mamba & RG-LRU**
+### 4. **Mamba**
 State-space models with selective scan mechanisms for linear-time sequence processing.
+
+### 5. **RG-LRU (Real-Gated Linear Recurrent Units)**
+Trainable temporal-mixing layers with diagonal, stable recurrence for efficient sequence processing.
+
+### 6. **MoH-RG-LRU (Multi-head RG-LRU with Mixture-of-Heads)**
+Combines multiple RG-LRU heads with learned gating for improved capacity and efficiency.
 
 ### Key Components
 
@@ -40,6 +46,8 @@ State-space models with selective scan mechanisms for linear-time sequence proce
 - **Adaptive Residuals**: Dynamic residual scaling for stable training
 - **Mixture of Experts**: Sparse expert routing for improved capacity
 - **Speculative Sampling**: Accelerated decoding with draft-verify mechanisms
+- **Modular Transformer Components**: AttentionContext, FeedforwardProcessor, NormalizationLayer, and ResidualConnection for flexible architecture composition
+- **Temporal Mixing**: Supports both attention and RG-LRU as temporal mixing mechanisms
 
 ## 🔍 Project Structure
 
@@ -100,11 +108,20 @@ cargo run --release
 # Basic training (default transformer)
 cargo run --release
 
-# With speculative sampling
-cargo run --release -- --speculative
+# With speculative sampling (transformer mode)
+cargo run --release -- --speculative --speculative-mode transformer
 
-# With diffusion training
-cargo run --release -- --diffusion
+# With speculative sampling (diffusion mode)
+cargo run --release -- --speculative --speculative-mode diffusion
+
+# With Mamba architecture
+cargo run --release -- --architecture mamba
+
+# With RG-LRU architecture
+cargo run --release -- --architecture rg-lru
+
+# With deterministic training (fixed seed)
+cargo run --release -- --seed 42
 
 # Continue training from saved model
 cargo run --release -- --continue-from models/rustgpt.bin
@@ -124,6 +141,9 @@ Model: Mountains form through tectonic forces or volcanism over geological time
 
 Enter prompt: What causes rain?
 Model: Rain occurs when water vapor condenses into droplets that become too heavy to remain airborne
+
+# Interactive mode with specific architecture
+cargo run --release -- --architecture mamba --interactive
 ```
 
 ## 💾 Model Persistence
@@ -142,6 +162,13 @@ let loaded_llm = LLM::load_versioned("model.rgpt")?;
 // ✅ Validates SHA256 checksum
 // ✅ Checks version compatibility  
 // ✅ Includes comprehensive metadata
+
+// Save different architectures
+let mamba_llm = LLM::new_mamba(vocab.clone(), config);
+mamba_llm.save_versioned("mamba_model.rgpt", Some("Mamba architecture".to_string()))?;
+
+let rg_lru_llm = LLM::new_rg_lru(vocab.clone(), config);
+rg_lru_llm.save_versioned("rg_lru_model.rgpt", Some("RG-LRU architecture".to_string()))?;
 ```
 
 ### Format Options
@@ -157,10 +184,12 @@ let loaded_llm = LLM::load_versioned("model.rgpt")?;
 - **Embedding Dimension**: 128 (configurable)
 - **Hidden Dimension**: 256 (configurable)
 - **Max Sequence Length**: 256 tokens
-- **Architecture Options**: Transformer, TRM, Diffusion, Mamba, RG-LRU
+- **Architecture Options**: Transformer, TRM, Diffusion, Mamba, RG-LRU, MoH-RG-LRU
 - **Normalization**: Richards-based Dynamic Tanh Normalization
 - **Positional Encoding**: CoPE (Context-aware Positional Encoding)
 - **Activation**: Richards GLU and SwiGLU
+- **Temporal Mixing**: Attention or RG-LRU (configurable per transformer block)
+- **Speculative Sampling**: Transformer and Diffusion modes with configurable gamma and tau
 
 ### Training Details
 - **Optimizer**: Adam with gradient clipping
@@ -176,6 +205,18 @@ let loaded_llm = LLM::load_versioned("model.rgpt")?;
 - **Verification Model**: Full model for validation
 - **Gamma Parameter**: Controls speculation aggressiveness
 - **Tau Parameter**: Controls acceptance threshold
+- **Transformer Support**: New speculative sampling implementation for transformer models
+- **Diffusion Support**: Existing speculative sampling for diffusion models
+
+#### Mamba Architecture
+- **Selective SSM**: State-space models with input-dependent parameters
+- **Causal Convolution**: Depthwise convolution for sequence processing
+- **Selective Scan**: Efficient sequence processing with selective state updates
+
+#### RG-LRU Architecture
+- **Real-Gated Recurrence**: Trainable temporal mixing with gated updates
+- **Diagonal Recurrence**: Stable recurrence with diagonal parameterization
+- **Multi-head Support**: MoH-RG-LRU combines multiple heads with learned gating
 
 #### Diffusion Models
 - **Karras Schedule**: Noise scheduling for diffusion
@@ -199,6 +240,9 @@ cargo test --lib
 cargo test --test transformer_block_stability
 cargo test --test model_persistence_roundtrip
 
+# Run attention tests
+cargo test --test attention_parallel
+
 # Run with clippy for code quality
 cargo clippy --tests -- -D warnings
 
@@ -207,6 +251,9 @@ cargo build --release
 
 # Run with verbose output
 cargo test -- --nocapture
+
+# Test specific architectures
+cargo test --lib -- --test-threads=1  # For deterministic test ordering
 ```
 
 ### Test Coverage
@@ -293,15 +340,20 @@ cargo test
 
 ### Current Capabilities
 
-- ✅ **Multiple Architectures**: Transformer, TRM, Diffusion, Mamba, RG-LRU
-- ✅ **Advanced Training**: Speculative sampling, MoE, adaptive residuals
+- ✅ **Multiple Architectures**: Transformer, TRM, Diffusion, Mamba, RG-LRU, MoH-RG-LRU
+- ✅ **Advanced Training**: Speculative sampling (Transformer & Diffusion), MoE, adaptive residuals
 - ✅ **Robust Serialization**: Versioned persistence with integrity checks
 - ✅ **Comprehensive Testing**: 183+ unit tests, property-based testing
 - ✅ **Production Error Handling**: Proper Result types throughout
 - ✅ **Configurable Pipeline**: CLI-driven training with multiple options
+- ✅ **Modular Components**: AttentionContext, FeedforwardProcessor, NormalizationLayer, ResidualConnection
+- ✅ **Temporal Mixing**: Configurable attention or RG-LRU per transformer block
 
 ### Recent Improvements
 
+- **Latest**: Added modular transformer components for flexible architecture composition
+- **Latest**: Implemented speculative sampling for transformer models
+- **Latest**: Added Mamba and RG-LRU state-space model implementations
 - **Sprint 5.2**: Systematic error handling (eliminated all panic!() calls)
 - **Sprint 5.1**: Code quality improvements (removed placeholder comments)
 - **Sprint 4.3**: Serialization integrity (SHA256 checksums, versioning)
@@ -310,8 +362,8 @@ cargo test
 ### Roadmap
 
 - **Next Sprint**: Convert remaining unwrap() calls in hot paths
-- **Future**: Beam search, advanced positional encodings
-- **Long-term**: Multi-modal capabilities, larger scale training
+- **Future**: Beam search, advanced positional encodings, mixed-precision training
+- **Long-term**: Multi-modal capabilities, larger scale training, architecture auto-selection
 
 ## 📚 Learning Resources
 

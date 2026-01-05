@@ -23,16 +23,30 @@ p_i = P[pos_i] ∈ ℝ^D
 x_i = e_i + p_i ∈ ℝ^D
 ```
 
+### Attention Context
+
+**Similarity Matrix:**
+```
+S = X · X^T / D ∈ ℝ^{N × N}
+```
+
+**Context-Conditioned Input:**
+```
+X' = X + (α / D) · X · S_{prev} ∈ ℝ^{N × D}
+```
+where α is the learned similarity context strength.
+
 ### DynamicTanhNorm
 
 **Normalization:**
 ```
-y = tanh(α · x) ⊙ γ + β
+y = tanh(α · (x - μ) / σ) ⊙ γ + β
 ```
 where:
 - α ∈ ℝ (learnable nonlinearity scale)
 - γ ∈ ℝ^D (per-feature scale)
 - β ∈ ℝ^D (per-feature bias)
+- μ ∈ ℝ^D (mean), σ ∈ ℝ^D (standard deviation)
 
 ### PolyAttention
 
@@ -233,6 +247,151 @@ L = -∑_{i=1}^N log(p_{i,target_i})
 4. **Numerical Stability:**
    - Safe softmax with max subtraction
    - Gradient anomaly detection and early stopping
+
+## New Component Mathematics
+
+### Temporal Mixing Wrapper
+
+**Unified Interface:**
+```
+Y = TemporalMixing(X, θ) ∈ ℝ^{N × D}
+```
+
+**Attention Mode:**
+```
+Y = PolyAttention(X, W_Q, W_K, W_V, W_O)
+```
+
+**RG-LRU Mode:**
+```
+Y = RG-LRU(X, W_a, W_x, λ, W_out)
+```
+
+### Feedforward Processor
+
+**Unified Feedforward:**
+```
+Y = FeedForward(X, variant, θ) ∈ ℝ^{N × D}
+```
+
+**RichardsGLU Variant:**
+```
+x1 = X · W1 ∈ ℝ^{N × D_hidden}
+x2 = X · W2 ∈ ℝ^{N × D_hidden}
+swish = x1 ⊙ Richards(α_swish · x1) ∈ ℝ^{N × D_hidden}
+gate = Richards(α_gate · x2 + β_gate) ∈ ℝ^{N × D_hidden}
+gated = swish ⊙ gate ∈ ℝ^{N × D_hidden}
+Y = gated · W_out + X ∈ ℝ^{N × D}
+```
+
+**MixtureOfExperts Variant:**
+```
+z = X · W_gate ∈ ℝ^{N × E}
+p = softmax(z) ∈ ℝ^{N × E}  // Routing probabilities
+e_i = Expert_i(X) ∈ ℝ^{N × D_hidden}  // Expert outputs
+Y = ∑_{i=1}^E p_i ⊙ e_i · W_out + X ∈ ℝ^{N × D}
+```
+
+### Residual Connection
+
+**Adaptive Residual:**
+```
+R = Residual(X, Y, α) = X + α · Y ∈ ℝ^{N × D}
+```
+
+where α is learned based on gradient norms:
+```
+α = σ(W_α · [||∇X||, ||∇Y||] + b_α)
+```
+
+### Window Adaptation
+
+**Dynamic Window:**
+```
+w_t = w_{t-1} + Δw_t
+Δw_t = η_w · (H(S_t) - H_target)
+```
+
+where H(S_t) is the entropy of attention scores at step t.
+
+### Speculative Sampling
+
+**Transformer Mode:**
+```
+// Draft phase
+Y_draft = DraftModel(X, γ)
+
+// Verification phase  
+Y_full = FullModel(X, γ)
+
+// Acceptance
+A_t = I(p(Y_full[t] | X) > τ) for t = 1..γ
+
+// Output
+Y = [Y_draft[1:A_1], Y_draft[A_1+1:A_2], ...]
+```
+
+**Diffusion Mode:**
+```
+// Draft denoising
+X_draft = DraftDiffusion(X_noisy, γ)
+
+// Full denoising
+X_full = FullDiffusion(X_noisy, γ)
+
+// Acceptance
+A_t = I(MSE(X_full[t], X_draft[t]) < τ) for t = 1..γ
+
+// Continue from last accepted
+X_next = X_draft[A_γ]
+```
+
+### Mamba Layer
+
+**Selective SSM:**
+```
+// Input projection
+U, G = X · W_in + b_in
+
+// Convolution
+U_conv = DepthwiseConv(U, W_conv)
+
+// State update
+Δ = A · S_{t-1} + B · U_conv[t]
+S_t = S_{t-1} + Δ
+
+// Output projection
+Y_t = C · S_t ⊙ σ(G_t)
+Y = [Y_1, Y_2, ..., Y_N] · W_out + D · X
+```
+
+where A = -softplus(A_log) ensures stability.
+
+### RG-LRU Layer
+
+**Real-Gated Recurrence:**
+```
+r_t = σ(X · W_a + b_a)  // Reset gate
+i_t = σ(X · W_x + b_x)  // Input gate
+a_t = σ(λ)              // Diagonal recurrence
+
+H_t = a_t ⊙ H_{t-1} + (1 - a_t) ⊙ (r_t ⊙ H_{t-1} + i_t ⊙ X_t)
+Y = H_T · W_out
+```
+
+### MoH-RG-LRU Layer
+
+**Multi-head Gated Recurrence:**
+```
+// Per-head processing
+H_{t,h} = RG-LRU_h(X_t) for h = 1..H
+
+// MoH gating
+e_h = MoHGating(X_t) ∈ ℝ^H
+
+// Weighted combination
+Y_t = ∑_{h=1}^H e_h ⊙ H_{t,h}
+```
 
 ## Polynomial Flexibility Enhancements
 

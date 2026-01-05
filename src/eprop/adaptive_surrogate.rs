@@ -295,7 +295,7 @@ impl AdaptiveSurrogate {
         // Compute spike efficiency
         let avg_surrogate = surrogate_grad.mean().unwrap_or(0.0);
         let spike_efficiency = if avg_surrogate > 0.0 {
-            crate::richards::sigmoid::<f32>(avg_surrogate)
+            crate::richards::RichardsCurve::sigmoid(false).forward_scalar_f32(avg_surrogate)
         } else {
             0.0
         };

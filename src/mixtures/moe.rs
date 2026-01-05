@@ -33,7 +33,7 @@ use crate::{
         threshold::ThresholdPredictor,
     },
     network::Layer,
-    richards::sigmoid_f32,
+    richards::RichardsCurve,
     rng::get_rng,
 };
 
@@ -315,7 +315,7 @@ impl LearnedKAdapter {
             0.0
         };
         let z = self.w[[0, 0]] * e + self.w[[1, 0]] * h + self.b[[0, 0]];
-        sigmoid_f32(z)
+        RichardsCurve::sigmoid(false).forward_scalar_f32(z)
     }
 }
 

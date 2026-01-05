@@ -417,6 +417,7 @@ impl TransformerBlock {
             }
         }
 
+        let tanh = crate::richards::RichardsCurve::tanh(false);
         for i in 0..embed_dim {
             for j in 0..embed_dim {
                 let mut dot = 0.0f64;
@@ -434,7 +435,7 @@ impl TransformerBlock {
                 } else {
                     0.0
                 };
-                let sim = if sim.is_finite() { crate::richards::tanh_f32(sim) } else { 0.0 };
+                let sim = if sim.is_finite() { tanh.forward_scalar_f32(sim) } else { 0.0 };
 
                 let prev = self.activation_similarity_matrix[[i, j]];
                 self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
