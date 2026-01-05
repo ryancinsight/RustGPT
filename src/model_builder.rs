@@ -114,6 +114,15 @@ fn build_diffusion_layers(
             timestep_strategy: config.diffusion_timestep_strategy,
             temporal_mixing: config.temporal_mixing,
             use_advanced_adaptive_residuals: true, // Enable by default for diffusion blocks
+            sampler: Default::default(),
+            guidance: None,
+            loss_weighting: Default::default(),
+            use_p2_weighting: false,
+            use_snr_weighting: false,
+            adaptive_guidance: false,
+            min_guidance_scale: 1.0,
+            max_guidance_scale: 10.0,
+            ddim_steps_policy: Default::default(),
         };
 
         let diffusion_block = DiffusionBlock::new(block_cfg);

@@ -10,7 +10,8 @@ pub fn smooth_clip_tanh(x: f32, limit: f32) -> f32 {
     if !x.is_finite() || !limit.is_finite() || limit <= 0.0 {
         return 0.0;
     }
-    limit * crate::richards::tanh_f32(x / limit)
+    let tanh = crate::richards::RichardsCurve::tanh(false);
+    limit * tanh.forward_scalar_f32(x / limit)
 }
 
 /// Smoothly saturate values to ±limit and return both the saturated value and its derivative.
@@ -21,10 +22,11 @@ pub fn smooth_clip_tanh_with_grad(x: f32, limit: f32) -> (f32, f32) {
     if !x.is_finite() || !limit.is_finite() || limit <= 0.0 {
         return (0.0, 0.0);
     }
+    let tanh = crate::richards::RichardsCurve::tanh(false);
     let u = x / limit;
-    let t = crate::richards::tanh_f32(u);
+    let t = tanh.forward_scalar_f32(u);
     // d/dx [limit * tanh(x/limit)] = dtanh(x/limit)
-    let dy_dx = crate::richards::dtanh_f32(u);
+    let dy_dx = tanh.derivative_scalar_f32(u);
     (limit * t, dy_dx)
 }
 

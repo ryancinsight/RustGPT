@@ -62,6 +62,9 @@ fn main() -> crate::Result<()> {
         LLM::new(vocab.clone(), network)
     };
 
+    // If the user provided an explicit DDIM steps override, apply it for diffusion sampling.
+    llm.set_diffusion_steps_override(args.ddim_steps);
+
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());
     println!("Decoder: {}", llm.decoder_description());

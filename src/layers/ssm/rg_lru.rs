@@ -7,7 +7,7 @@ use crate::{
     errors::Result,
     mixtures::{HeadSelectionStrategy, MoHGating},
     network::Layer,
-    richards::sigmoid_f32,
+    richards::RichardsCurve,
     rng::get_rng,
 };
 
@@ -232,6 +232,8 @@ impl RgLru {
         let t = input.nrows();
         let d = input.ncols();
 
+        let sigmoid = RichardsCurve::sigmoid(false);
+
         // z_r = X W_a + b_a; z_i = X W_x + b_x
         let mut z_r = input.dot(&self.w_a);
         let mut z_i = input.dot(&self.w_x);
@@ -242,8 +244,8 @@ impl RgLru {
             z_i += &self.b_x.broadcast((t, d)).unwrap();
         }
 
-        let r = z_r.mapv(sigmoid_f32);
-        let i = z_i.mapv(sigmoid_f32);
+        let r = z_r.mapv(|x| sigmoid.forward_scalar_f32(x));
+        let i = z_i.mapv(|x| sigmoid.forward_scalar_f32(x));
 
         // log_base_a = log(sigmoid(lambda)) = -softplus(-lambda)
         // a_t = exp(c * r_t * log_base_a)
@@ -422,7 +424,13 @@ impl Layer for RgLru {
         let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
         // d/dlambda log(sigmoid(lambda)) = sigmoid(-lambda) = 1 - sigmoid(lambda)
         let dlogsig_dlambda: Array1<f32> =
-            self.lambda.row(0).to_owned().mapv(|x| sigmoid_f32(-x));
+            {
+                let sigmoid = RichardsCurve::sigmoid(false);
+                self.lambda
+                    .row(0)
+                    .to_owned()
+                    .mapv(|x| sigmoid.forward_scalar_f32(-x))
+            };
 
         // Full BPTT through diagonal recurrence: dh_next carries gradients to h_{t-1}.
         let mut dh_next = Array1::<f32>::zeros(d);

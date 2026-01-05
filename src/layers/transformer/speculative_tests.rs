@@ -37,6 +37,15 @@ mod tests {
             mask_token_id: None,
             temporal_mixing: TemporalMixingType::Attention,
             use_advanced_adaptive_residuals: false, // Disable for testing
+            sampler: Default::default(),
+            guidance: None,
+            loss_weighting: Default::default(),
+            use_p2_weighting: false,
+            use_snr_weighting: false,
+            adaptive_guidance: false,
+            min_guidance_scale: 1.0,
+            max_guidance_scale: 10.0,
+            ddim_steps_policy: Default::default(),
         };
         DiffusionBlock::new(config)
     }

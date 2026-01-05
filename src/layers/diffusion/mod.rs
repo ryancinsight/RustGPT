@@ -3,9 +3,12 @@
 pub(crate) mod block;
 pub(crate) mod discrete;
 pub(crate) mod edm;
+pub(crate) mod sampling;
 
 pub use block::{
     DiffusionBlock, DiffusionBlockConfig, DiffusionCachedIntermediates, DiffusionPredictionTarget,
     NoiseSchedule,
 };
 pub use edm::EDM_SIGMA_DATA_DEFAULT;
+
+pub use sampling::{map_step_to_timestep, DdimStepsPolicy};

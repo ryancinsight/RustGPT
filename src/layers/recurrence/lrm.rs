@@ -588,6 +588,7 @@ impl LRM {
                     let thr = self.config.halting.threshold.max(0.0);
                     let slope = self.config.halting.slope.max(0.0);
                     let last_step = t + 1 == max_steps;
+                    let sigmoid = crate::richards::RichardsCurve::sigmoid(false);
 
                     for (i, &r) in active_rows.iter().enumerate() {
                         let remaining = (1.0 - halting_sum[[r, 0]]).max(0.0);
@@ -612,7 +613,7 @@ impl LRM {
                         }
                         let rel_r = diff_r / (ny_r + 1e-6);
 
-                        let p = crate::richards::sigmoid_f32((thr - rel_r) * slope);
+                        let p = sigmoid.forward_scalar_f32((thr - rel_r) * slope);
                         let will_finish = halting_sum[[r, 0]] + p >= 1.0 - halt_eps;
                         w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
                     }
@@ -714,7 +715,8 @@ impl LRM {
                     }
 
                     // Higher stop probability when rel_r is below threshold.
-                    let p = crate::richards::sigmoid_f32((thr - rel_r) * slope);
+                    let sigmoid = crate::richards::RichardsCurve::sigmoid(false);
+                    let p = sigmoid.forward_scalar_f32((thr - rel_r) * slope);
                     let will_finish = halting_sum[[r, 0]] + p >= 1.0 - eps;
                     w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
                 }

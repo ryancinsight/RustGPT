@@ -103,6 +103,12 @@ pub struct LLM {
     // Scratch buffers (not serialized) for allocation-free tokenization on repeated inference calls.
     #[serde(skip, default)]
     tokenize_scratch: Vec<usize>,
+
+    /// Optional runtime override for diffusion sampling steps (e.g. from CLI).
+    ///
+    /// Not serialized: checkpoints should carry model defaults via diffusion block config.
+    #[serde(skip, default)]
+    diffusion_steps_override: Option<usize>,
 }
 
 impl std::fmt::Debug for LLM {
@@ -133,6 +139,7 @@ impl Default for LLM {
             speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
                                                            * backward compatibility */
             tokenize_scratch: Vec::new(),
+            diffusion_steps_override: None,
         }
     }
 }
@@ -150,6 +157,7 @@ impl LLM {
             speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
                                                            * backward compatibility */
             tokenize_scratch: Vec::new(),
+            diffusion_steps_override: None,
         }
     }
 
@@ -165,6 +173,7 @@ impl LLM {
             speculative_mode: SpeculativeMode::Diffusion, /* Default to diffusion mode for
                                                            * backward compatibility */
             tokenize_scratch: Vec::new(),
+            diffusion_steps_override: None,
         }
     }
 
@@ -172,6 +181,10 @@ impl LLM {
     pub fn enable_greedy(&mut self) {
         let decoder = DecoderType::Greedy(GreedyDecoder::new());
         self.decoder = decoder;
+    }
+
+    pub fn set_diffusion_steps_override(&mut self, steps: Option<usize>) {
+        self.diffusion_steps_override = steps;
     }
 
     pub fn enable_speculative_sampling(
@@ -494,7 +507,7 @@ impl LLM {
         if let LayerEnum::DiffusionBlock(block) = &self.network[scheduler_block_idx] {
             block
                 .noise_scheduler
-                .ddim_step(current, t_idx, predicted_noise)
+                .ddim_step(current, t_idx, predicted_noise, 0.0, None)
         } else {
             current.clone()
         }
@@ -1083,30 +1096,32 @@ impl LLM {
                 }
             }
 
-            let tau_min_log = if tau_available {
-                tau_min_epoch
-            } else {
-                f32::NAN
-            };
-            let tau_max_log = if tau_available {
-                tau_max_epoch
-            } else {
-                f32::NAN
-            };
+            let tau_min_log = if tau_available { Some(tau_min_epoch) } else { None };
+            let tau_max_log = if tau_available { Some(tau_max_epoch) } else { None };
             let tau_range_log = if tau_available {
-                tau_max_epoch - tau_min_epoch
+                Some(tau_max_epoch - tau_min_epoch)
             } else {
-                f32::NAN
+                None
             };
             let pred_norm_rms = if pred_norm_count > 0 {
                 pred_norm_sum / pred_norm_count as f32
             } else {
-                f32::NAN
+                0.0
+            };
+            let pred_norm_rms_log = if pred_norm_count > 0 {
+                Some(pred_norm_rms)
+            } else {
+                None
             };
             let avg_active_heads = if heads_layers_count > 0 {
                 avg_heads_per_token_sum / heads_layers_count as f32
             } else {
-                f32::NAN
+                0.0
+            };
+            let avg_active_heads_log = if heads_layers_count > 0 {
+                Some(avg_active_heads)
+            } else {
+                None
             };
             let avg_active_experts = if experts_layers_count > 0 {
                 avg_experts_sum / experts_layers_count as f32
@@ -1191,11 +1206,12 @@ impl LLM {
 
             tracing::info!(
                 epoch = epoch,
-                tau_min = tau_min_log,
-                tau_max = tau_max_log,
-                tau_range = tau_range_log,
-                pred_norm_rms = pred_norm_rms,
-                avg_active_heads = avg_active_heads,
+                tau_available = tau_available,
+                tau_min = ?tau_min_log,
+                tau_max = ?tau_max_log,
+                tau_range = ?tau_range_log,
+                pred_norm_rms = ?pred_norm_rms_log,
+                avg_active_heads = ?avg_active_heads_log,
                 active_heads = active_heads,
                 total_heads = total_heads,
                 avg_active_experts = avg_active_experts,
@@ -2665,6 +2681,31 @@ impl LLM {
         } else {
             1000
         };
+
+        // "Learn" an effective DDIM step count over training by tracking validation loss trends.
+        // This is stored in the diffusion block config so it is checkpointed, while still
+        // remaining overridable at runtime via CLI.
+        let mut ddim_steps_min: usize = 16;
+        let mut ddim_steps_max: usize = 256;
+        let mut learned_ddim_steps: usize = if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+            match b.config.ddim_steps_policy {
+                crate::layers::diffusion::DdimStepsPolicy::Fixed(k) => k.max(1),
+                crate::layers::diffusion::DdimStepsPolicy::Auto { min_steps, max_steps } => {
+                    ddim_steps_min = min_steps.max(1);
+                    ddim_steps_max = max_steps.max(ddim_steps_min);
+                    // Start from ~T/10 like common practice; then adapt during training.
+                    ((num_timesteps.max(1) as f32 / 10.0).round() as usize).max(1)
+                }
+            }
+        } else {
+            ((num_timesteps.max(1) as f32 / 10.0).round() as usize).max(1)
+        };
+        learned_ddim_steps = learned_ddim_steps
+            .min(num_timesteps.max(1))
+            .clamp(ddim_steps_min, ddim_steps_max);
+        let mut prev_val_loss: Option<f32> = None;
+        let mut steps_plateau_epochs: usize = 0;
+
         let timestep_strategy = if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
             b.timestep_strategy()
         } else {
@@ -2730,7 +2771,7 @@ impl LLM {
             let sigma = (0.15 * total).max(1.0);
             let capped_t = t.min(num_timesteps.saturating_sub(1)) as f32;
             let x = (center - capped_t) / sigma;
-            let s = crate::richards::sigmoid::<f32>(x);
+            let s = crate::richards::RichardsCurve::sigmoid(false).forward_scalar_f32(x);
             s.clamp(0.5, 1.0)
         };
         let log_dir = std::path::Path::new("training_logs");
@@ -3548,6 +3589,49 @@ impl LLM {
                 val_mse = val_mse,
                 "Diffusion mixed (CE+MSE) epoch"
             );
+
+            // Update learned DDIM steps after validation is computed.
+            if val_loss.is_finite() {
+                if let Some(prev) = prev_val_loss {
+                    if prev.is_finite() {
+                        let rel_improvement = (prev - val_loss) / prev.max(1e-6);
+
+                        // If the model is improving quickly, prefer fewer steps.
+                        // If it stalls or gets worse, increase steps for higher-quality sampling.
+                        if rel_improvement > 0.01 {
+                            steps_plateau_epochs = 0;
+                            learned_ddim_steps = ((learned_ddim_steps as f32) * 0.90).round() as usize;
+                        } else if rel_improvement < -0.005 {
+                            steps_plateau_epochs = steps_plateau_epochs.saturating_add(1);
+                            learned_ddim_steps = ((learned_ddim_steps as f32) * 1.15).round() as usize;
+                        } else {
+                            steps_plateau_epochs = steps_plateau_epochs.saturating_add(1);
+                            if steps_plateau_epochs >= 2 {
+                                learned_ddim_steps = ((learned_ddim_steps as f32) * 1.05).round() as usize;
+                                steps_plateau_epochs = 0;
+                            }
+                        }
+                    }
+                }
+                prev_val_loss = Some(val_loss);
+
+                learned_ddim_steps = learned_ddim_steps
+                    .max(1)
+                    .min(num_timesteps.max(1))
+                    .clamp(ddim_steps_min, ddim_steps_max);
+
+                for &idx in &diffusion_blocks_idx {
+                    if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
+                        b.config.ddim_steps_policy =
+                            crate::layers::diffusion::DdimStepsPolicy::Fixed(learned_ddim_steps);
+                    }
+                }
+                info!(
+                    epoch = epoch,
+                    ddim_steps = learned_ddim_steps,
+                    "Updated learned DDIM steps policy"
+                );
+            }
             if let Some(f) = &mut log_file {
                 use std::io::Write;
                 let _ = writeln!(
@@ -3600,7 +3684,6 @@ impl LLM {
         max_length: usize,
         steps: Option<usize>,
     ) -> String {
-        let steps = steps.unwrap_or(100);
         let mut rng = get_rng();
 
         // Tokenize the prompt if provided
@@ -3637,6 +3720,19 @@ impl LLM {
         if diffusion_blocks_idx.is_empty() {
             return "Error: No diffusion blocks found".to_string();
         }
+
+        let (total_timesteps, steps_policy) = match &self.network[diffusion_blocks_idx[0]] {
+            LayerEnum::DiffusionBlock(b0) => {
+                (b0.noise_scheduler.num_timesteps(), b0.config.ddim_steps_policy.clone())
+            }
+            _ => return "Error: No diffusion blocks found".to_string(),
+        };
+
+        let requested_steps = steps.or(self.diffusion_steps_override);
+        let steps = match requested_steps {
+            Some(k) => k.max(1).min(total_timesteps.max(1)),
+            None => steps_policy.resolve(total_timesteps, max_length, prompt_tokens.len()),
+        };
 
         // Calculate available length for generation (accounting for prompt)
         let _available_length = max_length.saturating_sub(prompt_tokens.len());
@@ -3686,7 +3782,12 @@ impl LLM {
             }
 
             for t in (1..=steps).rev() {
-                let t_idx = t - 1;
+                let step_idx = t - 1;
+                let t_idx = crate::layers::diffusion::map_step_to_timestep(
+                    step_idx,
+                    steps,
+                    total_timesteps,
+                );
                 for &idx in &diffusion_blocks_idx {
                     if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
                         b.set_timestep(t_idx);
@@ -3755,7 +3856,12 @@ impl LLM {
                     let mut t = steps;
                     used_speculative = true;
                     while t > 0 {
-                        let t_idx = t - 1;
+                        let step_idx = t - 1;
+                        let t_idx = crate::layers::diffusion::map_step_to_timestep(
+                            step_idx,
+                            steps,
+                            total_timesteps,
+                        );
                         let main_pred = self.forward_diffusion_stack(
                             &diffusion_blocks_idx,
                             &current_sample,
@@ -3794,7 +3900,12 @@ impl LLM {
 
                         let mut accepted = 1usize;
                         while accepted < cfg.gamma && t > 0 {
-                            let next_t_idx = t - 1;
+                            let next_step_idx = t - 1;
+                            let next_t_idx = crate::layers::diffusion::map_step_to_timestep(
+                                next_step_idx,
+                                steps,
+                                total_timesteps,
+                            );
                             let draft_pred = self.forward_diffusion_stack(
                                 &draft_indices,
                                 &current_sample,
@@ -3814,7 +3925,12 @@ impl LLM {
             }
             if !used_speculative {
                 for t in (1..=steps).rev() {
-                    let t_idx = t - 1;
+                    let step_idx = t - 1;
+                    let t_idx = crate::layers::diffusion::map_step_to_timestep(
+                        step_idx,
+                        steps,
+                        total_timesteps,
+                    );
                     let predicted_noise =
                         self.forward_diffusion_stack(&diffusion_blocks_idx, &current_sample, t_idx);
                     current_sample = self.apply_ddim_step(
