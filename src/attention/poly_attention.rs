@@ -757,11 +757,15 @@ impl PolyAttention {
                         if pos < q_pe.len() {
                             s += q_pe[pos];
                         }
+
+                        // Match the forward path: smoothly clip extreme scores before
+                        // polynomial evaluation.
+                        let s_stable = smooth_clip_tanh(s, 8.0);
                         let sp = match p_i32 {
-                            1 => s,
-                            2 => s * s,
-                            3 => s * s * s,
-                            _ => s.powi(p_i32),
+                            1 => s_stable,
+                            2 => s_stable * s_stable,
+                            3 => s_stable * s_stable * s_stable,
+                            _ => s_stable.powi(p_i32),
                         };
                         let phi = scale * (a * sp + b);
                         for h in 0..self.head_dim {
@@ -1516,11 +1520,15 @@ impl PolyAttention {
                         if pos < q_pe.len() {
                             s += q_pe[pos];
                         }
+
+                        // Match the forward path: smoothly clip extreme scores before
+                        // polynomial evaluation.
+                        let s_stable = smooth_clip_tanh(s, 8.0);
                         let sp = match p_i32 {
-                            1 => s,
-                            2 => s * s,
-                            3 => s * s * s,
-                            _ => s.powi(p_i32),
+                            1 => s_stable,
+                            2 => s_stable * s_stable,
+                            3 => s_stable * s_stable * s_stable,
+                            _ => s_stable.powi(p_i32),
                         };
                         let phi = scale * (a * sp + b);
                         for h in 0..self.head_dim {
@@ -2310,6 +2318,43 @@ mod tests {
         pa.set_eff_skip_threshold(0.0);
         let out_no_skip = pa.forward_impl(&input, false);
         assert_ne!(out_no_skip, input);
+    }
+
+    #[test]
+    fn soft_top_p_cache_includes_modulation_and_token_scale() {
+        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        pa.moh.head_selection_config.gating.use_soft_top_p = true;
+        pa.moh.head_selection_config.gating.top_p = 0.9;
+        pa.moh.head_selection_config.gating.soft_top_p_alpha = 2.0;
+        // Keep activation scaling mild so we don't saturate to 0/1 everywhere.
+        pa.moh.head_selection_config.max_heads = 1;
+        pa.moh.head_selection_config.threshold_modulation = 1.25;
+
+        let n = 4;
+        let d = 32;
+        let mut input = Array2::<f32>::zeros((n, d));
+        for i in 0..n {
+            for j in 0..d {
+                input[[i, j]] = ((i * d + j) as f32 * 0.03).sin();
+            }
+        }
+
+        // Per-token scaling should be reflected in the cached mask because backward consumes it.
+        let token_scale = Array2::from_shape_vec((n, 1), vec![1.0, 0.5, 2.0, 1.5]).unwrap();
+        pa.set_token_threshold_scale(token_scale);
+
+        let _ = pa.forward_impl(&input, true);
+        let mask = pa
+            .moh
+            .cached_soft_top_p_mask
+            .as_ref()
+            .expect("soft top-p mask must be cached when enabled");
+
+        let sum0: f32 = mask.row(0).sum();
+        let sum1: f32 = mask.row(1).sum();
+        let sum2: f32 = mask.row(2).sum();
+        assert!(sum2 > sum0, "token_scale=2.0 should increase mask magnitude");
+        assert!(sum1 < sum0, "token_scale=0.5 should decrease mask magnitude");
     }
 
     #[test]

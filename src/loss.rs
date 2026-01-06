@@ -103,7 +103,9 @@ pub fn cross_entropy_gradients(probs: &Array2<f32>, targets: &[usize]) -> Array2
         }
     }
     if rows > 0 {
-        grads.mapv(|x| x / (rows as f32))
+        let scale = 1.0 / (rows as f32);
+        grads.mapv_inplace(|x| x * scale);
+        grads
     } else {
         grads.fill(0.0);
         grads
@@ -125,15 +127,19 @@ pub fn symmetric_cross_entropy(
 
     let ce = cross_entropy(probs, targets);
 
+    // Reverse CE: sum_k p_k * (-ln y_k), where y is stabilized one-hot.
+    // With y_t = 1 => -ln y_t = 0, and y_{k!=t} = eps => -ln eps is constant.
+    let c_other = -(epsilon.max(f32::MIN_POSITIVE)).ln();
     let mut rce = 0.0f32;
     for i in 0..rows {
         let t = targets[i];
-        let mut c_sum = 0.0f32;
-        for k in 0..vocab {
-            let y = if k == t { 1.0 } else { epsilon }; // stabilized one-hot
-            c_sum += probs[[i, k]] * (-y.ln());
+        if t < vocab {
+            let p_t = probs[[i, t]];
+            rce += c_other * (1.0 - p_t);
+        } else {
+            // If the target is invalid, treat all classes as non-target (matches original loop).
+            rce += c_other;
         }
-        rce += c_sum;
     }
     rce /= rows as f32;
 
@@ -159,15 +165,16 @@ pub fn symmetric_cross_entropy_from_logits(
 
     let ce = cross_entropy_from_logits(&logits.slice(ndarray::s![0..rows, ..]), &targets[..rows]);
 
+    let c_other = -(epsilon.max(f32::MIN_POSITIVE)).ln();
     let mut rce = 0.0f32;
     for i in 0..rows {
         let t = targets[i];
-        let mut c_sum = 0.0f32;
-        for k in 0..vocab {
-            let y = if k == t { 1.0 } else { epsilon }; // stabilized one-hot
-            c_sum += probs[[i, k]] * (-y.ln());
+        if t < vocab {
+            let p_t = probs[[i, t]];
+            rce += c_other * (1.0 - p_t);
+        } else {
+            rce += c_other;
         }
-        rce += c_sum;
     }
     rce /= rows as f32;
 
@@ -190,30 +197,31 @@ pub fn symmetric_cross_entropy_gradients(
 
     let ce_grad = cross_entropy_gradients(probs, targets);
 
+    // Reverse CE gradient w.r.t logits: p ∘ (c - E_p[c]) where
+    // c_t = 0, c_{k!=t} = -ln(eps).
+    // IMPORTANT: loss is averaged over rows, so gradients must also be scaled by 1/rows.
+    let c_other = -(epsilon.max(f32::MIN_POSITIVE)).ln();
+    let rce_scale = beta / (rows as f32);
+
     for i in 0..rows {
         let t = targets[i];
-        // c_i = -log(y_i)
-        let mut c = Array1::<f32>::zeros(vocab);
-        for k in 0..vocab {
-            c[k] = if k == t {
-                0.0
-            } else {
-                -(epsilon.max(f32::MIN_POSITIVE)).ln()
-            };
+        if t >= vocab {
+            continue;
         }
-        // dot(c, p)
-        let c_dot_p: f32 = c.iter().zip(probs.row(i)).map(|(ci, &pi)| ci * pi).sum();
-        // grad_rce_row = p ∘ (c - c_dot_p)
+
+        let p_t = probs[[i, t]];
+        // E_p[c] = sum_k p_k c_k = (1 - p_t) * c_other
+        let e_c = (1.0 - p_t) * c_other;
         for k in 0..vocab {
             let pk = probs[[i, k]];
-            grad[[i, k]] = beta * pk * (c[k] - c_dot_p);
+            let ck = if k == t { 0.0 } else { c_other };
+            grad[[i, k]] = rce_scale * pk * (ck - e_c);
         }
     }
 
     // Combine and normalize
-    for ((g, &gc), &p) in grad.iter_mut().zip(ce_grad.iter()).zip(probs.iter()) {
+    for (g, &gc) in grad.iter_mut().zip(ce_grad.iter()) {
         *g = alpha * gc + *g;
-        let _ = p; // keep iteration structure
     }
     grad
 }
@@ -329,6 +337,38 @@ mod tests {
             let fd = (l_pos - l_neg) / (2.0 * h);
             let gk = grad[[0, k]];
             assert!((fd - gk).abs() < 5e-3, "fd {} vs grad {}", fd, gk);
+        }
+    }
+
+    #[test]
+    fn test_sce_gradient_multirow_matches_finite_difference() {
+        let logits: Array2<f32> = array![[2.0f32, -1.0f32], [-0.5f32, 0.25f32]];
+        let softmax = crate::soft::Softmax::new();
+        let probs = softmax.forward_immutable(&logits.view());
+        let targets = [0usize, 1usize];
+        let alpha = 1.0;
+        let beta = 0.2;
+        let eps = 1e-4;
+        let grad = symmetric_cross_entropy_gradients(&probs, &targets, alpha, beta, eps);
+
+        // Finite difference on logits
+        let h = 1e-3;
+        for i in 0..logits.nrows() {
+            for k in 0..logits.ncols() {
+                let mut logits_pos = logits.clone();
+                logits_pos[[i, k]] += h;
+                let probs_pos = softmax.forward_immutable(&logits_pos.view());
+                let l_pos = symmetric_cross_entropy(&probs_pos, &targets, alpha, beta, eps);
+
+                let mut logits_neg = logits.clone();
+                logits_neg[[i, k]] -= h;
+                let probs_neg = softmax.forward_immutable(&logits_neg.view());
+                let l_neg = symmetric_cross_entropy(&probs_neg, &targets, alpha, beta, eps);
+
+                let fd = (l_pos - l_neg) / (2.0 * h);
+                let gk = grad[[i, k]];
+                assert!((fd - gk).abs() < 5e-3, "fd {} vs grad {} at ({},{})", fd, gk, i, k);
+            }
         }
     }
 

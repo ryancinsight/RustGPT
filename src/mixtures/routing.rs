@@ -278,7 +278,7 @@ fn apply_softmax_selection(
     gates: &ndarray::ArrayView2<f32>,
     temperature: f32,
 ) -> ndarray::Array2<f32> {
-    let mut softmax = Softmax::new();
+    let softmax = Softmax::new();
 
     let temperature = if temperature.is_finite() && temperature > 1e-6 {
         temperature
@@ -293,7 +293,9 @@ fn apply_softmax_selection(
     });
 
     // Apply softmax using the existing implementation
-    softmax.forward(&scaled_gates.view())
+    // This is a pure forward-only call site; avoid Softmax::forward() which caches outputs
+    // and would otherwise clone the full output tensor.
+    softmax.forward_immutable(&scaled_gates.view())
 }
 
 /// Compute routing entropy for a batch of routing decisions

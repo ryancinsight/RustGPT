@@ -1,16 +1,26 @@
-use llm::{Layer, llm::LLM, model_persistence::VersionedModel};
+use llm::{llm::LLM, Layer};
 
 #[test]
 fn versioned_model_binary_roundtrip_smoke() {
     let llm = LLM::default();
 
-    // "binary" payload now uses MessagePack (see VersionedModel::from_llm)
-    let versioned = VersionedModel::from_llm(&llm, "binary", Some("test".to_string()))
-        .expect("binary serialization should succeed");
+    let path = std::env::temp_dir().join(format!(
+        "rustgpt_versioned_roundtrip_{}_{}.rgpt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path_str = path.to_str().expect("temp path should be valid UTF-8");
 
-    let loaded = versioned
-        .to_llm("binary")
-        .expect("binary deserialization should succeed");
+    llm.save_versioned(path_str, Some("test".to_string()))
+        .expect("save_versioned should succeed");
+
+    let loaded = LLM::load_versioned(path_str).expect("load_versioned should succeed");
+
+    // Best effort cleanup.
+    let _ = std::fs::remove_file(&path);
 
     assert_eq!(loaded.vocab.size(), llm.vocab.size());
     assert_eq!(loaded.network.len(), llm.network.len());

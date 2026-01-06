@@ -147,9 +147,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         );
         let activation_scale = ctx.head_selection_config.max_heads.max(1) as f32;
         soft_weights.mapv_inplace(|v| smooth_saturate_01(v * activation_scale));
-        *ctx.cached_soft_top_p_mask = Some(soft_weights.clone());
 
-        let mut soft_weights = soft_weights;
         let m = ctx.head_selection_config.threshold_modulation;
         soft_weights.mapv_inplace(|v| v * m);
         if let Some(scale) = ctx.token_threshold_scale.as_ref() {
@@ -162,6 +160,10 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 }
             }
         }
+
+        // Cache the final per-token per-head selection weights that were actually used.
+        // This is consumed by the backward path (PolyAttention::compute_gradients*).
+        *ctx.cached_soft_top_p_mask = Some(soft_weights.clone());
         Some(soft_weights)
     } else {
         None
@@ -699,6 +701,20 @@ fn apply_soft_top_p_with_richards(
 
     // Process each token
     for (token_idx, token_gates) in gates.outer_iter().enumerate() {
+        // SoftTopP is defined over probabilities; normalize per token to make `top_p`
+        // meaningful even when gate magnitudes drift.
+        let mut sum_probs = 0.0f32;
+        for &v in token_gates.iter() {
+            if v.is_finite() && v > 0.0 {
+                sum_probs += v;
+            }
+        }
+        let inv_sum_probs = if sum_probs.is_finite() && sum_probs > 0.0 {
+            1.0f32 / sum_probs
+        } else {
+            0.0f32
+        };
+
         // Sort probabilities and compute cumulative sum (following AutoDeco approach)
         let token_len = token_gates.len();
         prob_indices.clear();
@@ -719,7 +735,18 @@ fn apply_soft_top_p_with_richards(
         soft_mask.reserve(token_len);
         let mut cum = 0.0f32;
         for &idx in &prob_indices {
-            cum += token_gates[idx];
+            let p = if inv_sum_probs > 0.0 {
+                let v = token_gates[idx];
+                if v.is_finite() && v > 0.0 {
+                    v * inv_sum_probs
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            cum += p;
             let diff = cum - top_p;
             // Richards sigmoid: smooth activation with better gradient properties than standard
             // sigmoid
@@ -738,7 +765,17 @@ fn apply_soft_top_p_with_richards(
 
         // Apply mask directly into the output row and renormalize.
         let mut sum_masked: f32 = 0.0;
-        for (i, &prob) in token_gates.iter().enumerate() {
+        for (i, &prob_raw) in token_gates.iter().enumerate() {
+            let prob = if inv_sum_probs > 0.0 {
+                if prob_raw.is_finite() && prob_raw > 0.0 {
+                    prob_raw * inv_sum_probs
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
             let v = prob * unsorted_mask[i];
             result[[token_idx, i]] = v;
             sum_masked += v;
@@ -749,8 +786,17 @@ fn apply_soft_top_p_with_richards(
                 result[[token_idx, i]] *= inv;
             }
         } else {
-            // Fallback to original if all masked
-            for (i, &prob) in token_gates.iter().enumerate() {
+            // Fallback: use normalized gates (or all zeros if degenerate)
+            for (i, &prob_raw) in token_gates.iter().enumerate() {
+                let prob = if inv_sum_probs > 0.0 {
+                    if prob_raw.is_finite() && prob_raw > 0.0 {
+                        prob_raw * inv_sum_probs
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 result[[token_idx, i]] = prob;
             }
         }

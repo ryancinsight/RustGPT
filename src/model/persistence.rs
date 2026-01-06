@@ -19,7 +19,7 @@ fn default_data_format() -> Option<String> {
 
 /// Versioned model container with integrity checking
 #[derive(Serialize, Deserialize, Clone)]
-pub struct VersionedModel {
+pub(crate) struct VersionedModel {
     /// Format version for backward compatibility
     pub version: u32,
     /// SHA256 checksum of the serialized model data (hex string)
@@ -35,7 +35,7 @@ pub struct VersionedModel {
 
 /// Metadata about the model
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ModelMetadata {
+pub(crate) struct ModelMetadata {
     /// Timestamp when model was saved (ISO 8601 format)
     pub saved_at: String,
     /// Model architecture type (e.g., "Transformer")
@@ -60,7 +60,7 @@ impl VersionedModel {
     ///
     /// # Errors
     /// Returns `ModelError::Serialization` if serialization fails
-    pub fn from_llm(llm: &LLM, format: &str, description: Option<String>) -> Result<Self> {
+    fn from_llm(llm: &LLM, format: &str, description: Option<String>) -> Result<Self> {
         // Serialize the model
         let (data_format, data) = match format {
             "json" => (
@@ -110,7 +110,7 @@ impl VersionedModel {
     ///
     /// # Errors
     /// Returns `ModelError::Serialization` if checksum validation fails
-    pub fn validate_checksum(&self) -> Result<()> {
+    fn validate_checksum(&self) -> Result<()> {
         let mut hasher = Sha256::new();
         hasher.update(&self.data);
         let computed_checksum = format!("{:x}", hasher.finalize());
@@ -134,7 +134,7 @@ impl VersionedModel {
     ///
     /// # Errors
     /// Returns `ModelError::Serialization` if version is incompatible
-    pub fn validate_version(&self) -> Result<()> {
+    fn validate_version(&self) -> Result<()> {
         if self.version > MODEL_VERSION {
             return Err(ModelError::Serialization {
                 source: Box::new(std::io::Error::new(
@@ -166,7 +166,7 @@ impl VersionedModel {
     ///
     /// # Errors
     /// Returns `ModelError::Serialization` if deserialization fails
-    pub fn to_llm(&self, format: &str) -> Result<LLM> {
+    fn to_llm(&self, format: &str) -> Result<LLM> {
         // Validate before deserializing
         self.validate_version()?;
         self.validate_checksum()?;
@@ -209,7 +209,7 @@ impl VersionedModel {
     ///
     /// # Errors
     /// Returns `ModelError::Serialization` if file write fails
-    pub fn save_to_file(&self, path: &str) -> Result<()> {
+    fn save_to_file(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(|e| ModelError::Serialization {
             source: Box::new(e),
         })?;
@@ -221,7 +221,7 @@ impl VersionedModel {
     ///
     /// # Errors
     /// Returns `ModelError` if file read or deserialization fails
-    pub fn load_from_file(path: &str) -> Result<Self> {
+    fn load_from_file(path: &str) -> Result<Self> {
         let data = fs::read_to_string(path).map_err(ModelError::from)?;
         let versioned_model: VersionedModel =
             serde_json::from_str(&data).map_err(|e| ModelError::Serialization {

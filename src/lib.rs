@@ -7,7 +7,6 @@ pub mod inference;
 pub mod interactive;
 pub mod layers;
 pub mod network;
-pub mod persistence;
 pub mod rng;
 pub mod trainer;
 pub mod training;
@@ -25,9 +24,13 @@ pub mod soft;
 pub mod llm;
 
 pub mod mixtures;
+pub mod model;
+#[path = "model/builder.rs"]
 pub mod model_builder;
+#[path = "model/config.rs"]
 pub mod model_config;
-pub mod model_persistence;
+#[path = "model/persistence.rs"]
+mod model_persistence;
 pub mod output_projection;
 
 pub mod decoding;
@@ -67,7 +70,6 @@ pub use mixtures::{
 pub use model_builder::{build_network, print_architecture_summary};
 pub use model_config::{ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy};
 pub use network::{Layer, LayerEnum};
-pub use persistence::ModelPersistence;
 // Also re-export RichardsGlu
 pub use richards::RichardsGlu;
 // Also re-export RichardsNorm as DynamicTanhNorm for compatibility
