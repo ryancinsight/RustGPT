@@ -151,7 +151,7 @@ cargo run --release -- --architecture mamba --interactive
 ### Versioned Serialization with Integrity Checks
 
 ```rust
-use llm::{LLM, ModelPersistence};
+use llm::LLM;
 
 // Save with versioning, checksums, and metadata
 let llm = LLM::default();

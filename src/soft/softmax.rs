@@ -62,8 +62,10 @@ impl Softmax {
     /// # Returns
     /// Softmax-normalized probabilities
     pub fn forward(&mut self, input: &ArrayView2<f32>) -> Array2<f32> {
-        // Cache input for gradient computation
-        self.cached_input = Some(input.to_owned());
+        // We intentionally do not cache the input here.
+        // Softmax backward only needs the softmax output (probabilities), and caching the input
+        // would force an unnecessary clone of the entire tensor.
+        self.cached_input = None;
 
         let result = self.softmax(input);
         self.cached_output = Some(result.clone());
@@ -213,9 +215,14 @@ impl Softmax {
 
                     if use_two_pass {
                         let mut exp_sum: f64 = 0.0;
-                        for &x in row.iter() {
+                        let mut exps = [0.0f64; 64];
+                        for (j, &x) in row.iter().enumerate() {
                             if x.is_finite() {
-                                exp_sum += PadeExp::exp((x - max_val) as f64);
+                                let e = PadeExp::exp((x - max_val) as f64);
+                                exps[j] = e;
+                                exp_sum += e;
+                            } else {
+                                exps[j] = 0.0;
                             }
                         }
 
@@ -227,12 +234,8 @@ impl Softmax {
                         }
 
                         let inv_sum = 1.0 / exp_sum;
-                        for (j, &x) in row.iter().enumerate() {
-                            result[[i, j]] = if x.is_finite() {
-                                (PadeExp::exp((x - max_val) as f64) * inv_sum) as f32
-                            } else {
-                                0.0
-                            };
+                        for j in 0..row.len() {
+                            result[[i, j]] = (exps[j] * inv_sum) as f32;
                         }
                     } else {
                         // Fast path: one exp() per element.
@@ -293,10 +296,15 @@ impl Softmax {
 
                     if use_two_pass {
                         let mut exp_sum: f64 = 0.0;
+                        let mut exps = [0.0f64; 64];
                         for i in 0..nrows {
                             let x = logits[[i, j]];
                             if x.is_finite() {
-                                exp_sum += PadeExp::exp((x - max_val) as f64);
+                                let e = PadeExp::exp((x - max_val) as f64);
+                                exps[i] = e;
+                                exp_sum += e;
+                            } else {
+                                exps[i] = 0.0;
                             }
                         }
 
@@ -309,12 +317,7 @@ impl Softmax {
 
                         let inv_sum = 1.0 / exp_sum;
                         for i in 0..nrows {
-                            let x = logits[[i, j]];
-                            result[[i, j]] = if x.is_finite() {
-                                (PadeExp::exp((x - max_val) as f64) * inv_sum) as f32
-                            } else {
-                                0.0
-                            };
+                            result[[i, j]] = (exps[i] * inv_sum) as f32;
                         }
                     } else {
                         let mut exp_sum: f64 = 0.0;
@@ -361,14 +364,21 @@ impl Softmax {
         // Find max value for numerical stability
         let mut max_val = f32::NEG_INFINITY;
         let mut any_finite = false;
-        for &x in row.iter() {
+        let mut argmax = 0usize;
+        for (j, &x) in row.iter().enumerate() {
             if x.is_finite() {
                 any_finite = true;
-                max_val = max_val.max(x);
+                if x > max_val {
+                    max_val = x;
+                    argmax = j;
+                }
             }
         }
         if !any_finite {
-            max_val = 0.0;
+            if row.len() > 0 {
+                result[0] = 1.0;
+            }
+            return result;
         }
 
         // Compute exp(x - max) once into output, accumulate in f64, then normalize.
@@ -385,14 +395,6 @@ impl Softmax {
 
         if exp_sum <= 0.0 || !exp_sum.is_finite() {
             // Degenerate case (extremely wide logits). Fall back to argmax = 1.0.
-            let mut argmax = 0usize;
-            let mut best = f32::NEG_INFINITY;
-            for (j, &x) in row.iter().enumerate() {
-                if x.is_finite() && x > best {
-                    best = x;
-                    argmax = j;
-                }
-            }
             for j in 0..row.len() {
                 result[j] = if j == argmax { 1.0 } else { 0.0 };
             }

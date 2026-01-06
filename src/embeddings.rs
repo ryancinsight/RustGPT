@@ -7,7 +7,10 @@ use crate::{EMBEDDING_DIM, Vocab, adam::Adam, network::Layer, rng::get_rng};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TokenEmbeddings {
     pub token_embeddings: Array2<f32>,
-    pub cached_input: Option<Array2<f32>>,
+    #[serde(skip, default)]
+    pub cached_token_ids: Option<Vec<usize>>,
+    #[serde(skip, default)]
+    pub cached_input_dim: Option<(usize, usize)>,
     pub token_optimizer: Adam,
 }
 
@@ -19,10 +22,12 @@ impl Default for TokenEmbeddings {
 
 impl TokenEmbeddings {
     pub fn new(vocab: Vocab) -> Self {
+        let vocab_size = vocab.size();
         Self {
-            token_embeddings: Self::init_embeddings(vocab.size(), EMBEDDING_DIM),
-            cached_input: None,
-            token_optimizer: Adam::new((vocab.size(), EMBEDDING_DIM)),
+            token_embeddings: Self::init_embeddings(vocab_size, EMBEDDING_DIM),
+            cached_token_ids: None,
+            cached_input_dim: None,
+            token_optimizer: Adam::new((vocab_size, EMBEDDING_DIM)),
         }
     }
 
@@ -52,6 +57,29 @@ impl TokenEmbeddings {
     pub fn embed_tokens(&self, token_ids: &[usize]) -> Array2<f32> {
         Self::get_token_embeddings(&self.token_embeddings, token_ids)
     }
+
+    #[inline]
+    fn token_ids_from_input(input: &Array2<f32>, vocab_size: usize) -> Vec<usize> {
+        if vocab_size == 0 {
+            return vec![0; input.len()];
+        }
+        let max_id = vocab_size.saturating_sub(1);
+        input
+            .iter()
+            .map(|&x| {
+                if !x.is_finite() || x < 0.0 {
+                    0usize
+                } else {
+                    let raw = if x >= (usize::MAX as f32) {
+                        usize::MAX
+                    } else {
+                        x as usize
+                    };
+                    raw.min(max_id)
+                }
+            })
+            .collect()
+    }
 }
 
 impl Layer for TokenEmbeddings {
@@ -62,25 +90,46 @@ impl Layer for TokenEmbeddings {
     #[inline]
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // input shape is [1, sequence_length]
-        self.cached_input = Some(input.clone());
-        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
-        self.embed_tokens(&token_ids) // shape is [sequence_length, embedding_dim]
+        self.cached_input_dim = Some(input.dim());
+        self.cached_token_ids = Some(Self::token_ids_from_input(
+            input,
+            self.token_embeddings.nrows(),
+        ));
+        let token_ids = self.cached_token_ids.as_deref().unwrap_or(&[]);
+        self.embed_tokens(token_ids) // shape is [sequence_length, embedding_dim]
     }
 
     #[inline]
     fn compute_gradients(
         &self,
-        _input: &Array2<f32>,
+        input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let input = self.cached_input.as_ref().unwrap();
-        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
+        let token_ids = if input.is_empty() {
+            self.cached_token_ids
+                .as_ref()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Self::token_ids_from_input(input, self.token_embeddings.nrows())
+        };
         let grads = output_grads.view(); // (sequence_length, embedding_dim)
 
         // Initialize gradients for token embeddings
         let mut token_grads = Array2::zeros(self.token_embeddings.dim());
 
-        for (i, &token_id) in token_ids.iter().enumerate() {
+        if grads.nrows() != token_ids.len() {
+            tracing::warn!(
+                layer = "TokenEmbeddings",
+                token_ids = token_ids.len(),
+                grad_rows = grads.nrows(),
+                "Sequence length mismatch between token ids and output gradients; clamping"
+            );
+        }
+
+        let seq_len = token_ids.len().min(grads.nrows());
+        for i in 0..seq_len {
+            let token_id = token_ids[i];
             // Clamp token_id to valid range
             let safe_token_id = token_id.min(self.token_embeddings.nrows().saturating_sub(1));
             let grad_row = grads.row(i);
@@ -91,7 +140,14 @@ impl Layer for TokenEmbeddings {
                 .zip_mut_with(&grad_row, |a, &b| *a += b);
         }
 
-        (output_grads.clone(), vec![token_grads])
+        // Gradients do not propagate into discrete token ids; return zeros with input shape.
+        let input_shape = if !input.is_empty() {
+            input.dim()
+        } else {
+            self.cached_input_dim.unwrap_or((1, token_ids.len()))
+        };
+        let input_grads = Array2::<f32>::zeros(input_shape);
+        (input_grads, vec![token_grads])
     }
 
     fn apply_gradients(

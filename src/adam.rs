@@ -1,4 +1,4 @@
-use ndarray::Array2;
+use ndarray::{Array2, Zip};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -113,44 +113,97 @@ impl Adam {
         }
         self.timestep += 1;
 
-        // Apply weight decay (AdamW style: decoupled from gradients)
-        let effective_grads = if self.use_decoupled_wd && self.weight_decay > 0.0 {
+        if lr == 0.0 {
+            return;
+        }
+
+        // Bias-correction scalars.
+        let inv_bias1 = 1.0 / (1.0 - self.beta1.powi(self.timestep as i32));
+        let inv_bias2 = 1.0 / (1.0 - self.beta2.powi(self.timestep as i32));
+
+        // Apply weight decay (AdamW style: decoupled from gradients).
+        if self.use_decoupled_wd && self.weight_decay > 0.0 {
             // AdamW: Apply weight decay directly to parameters, not gradients
             *params *= 1.0 - self.weight_decay * lr;
-            grads.clone()
-        } else if self.weight_decay > 0.0 {
-            // Traditional L2 regularization: add weight decay to gradients
-            grads + &(params.clone() * self.weight_decay)
-        } else {
-            grads.clone()
-        };
+        }
 
-        // Update m first
-        self.m = &self.m * self.beta1 + &(effective_grads.clone() * (1.0 - self.beta1));
+        let use_l2_wd = (!self.use_decoupled_wd) && self.weight_decay > 0.0;
 
-        // Then update v using the same effective_grads
-        self.v = &self.v * self.beta2 + &(effective_grads.mapv(|x| x * x) * (1.0 - self.beta2));
-
-        let m_hat = &self.m / (1.0 - self.beta1.powi(self.timestep as i32));
-        let v_hat = &self.v / (1.0 - self.beta2.powi(self.timestep as i32));
-
-        // AMSGrad variant: use maximum of past v_hat values for better convergence
-        let v_hat_used = if self.use_amsgrad {
-            if let Some(ref mut v_hat_max) = self.v_hat_max {
-                // Update maximum: v_hat_max = max(v_hat_max, v_hat)
-                v_hat_max.zip_mut_with(&v_hat, |max_val, &curr_val| {
-                    *max_val = max_val.max(curr_val);
-                });
-                v_hat_max
-            } else {
-                // Fallback to regular v_hat if v_hat_max not initialized
-                &v_hat
+        // Ensure AMSGrad buffer exists and has correct shape.
+        if self.use_amsgrad {
+            let need_init = self
+                .v_hat_max
+                .as_ref()
+                .is_none_or(|a| a.dim() != grads.dim());
+            if need_init {
+                self.v_hat_max = Some(Array2::zeros(grads.dim()));
             }
-        } else {
-            &v_hat
-        };
+        }
 
-        let update = &m_hat / (v_hat_used.mapv(|x| x.sqrt()) + self.epsilon);
-        *params -= &(update * lr);
+        // Update moments in-place (no intermediate allocations).
+        if self.use_amsgrad {
+            let v_hat_max = self
+                .v_hat_max
+                .as_mut()
+                .expect("AMSGrad buffer must exist");
+            Zip::from(&mut self.m)
+                .and(&mut self.v)
+                .and(&mut *v_hat_max)
+                .and(params.view())
+                .and(grads)
+                .for_each(|m, v, v_max, &p, &g_in| {
+                    let mut g = if g_in.is_finite() { g_in } else { 0.0 };
+                    if use_l2_wd {
+                        let wd_term = p * self.weight_decay;
+                        g += if wd_term.is_finite() { wd_term } else { 0.0 };
+                    }
+                    *m = *m * self.beta1 + g * (1.0 - self.beta1);
+                    *v = *v * self.beta2 + (g * g) * (1.0 - self.beta2);
+
+                    // Track max of bias-corrected v_hat (AMSGrad).
+                    let v_hat = (*v) * inv_bias2;
+                    if v_hat.is_finite() {
+                        *v_max = v_max.max(v_hat);
+                    }
+                });
+
+            // Apply update.
+            Zip::from(params)
+                .and(self.m.view())
+                .and(v_hat_max.view())
+                .for_each(|p, &m, &v_hat_max| {
+                    let m_hat = m * inv_bias1;
+                    let denom = v_hat_max.sqrt() + self.epsilon;
+                    if denom.is_finite() && denom > 0.0 && m_hat.is_finite() {
+                        *p -= lr * (m_hat / denom);
+                    }
+                });
+        } else {
+            Zip::from(&mut self.m)
+                .and(&mut self.v)
+                .and(params.view())
+                .and(grads)
+                .for_each(|m, v, &p, &g_in| {
+                    let mut g = if g_in.is_finite() { g_in } else { 0.0 };
+                    if use_l2_wd {
+                        let wd_term = p * self.weight_decay;
+                        g += if wd_term.is_finite() { wd_term } else { 0.0 };
+                    }
+                    *m = *m * self.beta1 + g * (1.0 - self.beta1);
+                    *v = *v * self.beta2 + (g * g) * (1.0 - self.beta2);
+                });
+
+            Zip::from(params)
+                .and(self.m.view())
+                .and(self.v.view())
+                .for_each(|p, &m, &v| {
+                    let m_hat = m * inv_bias1;
+                    let v_hat = v * inv_bias2;
+                    let denom = v_hat.sqrt() + self.epsilon;
+                    if denom.is_finite() && denom > 0.0 && m_hat.is_finite() {
+                        *p -= lr * (m_hat / denom);
+                    }
+                });
+        }
     }
 }
