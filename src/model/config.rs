@@ -221,6 +221,42 @@ pub struct ModelConfig {
     /// Strategy for sampling diffusion timesteps during training
     #[serde(default = "diffusion_timestep_strategy_default")]
     pub diffusion_timestep_strategy: DiffusionTimestepStrategy,
+
+    /// Auxiliary residual decorrelation loss weight.
+    ///
+    /// This is a redundancy-reduction objective on residual streams (VICReg/Barlow-Twins style)
+    /// that penalizes off-diagonal covariance of the hidden state right before the output
+    /// projection.
+    #[serde(default = "residual_decorrelation_weight_default")]
+    pub residual_decorrelation_weight: f32,
+
+    /// If true, increase decorrelation pressure on harder examples.
+    #[serde(default = "residual_decorrelation_adaptive_default")]
+    pub residual_decorrelation_adaptive: bool,
+
+    /// Auxiliary hard-negative residual repulsion weight.
+    #[serde(default = "residual_hardneg_weight_default")]
+    pub residual_hardneg_weight: f32,
+
+    /// If true, increase hard-negative pressure on harder examples.
+    #[serde(default = "residual_hardneg_adaptive_default")]
+    pub residual_hardneg_adaptive: bool,
+
+    /// Number of hard negatives (top-k) to use.
+    #[serde(default = "residual_hardneg_k_default")]
+    pub residual_hardneg_k: usize,
+
+    /// Cosine similarity margin.
+    #[serde(default = "residual_hardneg_margin_default")]
+    pub residual_hardneg_margin: f32,
+
+    /// Temperature for hard-negative softplus penalty.
+    #[serde(default = "residual_hardneg_temperature_default")]
+    pub residual_hardneg_temperature: f32,
+
+    /// Memory bank size.
+    #[serde(default = "residual_hardneg_bank_size_default")]
+    pub residual_hardneg_bank_size: usize,
 }
 
 impl ModelConfig {
@@ -292,6 +328,14 @@ impl ModelConfig {
             diffusion_min_snr_gamma: 3.0,
             diffusion_noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
             diffusion_timestep_strategy: DiffusionTimestepStrategy::Uniform,
+            residual_decorrelation_weight: residual_decorrelation_weight_default(),
+            residual_decorrelation_adaptive: residual_decorrelation_adaptive_default(),
+            residual_hardneg_weight: residual_hardneg_weight_default(),
+            residual_hardneg_adaptive: residual_hardneg_adaptive_default(),
+            residual_hardneg_k: residual_hardneg_k_default(),
+            residual_hardneg_margin: residual_hardneg_margin_default(),
+            residual_hardneg_temperature: residual_hardneg_temperature_default(),
+            residual_hardneg_bank_size: residual_hardneg_bank_size_default(),
         }
     }
 }
@@ -313,6 +357,38 @@ fn diffusion_noise_schedule_default() -> NoiseSchedule {
 
 fn diffusion_timestep_strategy_default() -> DiffusionTimestepStrategy {
     DiffusionTimestepStrategy::Uniform
+}
+
+fn residual_decorrelation_weight_default() -> f32 {
+    0.01
+}
+
+fn residual_decorrelation_adaptive_default() -> bool {
+    true
+}
+
+fn residual_hardneg_weight_default() -> f32 {
+    0.005
+}
+
+fn residual_hardneg_adaptive_default() -> bool {
+    true
+}
+
+fn residual_hardneg_k_default() -> usize {
+    8
+}
+
+fn residual_hardneg_margin_default() -> f32 {
+    0.2
+}
+
+fn residual_hardneg_temperature_default() -> f32 {
+    0.07
+}
+
+fn residual_hardneg_bank_size_default() -> usize {
+    512
 }
 
 impl ModelConfig {

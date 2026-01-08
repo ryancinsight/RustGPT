@@ -186,19 +186,18 @@ impl DepthwiseConv1D {
 
     /// Forward pass with causal convolution
     pub fn forward_causal(&self, x: &Array2<f32>) -> Array2<f32> {
+        if self.kernel_size == 0 {
+            return x.clone();
+        }
         let seq_len = x.nrows();
         let input_dim = x.ncols();
         let mut output = Array2::zeros((seq_len, input_dim));
         
         for t in 0..seq_len {
-            // Extract window [max(0, t-kernel_size+1)..t]
-            let start = if t >= self.kernel_size - 1 {
-                t - self.kernel_size + 1
-            } else {
-                0
-            };
-            
-            let window_size = t - start + 1;
+            // Extract window [t+1-window_size..t], where window_size=min(t+1, kernel_size)
+            // This avoids usize underflow for small t.
+            let window_size = (t + 1).min(self.kernel_size);
+            let start = (t + 1) - window_size;
             
             // Apply depthwise convolution
             for d in 0..input_dim {
@@ -224,6 +223,9 @@ impl DepthwiseConv1D {
 
     /// Apply gradients to convolution parameters
     pub fn apply_gradients(&mut self, input: &Array2<f32>, output_grad: &Array2<f32>, lr: f32) {
+        if self.kernel_size == 0 {
+            return;
+        }
         let seq_len = input.nrows();
         let input_dim = input.ncols();
         
@@ -233,13 +235,8 @@ impl DepthwiseConv1D {
         for t in 0..seq_len {
             for d in 0..input_dim {
                 // Compute gradient for each kernel position
-                let start = if t >= self.kernel_size - 1 {
-                    t - self.kernel_size + 1
-                } else {
-                    0
-                };
-                
-                let window_size = t - start + 1;
+                let window_size = (t + 1).min(self.kernel_size);
+                let start = (t + 1) - window_size;
                 
                 for k in 0..window_size {
                     let input_idx = start + k;

@@ -1996,9 +1996,10 @@ mod tests {
         let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
         residuals.max_seq_len = num_timesteps.min(2048);
 
+        assert_eq!(residuals.activation_similarity_diag.shape(), [embed_dim, 1]);
         assert_eq!(
-            residuals.weight_similarity_matrix.shape(),
-            [embed_dim, embed_dim]
+            residuals.activation_similarity_off_abs_mean.shape(),
+            [embed_dim, 1]
         );
         assert_eq!(residuals.max_seq_len, num_timesteps);
     }
@@ -2093,16 +2094,8 @@ mod tests {
         let residuals = AdaptiveResiduals::new_minimal(embed_dim);
 
         let param_count = residuals.parameter_count();
-        let expected_base = embed_dim * embed_dim
-            + embed_dim
-            + embed_dim * 3 * embed_dim
-            + embed_dim * embed_dim
-            + embed_dim
-            + embed_dim;
-        let expected_positional =
-            embed_dim * 3 * embed_dim + 2048 * embed_dim + embed_dim * embed_dim;
-
-        assert!(param_count >= expected_base + expected_positional);
+        let expected = 2 * embed_dim;
+        assert_eq!(param_count, expected);
     }
 }
 

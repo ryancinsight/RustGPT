@@ -10,6 +10,21 @@ pub fn run_training_pipeline(
     config: &crate::model_config::ModelConfig,
     mut llm: LLM,
 ) -> crate::Result<LLM> {
+    // Training-only auxiliary objectives.
+    llm.set_residual_decorrelation_training(
+        config.residual_decorrelation_weight,
+        config.residual_decorrelation_adaptive,
+    );
+
+    llm.set_residual_hardneg_training(
+        config.residual_hardneg_weight,
+        config.residual_hardneg_adaptive,
+        config.residual_hardneg_k,
+        config.residual_hardneg_margin,
+        config.residual_hardneg_temperature,
+        config.residual_hardneg_bank_size,
+    );
+
     // Configure speculative sampling if enabled
     if args.speculative {
         let gamma = args.speculative_gamma.max(1);

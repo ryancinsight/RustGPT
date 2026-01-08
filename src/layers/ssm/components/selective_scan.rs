@@ -72,7 +72,7 @@ impl SelectiveScanner {
 
             // Ensure both terms have same shape for addition
             let y_t = &a_x + &b_u.insert_axis(ndarray::Axis(0));
-            y.row_mut(t).assign(&y_t);
+            y.row_mut(t).assign(&y_t.row(0));
 
             // Update state: x_t = y_t (for simple recurrence)
             x_prev.assign(&y_t);
@@ -83,72 +83,11 @@ impl SelectiveScanner {
 
     /// Enhanced parallel selective scan with better load balancing and memory efficiency
     fn parallel_scan(&self, a: &Array2<f32>, b: &Array2<f32>, u: &Array2<f32>) -> Array2<f32> {
-        let seq_len = u.nrows();
-        let state_dim = a.ncols();
-        let chunk_size = self.config.chunk_size;
-
-        let mut y = Array2::zeros((seq_len, state_dim));
-
-        // Adaptive chunking based on sequence length for better load balancing
-        let adaptive_chunk_size = if seq_len > 4096 {
-            chunk_size.max(2048) // Larger chunks for very long sequences
-        } else if seq_len > 2048 {
-            chunk_size.max(1024)
-        } else {
-            chunk_size.max(512) // Smaller chunks for shorter sequences
-        };
-
-        // Process chunks in parallel with better memory locality
-        let indices: Vec<usize> = (0..seq_len).collect();
-        let chunks: Vec<Vec<usize>> = indices
-            .chunks(adaptive_chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
-
-        // Pre-allocate results to avoid dynamic resizing
-        let mut results = vec![Array2::zeros((0, state_dim)); chunks.len()];
-
-        // Parallel processing with optimized memory access patterns
-        results.par_iter_mut().enumerate().for_each(|(i, result)| {
-            let chunk = &chunks[i];
-            let start = chunk[0];
-            let end = chunk[chunk.len() - 1] + 1;
-            let chunk_size = end - start;
-
-            *result = Array2::zeros((chunk_size, state_dim));
-            let mut x_prev = if start == 0 {
-                Array2::zeros((1, state_dim))
-            } else {
-                y.row(start - 1).to_owned().insert_axis(ndarray::Axis(0))
-            };
-
-            // Process chunk with optimized memory access
-            for (local_idx, &global_idx) in chunk.iter().enumerate() {
-                // Vectorized operations for better cache utilization
-                let a_x = x_prev.dot(a);
-                let u_row = u.row(global_idx);
-                let b_u = u_row.dot(b);
-
-                let y_t = &a_x + &b_u.insert_axis(ndarray::Axis(0));
-                result.row_mut(local_idx).assign(&y_t);
-                x_prev.assign(&y_t);
-            }
-        });
-
-        // Combine results with minimal copying
-        let mut current_row = 0;
-        for chunk_result in results {
-            let chunk_rows = chunk_result.nrows();
-            if chunk_rows > 0 {
-                // Direct copy to avoid intermediate allocations
-                for i in 0..chunk_rows {
-                    y.row_mut(current_row + i).assign(&chunk_result.row(i));
-                }
-                current_row += chunk_rows;
-            }
-        }
-
-        y
+        // NOTE: This recurrence is inherently sequential in time because x_t depends on x_{t-1}.
+        // A correct parallel implementation would require a different formulation (e.g., scan
+        // with associativity). For now, keep correctness by falling back to the sequential scan.
+        let _ = (a, b, u);
+        self.sequential_scan(a, b, u)
     }
 
     /// Optimized selective scan with numerical stability checks
@@ -209,7 +148,7 @@ impl SelectiveScanner {
                 let b_u = u.row(t).dot(b);
 
                 let y_t = &a_x + &b_u.insert_axis(ndarray::Axis(0));
-                y.row_mut(t).assign(&y_t);
+                y.row_mut(t).assign(&y_t.row(0));
                 x_prev.assign(&y_t);
             }
         }

@@ -168,8 +168,10 @@ fn test_linear_projection_gradients() {
     let output = projection.forward(&input);
     
     // Calculate expected output: input * weight + bias
-    let expected_sum = 16.0 * 32.0 * 0.1 + 16.0 * 64.0 * 0.05;
-    assert_abs_diff_eq!(output.sum(), expected_sum, epsilon = 1e-5);
+    // Each output element is sum_{in}(1.0 * 0.1) = 32*0.1, plus bias 0.05.
+    // There are (16 * 64) output elements.
+    let expected_sum = 16.0 * 64.0 * (32.0 * 0.1 + 0.05);
+    assert_abs_diff_eq!(output.sum(), expected_sum, epsilon = 1e-3);
 }
 
 #[test]

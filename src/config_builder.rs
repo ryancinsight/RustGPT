@@ -60,6 +60,18 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     // Select temporal mixing mechanism (attention vs SSM-style RG-LRU)
     config.temporal_mixing = args.temporal_mixing.into();
 
+    // Residual decorrelation auxiliary objective (redundancy reduction)
+    config.residual_decorrelation_weight = args.residual_decorrelation_weight.max(0.0);
+    config.residual_decorrelation_adaptive = args.residual_decorrelation_adaptive;
+
+    // Residual hard-negative repulsion objective
+    config.residual_hardneg_weight = args.residual_hardneg_weight.max(0.0);
+    config.residual_hardneg_adaptive = args.residual_hardneg_adaptive;
+    config.residual_hardneg_k = args.residual_hardneg_k.max(1);
+    config.residual_hardneg_margin = args.residual_hardneg_margin;
+    config.residual_hardneg_temperature = args.residual_hardneg_temperature.max(1e-6);
+    config.residual_hardneg_bank_size = args.residual_hardneg_bank_size;
+
     // Enable MoE if requested
     if args.moe {
         config.moe_router = Some(crate::mixtures::moe::ExpertRouter::LearnedMoE {
