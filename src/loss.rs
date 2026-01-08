@@ -112,6 +112,272 @@ pub fn cross_entropy_gradients(probs: &Array2<f32>, targets: &[usize]) -> Array2
     }
 }
 
+/// Residual decorrelation loss (Barlow Twins / VICReg-style redundancy reduction).
+///
+/// Given features `H` with shape (n_tokens, d_model), we center across tokens and
+/// penalize squared off-diagonal covariance:
+///
+/// $$L = \sum_{i \ne j} \mathrm{cov}(H)_{ij}^2$$
+///
+/// This encourages residual channels to encode distinct information ("what it is")
+/// and discourages confusable/entangled features ("what it is not").
+pub fn residual_decorrelation_loss(features: &ArrayView2<f32>) -> f32 {
+    let n = features.nrows();
+    let d = features.ncols();
+    if n < 2 || d < 2 {
+        return 0.0;
+    }
+
+    // Compute per-dimension mean.
+    let mut mean = vec![0.0f64; d];
+    for i in 0..n {
+        for j in 0..d {
+            let v = features[[i, j]];
+            mean[j] += if v.is_finite() { v as f64 } else { 0.0 };
+        }
+    }
+    for j in 0..d {
+        mean[j] /= n as f64;
+    }
+
+    // Covariance: C = X^T X / n, where X is centered.
+    let inv_n = 1.0f64 / (n as f64);
+    let mut loss = 0.0f64;
+    for i in 0..d {
+        for j in 0..d {
+            if i == j {
+                continue;
+            }
+            let mut dot = 0.0f64;
+            for t in 0..n {
+                let xi = (features[[t, i]] as f64) - mean[i];
+                let xj = (features[[t, j]] as f64) - mean[j];
+                let xi = if xi.is_finite() { xi } else { 0.0 };
+                let xj = if xj.is_finite() { xj } else { 0.0 };
+                dot += xi * xj;
+            }
+            let cij = dot * inv_n;
+            loss += cij * cij;
+        }
+    }
+
+    // Normalize by number of off-diagonal entries for scale stability.
+    let denom = (d * (d - 1)) as f64;
+    (loss / denom.max(1.0)) as f32
+}
+
+/// Gradients of `residual_decorrelation_loss` w.r.t. the input features.
+///
+/// Let X be centered features (n x d), C = X^T X / n.
+/// L = sum_{i!=j} C_ij^2.
+/// dL/dC = G where G_ij = 2*C_ij for i!=j, else 0.
+/// dL/dX = (2/n) * X * G (since G is symmetric).
+/// Then project back through centering: dL/dH = dL/dX - mean_token(dL/dX).
+pub fn residual_decorrelation_gradients(features: &ArrayView2<f32>) -> Array2<f32> {
+    let n = features.nrows();
+    let d = features.ncols();
+    let mut grad = Array2::<f32>::zeros((n, d));
+    if n < 2 || d < 2 {
+        return grad;
+    }
+
+    // Mean over tokens.
+    let mut mean = vec![0.0f64; d];
+    for i in 0..n {
+        for j in 0..d {
+            let v = features[[i, j]];
+            mean[j] += if v.is_finite() { v as f64 } else { 0.0 };
+        }
+    }
+    for j in 0..d {
+        mean[j] /= n as f64;
+    }
+
+    // Centered X (as f64 for stability).
+    let mut x = vec![0.0f64; n * d];
+    for i in 0..n {
+        for j in 0..d {
+            let v = (features[[i, j]] as f64) - mean[j];
+            x[i * d + j] = if v.is_finite() { v } else { 0.0 };
+        }
+    }
+
+    // Compute covariance C = X^T X / n.
+    let inv_n = 1.0f64 / (n as f64);
+    let mut c = vec![0.0f64; d * d];
+    for i in 0..d {
+        for j in 0..d {
+            let mut dot = 0.0f64;
+            for t in 0..n {
+                dot += x[t * d + i] * x[t * d + j];
+            }
+            c[i * d + j] = dot * inv_n;
+        }
+    }
+
+    // G = dL/dC.
+    let mut g = vec![0.0f64; d * d];
+    for i in 0..d {
+        for j in 0..d {
+            if i == j {
+                g[i * d + j] = 0.0;
+            } else {
+                g[i * d + j] = 2.0 * c[i * d + j];
+            }
+        }
+    }
+
+    // dL/dX = (2/n) * X * G.
+    let scale = 2.0f64 * inv_n;
+    let mut dx = vec![0.0f64; n * d];
+    for t in 0..n {
+        for j in 0..d {
+            let mut acc = 0.0f64;
+            for k in 0..d {
+                acc += x[t * d + k] * g[k * d + j];
+            }
+            dx[t * d + j] = scale * acc;
+        }
+    }
+
+    // Project through centering: subtract token-mean gradient per dimension.
+    let mut dx_mean = vec![0.0f64; d];
+    for t in 0..n {
+        for j in 0..d {
+            dx_mean[j] += dx[t * d + j];
+        }
+    }
+    for j in 0..d {
+        dx_mean[j] /= n as f64;
+    }
+    for t in 0..n {
+        for j in 0..d {
+            let v = dx[t * d + j] - dx_mean[j];
+            grad[[t, j]] = if v.is_finite() { v as f32 } else { 0.0 };
+        }
+    }
+
+    // Normalize by number of off-diagonal entries for scale stability.
+    let denom = (d * (d - 1)) as f32;
+    if denom > 0.0 {
+        grad.mapv_inplace(|x| x / denom);
+    }
+
+    grad
+}
+
+/// Hard-negative repulsion loss over a pooled representation.
+///
+/// This implements a lightweight "learn what it is not" objective without requiring a
+/// second positive view/augmentation. Given an anchor vector `a` and a set of negative
+/// vectors `negatives`, we select the top-k most similar negatives (hard negatives) by
+/// cosine similarity and penalize any similarity above a margin:
+///
+/// $$L = \frac{1}{k} \sum_{n \in \mathrm{TopK}} \mathrm{softplus}((\cos(a,n) - m)/\tau)$$
+///
+/// Returns (loss, grad_wrt_anchor).
+pub fn hard_negative_repulsion_loss_and_grad(
+    anchor: &[f32],
+    negatives: &[Vec<f32>],
+    k: usize,
+    margin: f32,
+    temperature: f32,
+) -> (f32, Vec<f32>) {
+    let d = anchor.len();
+    if d == 0 || negatives.is_empty() || k == 0 {
+        return (0.0, vec![0.0; d]);
+    }
+
+    let tau = temperature.max(1e-6);
+    let m = margin;
+
+    // Norm of anchor.
+    let mut na2 = 0.0f64;
+    for &v in anchor {
+        let x = if v.is_finite() { v as f64 } else { 0.0 };
+        na2 += x * x;
+    }
+    let na = na2.sqrt().max(1e-12);
+
+    // Compute similarities for all negatives.
+    let mut sims: Vec<(f32, usize, f64)> = Vec::with_capacity(negatives.len());
+    for (idx, neg) in negatives.iter().enumerate() {
+        if neg.len() != d {
+            continue;
+        }
+        let mut dot = 0.0f64;
+        let mut nb2 = 0.0f64;
+        for j in 0..d {
+            let a = anchor[j];
+            let b = neg[j];
+            let af = if a.is_finite() { a as f64 } else { 0.0 };
+            let bf = if b.is_finite() { b as f64 } else { 0.0 };
+            dot += af * bf;
+            nb2 += bf * bf;
+        }
+        let nb = nb2.sqrt().max(1e-12);
+        let cos = (dot / (na * nb)).clamp(-1.0, 1.0) as f32;
+        sims.push((cos, idx, nb));
+    }
+    if sims.is_empty() {
+        return (0.0, vec![0.0; d]);
+    }
+
+    // Select top-k by similarity.
+    sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let k_eff = k.min(sims.len());
+    let top = &sims[..k_eff];
+
+    let mut loss = 0.0f64;
+    let mut grad = vec![0.0f64; d];
+
+    // d cos / d a = b/(||a|| ||b||) - cos * a/(||a||^2)
+    for &(cos_f32, neg_idx, nb) in top {
+        let cos = cos_f32 as f64;
+
+        // softplus(x) where x=(cos - m)/tau
+        let x = ((cos_f32 - m) / tau) as f64;
+        // stable softplus
+        let sp = if x > 30.0 {
+            x
+        } else if x < -30.0 {
+            0.0
+        } else {
+            (1.0 + x.exp()).ln()
+        };
+        loss += sp;
+
+        // d softplus / d x = sigmoid(x)
+        let sig = 1.0 / (1.0 + (-x).exp());
+        // dL/dcos = sigmoid(x) * (1/tau)
+        let dldcos = sig * (1.0 / (tau as f64));
+
+        let neg = &negatives[neg_idx];
+        for j in 0..d {
+            let a = anchor[j];
+            let b = neg[j];
+            let af = if a.is_finite() { a as f64 } else { 0.0 };
+            let bf = if b.is_finite() { b as f64 } else { 0.0 };
+
+            let dcos_da = (bf / (na * nb)) - (cos * af / (na * na));
+            grad[j] += dldcos * dcos_da;
+        }
+    }
+
+    // Average over k.
+    let inv_k = 1.0f64 / (k_eff as f64);
+    loss *= inv_k;
+    for g in &mut grad {
+        *g *= inv_k;
+    }
+
+    let grad_f32: Vec<f32> = grad
+        .into_iter()
+        .map(|v| if v.is_finite() { v as f32 } else { 0.0 })
+        .collect();
+    (loss as f32, grad_f32)
+}
+
 pub fn symmetric_cross_entropy(
     probs: &Array2<f32>,
     targets: &[usize],

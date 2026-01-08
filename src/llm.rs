@@ -109,6 +109,57 @@ pub struct LLM {
     /// Not serialized: checkpoints should carry model defaults via diffusion block config.
     #[serde(skip, default)]
     diffusion_steps_override: Option<usize>,
+
+    /// Training-only hyperparameters (not serialized).
+    #[serde(skip, default)]
+    training_hparams: TrainingHyperParams,
+
+    /// Non-serialized memory bank for hard-negative residual repulsion.
+    #[serde(skip, default)]
+    residual_neg_bank: ResidualNegBank,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrainingHyperParams {
+    residual_decorrelation_weight: f32,
+    residual_decorrelation_adaptive: bool,
+
+    residual_hardneg_weight: f32,
+    residual_hardneg_adaptive: bool,
+    residual_hardneg_k: usize,
+    residual_hardneg_margin: f32,
+    residual_hardneg_temperature: f32,
+    residual_hardneg_bank_size: usize,
+}
+
+#[derive(Debug, Default)]
+struct ResidualNegBank {
+    items: Vec<Vec<f32>>,
+    next: usize,
+}
+
+impl ResidualNegBank {
+    fn push(&mut self, v: Vec<f32>, max: usize) {
+        if max == 0 {
+            return;
+        }
+        if self.items.len() < max {
+            self.items.push(v);
+            return;
+        }
+        if self.items.is_empty() {
+            self.items.push(v);
+            self.next = 0;
+            return;
+        }
+        let idx = self.next % max;
+        self.items[idx] = v;
+        self.next = (self.next + 1) % max;
+    }
+
+    fn as_slice(&self) -> &[Vec<f32>] {
+        self.items.as_slice()
+    }
 }
 
 impl std::fmt::Debug for LLM {
@@ -140,6 +191,8 @@ impl Default for LLM {
                                                            * backward compatibility */
             tokenize_scratch: Vec::new(),
             diffusion_steps_override: None,
+            training_hparams: TrainingHyperParams::default(),
+            residual_neg_bank: ResidualNegBank::default(),
         }
     }
 }
@@ -158,7 +211,35 @@ impl LLM {
                                                            * backward compatibility */
             tokenize_scratch: Vec::new(),
             diffusion_steps_override: None,
+            training_hparams: TrainingHyperParams::default(),
+            residual_neg_bank: ResidualNegBank::default(),
         }
+    }
+
+    pub fn set_residual_decorrelation_training(
+        &mut self,
+        weight: f32,
+        adaptive: bool,
+    ) {
+        self.training_hparams.residual_decorrelation_weight = weight.max(0.0);
+        self.training_hparams.residual_decorrelation_adaptive = adaptive;
+    }
+
+    pub fn set_residual_hardneg_training(
+        &mut self,
+        weight: f32,
+        adaptive: bool,
+        k: usize,
+        margin: f32,
+        temperature: f32,
+        bank_size: usize,
+    ) {
+        self.training_hparams.residual_hardneg_weight = weight.max(0.0);
+        self.training_hparams.residual_hardneg_adaptive = adaptive;
+        self.training_hparams.residual_hardneg_k = k.max(1);
+        self.training_hparams.residual_hardneg_margin = margin;
+        self.training_hparams.residual_hardneg_temperature = temperature.max(1e-6);
+        self.training_hparams.residual_hardneg_bank_size = bank_size;
     }
 
     /// Create LLM with GreedyDecoder
@@ -174,6 +255,8 @@ impl LLM {
                                                            * backward compatibility */
             tokenize_scratch: Vec::new(),
             diffusion_steps_override: None,
+            training_hparams: TrainingHyperParams::default(),
+            residual_neg_bank: ResidualNegBank::default(),
         }
     }
 
@@ -583,8 +666,14 @@ impl LLM {
     /// Set TRM layers to training mode for full supervision steps
     pub fn set_trm_training_mode(&mut self) {
         for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer {
-                lrm.set_training_mode(true);
+            match layer {
+                LayerEnum::LRM(lrm) => {
+                    lrm.set_training_mode(true);
+                }
+                LayerEnum::TransformerBlock(block) => {
+                    block.set_training_mode(true);
+                }
+                _ => {}
             }
         }
     }
@@ -639,6 +728,12 @@ impl LLM {
         }
 
         let input_len = tokenized.len();
+
+        // Pre-allocate to avoid repeated growth reallocations during generation.
+        output_tokens.reserve(MAX_SEQ_LEN.saturating_sub(input_len));
+
+        // Hoist EOS lookup out of the loop.
+        let eos_token = self.vocab.encode("</s>");
 
         // Prevent overflow if input_len >= MAX_SEQ_LEN
         if input_len >= MAX_SEQ_LEN {
@@ -730,12 +825,10 @@ impl LLM {
             output_tokens.push(next_token);
             tokenized.push(next_token);
 
-            if self
-                .vocab
-                .encode("</s>")
-                .is_some_and(|eos| next_token == eos)
-            {
-                break;
+            if let Some(eos) = eos_token {
+                if next_token == eos {
+                    break;
+                }
             }
         }
 
@@ -1750,6 +1843,71 @@ impl LLM {
             batch_loss += loss_norm;
             batch_base_loss += loss_norm;
 
+            // Auxiliary: residual decorrelation (redundancy reduction) on the pre-logit hidden state.
+            let mut decor_grad_opt: Option<Array2<f32>> = None;
+            let base_w = self.training_hparams.residual_decorrelation_weight;
+            if base_w > 0.0 {
+                let difficulty = if self.training_hparams.residual_decorrelation_adaptive {
+                    (loss_norm / (loss_norm + 1.0)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let w = base_w * (1.0 + difficulty);
+                let decor_loss = crate::loss::residual_decorrelation_loss(&hidden.view());
+                batch_loss += w * decor_loss;
+                let decor_grad = crate::loss::residual_decorrelation_gradients(&hidden.view());
+                decor_grad_opt = Some(decor_grad.mapv(|x| x * w));
+            }
+
+            // Auxiliary: hard-negative residual repulsion (pooled hidden vs memory bank).
+            let mut hardneg_grad_opt: Option<Array2<f32>> = None;
+            let base_hn_w = self.training_hparams.residual_hardneg_weight;
+            if base_hn_w > 0.0 {
+                let difficulty = if self.training_hparams.residual_hardneg_adaptive {
+                    (loss_norm / (loss_norm + 1.0)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let w = base_hn_w * (1.0 + difficulty);
+
+                // Mean-pool across tokens.
+                let rows = hidden.nrows().max(1);
+                let cols = hidden.ncols();
+                let mut anchor = vec![0.0f32; cols];
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let v = hidden[[i, j]];
+                        anchor[j] += if v.is_finite() { v } else { 0.0 };
+                    }
+                }
+                let inv = 1.0f32 / (rows as f32);
+                for a in &mut anchor {
+                    *a *= inv;
+                }
+
+                let (hn_loss, grad_anchor) = crate::loss::hard_negative_repulsion_loss_and_grad(
+                    &anchor,
+                    self.residual_neg_bank.as_slice(),
+                    self.training_hparams.residual_hardneg_k,
+                    self.training_hparams.residual_hardneg_margin,
+                    self.training_hparams.residual_hardneg_temperature,
+                );
+                batch_loss += w * hn_loss;
+
+                // Distribute pooled gradient equally back to each token row.
+                let mut g = Array2::<f32>::zeros(hidden.raw_dim());
+                for i in 0..rows {
+                    for j in 0..cols {
+                        g[[i, j]] = (grad_anchor[j] * w) * inv;
+                    }
+                }
+                hardneg_grad_opt = Some(g);
+
+                // Update memory bank with current anchor (detached).
+                self.residual_neg_bank
+                    .push(anchor, self.training_hparams.residual_hardneg_bank_size);
+            }
+
             let target_avg = match &self.network[t_idx] {
                 LayerEnum::LRM(l) => l.attention().moh_num_active() as f32,
                 _ => 0.0,
@@ -1811,6 +1969,14 @@ impl LLM {
             } else {
                 (grads_logits.clone(), Vec::new())
             };
+
+            if let Some(decor_grad) = decor_grad_opt {
+                grad_hidden = grad_hidden + decor_grad;
+            }
+
+            if let Some(hn_grad) = hardneg_grad_opt {
+                grad_hidden = grad_hidden + hn_grad;
+            }
             if let Some(opidx) = out_proj_idx {
                 Self::accumulate_layer_gradients(
                     &mut accumulated_param_grads[opidx],
@@ -1901,6 +2067,14 @@ impl LLM {
             layer_grad_norms.push(0.0);
         }
 
+        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden state).
+        let mut out_proj_idx: Option<usize> = None;
+        for (i, layer) in self.network.iter().enumerate() {
+            if matches!(layer, LayerEnum::OutputProjection(_)) {
+                out_proj_idx = Some(i);
+            }
+        }
+
         // Process each sequence in the batch
         for training_row in batch {
             if training_row.len() < 2 {
@@ -1969,6 +2143,84 @@ impl LLM {
             let sce_norm = sce / (target_ids.len().max(1) as f32);
             batch_loss += sce_norm;
             batch_base_loss += sce_norm;
+
+            // Auxiliary residual decorrelation (redundancy reduction) on the pre-logit hidden state.
+            let decor_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx {
+                let base_w = self.training_hparams.residual_decorrelation_weight;
+                if base_w > 0.0 {
+                    let difficulty = if self.training_hparams.residual_decorrelation_adaptive {
+                        (sce_norm / (sce_norm + 1.0)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let w = base_w * (1.0 + difficulty);
+                    let hidden_prelogit = &layer_inputs[op_idx];
+                    let dl = crate::loss::residual_decorrelation_loss(&hidden_prelogit.view());
+                    batch_loss += w * dl;
+                    let dg = crate::loss::residual_decorrelation_gradients(&hidden_prelogit.view());
+                    Some((op_idx, dg.mapv(|x| x * w)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Auxiliary hard-negative repulsion on pooled pre-logit hidden state.
+            let hardneg_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx {
+                let base_w = self.training_hparams.residual_hardneg_weight;
+                if base_w > 0.0 {
+                    let difficulty = if self.training_hparams.residual_hardneg_adaptive {
+                        (sce_norm / (sce_norm + 1.0)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let w = base_w * (1.0 + difficulty);
+                    let hidden_prelogit = &layer_inputs[op_idx];
+                    let rows = hidden_prelogit.nrows().max(1);
+                    let cols = hidden_prelogit.ncols();
+
+                    // Mean-pool.
+                    let mut anchor = vec![0.0f32; cols];
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            let v = hidden_prelogit[[i, j]];
+                            anchor[j] += if v.is_finite() { v } else { 0.0 };
+                        }
+                    }
+                    let inv = 1.0f32 / (rows as f32);
+                    for a in &mut anchor {
+                        *a *= inv;
+                    }
+
+                    let (hn_loss, grad_anchor) = crate::loss::hard_negative_repulsion_loss_and_grad(
+                        &anchor,
+                        self.residual_neg_bank.as_slice(),
+                        self.training_hparams.residual_hardneg_k,
+                        self.training_hparams.residual_hardneg_margin,
+                        self.training_hparams.residual_hardneg_temperature,
+                    );
+                    batch_loss += w * hn_loss;
+
+                    // Spread pooled grad across tokens.
+                    let mut g = Array2::<f32>::zeros(hidden_prelogit.raw_dim());
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            g[[i, j]] = (grad_anchor[j] * w) * inv;
+                        }
+                    }
+
+                    // Update memory bank.
+                    self.residual_neg_bank
+                        .push(anchor, self.training_hparams.residual_hardneg_bank_size);
+
+                    Some((op_idx, g))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             // Compute gradients w.r.t. logits
             let mut grads_output = crate::loss::symmetric_cross_entropy_gradients(
@@ -2200,6 +2452,19 @@ impl LLM {
                 layer_grad_norms[layer_idx] += layer_grad_norm;
 
                 grads_output = input_grads;
+
+                if let Some((op_idx, ref decor_grad)) = decor_grad_opt {
+                    if layer_idx == op_idx {
+                        // grads_output is now dL/d(hidden_prelogit).
+                        grads_output = grads_output + decor_grad.clone();
+                    }
+                }
+
+                if let Some((op_idx, ref hn_grad)) = hardneg_grad_opt {
+                    if layer_idx == op_idx {
+                        grads_output = grads_output + hn_grad.clone();
+                    }
+                }
 
                 if accumulated_param_grads[layer_idx].is_empty() {
                     accumulated_param_grads[layer_idx] = param_grads;
@@ -3077,6 +3342,70 @@ impl LLM {
                         1e-4,
                     );
 
+                    // Auxiliary: residual decorrelation on pre-logit hidden.
+                    let mut decor_term: f32 = 0.0;
+                    let mut decor_grad_opt: Option<Array2<f32>> = None;
+                    let base_w = self.training_hparams.residual_decorrelation_weight;
+                    if base_w > 0.0 {
+                        let difficulty = if self.training_hparams.residual_decorrelation_adaptive {
+                            (sce / (sce + 1.0)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let w = base_w * (1.0 + difficulty);
+                        let dl = crate::loss::residual_decorrelation_loss(&hidden.view());
+                        decor_term = w * dl;
+                        let dg = crate::loss::residual_decorrelation_gradients(&hidden.view());
+                        decor_grad_opt = Some(dg.mapv(|x| x * w));
+                    }
+
+                    // Auxiliary: hard-negative repulsion on pooled pre-logit hidden.
+                    let mut hardneg_term: f32 = 0.0;
+                    let mut hardneg_grad_opt: Option<Array2<f32>> = None;
+                    let base_hn_w = self.training_hparams.residual_hardneg_weight;
+                    if base_hn_w > 0.0 {
+                        let difficulty = if self.training_hparams.residual_hardneg_adaptive {
+                            (sce / (sce + 1.0)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let w = base_hn_w * (1.0 + difficulty);
+
+                        let rows = hidden.nrows().max(1);
+                        let cols = hidden.ncols();
+                        let mut anchor = vec![0.0f32; cols];
+                        for i in 0..rows {
+                            for j in 0..cols {
+                                let v = hidden[[i, j]];
+                                anchor[j] += if v.is_finite() { v } else { 0.0 };
+                            }
+                        }
+                        let inv = 1.0f32 / (rows as f32);
+                        for a in &mut anchor {
+                            *a *= inv;
+                        }
+
+                        let (hn_loss, grad_anchor) = crate::loss::hard_negative_repulsion_loss_and_grad(
+                            &anchor,
+                            self.residual_neg_bank.as_slice(),
+                            self.training_hparams.residual_hardneg_k,
+                            self.training_hparams.residual_hardneg_margin,
+                            self.training_hparams.residual_hardneg_temperature,
+                        );
+                        hardneg_term = w * hn_loss;
+
+                        let mut g = Array2::<f32>::zeros(hidden.raw_dim());
+                        for i in 0..rows {
+                            for j in 0..cols {
+                                g[[i, j]] = (grad_anchor[j] * w) * inv;
+                            }
+                        }
+                        hardneg_grad_opt = Some(g);
+
+                        self.residual_neg_bank
+                            .push(anchor, self.training_hparams.residual_hardneg_bank_size);
+                    }
+
                     let (denoise_target, w_mse_raw) = if discrete_used {
                         (None, 1.0f32)
                     } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
@@ -3124,6 +3453,14 @@ impl LLM {
                     } else {
                         (grads_logits.clone(), Vec::new())
                     };
+
+                    if let Some(dg) = decor_grad_opt {
+                        grad_hidden = grad_hidden + dg;
+                    }
+
+                    if let Some(dg) = hardneg_grad_opt {
+                        grad_hidden = grad_hidden + dg;
+                    }
                     if let Some(opidx) = out_proj_idx {
                         if !op_param_grads.is_empty() {
                             if let Some(slot) = &mut grads_per_layer[opidx] {
@@ -3262,7 +3599,7 @@ impl LLM {
                         sce
                     } else {
                         lambda_ce * sce + (lambda_eps * w_mse) * mse
-                    };
+                    } + decor_term + hardneg_term;
                     total_loss += loss;
                     total_ce += sce;
                     count += 1;

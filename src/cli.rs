@@ -120,9 +120,121 @@ pub struct Args {
     #[arg(long)]
     pub moe: bool,
 
+    /// Enable/disable learned router temperature for MoE (log-space parameterization).
+    ///
+    /// If not set, defaults to enabled when MoE is enabled.
+    #[arg(long)]
+    pub moe_learned_temperature: Option<bool>,
+
+    /// Initial router log-temperature for MoE (temperature = exp(logT)).
+    ///
+    /// If not set, defaults to 0.0 (T=1).
+    #[arg(long)]
+    pub moe_router_log_temperature_init: Option<f32>,
+
+    /// Learning-rate multiplier for MoE router log-temperature updates.
+    ///
+    /// If not set, defaults to a small multiplier (e.g. 0.05).
+    #[arg(long)]
+    pub moe_router_temperature_lr_mult: Option<f32>,
+
+    /// Enable/disable MoH head-conditioned router temperature (logT_eff = logT + head_scale * h).
+    ///
+    /// If not set, defaults to enabled.
+    #[arg(long)]
+    pub moe_head_conditioned_temperature: Option<bool>,
+
+    /// Initial scale for head-conditioned log-temperature.
+    ///
+    /// If not set, defaults to 0.0.
+    #[arg(long)]
+    pub moe_router_log_temperature_head_scale_init: Option<f32>,
+
+    /// Learning-rate multiplier for head-conditioned log-temperature scale.
+    ///
+    /// If not set, defaults to 0.05.
+    #[arg(long)]
+    pub moe_router_temperature_head_lr_mult: Option<f32>,
+
+    /// Enable/disable MoE router exploration noise injection during training.
+    ///
+    /// If not set, defaults to enabled.
+    #[arg(long)]
+    pub moe_router_use_noise: Option<bool>,
+
+    /// Initial log-standard-deviation for MoE router exploration noise.
+    ///
+    /// If not set, defaults to -2.0 (σ ≈ 0.135).
+    #[arg(long)]
+    pub moe_router_log_noise_std_init: Option<f32>,
+
+    /// Learning-rate multiplier for MoE router noise log-std updates.
+    ///
+    /// If not set, defaults to 0.05.
+    #[arg(long)]
+    pub moe_router_noise_lr_mult: Option<f32>,
+
+    /// Enable/disable MoH head-conditioned router noise scale.
+    ///
+    /// If not set, defaults to enabled.
+    #[arg(long)]
+    pub moe_head_conditioned_noise: Option<bool>,
+
+    /// Initial scale for head-conditioned router noise.
+    ///
+    /// If not set, defaults to 0.0.
+    #[arg(long)]
+    pub moe_router_log_noise_head_scale_init: Option<f32>,
+
+    /// Learning-rate multiplier for head-conditioned router noise scale.
+    ///
+    /// If not set, defaults to 0.05.
+    #[arg(long)]
+    pub moe_router_noise_head_lr_mult: Option<f32>,
+
     /// Temporal mixing mechanism (attention vs SSM-style RG-LRU)
     #[arg(long, value_enum, default_value_t = TemporalMixingCli::Attention)]
     pub temporal_mixing: TemporalMixingCli,
+
+    /// Auxiliary residual decorrelation weight (VICReg/Barlow-Twins style redundancy reduction).
+    ///
+    /// When > 0, adds a loss term that penalizes off-diagonal covariance of the residual stream
+    /// right before the OutputProjection, encouraging features to be distinct ("what it is") and
+    /// less confusable ("what it is not").
+    #[arg(long, default_value_t = 0.01)]
+    pub residual_decorrelation_weight: f32,
+
+    /// If set, scales residual decorrelation strength up on harder examples (higher CE/SCE).
+    #[arg(long, default_value_t = true)]
+    pub residual_decorrelation_adaptive: bool,
+
+    /// Auxiliary hard-negative residual repulsion weight (cosine-based, memory-bank hard negatives).
+    ///
+    /// When > 0, penalizes residual representations that are too similar to recent representations
+    /// from other examples, using hard-negative top-k mining. This explicitly teaches “what it is
+    /// not” by pushing away confusable states.
+    #[arg(long, default_value_t = 0.005)]
+    pub residual_hardneg_weight: f32,
+
+    /// If set, scales hard-negative repulsion up on harder examples (higher CE/SCE).
+    #[arg(long, default_value_t = true)]
+    pub residual_hardneg_adaptive: bool,
+
+    /// Number of hard negatives (top-k by cosine similarity) to use from the memory bank.
+    #[arg(long, default_value_t = 8)]
+    pub residual_hardneg_k: usize,
+
+    /// Cosine similarity margin; similarities above this are penalized.
+    #[arg(long, default_value_t = 0.2)]
+    pub residual_hardneg_margin: f32,
+
+    /// Temperature for the softplus penalty on (sim - margin).
+    #[arg(long, default_value_t = 0.07)]
+    pub residual_hardneg_temperature: f32,
+
+    /// Maximum number of pooled residual vectors stored in the hard-negative memory bank.
+    #[arg(long, default_value_t = 512)]
+    pub residual_hardneg_bank_size: usize,
 }
 
 /// CLI representation of temporal mixing types

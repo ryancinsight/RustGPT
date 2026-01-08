@@ -1230,6 +1230,15 @@ impl MixtureOfExperts {
         }
     }
 
+    /// Set training mode for the MoE layer.
+    ///
+    /// Some layers toggle dropout/regularization behavior between train/eval.
+    /// MoE currently has no explicit train/eval-only behavior, so this is a no-op
+    /// kept for API compatibility with other modules.
+    pub fn set_training_mode(&mut self, _training: bool) {
+        // Intentionally no-op.
+    }
+
     /// Forward pass: predict routing → all experts process → weighted sum
     pub fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
         self.forward_with_head_activity(input, None)

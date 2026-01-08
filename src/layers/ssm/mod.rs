@@ -13,8 +13,8 @@
 //!
 //! ## Usage Example
 //! ```rust
-//! use llm::layers::ssm::components::*;
-//! use llm::richards::Variant;
+//! use llm::layers::ssm::{SelectiveScanner, SsmRichardsActivation, StateManager};
+//! use ndarray::Array2;
 //!
 //! // Create a state manager with memory limits
 //! let mut state_manager = StateManager::new(512, 1024 * 1024); // 1MB limit
@@ -26,7 +26,7 @@
 //! let activation = SsmRichardsActivation::sigmoid(true, true); // Learnable Swish-like
 //!
 //! // Use in your SSM implementation
-//! let input = ndarray::Array2::zeros((64, 512));
+//! let input = Array2::zeros((64, 512));
 //! let cache = state_manager.cache(&input);
 //! let output = activation.forward(&input);
 //! ```

@@ -11,9 +11,12 @@ use crate::{
     adam::Adam,
     attention::poly_attention::PolyAttention,
     errors::Result,
-    layers::components::common::{
-        CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
-        apply_adaptive_gradients,
+    layers::components::{
+        adaptive_residuals::AdaptiveResiduals,
+        common::{
+            CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
+            apply_adaptive_gradients,
+        },
     },
     mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
     model_config::{ModelConfig, TemporalMixingType, WindowAdaptationStrategy},
@@ -42,8 +45,10 @@ pub type CachedIntermediates = (
     Arc<Array2<f32>>, // input_original - Arc for zero-copy sharing
     Arc<Array2<f32>>, // input_used - Arc for zero-copy sharing
     Arc<Array2<f32>>, // norm1_out
+    Arc<Array2<f32>>, // mix_out
     Arc<Array2<f32>>, // residual1
     Arc<Array2<f32>>, // norm2_out
+    Arc<Array2<f32>>, // ffn_out
 );
 
 /// A complete transformer block containing attention and feedforward components
@@ -106,6 +111,11 @@ pub struct TransformerBlock {
     /// EMA update rate for the activation similarity matrix.
     #[serde(skip_serializing, skip_deserializing)]
     similarity_update_rate: f32,
+
+    /// Adaptive residuals component for similarity-based residual connections
+    #[serde(skip_serializing, skip_deserializing)]
+    adaptive_residuals: Option<AdaptiveResiduals>,
+
 }
 
 // Custom deserialization to ensure runtime-only buffers/optimizers are initialized with
@@ -190,6 +200,8 @@ impl<'de> Deserialize<'de> for TransformerBlock {
         let mut similarity_context_strength = Array2::zeros((1, 1));
         similarity_context_strength[[0, 0]] = if scalar.is_finite() { scalar } else { 0.0 };
 
+        let use_advanced_adaptive_residuals = config.use_advanced_adaptive_residuals;
+
         Ok(Self {
             pre_attention_norm,
             temporal_mixing,
@@ -204,6 +216,11 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             similarity_context_strength,
             opt_similarity_context_strength: Adam::new((1, 1)),
             similarity_update_rate: 0.01,
+            adaptive_residuals: if use_advanced_adaptive_residuals {
+                Some(AdaptiveResiduals::new_minimal(embed_dim))
+            } else {
+                None
+            },
         })
     }
 }
@@ -215,6 +232,7 @@ struct ParamPartitions {
     pre_ffn_norm: usize,
     pre_attn_norm: usize,
     similarity_context_strength: usize,
+    adaptive_residuals: usize,
 }
 
 /// Configuration for a transformer block
@@ -338,6 +356,8 @@ impl TransformerBlock {
         let common_config = CommonLayerConfig::from(&config);
         let layers = CommonLayers::new(&common_config);
 
+        let use_advanced_adaptive_residuals = config.use_advanced_adaptive_residuals;
+
         // Fully adaptive: this starts at 0 and is learned.
         let similarity_context_strength = Array2::zeros((1, 1));
         let opt_similarity_context_strength = Adam::new((1, 1));
@@ -357,6 +377,11 @@ impl TransformerBlock {
             similarity_context_strength,
             opt_similarity_context_strength,
             similarity_update_rate: 0.01,
+            adaptive_residuals: if use_advanced_adaptive_residuals {
+                Some(AdaptiveResiduals::new_minimal(embed_dim))
+            } else {
+                None
+            },
         }
     }
 
@@ -383,6 +408,12 @@ impl TransformerBlock {
             }
         } else {
             self.incoming_similarity_context = None;
+        }
+    }
+
+    pub fn set_training_mode(&mut self, is_training: bool) {
+        if let FeedForwardVariant::MixtureOfExperts(ref mut moe) = self.feedforward {
+            moe.set_training_mode(is_training);
         }
     }
 
@@ -517,24 +548,32 @@ impl TransformerBlock {
 
     /// Get the total number of parameters in this transformer block
     pub fn parameter_count(&self) -> usize {
-        self.pre_attention_norm.parameters()
+        let mut count = self.pre_attention_norm.parameters()
             + self.temporal_mixing.parameters()
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
-            + 1 // similarity_context_strength (scalar)
+            + 1; // similarity_context_strength (scalar)
+
+        if let Some(ref residuals) = self.adaptive_residuals {
+            count += residuals.parameter_count();
+        }
+
+        count
     }
 
     /// Get the weight norm (Frobenius norm) for LARS adaptive learning rates
     pub fn weight_norm(&self) -> f32 {
-        let s = self.similarity_context_strength[[0, 0]];
-        let s2 = if s.is_finite() { s * s } else { 0.0 };
-
-        (self.pre_attention_norm.weight_norm().powi(2)
+        let mut sum_sq = self.pre_attention_norm.weight_norm().powi(2)
             + self.temporal_mixing.weight_norm().powi(2)
             + self.pre_ffn_norm.weight_norm().powi(2)
             + self.feedforward.weight_norm().powi(2)
-            + s2)
-            .sqrt()
+            + self.similarity_context_strength[[0, 0]].powi(2);
+
+        if let Some(ref residuals) = self.adaptive_residuals {
+            sum_sq += residuals.weight_norm().powi(2);
+        }
+
+        sum_sq.sqrt()
     }
 }
 
@@ -545,6 +584,7 @@ impl ParamPartitions {
             + self.pre_ffn_norm
             + self.pre_attn_norm
             + self.similarity_context_strength
+            + self.adaptive_residuals
     }
 }
 
@@ -657,25 +697,38 @@ impl Layer for TransformerBlock {
             _ => 1.0,
         };
 
+        // Own the head-activity vector so we don't hold an immutable borrow of
+        // self.temporal_mixing across calls that need &mut self.
+        let head_activity_vec_owned: Option<Vec<f32>> = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.clone(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.clone(),
+            _ => None,
+        };
+        let head_activity_vec = head_activity_vec_owned.as_deref();
+
         // Update per-layer similarity representation matrix (input→mix-output channel similarity).
         self.update_activation_similarity_matrix(input_used_arc.as_ref(), &mix_out);
 
-        // In-place residual connection: take ownership and add in-place
-        // This avoids allocating a new array for residual1
-        let mut residual1 = mix_out;
-        residual1 += input_used_arc.as_ref(); // ndarray supports += for in-place addition
+        // In-place residual connection: use adaptive residuals if available
+        let residual1 = if let Some(ref mut residuals) = self.adaptive_residuals {
+            residuals.apply_attention_residual_with_moh(
+                input_used_arc.as_ref(),
+                &mix_out,
+                Some(head_activity_ratio),
+                head_activity_vec,
+            )
+        } else {
+            // Fallback to simple residual addition
+            let mut residual1 = mix_out.clone();
+            residual1 += input_used_arc.as_ref();
+            residual1
+        };
 
         // Pre-feedforward normalization
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
 
-        let head_activity_vec = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
-            _ => None,
-        };
-
         // Feedforward with residual connection
-        let ffn_out = match &mut self.feedforward {
+        let mut ffn_out = match &mut self.feedforward {
             FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_out),
             FeedForwardVariant::MixtureOfExperts(layer) => layer.forward_with_head_features(
                 &norm2_out,
@@ -684,17 +737,22 @@ impl Layer for TransformerBlock {
             ),
         };
 
+        // Cache FFN output *before* the residual addition.
+        let ffn_out_arc = Arc::new(ffn_out.clone());
+
         // In-place final residual: reuse ffn_out allocation
-        let mut output = ffn_out;
-        output += &residual1;
+        ffn_out += &residual1;
+        let output = ffn_out;
 
         // Cache intermediates with Arc for zero-copy backward pass access
         *self.cached_intermediates.write().unwrap() = Some((
             input_original_arc,
             input_used_arc,
             Arc::new(norm1_out),
+            Arc::new(mix_out),
             Arc::new(residual1),
             Arc::new(norm2_out),
+            ffn_out_arc,
         ));
 
         output
@@ -728,14 +786,16 @@ impl Layer for TransformerBlock {
         // Access cached intermediates without cloning the entire tuple.
         // The Arc<Array2> for input enables zero-copy access.
         let guard = self.cached_intermediates.read().unwrap();
-        if let Some((input_original_arc, input_used_arc, norm1_out_arc, residual1_arc, norm2_out_arc)) =
+        if let Some((input_original_arc, input_used_arc, norm1_out_arc, mix_out_arc, residual1_arc, norm2_out_arc, ffn_out_arc)) =
             guard.as_ref()
         {
             let input_original: &Array2<f32> = input_original_arc.as_ref();
             let input_used: &Array2<f32> = input_used_arc.as_ref();
             let norm1_out: &Array2<f32> = norm1_out_arc.as_ref();
+            let mix_out: &Array2<f32> = mix_out_arc.as_ref();
             let residual1: &Array2<f32> = residual1_arc.as_ref();
             let norm2_out: &Array2<f32> = norm2_out_arc.as_ref();
+            let ffn_out: &Array2<f32> = ffn_out_arc.as_ref();
 
             // Compute gradients through the transformer block layers
 
@@ -784,9 +844,9 @@ impl Layer for TransformerBlock {
                     let d = (self.config.embed_dim.max(1)) as f32;
                     let mixed = input_original.dot(ctx);
                     let mut acc = 0.0f64;
-                    for (g, m) in final_input_used_grads.iter().zip(mixed.iter()) {
-                        let gs = if g.is_finite() { *g as f64 } else { 0.0 };
-                        let ms = if m.is_finite() { *m as f64 } else { 0.0 };
+                    for (&g, &m) in final_input_used_grads.iter().zip(mixed.iter()) {
+                        let gs: f64 = if g.is_finite() { g as f64 } else { 0.0 };
+                        let ms: f64 = if m.is_finite() { m as f64 } else { 0.0 };
                         acc += gs * ms;
                     }
                     similarity_strength_grad[[0, 0]] = (acc as f32) / d;
@@ -813,12 +873,27 @@ impl Layer for TransformerBlock {
             }
 
             // Capture gradient partition sizes so apply_gradients can re-slice accurately later
+            // Compute adaptive-residual gradients first, but append them *last* so the
+            // gradient ordering matches apply_gradients().
+            let adaptive_param_grads = if let Some(residuals) = self.adaptive_residuals.as_ref() {
+                residuals.compute_gradients(
+                    input_used,
+                    mix_out,
+                    ffn_out,
+                    output_grads,
+                )
+            } else {
+                Vec::new()
+            };
+            let adaptive_grad_count = adaptive_param_grads.len();
+
             let partitions = ParamPartitions {
                 temporal_mixing: mix_param_grads.len(),
                 feedforward: ffn_param_grads.len(),
                 pre_ffn_norm: pre_ffn_param_grads.len(),
                 pre_attn_norm: pre_attn_param_grads.len(),
                 similarity_context_strength: 1,
+                adaptive_residuals: adaptive_grad_count,
             };
             // Release read lock before acquiring write lock
             drop(guard);
@@ -833,6 +908,7 @@ impl Layer for TransformerBlock {
             all_param_grads.extend(pre_ffn_param_grads);
             all_param_grads.extend(pre_attn_param_grads);
             all_param_grads.push(similarity_strength_grad);
+            all_param_grads.extend(adaptive_param_grads);
 
             (final_input_grads, all_param_grads)
         } else {
@@ -982,6 +1058,19 @@ impl Layer for TransformerBlock {
                     g.as_ref(),
                     lr,
                 );
+            }
+        }
+
+        // Apply adaptive residuals gradients
+        let adaptive_range = next_range(partitions.adaptive_residuals);
+        let adaptive_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[adaptive_range.clone()].to_vec();
+        if !adaptive_grads.is_empty() && self.adaptive_residuals.is_some() {
+            let owned_grads: Vec<Array2<f32>> = adaptive_grads
+                .iter()
+                .map(|c| c.as_ref().clone())
+                .collect();
+            if let Some(ref mut residuals) = self.adaptive_residuals {
+                residuals.apply_gradients(&owned_grads, lr)?;
             }
         }
 
@@ -1241,30 +1330,14 @@ mod tests {
 
         // Check parameter counts
         let param_count = residuals.parameter_count();
-        let expected = (embed_dim * embed_dim)
-            + embed_dim
-            + (embed_dim * 3 * embed_dim)
-            + (embed_dim * embed_dim)
-            + embed_dim
-            + embed_dim
-            + (embed_dim * 3 * embed_dim)
-            + 2048 * embed_dim
-            + (embed_dim * embed_dim);
+        let expected = (2 * embed_dim) as usize;
         assert_eq!(param_count, expected);
 
         // Check dimensions
+        assert_eq!(residuals.activation_similarity_diag.shape(), [embed_dim, 1]);
         assert_eq!(
-            residuals.weight_similarity_matrix.shape(),
-            [embed_dim, embed_dim]
-        );
-        assert_eq!(residuals.layer_affinity_scores.shape(), [embed_dim, 1]);
-        assert_eq!(
-            residuals.positional_residual_qkv.shape(),
-            [embed_dim, embed_dim * 3]
-        );
-        assert_eq!(
-            residuals.activation_similarity_matrix.shape(),
-            [embed_dim, embed_dim]
+            residuals.activation_similarity_off_abs_mean.shape(),
+            [embed_dim, 1]
         );
         assert_eq!(residuals.attention_residual_scales.shape(), [embed_dim, 1]);
         assert_eq!(residuals.ffn_residual_scales.shape(), [embed_dim, 1]);
@@ -1349,8 +1422,8 @@ mod tests {
 
         let param_grads = residuals.compute_gradients(&input, &attn_out, &ffn_out, &residual_grads);
 
-        // Unified adaptive residuals include Theorem 4 extension gradients.
-        assert_eq!(param_grads.len(), 9);
+        // Parameter-efficient adaptive residuals only learn per-channel scales.
+        assert_eq!(param_grads.len(), 2);
 
         // All gradients should be finite and non-zero for this test
         for grad in param_grads.iter() {
@@ -1368,15 +1441,8 @@ mod tests {
 
         // Create dummy gradients
         let param_grads = vec![
-            Array2::from_elem((embed_dim, embed_dim), 0.01),
-            Array2::from_elem((embed_dim, 1), 0.01),
-            Array2::from_elem((embed_dim, embed_dim * 3), 0.01),
-            Array2::from_elem((embed_dim, embed_dim), 0.01),
             Array2::from_elem((embed_dim, 1), 0.01),
             Array2::from_elem((embed_dim, 1), 0.01),
-            Array2::from_elem((embed_dim, embed_dim * 3), 0.01),
-            Array2::from_elem((2048, embed_dim), 0.01),
-            Array2::from_elem((embed_dim, embed_dim), 0.01),
         ];
 
         let lr = 0.001;
@@ -1396,7 +1462,7 @@ mod tests {
     fn test_performance_metrics() {
         let embed_dim = 16;
 
-        let residuals = AdaptiveResiduals::new_minimal(embed_dim);
+        let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
         let (affinity_entropy, similarity_std, scale_stability) =
             residuals.get_performance_metrics();
 
@@ -1814,8 +1880,8 @@ impl ModularTransformerBlock {
             &mix_out
         );
 
-        // In-place residual connection
-        let mut residual1 = mix_out;
+        // In-place residual connection (keep mix_out for caching)
+        let mut residual1 = mix_out.clone();
         residual1 += input_used_arc.as_ref();
 
         // Pre-feedforward normalization using modular component
@@ -1826,23 +1892,28 @@ impl ModularTransformerBlock {
         let head_activity_vec = self.temporal_mixing.get_head_activity_vec();
 
         // Feedforward processing using modular component
-        let ffn_out = self.feedforward.forward(
+        let mut ffn_out = self.feedforward.forward(
             &norm2_out,
             head_activity_ratio,
             head_activity_vec
         );
 
+        // Cache FFN output *before* the residual addition.
+        let ffn_out_arc = Arc::new(ffn_out.clone());
+
         // In-place final residual
-        let mut output = ffn_out;
-        output += &residual1;
+        ffn_out += &residual1;
+        let output = ffn_out;
 
         // Cache intermediates with Arc for zero-copy backward pass access
         *self.cached_intermediates.write().unwrap() = Some((
             input_original_arc,
             input_used_arc,
             Arc::new(norm1_out),
+            Arc::new(mix_out),
             Arc::new(residual1),
             Arc::new(norm2_out),
+            ffn_out_arc,
         ));
 
         output
