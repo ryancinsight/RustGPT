@@ -136,8 +136,8 @@ pub fn residual_decorrelation_loss(features: &ArrayView2<f32>) -> f32 {
             mean[j] += if v.is_finite() { v as f64 } else { 0.0 };
         }
     }
-    for j in 0..d {
-        mean[j] /= n as f64;
+    for m in mean.iter_mut().take(d) {
+        *m /= n as f64;
     }
 
     // Covariance: C = X^T X / n, where X is centered.
@@ -189,8 +189,8 @@ pub fn residual_decorrelation_gradients(features: &ArrayView2<f32>) -> Array2<f3
             mean[j] += if v.is_finite() { v as f64 } else { 0.0 };
         }
     }
-    for j in 0..d {
-        mean[j] /= n as f64;
+    for m in mean.iter_mut().take(d) {
+        *m /= n as f64;
     }
 
     // Centered X (as f64 for stability).
@@ -247,8 +247,8 @@ pub fn residual_decorrelation_gradients(features: &ArrayView2<f32>) -> Array2<f3
             dx_mean[j] += dx[t * d + j];
         }
     }
-    for j in 0..d {
-        dx_mean[j] /= n as f64;
+    for m in dx_mean.iter_mut().take(d) {
+        *m /= n as f64;
     }
     for t in 0..n {
         for j in 0..d {
@@ -487,7 +487,7 @@ pub fn symmetric_cross_entropy_gradients(
 
     // Combine and normalize
     for (g, &gc) in grad.iter_mut().zip(ce_grad.iter()) {
-        *g = alpha * gc + *g;
+        *g += alpha * gc;
     }
     grad
 }
@@ -633,7 +633,14 @@ mod tests {
 
                 let fd = (l_pos - l_neg) / (2.0 * h);
                 let gk = grad[[i, k]];
-                assert!((fd - gk).abs() < 5e-3, "fd {} vs grad {} at ({},{})", fd, gk, i, k);
+                assert!(
+                    (fd - gk).abs() < 5e-3,
+                    "fd {} vs grad {} at ({},{})",
+                    fd,
+                    gk,
+                    i,
+                    k
+                );
             }
         }
     }

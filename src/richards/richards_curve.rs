@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::adam::Adam;
 
-
 // Shared internal numerics for the richards module.
 // Kept non-public to prevent namespace bleeding into the rest of the codebase.
 
@@ -485,10 +484,9 @@ impl<V: VariantMarkerF32> RichardsKernelF32<V> {
 /// - **Memory efficiency** through in-place gradient computation
 /// - **Serialization support** for model persistence
 /// - **Zero-allocation iterators** for parameter access
-/// - **Momentum-based optimization** with Adam algorithm
-
-/// Unified Richards curve with variant-based initialization and full parameter learning
-/// Extended with beta parameter for asymmetric control and temperature for sharpness
+/// - **Momentum-based optimization** with Adam algorithm Unified Richards curve with variant-based
+///   initialization and full parameter learning Extended with beta parameter for asymmetric control
+///   and temperature for sharpness
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RichardsCurve {
     // Core Richards parameter values (Some for fixed, None for learnable)
@@ -668,7 +666,9 @@ impl RichardsCurve {
     #[inline]
     pub fn eval_scalar(&self, x: f64) -> (f64, f64) {
         match self.variant {
-            crate::richards::Variant::Tanh => RichardsKernel::<TanhLike>::from_curve(self).eval_one_f64(x),
+            crate::richards::Variant::Tanh => {
+                RichardsKernel::<TanhLike>::from_curve(self).eval_one_f64(x)
+            }
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).eval_one_f64(x),
         }
     }
@@ -745,12 +745,16 @@ impl RichardsCurve {
         // Set output_gain/output_bias coefficients based on variant (Some for fixed, None for
         // learnable)
         let (output_gain_val, output_bias_val) = match variant {
-            crate::richards::Variant::Sigmoid | crate::richards::Variant::Gompertz => (Some(1.0), Some(0.0)), /* [0, 1] range, fixed */
-            crate::richards::Variant::Tanh => (Some(1.0), Some(0.0)), // [-1, 1] via 2σ(2x) - 1 transform,
+            crate::richards::Variant::Sigmoid | crate::richards::Variant::Gompertz => {
+                (Some(1.0), Some(0.0))
+            } // [0, 1] range, fixed
+            crate::richards::Variant::Tanh => (Some(1.0), Some(0.0)), /* [-1, 1] via 2σ(2x) - 1
+                                                                        * transform, */
             // fixed
-            crate::richards::Variant::Adaptive | crate::richards::Variant::None | crate::richards::Variant::Polynomial => {
-                (None, None)
-            } // Fully learnable including output_gain/output_bias
+            crate::richards::Variant::Adaptive
+            | crate::richards::Variant::None
+            | crate::richards::Variant::Polynomial => (None, None), /* Fully learnable including
+                                                                     * output_gain/output_bias */
         };
 
         // Determine parameter count based on whether output_gain/output_bias are learnable
@@ -760,23 +764,21 @@ impl RichardsCurve {
             + if output_bias_val.is_none() { 1 } else { 0 };
 
         let (adaptive_initialized, momentum) = match variant {
-            crate::richards::Variant::Adaptive => (true, 0.01), // Enable adaptive normalization with
+            crate::richards::Variant::Adaptive => (true, 0.01), /* Enable adaptive normalization
+                                                                  * with */
             // default momentum
             _ => (false, 0.0), // Disable adaptive for other variants
         };
 
         let polynomial_initialized = match variant {
             crate::richards::Variant::Polynomial => true, // Enable polynomial transformation
-            _ => false,                         // Disable polynomial for other variants
+            _ => false,                                   // Disable polynomial for other variants
         };
 
         // Enable Birch-inspired exponential tail by default for sigmoid-like generalized logistic
         // usage (helps ensure exponential behavior in the left tail across nu values).
         // Keep it disabled for Tanh, where the notion of “small size” growth is less aligned.
-        let birch_exponential_tail = match variant {
-            crate::richards::Variant::Tanh => false,
-            _ => true,
-        };
+        let birch_exponential_tail = !matches!(variant, crate::richards::Variant::Tanh);
 
         Self {
             // Parameter values (Some for fixed, None for learnable)
@@ -1146,8 +1148,8 @@ impl RichardsCurve {
 
     /// Helper: get parameter value (learnable or fixed).
     fn get_param(&self, param: Option<f64>, learned: Option<f64>, default: f64) -> f64 {
-        if param.is_some() {
-            param.unwrap()
+        if let Some(param) = param {
+            param
         } else {
             learned.unwrap_or(default)
         }
@@ -1362,7 +1364,9 @@ impl RichardsCurve {
     /// Forward for a single scalar x
     pub fn forward_scalar(&self, x: f64) -> f64 {
         match self.variant {
-            crate::richards::Variant::Tanh => RichardsKernel::<TanhLike>::from_curve(self).forward_one_f64(x),
+            crate::richards::Variant::Tanh => {
+                RichardsKernel::<TanhLike>::from_curve(self).forward_one_f64(x)
+            }
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).forward_one_f64(x),
         }
     }
@@ -1446,11 +1450,10 @@ impl RichardsCurve {
             };
 
         // Average scalar parameters across batch and features
-        for i in 0..scalar_param_count {
-            grads_accum[i] /= total_elements;
-            // Safety: replace NaN/Inf with 0.0
-            if !grads_accum[i].is_finite() {
-                grads_accum[i] = 0.0;
+        for g in grads_accum.iter_mut().take(scalar_param_count) {
+            *g /= total_elements;
+            if !g.is_finite() {
+                *g = 0.0;
             }
         }
 
@@ -1477,14 +1480,16 @@ impl RichardsCurve {
                         || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
                         |mut acc, (x_row, grad_row)| {
                             if self.gamma_learnable {
-                                for j in 0..embedding_dim {
-                                    let raw = self.forward_scalar(x_row[j]);
-                                    acc.0[j] += raw * grad_row[j];
+                                for ((sum, &xj), &dy) in
+                                    acc.0.iter_mut().zip(x_row.iter()).zip(grad_row.iter())
+                                {
+                                    let raw = self.forward_scalar(xj);
+                                    *sum += raw * dy;
                                 }
                             }
                             if self.bias_learnable {
-                                for j in 0..embedding_dim {
-                                    acc.1[j] += grad_row[j];
+                                for (sum, &dy) in acc.1.iter_mut().zip(grad_row.iter()) {
+                                    *sum += dy;
                                 }
                             }
                             acc
@@ -1494,13 +1499,13 @@ impl RichardsCurve {
                         || (vec![0.0f64; embedding_dim], vec![0.0f64; embedding_dim]),
                         |mut a, b| {
                             if self.gamma_learnable {
-                                for j in 0..embedding_dim {
-                                    a.0[j] += b.0[j];
+                                for (dst, &src) in a.0.iter_mut().zip(b.0.iter()) {
+                                    *dst += src;
                                 }
                             }
                             if self.bias_learnable {
-                                for j in 0..embedding_dim {
-                                    a.1[j] += b.1[j];
+                                for (dst, &src) in a.1.iter_mut().zip(b.1.iter()) {
+                                    *dst += src;
                                 }
                             }
                             a
@@ -1512,14 +1517,21 @@ impl RichardsCurve {
 
                 for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
                     if self.gamma_learnable {
-                        for j in 0..embedding_dim {
-                            let raw = self.forward_scalar(x_row[j]);
-                            sum_gamma[j] += raw * grad_row[j];
+                        for ((sum, &xj), &dy) in sum_gamma
+                            .iter_mut()
+                            .zip(x_row.iter())
+                            .zip(grad_row.iter())
+                            .take(embedding_dim)
+                        {
+                            let raw = self.forward_scalar(xj);
+                            *sum += raw * dy;
                         }
                     }
                     if self.bias_learnable {
-                        for j in 0..embedding_dim {
-                            sum_bias[j] += grad_row[j];
+                        for (sum, &dy) in
+                            sum_bias.iter_mut().zip(grad_row.iter()).take(embedding_dim)
+                        {
+                            *sum += dy;
                         }
                     }
                 }
@@ -1595,83 +1607,100 @@ impl RichardsCurve {
         let total_elements = (batch_size * embedding_dim) as f64;
 
         debug_assert!(scalar_param_count <= MAX_SCALAR_PARAMS);
-        let grads_accum = if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
-            match self.variant {
-                crate::richards::Variant::Tanh => x_slice
-                    .par_iter()
-                    .zip(grad_slice.par_iter())
-                    .fold(
-                        || vec![0.0f32; scalar_param_count],
-                        |mut acc, (&xi, &dy)| {
+        let grads_accum =
+            if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
+                match self.variant {
+                    crate::richards::Variant::Tanh => x_slice
+                        .par_iter()
+                        .zip(grad_slice.par_iter())
+                        .fold(
+                            || vec![0.0f32; scalar_param_count],
+                            |mut acc, (&xi, &dy)| {
+                                let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+                                self.grad_weights_scalar_into_kernel_f32::<TanhLike>(
+                                    xi,
+                                    dy,
+                                    &mut buf[..scalar_param_count],
+                                );
+                                for i in 0..scalar_param_count {
+                                    acc[i] += buf[i];
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || vec![0.0f32; scalar_param_count],
+                            |mut a, b| {
+                                for i in 0..scalar_param_count {
+                                    a[i] += b[i];
+                                }
+                                a
+                            },
+                        ),
+                    _ => x_slice
+                        .par_iter()
+                        .zip(grad_slice.par_iter())
+                        .fold(
+                            || vec![0.0f32; scalar_param_count],
+                            |mut acc, (&xi, &dy)| {
+                                let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+                                self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(
+                                    xi,
+                                    dy,
+                                    &mut buf[..scalar_param_count],
+                                );
+                                for i in 0..scalar_param_count {
+                                    acc[i] += buf[i];
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || vec![0.0f32; scalar_param_count],
+                            |mut a, b| {
+                                for i in 0..scalar_param_count {
+                                    a[i] += b[i];
+                                }
+                                a
+                            },
+                        ),
+                }
+            } else {
+                let mut acc = vec![0.0f32; scalar_param_count];
+                match self.variant {
+                    crate::richards::Variant::Tanh => {
+                        for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
                             let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
-                            self.grad_weights_scalar_into_kernel_f32::<TanhLike>(xi, dy, &mut buf[..scalar_param_count]);
+                            self.grad_weights_scalar_into_kernel_f32::<TanhLike>(
+                                xi,
+                                dy,
+                                &mut buf[..scalar_param_count],
+                            );
                             for i in 0..scalar_param_count {
                                 acc[i] += buf[i];
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || vec![0.0f32; scalar_param_count],
-                        |mut a, b| {
-                            for i in 0..scalar_param_count {
-                                a[i] += b[i];
-                            }
-                            a
-                        },
-                    ),
-                _ => x_slice
-                    .par_iter()
-                    .zip(grad_slice.par_iter())
-                    .fold(
-                        || vec![0.0f32; scalar_param_count],
-                        |mut acc, (&xi, &dy)| {
+                        }
+                    }
+                    _ => {
+                        for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
                             let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
-                            self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(xi, dy, &mut buf[..scalar_param_count]);
+                            self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(
+                                xi,
+                                dy,
+                                &mut buf[..scalar_param_count],
+                            );
                             for i in 0..scalar_param_count {
                                 acc[i] += buf[i];
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || vec![0.0f32; scalar_param_count],
-                        |mut a, b| {
-                            for i in 0..scalar_param_count {
-                                a[i] += b[i];
-                            }
-                            a
-                        },
-                    ),
-            }
-        } else {
-            let mut acc = vec![0.0f32; scalar_param_count];
-            match self.variant {
-                crate::richards::Variant::Tanh => {
-                    for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
-                        let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
-                        self.grad_weights_scalar_into_kernel_f32::<TanhLike>(xi, dy, &mut buf[..scalar_param_count]);
-                        for i in 0..scalar_param_count {
-                            acc[i] += buf[i];
                         }
                     }
                 }
-                _ => {
-                    for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
-                        let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
-                        self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(xi, dy, &mut buf[..scalar_param_count]);
-                        for i in 0..scalar_param_count {
-                            acc[i] += buf[i];
-                        }
-                    }
-                }
-            }
-            acc
-        };
+                acc
+            };
 
         let mut grads_accum_f64: Vec<f64> = Vec::with_capacity(self.weights_len());
-        for i in 0..scalar_param_count {
-            let mut g = (grads_accum[i] as f64) / total_elements;
+        for &gi in grads_accum.iter().take(scalar_param_count) {
+            let mut g = (gi as f64) / total_elements;
             if !g.is_finite() {
                 g = 0.0;
             }
@@ -1686,7 +1715,9 @@ impl RichardsCurve {
         if (self.gamma_learnable || self.bias_learnable)
             && (self.gamma.is_some() || self.bias.is_some())
         {
-            let (sum_gamma, sum_bias) = if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
+            let (sum_gamma, sum_bias) = if let (Some(x_slice), Some(grad_slice)) =
+                (x.as_slice(), output_grads.as_slice())
+            {
                 match self.variant {
                     crate::richards::Variant::Tanh => {
                         let k = RichardsKernelF32::<TanhLike>::from_curve(self);
@@ -1697,14 +1728,25 @@ impl RichardsCurve {
                                 || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
                                 |mut acc, (x_row, grad_row)| {
                                     if self.gamma_learnable {
-                                        for j in 0..embedding_dim {
-                                            let raw = k.forward_one_f32(x_row[j]);
-                                            acc.0[j] += raw * grad_row[j];
+                                        for ((sum, &xj), &dy) in acc
+                                            .0
+                                            .iter_mut()
+                                            .zip(x_row.iter())
+                                            .zip(grad_row.iter())
+                                            .take(embedding_dim)
+                                        {
+                                            let raw = k.forward_one_f32(xj);
+                                            *sum += raw * dy;
                                         }
                                     }
                                     if self.bias_learnable {
-                                        for j in 0..embedding_dim {
-                                            acc.1[j] += grad_row[j];
+                                        for (sum, &dy) in acc
+                                            .1
+                                            .iter_mut()
+                                            .zip(grad_row.iter())
+                                            .take(embedding_dim)
+                                        {
+                                            *sum += dy;
                                         }
                                     }
                                     acc
@@ -1714,13 +1756,13 @@ impl RichardsCurve {
                                 || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
                                 |mut a, b| {
                                     if self.gamma_learnable {
-                                        for j in 0..embedding_dim {
-                                            a.0[j] += b.0[j];
+                                        for (dst, &src) in a.0.iter_mut().zip(b.0.iter()) {
+                                            *dst += src;
                                         }
                                     }
                                     if self.bias_learnable {
-                                        for j in 0..embedding_dim {
-                                            a.1[j] += b.1[j];
+                                        for (dst, &src) in a.1.iter_mut().zip(b.1.iter()) {
+                                            *dst += src;
                                         }
                                     }
                                     a
@@ -1736,14 +1778,25 @@ impl RichardsCurve {
                                 || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
                                 |mut acc, (x_row, grad_row)| {
                                     if self.gamma_learnable {
-                                        for j in 0..embedding_dim {
-                                            let raw = k.forward_one_f32(x_row[j]);
-                                            acc.0[j] += raw * grad_row[j];
+                                        for ((sum, &xj), &dy) in acc
+                                            .0
+                                            .iter_mut()
+                                            .zip(x_row.iter())
+                                            .zip(grad_row.iter())
+                                            .take(embedding_dim)
+                                        {
+                                            let raw = k.forward_one_f32(xj);
+                                            *sum += raw * dy;
                                         }
                                     }
                                     if self.bias_learnable {
-                                        for j in 0..embedding_dim {
-                                            acc.1[j] += grad_row[j];
+                                        for (sum, &dy) in acc
+                                            .1
+                                            .iter_mut()
+                                            .zip(grad_row.iter())
+                                            .take(embedding_dim)
+                                        {
+                                            *sum += dy;
                                         }
                                     }
                                     acc
@@ -1753,13 +1806,13 @@ impl RichardsCurve {
                                 || (vec![0.0f32; embedding_dim], vec![0.0f32; embedding_dim]),
                                 |mut a, b| {
                                     if self.gamma_learnable {
-                                        for j in 0..embedding_dim {
-                                            a.0[j] += b.0[j];
+                                        for (dst, &src) in a.0.iter_mut().zip(b.0.iter()) {
+                                            *dst += src;
                                         }
                                     }
                                     if self.bias_learnable {
-                                        for j in 0..embedding_dim {
-                                            a.1[j] += b.1[j];
+                                        for (dst, &src) in a.1.iter_mut().zip(b.1.iter()) {
+                                            *dst += src;
                                         }
                                     }
                                     a
@@ -2088,7 +2141,11 @@ impl RichardsCurve {
             pos += 1;
         }
 
-        debug_assert_eq!(pos, out.len(), "grad_weights_scalar_into_kernel_f32: slice length mismatch");
+        debug_assert_eq!(
+            pos,
+            out.len(),
+            "grad_weights_scalar_into_kernel_f32: slice length mismatch"
+        );
     }
 
     /// Compute gradients w.r.t. learnable parameters for a single scalar input into a preallocated
@@ -2156,9 +2213,11 @@ impl RichardsCurve {
         let param_count = self.weights_len();
 
         // Ensure optimizer is properly initialized for the correct number of parameters
-        if self.optimizer.is_none()
-            || (self.optimizer.as_ref().unwrap().m.shape() != &[param_count, 1])
-        {
+        let needs_optimizer_init = match self.optimizer.as_ref() {
+            None => true,
+            Some(opt) => opt.m.shape() != [param_count, 1],
+        };
+        if needs_optimizer_init {
             self.optimizer = Some(Adam::new((param_count, 1)));
         }
 
@@ -2231,22 +2290,22 @@ impl RichardsCurve {
             grad_values.push(gradients[grad_idx] as f32);
             grad_idx += 1;
         }
-        if self.gamma_learnable {
-            if let Some(g) = self.gamma.as_ref() {
-                param_values.extend(g.iter().copied());
-                for _ in 0..g.len() {
-                    grad_values.push(gradients[grad_idx] as f32);
-                    grad_idx += 1;
-                }
+        if self.gamma_learnable
+            && let Some(g) = self.gamma.as_ref()
+        {
+            param_values.extend(g.iter().copied());
+            for _ in 0..g.len() {
+                grad_values.push(gradients[grad_idx] as f32);
+                grad_idx += 1;
             }
         }
-        if self.bias_learnable {
-            if let Some(b) = self.bias.as_ref() {
-                param_values.extend(b.iter().copied());
-                for _ in 0..b.len() {
-                    grad_values.push(gradients[grad_idx] as f32);
-                    grad_idx += 1;
-                }
+        if self.bias_learnable
+            && let Some(b) = self.bias.as_ref()
+        {
+            param_values.extend(b.iter().copied());
+            for _ in 0..b.len() {
+                grad_values.push(gradients[grad_idx] as f32);
+                grad_idx += 1;
             }
         }
 
@@ -2414,15 +2473,15 @@ impl RichardsCurve {
         if self.shift_learnable {
             weights.push(self.get_param(self.shift, self.learned_shift, 0.0));
         }
-        if self.gamma_learnable {
-            if let Some(g) = self.gamma.as_ref() {
-                weights.extend(g.iter().map(|&x| x as f64));
-            }
+        if self.gamma_learnable
+            && let Some(g) = self.gamma.as_ref()
+        {
+            weights.extend(g.iter().map(|&x| x as f64));
         }
-        if self.bias_learnable {
-            if let Some(b) = self.bias.as_ref() {
-                weights.extend(b.iter().map(|&x| x as f64));
-            }
+        if self.bias_learnable
+            && let Some(b) = self.bias.as_ref()
+        {
+            weights.extend(b.iter().map(|&x| x as f64));
         }
 
         // Debug: Log if weights are still at defaults (indicating no training occurred)
@@ -2457,17 +2516,17 @@ impl RichardsCurve {
     pub fn has_trained_parameters(&self) -> bool {
         // Check if any learned parameters exist and differ significantly from defaults
         let checks = [
-            self.learned_nu.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_k.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_m.map_or(false, |v| v.abs() > 1e-6),
-            self.learned_beta.map_or(false, |v| (v - 1.0).abs() > 1e-6),
+            self.learned_nu.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_k.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_m.is_some_and(|v| v.abs() > 1e-6),
+            self.learned_beta.is_some_and(|v| (v - 1.0).abs() > 1e-6),
             self.learned_temperature
-                .map_or(false, |v| (v - 1.0).abs() > 1e-6),
+                .is_some_and(|v| (v - 1.0).abs() > 1e-6),
             self.learned_output_gain
-                .map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_output_bias.map_or(false, |v| v.abs() > 1e-6),
-            self.learned_scale.map_or(false, |v| (v - 1.0).abs() > 1e-6),
-            self.learned_shift.map_or(false, |v| v.abs() > 1e-6),
+                .is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_output_bias.is_some_and(|v| v.abs() > 1e-6),
+            self.learned_scale.is_some_and(|v| (v - 1.0).abs() > 1e-6),
+            self.learned_shift.is_some_and(|v| v.abs() > 1e-6),
         ];
 
         checks.iter().any(|&x| x)
@@ -2556,10 +2615,9 @@ impl RichardsCurve {
 
         // Update running statistics with momentum
         let momentum = self.momentum.max(1e-7); // Ensure minimum momentum for stability
-        let new_running_sum =
-            (self.running_sum.unwrap() * momentum + x.sum() * (1.0 - momentum)) as f64;
+        let new_running_sum = self.running_sum.unwrap() * momentum + x.sum() * (1.0 - momentum);
         let new_running_sq_sum =
-            (self.running_sq_sum.unwrap() * momentum + batch_var_sum * (1.0 - momentum)) as f64;
+            self.running_sq_sum.unwrap() * momentum + batch_var_sum * (1.0 - momentum);
 
         self.running_sum = Some(new_running_sum);
         self.running_sq_sum = Some(new_running_sq_sum);
@@ -2572,17 +2630,16 @@ impl RichardsCurve {
     fn update_adaptive_scaling(&mut self) {
         if let (Some(running_sum), Some(running_sq_sum), Some(count)) =
             (self.running_sum, self.running_sq_sum, self.count)
+            && count > 1
         {
-            if count > 1 {
-                let mean = running_sum / count as f64;
-                let variance = (running_sq_sum / (count - 1) as f64)
-                    - (running_sum.powi(2) / count as f64) / (count - 1) as f64;
-                let std = variance.sqrt().max(1e-6); // Minimum std for numerical stability
+            let mean = running_sum / count as f64;
+            let variance = (running_sq_sum / (count - 1) as f64)
+                - (running_sum.powi(2) / count as f64) / (count - 1) as f64;
+            let std = variance.sqrt().max(1e-6); // Minimum std for numerical stability
 
-                // Adaptive normalization: center at mean, scale to unit variance
-                self.adaptive_scale = Some(1.0 / std);
-                self.adaptive_shift = Some(-mean / std);
-            }
+            // Adaptive normalization: center at mean, scale to unit variance
+            self.adaptive_scale = Some(1.0 / std);
+            self.adaptive_shift = Some(-mean / std);
         }
     }
 
@@ -2616,7 +2673,7 @@ impl RichardsCurve {
         if self.variant != crate::richards::Variant::Polynomial {
             return Err("Can only set polynomial coefficients for Polynomial variant".to_string());
         }
-        if power < 1 || power > 5 {
+        if !(1..=5).contains(&power) {
             return Err("Polynomial degree must be between 1 and 5".to_string());
         }
         if coeffs.len() != power + 1 {

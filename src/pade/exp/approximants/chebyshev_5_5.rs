@@ -1,4 +1,4 @@
-use super::super::{utils::horner_iter, PadeExp};
+use super::super::{PadeExp, utils::horner_iter};
 
 impl PadeExp {
     #[inline]

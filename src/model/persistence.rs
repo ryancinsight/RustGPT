@@ -305,7 +305,10 @@ impl LLM {
             .network
             .iter()
             .any(|l| matches!(l, crate::LayerEnum::DiffusionBlock(_)));
-        let has_trm = self.network.iter().any(|l| matches!(l, crate::LayerEnum::LRM(_)));
+        let has_trm = self
+            .network
+            .iter()
+            .any(|l| matches!(l, crate::LayerEnum::LRM(_)));
         let has_transformer = self
             .network
             .iter()

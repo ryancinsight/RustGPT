@@ -335,7 +335,7 @@ mod tests {
 
         // Check values are in [0, 1] range (sigmoid output)
         for &val in thresholds.iter() {
-            assert!(val >= 0.0 && val <= 1.0);
+            assert!((0.0..=1.0).contains(&val));
         }
     }
 

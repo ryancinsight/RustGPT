@@ -1,8 +1,6 @@
 use std::fs;
 
 use ndarray::{Array2, Axis, s};
-#[cfg(test)]
-use ndarray::Array1;
 use rand::Rng;
 use rand_distr::Distribution;
 use rayon::prelude::*;
@@ -54,10 +52,12 @@ fn response_span_from_tokens(vocab: &Vocab, tokens: &[usize]) -> Option<(usize, 
                 return None;
             }
             let mut end = tokens.len();
-            if let Some(last_tok) = tokens.last().and_then(|&id| vocab.decode(id)) {
-                if last_tok == "</s>" && end > start {
-                    end -= 1;
-                }
+            if tokens
+                .last()
+                .and_then(|&id| vocab.decode(id))
+                .is_some_and(|last_tok| last_tok == "</s>" && end > start)
+            {
+                end -= 1;
             }
             if start >= end {
                 return None;
@@ -100,7 +100,8 @@ pub struct LLM {
     #[serde(default)]
     speculative_mode: SpeculativeMode,
 
-    // Scratch buffers (not serialized) for allocation-free tokenization on repeated inference calls.
+    // Scratch buffers (not serialized) for allocation-free tokenization on repeated inference
+    // calls.
     #[serde(skip, default)]
     tokenize_scratch: Vec<usize>,
 
@@ -216,11 +217,7 @@ impl LLM {
         }
     }
 
-    pub fn set_residual_decorrelation_training(
-        &mut self,
-        weight: f32,
-        adaptive: bool,
-    ) {
+    pub fn set_residual_decorrelation_training(&mut self, weight: f32, adaptive: bool) {
         self.training_hparams.residual_decorrelation_weight = weight.max(0.0);
         self.training_hparams.residual_decorrelation_adaptive = adaptive;
     }
@@ -505,8 +502,10 @@ impl LLM {
     ///
     /// Uses a fixed-size min-heap so this is $O(V \log k)$ rather than sorting the whole vocab.
     fn get_top_k_tokens_from_probs(&self, probs: &ndarray::Array1<f32>, k: usize) -> Vec<usize> {
-        use std::cmp::{Ordering, Reverse};
-        use std::collections::BinaryHeap;
+        use std::{
+            cmp::{Ordering, Reverse},
+            collections::BinaryHeap,
+        };
 
         #[derive(Copy, Clone, Debug)]
         struct Score(f32);
@@ -527,10 +526,7 @@ impl LLM {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Less,
                     (false, true) => Ordering::Greater,
-                    (false, false) => self
-                        .0
-                        .partial_cmp(&other.0)
-                        .unwrap_or(Ordering::Equal),
+                    (false, false) => self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal),
                 }
             }
         }
@@ -556,8 +552,7 @@ impl LLM {
             }
         }
 
-        let mut out: Vec<(Score, usize)> =
-            heap.into_iter().map(|(Reverse(s), i)| (s, i)).collect();
+        let mut out: Vec<(Score, usize)> = heap.into_iter().map(|(Reverse(s), i)| (s, i)).collect();
         out.sort_by(|a, b| b.0.cmp(&a.0));
         out.into_iter().map(|(_, i)| i).collect()
     }
@@ -638,7 +633,7 @@ impl LLM {
                     mode, cfg.gamma, cfg.tau, cfg.draft_layers, cfg.temperature, cfg.top_p
                 )
             }
-            (None, _) => format!("Greedy (deterministic argmax)"),
+            (None, _) => "Greedy (deterministic argmax)".to_string(),
         }
     }
 
@@ -825,10 +820,8 @@ impl LLM {
             output_tokens.push(next_token);
             tokenized.push(next_token);
 
-            if let Some(eos) = eos_token {
-                if next_token == eos {
-                    break;
-                }
+            if eos_token.is_some_and(|eos| next_token == eos) {
+                break;
             }
         }
 
@@ -1189,8 +1182,16 @@ impl LLM {
                 }
             }
 
-            let tau_min_log = if tau_available { Some(tau_min_epoch) } else { None };
-            let tau_max_log = if tau_available { Some(tau_max_epoch) } else { None };
+            let tau_min_log = if tau_available {
+                Some(tau_min_epoch)
+            } else {
+                None
+            };
+            let tau_max_log = if tau_available {
+                Some(tau_max_epoch)
+            } else {
+                None
+            };
             let tau_range_log = if tau_available {
                 Some(tau_max_epoch - tau_min_epoch)
             } else {
@@ -1397,16 +1398,14 @@ impl LLM {
                         );
                     }
                 }
+            } else if prev_richards_glu_weights.is_empty() {
+                tracing::debug!("No previous RichardsGlu weights available (first epoch)");
             } else {
-                if prev_richards_glu_weights.is_empty() {
-                    tracing::debug!("No previous RichardsGlu weights available (first epoch)");
-                } else {
-                    tracing::warn!(
-                        "RichardsGlu layer count mismatch: prev={}, curr={}",
-                        prev_richards_glu_weights.len(),
-                        current_richards_glu_weights.len()
-                    );
-                }
+                tracing::warn!(
+                    "RichardsGlu layer count mismatch: prev={}, curr={}",
+                    prev_richards_glu_weights.len(),
+                    current_richards_glu_weights.len()
+                );
             }
 
             // Debug: Log parameter change statistics
@@ -1464,19 +1463,17 @@ impl LLM {
                 },
             };
             for layer in &mut self.network {
-                if let LayerEnum::TransformerBlock(tb) = layer {
-                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
+                if let LayerEnum::TransformerBlock(tb) = layer
+                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut tb.temporal_mixing
-                    {
-                        attn.adapt_degree(&metrics);
-                    }
+                {
+                    attn.adapt_degree(&metrics);
                 }
-                if let LayerEnum::DiffusionBlock(db) = layer {
-                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
+                if let LayerEnum::DiffusionBlock(db) = layer
+                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut db.temporal_mixing
-                    {
-                        attn.adapt_degree(&metrics);
-                    }
+                {
+                    attn.adapt_degree(&metrics);
                 }
                 if let LayerEnum::PolyAttention(pa) = layer {
                     pa.adapt_degree(&metrics);
@@ -1843,7 +1840,8 @@ impl LLM {
             batch_loss += loss_norm;
             batch_base_loss += loss_norm;
 
-            // Auxiliary: residual decorrelation (redundancy reduction) on the pre-logit hidden state.
+            // Auxiliary: residual decorrelation (redundancy reduction) on the pre-logit hidden
+            // state.
             let mut decor_grad_opt: Option<Array2<f32>> = None;
             let base_w = self.training_hparams.residual_decorrelation_weight;
             if base_w > 0.0 {
@@ -2067,7 +2065,8 @@ impl LLM {
             layer_grad_norms.push(0.0);
         }
 
-        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden state).
+        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden
+        // state).
         let mut out_proj_idx: Option<usize> = None;
         for (i, layer) in self.network.iter().enumerate() {
             if matches!(layer, LayerEnum::OutputProjection(_)) {
@@ -2144,7 +2143,8 @@ impl LLM {
             batch_loss += sce_norm;
             batch_base_loss += sce_norm;
 
-            // Auxiliary residual decorrelation (redundancy reduction) on the pre-logit hidden state.
+            // Auxiliary residual decorrelation (redundancy reduction) on the pre-logit hidden
+            // state.
             let decor_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx {
                 let base_w = self.training_hparams.residual_decorrelation_weight;
                 if base_w > 0.0 {
@@ -2167,7 +2167,8 @@ impl LLM {
             };
 
             // Auxiliary hard-negative repulsion on pooled pre-logit hidden state.
-            let hardneg_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx {
+            let hardneg_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx
+            {
                 let base_w = self.training_hparams.residual_hardneg_weight;
                 if base_w > 0.0 {
                     let difficulty = if self.training_hparams.residual_hardneg_adaptive {
@@ -2453,17 +2454,17 @@ impl LLM {
 
                 grads_output = input_grads;
 
-                if let Some((op_idx, ref decor_grad)) = decor_grad_opt {
-                    if layer_idx == op_idx {
-                        // grads_output is now dL/d(hidden_prelogit).
-                        grads_output = grads_output + decor_grad.clone();
-                    }
+                if let Some((op_idx, ref decor_grad)) = decor_grad_opt
+                    && layer_idx == op_idx
+                {
+                    // grads_output is now dL/d(hidden_prelogit).
+                    grads_output = grads_output + decor_grad.clone();
                 }
 
-                if let Some((op_idx, ref hn_grad)) = hardneg_grad_opt {
-                    if layer_idx == op_idx {
-                        grads_output = grads_output + hn_grad.clone();
-                    }
+                if let Some((op_idx, ref hn_grad)) = hardneg_grad_opt
+                    && layer_idx == op_idx
+                {
+                    grads_output = grads_output + hn_grad.clone();
                 }
 
                 if accumulated_param_grads[layer_idx].is_empty() {
@@ -2896,6 +2897,7 @@ impl LLM {
         self.network.iter().map(|layer| layer.weight_norm()).sum()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn train_diffusion_ce(
         &mut self,
         data: Vec<&str>,
@@ -2952,19 +2954,23 @@ impl LLM {
         // remaining overridable at runtime via CLI.
         let mut ddim_steps_min: usize = 16;
         let mut ddim_steps_max: usize = 256;
-        let mut learned_ddim_steps: usize = if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-            match b.config.ddim_steps_policy {
-                crate::layers::diffusion::DdimStepsPolicy::Fixed(k) => k.max(1),
-                crate::layers::diffusion::DdimStepsPolicy::Auto { min_steps, max_steps } => {
-                    ddim_steps_min = min_steps.max(1);
-                    ddim_steps_max = max_steps.max(ddim_steps_min);
-                    // Start from ~T/10 like common practice; then adapt during training.
-                    ((num_timesteps.max(1) as f32 / 10.0).round() as usize).max(1)
+        let mut learned_ddim_steps: usize =
+            if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                match b.config.ddim_steps_policy {
+                    crate::layers::diffusion::DdimStepsPolicy::Fixed(k) => k.max(1),
+                    crate::layers::diffusion::DdimStepsPolicy::Auto {
+                        min_steps,
+                        max_steps,
+                    } => {
+                        ddim_steps_min = min_steps.max(1);
+                        ddim_steps_max = max_steps.max(ddim_steps_min);
+                        // Start from ~T/10 like common practice; then adapt during training.
+                        ((num_timesteps.max(1) as f32 / 10.0).round() as usize).max(1)
+                    }
                 }
-            }
-        } else {
-            ((num_timesteps.max(1) as f32 / 10.0).round() as usize).max(1)
-        };
+            } else {
+                ((num_timesteps.max(1) as f32 / 10.0).round() as usize).max(1)
+            };
         learned_ddim_steps = learned_ddim_steps
             .min(num_timesteps.max(1))
             .clamp(ddim_steps_min, ddim_steps_max);
@@ -3138,8 +3144,12 @@ impl LLM {
                 let mut grads_per_layer: Vec<Option<Vec<Array2<f32>>>> =
                     vec![None; self.network.len()];
                 let mut examples_in_batch = 0usize;
-                for seq_idx in batch_start..batch_end {
-                    let training_row = &tokenized_data[seq_idx];
+                for (seq_idx, training_row) in tokenized_data
+                    .iter()
+                    .enumerate()
+                    .take(batch_end)
+                    .skip(batch_start)
+                {
                     if training_row.len() < 2 {
                         continue;
                     }
@@ -3229,46 +3239,42 @@ impl LLM {
                     };
                     let t = (((1.0 - complexity) * candidate as f32).round() as usize)
                         .min(active_steps - 1);
-                    let (x_t, sqrt_a, sqrt_one_minus_a, discrete_used) = {
-                        if is_discrete {
-                            let mask_token_id = mask_id_opt
-                                .or_else(|| self.vocab.encode("<mask>"))
-                                .unwrap_or(self.vocab.encode_or_unknown("<unk>").unwrap_or(0));
-                            let ids_masked =
-                                if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                                    if let Some(ds) = &b.discrete_scheduler {
-                                        if let Some((span_start, span_end)) = response_span {
-                                            ds.mask_sequence_span_at_t(
-                                                &ids_arr,
-                                                mask_token_id,
-                                                t,
-                                                span_start,
-                                                span_end,
-                                            )
-                                        } else {
-                                            ds.mask_sequence_at_t(&ids_arr, mask_token_id, t)
-                                        }
+                    let (x_t, sqrt_a, sqrt_one_minus_a, discrete_used) = if is_discrete {
+                        let mask_token_id = mask_id_opt
+                            .or_else(|| self.vocab.encode("<mask>"))
+                            .unwrap_or(self.vocab.encode_or_unknown("<unk>").unwrap_or(0));
+                        let ids_masked =
+                            if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                                if let Some(ds) = &b.discrete_scheduler {
+                                    if let Some((span_start, span_end)) = response_span {
+                                        ds.mask_sequence_span_at_t(
+                                            &ids_arr,
+                                            mask_token_id,
+                                            t,
+                                            span_start,
+                                            span_end,
+                                        )
                                     } else {
-                                        ids_arr.clone()
+                                        ds.mask_sequence_at_t(&ids_arr, mask_token_id, t)
                                     }
                                 } else {
                                     ids_arr.clone()
-                                };
-                            let x_t_local = match &mut self.network[embeddings_idx.unwrap()] {
-                                LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_masked),
-                                _ => x0.clone(),
-                            };
-                            (x_t_local, 1.0, 0.0, true)
-                        } else {
-                            if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                                let x_t_local = b.noise_scheduler.q_sample(&x0, t, &noise);
-                                let sa = b.noise_scheduler.sqrt_alpha_cumprod(t);
-                                let soa = b.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
-                                (x_t_local, sa, soa, false)
+                                }
                             } else {
-                                continue;
-                            }
-                        }
+                                ids_arr.clone()
+                            };
+                        let x_t_local = match &mut self.network[embeddings_idx.unwrap()] {
+                            LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_masked),
+                            _ => x0.clone(),
+                        };
+                        (x_t_local, 1.0, 0.0, true)
+                    } else if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                        let x_t_local = b.noise_scheduler.q_sample(&x0, t, &noise);
+                        let sa = b.noise_scheduler.sqrt_alpha_cumprod(t);
+                        let soa = b.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
+                        (x_t_local, sa, soa, false)
+                    } else {
+                        continue;
                     };
 
                     // Predict via full diffusion stack (epsilon or v parameterization)
@@ -3284,31 +3290,32 @@ impl LLM {
                     // Recover x0_hat for continuous path according to parameterization
                     let x0_hat = if discrete_used {
                         pred.clone()
-                    } else {
-                        if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                            match b0.prediction_target() {
-                                crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
-                                    let sa = sqrt_a.max(1e-6);
-                                    (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
-                                }
-                                crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
-                                    // x0 = sqrt(alpha_bar) * x_t − sqrt(1 − alpha_bar) * v
-                                    (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
-                                }
-                                crate::layers::diffusion::DiffusionPredictionTarget::Sample => pred.clone(),
-                                crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => pred.clone(),
+                    } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
+                        match b0.prediction_target() {
+                            crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
+                                let sa = sqrt_a.max(1e-6);
+                                (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
                             }
-                        } else {
-                            pred.clone()
+                            crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
+                                (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
+                            }
+                            crate::layers::diffusion::DiffusionPredictionTarget::Sample => {
+                                pred.clone()
+                            }
+                            crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => {
+                                pred.clone()
+                            }
                         }
+                    } else {
+                        pred.clone()
                     };
 
                     // Forward through final norm (if present) and output projection
                     let mut hidden = x0_hat.clone();
-                    if let Some(nidx) = norm_idx {
-                        if let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx] {
-                            hidden = norm.forward(&hidden);
-                        }
+                    if let Some(nidx) = norm_idx
+                        && let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx]
+                    {
+                        hidden = norm.forward(&hidden);
                     }
 
                     let logits = if let Some(opidx) = out_proj_idx {
@@ -3385,13 +3392,14 @@ impl LLM {
                             *a *= inv;
                         }
 
-                        let (hn_loss, grad_anchor) = crate::loss::hard_negative_repulsion_loss_and_grad(
-                            &anchor,
-                            self.residual_neg_bank.as_slice(),
-                            self.training_hparams.residual_hardneg_k,
-                            self.training_hparams.residual_hardneg_margin,
-                            self.training_hparams.residual_hardneg_temperature,
-                        );
+                        let (hn_loss, grad_anchor) =
+                            crate::loss::hard_negative_repulsion_loss_and_grad(
+                                &anchor,
+                                self.residual_neg_bank.as_slice(),
+                                self.training_hparams.residual_hardneg_k,
+                                self.training_hparams.residual_hardneg_margin,
+                                self.training_hparams.residual_hardneg_temperature,
+                            );
                         hardneg_term = w * hn_loss;
 
                         let mut g = Array2::<f32>::zeros(hidden.raw_dim());
@@ -3461,27 +3469,27 @@ impl LLM {
                     if let Some(dg) = hardneg_grad_opt {
                         grad_hidden = grad_hidden + dg;
                     }
-                    if let Some(opidx) = out_proj_idx {
-                        if !op_param_grads.is_empty() {
-                            if let Some(slot) = &mut grads_per_layer[opidx] {
-                                for (i, g) in op_param_grads.iter().enumerate() {
-                                    if i < slot.len() {
-                                        slot[i] = &slot[i] + g;
-                                    } else {
-                                        slot.push(g.clone());
-                                    }
+                    if let Some(opidx) = out_proj_idx
+                        && !op_param_grads.is_empty()
+                    {
+                        if let Some(slot) = &mut grads_per_layer[opidx] {
+                            for (i, g) in op_param_grads.iter().enumerate() {
+                                if i < slot.len() {
+                                    slot[i] = &slot[i] + g;
+                                } else {
+                                    slot.push(g.clone());
                                 }
-                            } else {
-                                grads_per_layer[opidx] = Some(op_param_grads.clone());
                             }
+                        } else {
+                            grads_per_layer[opidx] = Some(op_param_grads.clone());
                         }
                     }
 
                     // Backward through norm to x0_hat
-                    if let Some(nidx) = norm_idx {
-                        if let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx] {
-                            grad_hidden = norm.backward(&grad_hidden, lr);
-                        }
+                    if let Some(nidx) = norm_idx
+                        && let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx]
+                    {
+                        grad_hidden = norm.backward(&grad_hidden, lr);
                     }
 
                     // Build gradient for diffusion stack from mixed objectives
@@ -3563,23 +3571,23 @@ impl LLM {
                         grad_pred.mapv(|g| g * sa)
                     };
 
-                    if let Some(eidx) = embeddings_idx {
-                        if let LayerEnum::TokenEmbeddings(layer) = &mut self.network[eidx] {
-                            let (emb_in_grad, emb_param_grads) =
-                                layer.compute_gradients(&ids_arr, &grad_x0);
-                            let _ = emb_in_grad;
-                            if !emb_param_grads.is_empty() {
-                                if let Some(slot) = &mut grads_per_layer[eidx] {
-                                    for (i, g) in emb_param_grads.iter().enumerate() {
-                                        if i < slot.len() {
-                                            slot[i] = &slot[i] + g;
-                                        } else {
-                                            slot.push(g.clone());
-                                        }
+                    if let Some(eidx) = embeddings_idx
+                        && let LayerEnum::TokenEmbeddings(layer) = &mut self.network[eidx]
+                    {
+                        let (emb_in_grad, emb_param_grads) =
+                            layer.compute_gradients(&ids_arr, &grad_x0);
+                        let _ = emb_in_grad;
+                        if !emb_param_grads.is_empty() {
+                            if let Some(slot) = &mut grads_per_layer[eidx] {
+                                for (i, g) in emb_param_grads.iter().enumerate() {
+                                    if i < slot.len() {
+                                        slot[i] = &slot[i] + g;
+                                    } else {
+                                        slot.push(g.clone());
                                     }
-                                } else {
-                                    grads_per_layer[eidx] = Some(emb_param_grads.clone());
                                 }
+                            } else {
+                                grads_per_layer[eidx] = Some(emb_param_grads.clone());
                             }
                         }
                     }
@@ -3599,7 +3607,8 @@ impl LLM {
                         sce
                     } else {
                         lambda_ce * sce + (lambda_eps * w_mse) * mse
-                    } + decor_term + hardneg_term;
+                    } + decor_term
+                        + hardneg_term;
                     total_loss += loss;
                     total_ce += sce;
                     count += 1;
@@ -3678,21 +3687,19 @@ impl LLM {
             let mut tau_range: Option<(f32, f32)> = None;
             let mut pred_norm_rms: Option<f32> = None;
             for layer in &mut self.network {
-                if let LayerEnum::TransformerBlock(tb) = layer {
-                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
+                if let LayerEnum::TransformerBlock(tb) = layer
+                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut tb.temporal_mixing
-                    {
-                        tau_range = attn.take_tau_metrics();
-                        pred_norm_rms = attn.take_pred_norm();
-                    }
+                {
+                    tau_range = attn.take_tau_metrics();
+                    pred_norm_rms = attn.take_pred_norm();
                 }
-                if let LayerEnum::DiffusionBlock(db) = layer {
-                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
+                if let LayerEnum::DiffusionBlock(db) = layer
+                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut db.temporal_mixing
-                    {
-                        tau_range = attn.take_tau_metrics();
-                        pred_norm_rms = attn.take_pred_norm();
-                    }
+                {
+                    tau_range = attn.take_tau_metrics();
+                    pred_norm_rms = attn.take_pred_norm();
                 }
                 if let LayerEnum::LRM(lrm) = layer {
                     tau_range = lrm.attention_mut().take_tau_metrics();
@@ -3709,19 +3716,17 @@ impl LLM {
                 pred_norm_rms,
             };
             for layer in &mut self.network {
-                if let LayerEnum::TransformerBlock(tb) = layer {
-                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
+                if let LayerEnum::TransformerBlock(tb) = layer
+                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut tb.temporal_mixing
-                    {
-                        attn.adapt_degree(&metrics);
-                    }
+                {
+                    attn.adapt_degree(&metrics);
                 }
-                if let LayerEnum::DiffusionBlock(db) = layer {
-                    if let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
+                if let LayerEnum::DiffusionBlock(db) = layer
+                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
                         &mut db.temporal_mixing
-                    {
-                        attn.adapt_degree(&metrics);
-                    }
+                {
+                    attn.adapt_degree(&metrics);
                 }
                 if let LayerEnum::LRM(lrm) = layer {
                     lrm.attention_mut().adapt_degree(&metrics);
@@ -3734,8 +3739,7 @@ impl LLM {
             let mut val_sce_total = 0.0f32;
             let mut val_mse_total = 0.0f32;
             let mut val_count = 0usize;
-            for seq_idx in val_start..tokenized_data.len() {
-                let training_row = &tokenized_data[seq_idx];
+            for (seq_idx, training_row) in tokenized_data.iter().enumerate().skip(val_start) {
                 if training_row.len() < 2 {
                     continue;
                 }
@@ -3803,15 +3807,13 @@ impl LLM {
                             _ => x0.clone(),
                         };
                         (x_t_local, 1.0, 0.0, true)
+                    } else if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                        let x_t_local = b.noise_scheduler.q_sample(&x0, t, &noise);
+                        let sa = b.noise_scheduler.sqrt_alpha_cumprod(t);
+                        let soa = b.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
+                        (x_t_local, sa, soa, false)
                     } else {
-                        if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                            let x_t_local = b.noise_scheduler.q_sample(&x0, t, &noise);
-                            let sa = b.noise_scheduler.sqrt_alpha_cumprod(t);
-                            let soa = b.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
-                            (x_t_local, sa, soa, false)
-                        } else {
-                            continue;
-                        }
+                        continue;
                     }
                 };
                 let mut pred = x_t.clone();
@@ -3824,32 +3826,26 @@ impl LLM {
                 }
                 let x0_hat = if discrete_used {
                     pred.clone()
-                } else {
-                    if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                        match b0.prediction_target() {
-                            crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
-                                let sa = sqrt_a.max(1e-6);
-                                (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
-                            }
-                            crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
-                                (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
-                            }
-                            crate::layers::diffusion::DiffusionPredictionTarget::Sample => {
-                                pred.clone()
-                            }
-                            crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => {
-                                pred.clone()
-                            }
+                } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
+                    match b0.prediction_target() {
+                        crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
+                            let sa = sqrt_a.max(1e-6);
+                            (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
                         }
-                    } else {
-                        pred.clone()
+                        crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
+                            (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
+                        }
+                        crate::layers::diffusion::DiffusionPredictionTarget::Sample => pred.clone(),
+                        crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => pred.clone(),
                     }
+                } else {
+                    pred.clone()
                 };
                 let mut hidden = x0_hat.clone();
-                if let Some(nidx) = norm_idx {
-                    if let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx] {
-                        hidden = norm.forward(&hidden);
-                    }
+                if let Some(nidx) = norm_idx
+                    && let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx]
+                {
+                    hidden = norm.forward(&hidden);
                 }
                 let logits = if let Some(opidx) = out_proj_idx {
                     if let LayerEnum::OutputProjection(op) = &mut self.network[opidx] {
@@ -3929,24 +3925,23 @@ impl LLM {
 
             // Update learned DDIM steps after validation is computed.
             if val_loss.is_finite() {
-                if let Some(prev) = prev_val_loss {
-                    if prev.is_finite() {
-                        let rel_improvement = (prev - val_loss) / prev.max(1e-6);
+                if let Some(prev) = prev_val_loss
+                    && prev.is_finite()
+                {
+                    let rel_improvement = (prev - val_loss) / prev.max(1e-6);
 
-                        // If the model is improving quickly, prefer fewer steps.
-                        // If it stalls or gets worse, increase steps for higher-quality sampling.
-                        if rel_improvement > 0.01 {
+                    if rel_improvement > 0.01 {
+                        steps_plateau_epochs = 0;
+                        learned_ddim_steps = ((learned_ddim_steps as f32) * 0.90).round() as usize;
+                    } else if rel_improvement < -0.005 {
+                        steps_plateau_epochs = steps_plateau_epochs.saturating_add(1);
+                        learned_ddim_steps = ((learned_ddim_steps as f32) * 1.15).round() as usize;
+                    } else {
+                        steps_plateau_epochs = steps_plateau_epochs.saturating_add(1);
+                        if steps_plateau_epochs >= 2 {
+                            learned_ddim_steps =
+                                ((learned_ddim_steps as f32) * 1.05).round() as usize;
                             steps_plateau_epochs = 0;
-                            learned_ddim_steps = ((learned_ddim_steps as f32) * 0.90).round() as usize;
-                        } else if rel_improvement < -0.005 {
-                            steps_plateau_epochs = steps_plateau_epochs.saturating_add(1);
-                            learned_ddim_steps = ((learned_ddim_steps as f32) * 1.15).round() as usize;
-                        } else {
-                            steps_plateau_epochs = steps_plateau_epochs.saturating_add(1);
-                            if steps_plateau_epochs >= 2 {
-                                learned_ddim_steps = ((learned_ddim_steps as f32) * 1.05).round() as usize;
-                                steps_plateau_epochs = 0;
-                            }
                         }
                     }
                 }
@@ -4039,7 +4034,7 @@ impl LLM {
             };
 
         // Snapshot token embeddings (for prompt conditioning) before borrowing network mutably
-        let token_embs_cloned = match self.network.get(0) {
+        let token_embs_cloned = match self.network.first() {
             Some(LayerEnum::TokenEmbeddings(embeddings)) => {
                 Some(embeddings.token_embeddings.clone())
             }
@@ -4059,9 +4054,10 @@ impl LLM {
         }
 
         let (total_timesteps, steps_policy) = match &self.network[diffusion_blocks_idx[0]] {
-            LayerEnum::DiffusionBlock(b0) => {
-                (b0.noise_scheduler.num_timesteps(), b0.config.ddim_steps_policy.clone())
-            }
+            LayerEnum::DiffusionBlock(b0) => (
+                b0.noise_scheduler.num_timesteps(),
+                b0.config.ddim_steps_policy.clone(),
+            ),
             _ => return "Error: No diffusion blocks found".to_string(),
         };
 
@@ -4085,8 +4081,8 @@ impl LLM {
             // Replace the first K rows with prompt token embeddings
             let k = prompt_tokens.len().min(max_length);
             if let Some(token_embs) = token_embs_cloned {
-                for i in 0..k {
-                    let tid = prompt_tokens[i].min(token_embs.nrows().saturating_sub(1));
+                for (i, &token_id) in prompt_tokens.iter().take(k).enumerate() {
+                    let tid = token_id.min(token_embs.nrows().saturating_sub(1));
                     current_sample.row_mut(i).assign(&token_embs.row(tid));
                 }
             }
@@ -4114,8 +4110,8 @@ impl LLM {
             for i in 0..max_length {
                 ids_arr[[0, i]] = mask_token_id as f32;
             }
-            for i in 0..prompt_tokens.len().min(max_length) {
-                ids_arr[[0, i]] = prompt_tokens[i] as f32;
+            for (i, &token_id) in prompt_tokens.iter().take(max_length).enumerate() {
+                ids_arr[[0, i]] = token_id as f32;
             }
 
             for t in (1..=steps).rev() {
@@ -4158,11 +4154,10 @@ impl LLM {
                 };
                 let softmax = crate::soft::Softmax::new();
                 let probs = softmax.forward_immutable(&logits.view());
-                if let LayerEnum::DiffusionBlock(b0) = &self.network[diffusion_blocks_idx[0]] {
-                    if let Some(ds) = &b0.discrete_scheduler {
-                        ids_arr =
-                            ds.reverse_unmask_step(&ids_arr, &probs, mask_token_id, t_idx, 0.9);
-                    }
+                if let LayerEnum::DiffusionBlock(b0) = &self.network[diffusion_blocks_idx[0]]
+                    && let Some(ds) = &b0.discrete_scheduler
+                {
+                    ids_arr = ds.reverse_unmask_step(&ids_arr, &probs, mask_token_id, t_idx, 0.9);
                 }
                 let mut cur_unmasked = 0usize;
                 for i in 0..max_length {
@@ -4289,11 +4284,8 @@ impl LLM {
         // Pass through final DynamicTanhNorm if present
         let mut hidden = current_sample.clone();
         for layer in &mut self.network {
-            match layer {
-                LayerEnum::DynamicTanhNorm(norm) => {
-                    hidden = norm.forward(&hidden);
-                }
-                _ => {}
+            if let LayerEnum::DynamicTanhNorm(norm) = layer {
+                hidden = norm.forward(&hidden);
             }
         }
 
@@ -4417,10 +4409,10 @@ impl LLM {
                     hidden = b.forward_with_timestep(&hidden, 0);
                 }
             }
-            if let Some(nidx) = norm_idx {
-                if let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx] {
-                    hidden = norm.forward(&hidden);
-                }
+            if let Some(nidx) = norm_idx
+                && let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx]
+            {
+                hidden = norm.forward(&hidden);
             }
             let logits = if let Some(opidx) = out_proj_idx {
                 if let LayerEnum::OutputProjection(op) = &mut self.network[opidx] {
@@ -4463,23 +4455,6 @@ impl LLM {
             .collect::<Vec<Vec<usize>>>();
         let (b1, b2) = corpus_bleu_1_2(&refs, &cands);
         Ok((b1, b2))
-    }
-
-    /// Get token embedding vector (test helper method)
-    #[cfg(test)]
-    fn get_token_embedding(&self, token_id: usize, embedding_dim: usize) -> Array1<f32> {
-        // Access TokenEmbeddings layer directly
-        if let Some(LayerEnum::TokenEmbeddings(embeddings)) = self.network.first() {
-            embeddings.token_embeddings.row(token_id).to_owned()
-        } else {
-            // Fallback: return random embedding if no embeddings layer found
-            let mut rng = get_rng();
-            Array1::from_vec(
-                (0..embedding_dim)
-                    .map(|_| rng.random::<f32>() * 2.0 - 1.0)
-                    .collect(),
-            )
-        }
     }
 
     /// Load model (auto-detects format from extension: .json or .bin)

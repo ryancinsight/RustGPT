@@ -7,8 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    layers::components::common::TemporalMixingLayer,
-    model_config::WindowAdaptationStrategy,
+    layers::components::common::TemporalMixingLayer, model_config::WindowAdaptationStrategy,
 };
 
 /// Window adaptation configuration
@@ -46,6 +45,12 @@ impl WindowAdaptationConfig {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WindowAdaptationState {
     window_entropy_ema: f32,
+}
+
+impl Default for WindowAdaptationState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WindowAdaptationState {
@@ -91,38 +96,28 @@ impl WindowAdaptation {
         }
 
         match self.config.window_adaptation_strategy {
-            WindowAdaptationStrategy::Fixed => {
-                base_w.min(seq_len.max(1))
-            }
-            WindowAdaptationStrategy::SequenceLengthBased => {
-                let w = (seq_len / 2).max(min_w).min(max_w);
-                w
-            }
+            WindowAdaptationStrategy::Fixed => base_w.min(seq_len.max(1)),
+            WindowAdaptationStrategy::SequenceLengthBased => (seq_len / 2).max(min_w).min(max_w),
             WindowAdaptationStrategy::AttentionEntropy => {
                 let (tau_span, pred_rms) = self.extract_attention_metrics(temporal_mixing);
                 let signal = (0.7 * tau_span + 0.3 * pred_rms).clamp(0.0, 1.0);
-                
+
                 let alpha = self.config.entropy_ema_alpha.clamp(0.0, 1.0);
-                self.state.window_entropy_ema = 
+                self.state.window_entropy_ema =
                     alpha * signal + (1.0 - alpha) * self.state.window_entropy_ema;
-                
+
                 let w = min_w as f32
                     + self.state.window_entropy_ema * (max_w.saturating_sub(min_w) as f32);
                 w.round() as usize
             }
-            WindowAdaptationStrategy::PerplexityBased => {
-                base_w.min(seq_len.max(1))
-            }
+            WindowAdaptationStrategy::PerplexityBased => base_w.min(seq_len.max(1)),
         }
         .min(seq_len.max(1))
         .clamp(min_w, max_w)
     }
 
     /// Extract attention metrics from temporal mixing layer
-    fn extract_attention_metrics(
-        &self,
-        temporal_mixing: &TemporalMixingLayer,
-    ) -> (f32, f32) {
+    fn extract_attention_metrics(&self, temporal_mixing: &TemporalMixingLayer) -> (f32, f32) {
         match temporal_mixing {
             TemporalMixingLayer::Attention(attn) => {
                 let tau_span = if let Some((tmin, tmax)) = attn.last_tau_metrics {

@@ -7,5 +7,5 @@ pub use impl_::{RichardsCurve, WeightsIter};
 ///
 /// Kept `pub(crate)` so they don't leak outside the crate.
 pub(crate) mod numerics {
-	pub(crate) use super::impl_::{exp_f32_richards, softplus_f32_richards};
+    pub(crate) use super::impl_::{exp_f32_richards, softplus_f32_richards};
 }

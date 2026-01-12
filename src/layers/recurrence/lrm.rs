@@ -14,8 +14,8 @@ use crate::{
             block::CachedIntermediates as TransformerCachedIntermediates,
         },
     },
-    model_config::ModelConfig,
     mixtures::MixtureOfDepthsConfig,
+    model_config::ModelConfig,
     network::Layer,
 };
 
@@ -133,8 +133,8 @@ impl Default for LRMConfig {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum RecursiveBlockVariant {
-    Transformer(TransformerBlock),
-    Diffusion(DiffusionBlock),
+    Transformer(Box<TransformerBlock>),
+    Diffusion(Box<DiffusionBlock>),
 }
 
 impl RecursiveBlockVariant {
@@ -344,10 +344,10 @@ impl LRM {
     pub fn new(config: LRMConfig) -> Self {
         let block = match &config.block_config {
             BlockTypeConfig::Transformer(c) => {
-                RecursiveBlockVariant::Transformer(TransformerBlock::new(c.clone()))
+                RecursiveBlockVariant::Transformer(Box::new(TransformerBlock::new(c.clone())))
             }
             BlockTypeConfig::Diffusion(c) => {
-                RecursiveBlockVariant::Diffusion(DiffusionBlock::new(c.clone()))
+                RecursiveBlockVariant::Diffusion(Box::new(DiffusionBlock::new(c.clone())))
             }
         };
 
@@ -454,7 +454,6 @@ impl LRM {
         }
     }
 
-
     pub fn forward_recursive(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
         if self.config.num_recursions == 0 {
             let out = self.block.write().unwrap().forward_step(input, 0);
@@ -497,7 +496,11 @@ impl LRM {
         let mut max_steps = self.get_max_steps();
         // Mixture-of-Depths: sample a shallower cap during training.
         if self.is_training {
-            max_steps = self.config.mixture_of_depths.sample_depth_cap(max_steps).max(1);
+            max_steps = self
+                .config
+                .mixture_of_depths
+                .sample_depth_cap(max_steps)
+                .max(1);
         }
         self.cached_supervision_outputs.clear();
         self.cached_step_states.clear();
@@ -615,7 +618,11 @@ impl LRM {
 
                         let p = sigmoid.forward_scalar_f32((thr - rel_r) * slope);
                         let will_finish = halting_sum[[r, 0]] + p >= 1.0 - halt_eps;
-                        w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
+                        w[[r, 0]] = if will_finish {
+                            remaining
+                        } else {
+                            p.min(remaining)
+                        };
                     }
 
                     if self.config.halting.act_weighted_output {
@@ -718,7 +725,11 @@ impl LRM {
                     let sigmoid = crate::richards::RichardsCurve::sigmoid(false);
                     let p = sigmoid.forward_scalar_f32((thr - rel_r) * slope);
                     let will_finish = halting_sum[[r, 0]] + p >= 1.0 - eps;
-                    w[[r, 0]] = if will_finish { remaining } else { p.min(remaining) };
+                    w[[r, 0]] = if will_finish {
+                        remaining
+                    } else {
+                        p.min(remaining)
+                    };
                 }
 
                 // Apply weights to the ACT accumulator.
@@ -757,8 +768,12 @@ impl LRM {
                 // Store initial_z and prev_y instead of full recursion caches (Gradient
                 // Checkpointing)
                 if let (Some(cache), Some(initial_z)) = (answer_cache, initial_z) {
-                    self.cached_step_states
-                    .push(SupervisionStepCache::new(cache, initial_z, prev_y, step_weight));
+                    self.cached_step_states.push(SupervisionStepCache::new(
+                        cache,
+                        initial_z,
+                        prev_y,
+                        step_weight,
+                    ));
                 } else {
                     // Keep semantics consistent: still advance y even if cache is missing.
                     // prev_y is dropped here.
@@ -794,9 +809,7 @@ impl LRM {
     }
 
     fn latent_init_gradients(&self, z_grads: &Array2<f32>) -> Option<(Array2<f32>, Array2<f32>)> {
-        if self.latent_init.is_none() {
-            return None;
-        }
+        self.latent_init.as_ref()?;
         let mean = self.cached_mean_input.as_ref()?;
         if z_grads.ncols() != mean.ncols() {
             return None;
@@ -912,24 +925,23 @@ impl LRM {
             }
         }
 
-        if let Some((gw, gb)) = self.latent_init_gradients(&d_z) {
+        let partitions = if let Some((gw, gb)) = self.latent_init_gradients(&d_z) {
             all.push(gw);
             all.push(gb);
-            if let Ok(mut guard) = self.param_partitions.write() {
-                *guard = Some(ParamPartitions {
-                    block: all.len() - 2,
-                    latent_w: 1,
-                    latent_b: 1,
-                });
+            ParamPartitions {
+                block: all.len() - 2,
+                latent_w: 1,
+                latent_b: 1,
             }
         } else {
-            if let Ok(mut guard) = self.param_partitions.write() {
-                *guard = Some(ParamPartitions {
-                    block: all.len(),
-                    latent_w: 0,
-                    latent_b: 0,
-                });
+            ParamPartitions {
+                block: all.len(),
+                latent_w: 0,
+                latent_b: 0,
             }
+        };
+        if let Ok(mut guard) = self.param_partitions.write() {
+            *guard = Some(partitions);
         }
 
         (d_y, all)
@@ -948,7 +960,10 @@ impl LRM {
                 .compute_gradients(_input, output_grads);
         }
 
-        if self.is_training && self.config.halting.enabled && self.config.halting.act_weighted_output {
+        if self.is_training
+            && self.config.halting.enabled
+            && self.config.halting.act_weighted_output
+        {
             // Full BPTT across outer refinement steps.
             // Output is a weighted sum of step outputs, and later steps depend on earlier y.
             if self.cached_step_states.is_empty() {
@@ -1095,7 +1110,13 @@ impl LRM {
     ) -> Vec<CoreCache> {
         let mut block_guard = self.block.write().unwrap();
         let mut scratch_combined = Array2::<f32>::zeros(y.raw_dim());
-        self.run_recursions_with_guard(&mut block_guard, y, z, &mut scratch_combined, capture_caches)
+        self.run_recursions_with_guard(
+            &mut block_guard,
+            y,
+            z,
+            &mut scratch_combined,
+            capture_caches,
+        )
     }
 
     fn run_recursions_with_guard(
@@ -1117,10 +1138,8 @@ impl LRM {
             Self::sanitize(scratch_combined);
             let block_out = block_guard.forward_step(scratch_combined, r_step);
 
-            if capture_caches {
-                if let Some(cache) = block_guard.get_cache() {
-                    caches.push(cache);
-                }
+            if capture_caches && let Some(cache) = block_guard.get_cache() {
+                caches.push(cache);
             }
 
             let mut new_z = block_out;
@@ -1298,12 +1317,20 @@ mod tests {
 
     #[test]
     fn test_lrm_training_act_halting_bptt_runs() {
-        let mut cfg = LRMConfig::default();
-        cfg.max_supervision_steps = 4;
-        cfg.max_inference_steps = 2;
-        cfg.halting.enabled = true;
-        cfg.halting.act_weighted_output = true;
-        cfg.mixture_of_depths.enabled = false; // keep test deterministic
+        let cfg = LRMConfig {
+            max_supervision_steps: 4,
+            max_inference_steps: 2,
+            halting: HaltingConfig {
+                enabled: true,
+                act_weighted_output: true,
+                ..Default::default()
+            },
+            mixture_of_depths: MixtureOfDepthsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let mut lrm = LRM::new(cfg);
         lrm.set_training_mode(true);

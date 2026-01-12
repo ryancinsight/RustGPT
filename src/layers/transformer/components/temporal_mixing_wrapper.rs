@@ -22,11 +22,11 @@ impl TemporalMixingWrapper {
     /// Forward pass through the temporal mixing layer
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         match &mut self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::RgLru(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::Mamba(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::Mamba2(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::RgLruMoH(layer) => Layer::forward(layer, input),
+            TemporalMixingLayer::Attention(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
+            TemporalMixingLayer::Mamba(layer) => layer.forward(input),
+            TemporalMixingLayer::Mamba2(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
         }
     }
 
@@ -69,6 +69,14 @@ impl TemporalMixingWrapper {
         }
     }
 
+    pub fn get_token_head_activity_vec(&self) -> Option<&[f32]> {
+        match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Get window entropy EMA from attention layer
     pub fn get_window_entropy_ema(&self) -> Option<f32> {
         match &self.temporal_mixing {
@@ -87,7 +95,11 @@ impl TemporalMixingWrapper {
     }
 
     /// Backward pass through the temporal mixing layer
-    pub fn backward(&mut self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    pub fn backward(
+        &mut self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match &mut self.temporal_mixing {
             TemporalMixingLayer::Attention(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::RgLru(layer) => layer.compute_gradients(input, output_grads),
@@ -98,7 +110,11 @@ impl TemporalMixingWrapper {
     }
 
     /// Apply gradients to the temporal mixing layer
-    pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
+    pub fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
         match &mut self.temporal_mixing {
             TemporalMixingLayer::Attention(layer) => layer.apply_gradients(param_grads, lr),
             TemporalMixingLayer::RgLru(layer) => layer.apply_gradients(param_grads, lr),

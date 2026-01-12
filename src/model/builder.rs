@@ -100,7 +100,7 @@ fn build_diffusion_layers(
             moe_config: config
                 .moe_router
                 .as_ref()
-                .map(|router| crate::mixtures::moe::ExpertRouterConfig::from_router(router)),
+                .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
             time_embed_dim: config.embedding_dim,
             num_timesteps: 1000,
@@ -130,9 +130,9 @@ fn build_diffusion_layers(
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)
-    layers.push(LayerEnum::DynamicTanhNorm(
+    layers.push(LayerEnum::DynamicTanhNorm(Box::new(
         crate::richards::RichardsNorm::new(config.embedding_dim),
-    ));
+    )));
 }
 
 /// Build Transformer architecture layers
@@ -152,9 +152,9 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)
-    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(
+    layers.push(LayerEnum::DynamicTanhNorm(Box::new(RichardsNorm::new(
         config.embedding_dim,
-    )));
+    ))));
 }
 
 /// Build TRM (Tiny Recursive Model) layers
@@ -164,9 +164,9 @@ fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
 fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
     let lrm = LRM::from_model_config(config);
     layers.push(LayerEnum::LRM(Box::new(lrm)));
-    layers.push(LayerEnum::DynamicTanhNorm(RichardsNorm::new(
+    layers.push(LayerEnum::DynamicTanhNorm(Box::new(RichardsNorm::new(
         config.embedding_dim,
-    )));
+    ))));
 }
 
 /// Print architecture summary
@@ -245,7 +245,10 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     // Only print the attention configuration when attention is actually the temporal mixer.
     // When temporal mixing is Mamba/RG-LRU, the attention-specific config is not the primary path.
-    if matches!(config.temporal_mixing, crate::model_config::TemporalMixingType::Attention) {
+    if matches!(
+        config.temporal_mixing,
+        crate::model_config::TemporalMixingType::Attention
+    ) {
         println!("\n🧠 Attention:");
         use crate::model_config::AttentionType;
         match &config.attention {
@@ -312,9 +315,6 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 ///
 /// This section previously described HRM-specific layer construction, which
 /// has been removed. Supported architectures: Transformer.
-
-// TRM architecture removed; only Transformer is supported now.
-
 #[cfg(test)]
 mod tests {
     use super::*;

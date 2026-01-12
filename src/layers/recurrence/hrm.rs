@@ -131,7 +131,7 @@ impl HRM {
     fn downsample(&self, input: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         let (seq_len, dim) = input.dim();
         let stride = self.config.stride;
-        let out_len = (seq_len + stride - 1) / stride;
+        let out_len = seq_len.div_ceil(stride);
 
         let mut pooled = Array2::<f32>::zeros((out_len, dim));
 

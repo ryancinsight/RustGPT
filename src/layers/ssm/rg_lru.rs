@@ -88,12 +88,14 @@ pub struct MoHRgLru {
     pub last_avg_active_heads: Option<f32>,
     #[serde(skip_serializing, skip_deserializing)]
     pub last_head_activity_vec: Option<Vec<f32>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub last_token_head_activity_vec: Option<Vec<f32>>,
 }
 
 impl MoHRgLru {
     pub fn new(embed_dim: usize, num_heads: usize, head_selection: &HeadSelectionStrategy) -> Self {
         let mut nh = num_heads.max(1);
-        if embed_dim == 0 || embed_dim % nh != 0 {
+        if embed_dim == 0 || !embed_dim.is_multiple_of(nh) {
             nh = 1;
         }
         let head_dim = if nh > 0 { embed_dim / nh } else { embed_dim };
@@ -117,6 +119,7 @@ impl MoHRgLru {
             cached_head_out: None,
             last_avg_active_heads: None,
             last_head_activity_vec: None,
+            last_token_head_activity_vec: None,
         }
     }
 
@@ -127,6 +130,7 @@ impl MoHRgLru {
         self.cached_head_out = None;
         self.last_avg_active_heads = None;
         self.last_head_activity_vec = None;
+        self.last_token_head_activity_vec = None;
     }
 
     pub fn take_tau_metrics(&mut self) -> Option<(f32, f32)> {
@@ -255,7 +259,7 @@ impl RgLru {
         let mut a = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                let lt = (c * r[[ti, j]] * log_base_a[j]).max(-80.0).min(0.0);
+                let lt = (c * r[[ti, j]] * log_base_a[j]).clamp(-80.0, 0.0);
                 a[[ti, j]] = crate::pade::exp(lt);
             }
         }
@@ -335,15 +339,15 @@ impl RgLru {
             let key_ok = self
                 .cached_input_sum
                 .is_some_and(|k| (k - key).abs() <= (1e-5 * k.abs().max(1.0) + 1e-6));
-            if let (Some(r), Some(i), Some(a), Some(hp)) = (
-                self.cached_r.as_ref(),
-                self.cached_i.as_ref(),
-                self.cached_a.as_ref(),
-                self.cached_hprev.as_ref(),
-            ) {
-                if key_ok {
-                    return (r.clone(), i.clone(), a.clone(), hp.clone());
-                }
+            if key_ok
+                && let (Some(r), Some(i), Some(a), Some(hp)) = (
+                    self.cached_r.as_ref(),
+                    self.cached_i.as_ref(),
+                    self.cached_a.as_ref(),
+                    self.cached_hprev.as_ref(),
+                )
+            {
+                return (r.clone(), i.clone(), a.clone(), hp.clone());
             }
         }
 
@@ -423,14 +427,13 @@ impl Layer for RgLru {
         // log(sigmoid(lambda)) = -softplus(-lambda)
         let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
         // d/dlambda log(sigmoid(lambda)) = sigmoid(-lambda) = 1 - sigmoid(lambda)
-        let dlogsig_dlambda: Array1<f32> =
-            {
-                let sigmoid = RichardsCurve::sigmoid(false);
-                self.lambda
-                    .row(0)
-                    .to_owned()
-                    .mapv(|x| sigmoid.forward_scalar_f32(-x))
-            };
+        let dlogsig_dlambda: Array1<f32> = {
+            let sigmoid = RichardsCurve::sigmoid(false);
+            self.lambda
+                .row(0)
+                .to_owned()
+                .mapv(|x| sigmoid.forward_scalar_f32(-x))
+        };
 
         // Full BPTT through diagonal recurrence: dh_next carries gradients to h_{t-1}.
         let mut dh_next = Array1::<f32>::zeros(d);
@@ -478,7 +481,7 @@ impl Layer for RgLru {
 
                 // a_t = exp(clamp(k_t, -80, 0)), k_t = c * r_t * log_base_a
                 let k = c * rt * log_base_a[j];
-                let active = (k >= -80.0) && (k <= 0.0);
+                let active = (-80.0..=0.0).contains(&k);
                 let dk = if active { da * at } else { 0.0 };
 
                 // k depends on r_t and log_base_a
@@ -605,13 +608,29 @@ impl Layer for MoHRgLru {
             Some(0.0)
         };
 
-        // Provide a per-head activity vector for downstream MoE conditioning.
         let mut hv = Vec::with_capacity(self.num_heads);
         for h in 0..self.num_heads {
             let mean = eff.column(h).iter().map(|&x| x.max(0.0)).sum::<f32>() / (t.max(1) as f32);
             hv.push(if mean.is_finite() { mean } else { 0.0 });
         }
         self.last_head_activity_vec = Some(hv);
+        let mut tv = Vec::with_capacity(t);
+        for i in 0..t {
+            let mut sum = 0.0f32;
+            for h in 0..self.num_heads {
+                let w = eff[[i, h]];
+                let w = if w.is_finite() { w } else { 0.0 };
+                sum += w.max(0.0);
+            }
+            let denom = self.num_heads.max(1) as f32;
+            let v = if denom > 0.0 { sum / denom } else { 0.0 };
+            tv.push(if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+        self.last_token_head_activity_vec = Some(tv);
 
         out
     }

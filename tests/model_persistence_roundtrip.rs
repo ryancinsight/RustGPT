@@ -1,4 +1,4 @@
-use llm::{llm::LLM, Layer};
+use llm::{Layer, llm::LLM};
 
 #[test]
 fn versioned_model_binary_roundtrip_smoke() {

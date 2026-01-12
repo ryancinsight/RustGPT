@@ -89,16 +89,20 @@ pub fn init_gate_polynomial() -> RichardsCurve {
     RichardsCurve::new_learnable(Variant::Sigmoid)
 }
 
+pub struct ThresholdPredictorOptimizers<'a> {
+    pub opt_w_tau: &'a mut Option<Adam>,
+    pub opt_b_tau: &'a mut Option<Adam>,
+    pub opt_w2_tau: &'a mut Option<Adam>,
+    pub opt_b2_tau: &'a mut Option<Adam>,
+    pub opt_cond_w_tau: &'a mut Option<Adam>,
+}
+
 /// Ensure threshold predictor is initialized with appropriate configuration
 pub fn ensure_threshold_predictor_initialized(
     threshold_predictor: &mut Option<ThresholdPredictor>,
     embed_dim: usize,
     num_heads: usize,
-    opt_w_tau: &mut Option<Adam>,
-    opt_b_tau: &mut Option<Adam>,
-    opt_w2_tau: &mut Option<Adam>,
-    opt_b2_tau: &mut Option<Adam>,
-    opt_cond_w_tau: &mut Option<Adam>,
+    optimizers: ThresholdPredictorOptimizers<'_>,
 ) {
     if threshold_predictor.is_none() {
         let predictor_hidden_dim = 128.min(embed_dim / 2).max(32);
@@ -109,11 +113,11 @@ pub fn ensure_threshold_predictor_initialized(
             embed_dim,
         ));
 
-        *opt_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
-        *opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
-        *opt_w2_tau = Some(Adam::new((predictor_hidden_dim, num_heads)));
-        *opt_b2_tau = Some(Adam::new((num_heads, 1)));
-        *opt_cond_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
+        *optimizers.opt_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
+        *optimizers.opt_b_tau = Some(Adam::new((predictor_hidden_dim, 1)));
+        *optimizers.opt_w2_tau = Some(Adam::new((predictor_hidden_dim, num_heads)));
+        *optimizers.opt_b2_tau = Some(Adam::new((num_heads, 1)));
+        *optimizers.opt_cond_w_tau = Some(Adam::new((embed_dim, predictor_hidden_dim)));
     }
 }
 
@@ -123,11 +127,7 @@ pub fn configure_head_selection(
     threshold_predictor: &mut Option<ThresholdPredictor>,
     embed_dim: usize,
     num_heads: usize,
-    opt_w_tau: &mut Option<Adam>,
-    opt_b_tau: &mut Option<Adam>,
-    opt_w2_tau: &mut Option<Adam>,
-    opt_b2_tau: &mut Option<Adam>,
-    opt_cond_w_tau: &mut Option<Adam>,
+    optimizers: ThresholdPredictorOptimizers<'_>,
     strategy: &HeadSelectionStrategy,
 ) {
     *head_selection_config = HeadSelectionConfig::from_strategy(strategy, num_heads);
@@ -138,11 +138,7 @@ pub fn configure_head_selection(
             threshold_predictor,
             embed_dim,
             num_heads,
-            opt_w_tau,
-            opt_b_tau,
-            opt_w2_tau,
-            opt_b2_tau,
-            opt_cond_w_tau,
+            optimizers,
         );
     }
 }

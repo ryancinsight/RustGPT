@@ -202,7 +202,7 @@ impl Softmax {
                     if !any_finite {
                         // Match historical behavior: if everything is non-finite, fall back to a
                         // deterministic one-hot at index 0.
-                        if row.len() > 0 {
+                        if !row.is_empty() {
                             result[[i, 0]] = 1.0;
                         }
                         continue;
@@ -375,7 +375,7 @@ impl Softmax {
             }
         }
         if !any_finite {
-            if row.len() > 0 {
+            if !row.is_empty() {
                 result[0] = 1.0;
             }
             return result;
@@ -436,10 +436,7 @@ mod tests {
         assert_eq!(a.len(), b.len());
         for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
             let diff = (x - y).abs();
-            assert!(
-                diff <= tol,
-                "mismatch at {i}: {x} vs {y} (diff={diff})"
-            );
+            assert!(diff <= tol, "mismatch at {i}: {x} vs {y} (diff={diff})");
         }
     }
 

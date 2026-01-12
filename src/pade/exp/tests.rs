@@ -70,7 +70,12 @@ fn test_pade_approximant_accuracy() {
         let std_result = x.exp();
         let rel_error = ((pade_result - std_result) / std_result).abs();
 
-        assert!(rel_error < 1e-13, "[7/7] Pade x={}, rel_error={}", x, rel_error);
+        assert!(
+            rel_error < 1e-13,
+            "[7/7] Pade x={}, rel_error={}",
+            x,
+            rel_error
+        );
     }
 
     for &x in &test_values_5_5 {
@@ -78,7 +83,12 @@ fn test_pade_approximant_accuracy() {
         let std_result = x.exp();
         let rel_error = ((pade_result - std_result) / std_result).abs();
 
-        assert!(rel_error < 1e-4, "[5/5] Pade x={}, rel_error={}", x, rel_error);
+        assert!(
+            rel_error < 1e-4,
+            "[5/5] Pade x={}, rel_error={}",
+            x,
+            rel_error
+        );
     }
 
     for &x in &test_values_3_3 {
@@ -86,7 +96,12 @@ fn test_pade_approximant_accuracy() {
         let std_result = x.exp();
         let rel_error = ((pade_result - std_result) / std_result).abs();
 
-        assert!(rel_error < 1e-4, "[3/3] Pade x={}, rel_error={}", x, rel_error);
+        assert!(
+            rel_error < 1e-4,
+            "[3/3] Pade x={}, rel_error={}",
+            x,
+            rel_error
+        );
     }
 }
 
@@ -95,14 +110,27 @@ fn test_benchmark_accuracy() {
     let max_error_small = PadeExp::benchmark_accuracy(1000, (-0.346574, 0.346574));
     let max_error_large = PadeExp::benchmark_accuracy(100, (-10.0, 10.0));
 
-    assert!(max_error_small < 1e-4, "Small range max error: {}", max_error_small);
-    assert!(max_error_large < 1e-4, "Large range max error: {}", max_error_large);
+    assert!(
+        max_error_small < 1e-4,
+        "Small range max error: {}",
+        max_error_small
+    );
+    assert!(
+        max_error_large < 1e-4,
+        "Large range max error: {}",
+        max_error_large
+    );
 }
 
 #[test]
 fn test_critical_points_accuracy() {
     let (max_error, worst_x) = PadeExp::test_critical_points();
-    assert!(max_error < 1e-4, "Critical points max error: {} at x={}", max_error, worst_x);
+    assert!(
+        max_error < 1e-4,
+        "Critical points max error: {} at x={}",
+        max_error,
+        worst_x
+    );
 }
 
 #[test]
@@ -115,7 +143,12 @@ fn test_range_reduction_accuracy() {
 
         if std_result.is_finite() && pade_result.is_finite() {
             let rel_error = ((pade_result - std_result) / std_result).abs();
-            assert!(rel_error < 1e-11, "Range reduction x={}, rel_error={}", x, rel_error);
+            assert!(
+                rel_error < 1e-11,
+                "Range reduction x={}, rel_error={}",
+                x,
+                rel_error
+            );
         }
     }
 }
@@ -129,7 +162,11 @@ fn test_pade_coefficient_stability() {
     let perturbed_result = PadeExp::chebyshev_pade_7_7(x + eps);
 
     let change = (perturbed_result - base_result).abs();
-    assert!(change < 1e-13, "Numerical stability test failed: change={}", change);
+    assert!(
+        change < 1e-13,
+        "Numerical stability test failed: change={}",
+        change
+    );
 }
 
 #[test]
@@ -141,7 +178,13 @@ fn test_ldexp_accuracy() {
         let expected = x * (2.0_f64).powi(exp);
 
         let rel_error = ((ldexp_result - expected) / expected).abs();
-        assert!(rel_error < 1e-15, "ldexp({}, {}) error: {}", x, exp, rel_error);
+        assert!(
+            rel_error < 1e-15,
+            "ldexp({}, {}) error: {}",
+            x,
+            exp,
+            rel_error
+        );
     }
 }
 
@@ -270,7 +313,14 @@ fn test_pade_gradient_consistency() {
 
 #[test]
 fn test_approximant_selection() {
-    let test_values = [-0.2, -0.2 + 1e-8, -0.2 - 1e-8, -0.15, -0.15 + 1e-8, -0.15 - 1e-8];
+    let test_values = [
+        -0.2,
+        -0.2 + 1e-8,
+        -0.2 - 1e-8,
+        -0.15,
+        -0.15 + 1e-8,
+        -0.15 - 1e-8,
+    ];
 
     for &x in &test_values as &[f64] {
         let abs_x = x.abs();
@@ -305,7 +355,11 @@ fn test_pade_derivative_functionality() {
         assert_eq!(value_combined, pade_value);
         assert_eq!(grad_combined, pade_grad);
 
-        assert!(pade_grad.is_finite(), "Pade gradient should be finite at x={}", x);
+        assert!(
+            pade_grad.is_finite(),
+            "Pade gradient should be finite at x={}",
+            x
+        );
         assert!(pade_grad > 0.0, "exp'(x) should be positive for x >= 0");
     }
 }
@@ -327,15 +381,30 @@ fn test_exp_with_grad_consistency() {
 #[test]
 fn test_coefficient_optimization() {
     let optimization_results = PadeExp::optimize_coefficients();
-    println!("Coefficient Optimization Results:\n{}", optimization_results);
+    println!(
+        "Coefficient Optimization Results:\n{}",
+        optimization_results
+    );
 
     let error_7_7 = PadeExp::benchmark_accuracy(1000, (-0.4, 0.4));
     let error_5_5 = PadeExp::benchmark_accuracy(1000, (-0.8, 0.8));
     let error_3_3 = PadeExp::benchmark_accuracy(1000, (-1.2, 1.2));
 
-    assert!(error_7_7 < 1e-4, "[7/7] Pade error too high: {:.2e}", error_7_7);
-    assert!(error_5_5 < 1e-4, "[5/5] Pade error too high: {:.2e}", error_5_5);
-    assert!(error_3_3 < 1e-3, "[3/3] Pade error too high: {:.2e}", error_3_3);
+    assert!(
+        error_7_7 < 1e-4,
+        "[7/7] Pade error too high: {:.2e}",
+        error_7_7
+    );
+    assert!(
+        error_5_5 < 1e-4,
+        "[5/5] Pade error too high: {:.2e}",
+        error_5_5
+    );
+    assert!(
+        error_3_3 < 1e-3,
+        "[3/3] Pade error too high: {:.2e}",
+        error_3_3
+    );
 }
 
 #[test]
@@ -347,7 +416,11 @@ fn test_optimal_approximant_selection() {
     println!("Scientific Selection (1e-10):\n{}", sci_selection);
 
     let ml_error = PadeExp::benchmark_accuracy(1000, (-0.4, 0.4));
-    assert!(ml_error <= 1e-4, "ML applications need [7/7] but error is {:.2e}", ml_error);
+    assert!(
+        ml_error <= 1e-4,
+        "ML applications need [7/7] but error is {:.2e}",
+        ml_error
+    );
 }
 
 #[test]
@@ -356,7 +429,11 @@ fn test_unified_pade_interface() {
 
     for &x in &test_values {
         let exp_result = PadeExp::exp(x);
-        assert!(exp_result.is_finite() || x.is_infinite(), "exp({}) should be finite", x);
+        assert!(
+            exp_result.is_finite() || x.is_infinite(),
+            "exp({}) should be finite",
+            x
+        );
 
         let grad_result = PadeExp::exp_grad(x);
         assert!(
@@ -388,7 +465,11 @@ fn test_codebase_consistency() {
     let attention_logits = [-2.0, -1.0, 0.0, 1.0, 2.0];
     for &logit in &attention_logits {
         let masked = PadeExp::exp(logit);
-        assert!(masked.is_finite(), "Attention masking failed for logit {}", logit);
+        assert!(
+            masked.is_finite(),
+            "Attention masking failed for logit {}",
+            logit
+        );
     }
 
     let softmax_vals = [-1.0, 0.0, 1.0];
@@ -397,7 +478,11 @@ fn test_codebase_consistency() {
         .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
     for &val in &softmax_vals {
         let exp_val = PadeExp::exp(val - max_val);
-        assert!(exp_val.is_finite() && exp_val >= 0.0, "Softmax exp failed for {}", val);
+        assert!(
+            exp_val.is_finite() && exp_val >= 0.0,
+            "Softmax exp failed for {}",
+            val
+        );
     }
 
     let richards_inputs = [-0.5, 0.0, 0.5];
@@ -406,10 +491,16 @@ fn test_codebase_consistency() {
         let exp_neg = PadeExp::exp(-x);
         let sigmoid = 1.0 / (1.0 + PadeExp::exp(-x));
 
-        assert!(exp_pos.is_finite() && exp_pos > 0.0, "Richards exp(+) failed");
-        assert!(exp_neg.is_finite() && exp_neg > 0.0, "Richards exp(-) failed");
         assert!(
-            sigmoid.is_finite() && sigmoid >= 0.0 && sigmoid <= 1.0,
+            exp_pos.is_finite() && exp_pos > 0.0,
+            "Richards exp(+) failed"
+        );
+        assert!(
+            exp_neg.is_finite() && exp_neg > 0.0,
+            "Richards exp(-) failed"
+        );
+        assert!(
+            sigmoid.is_finite() && (0.0..=1.0).contains(&sigmoid),
             "Richards sigmoid failed"
         );
     }
@@ -506,14 +597,24 @@ fn test_error_analysis() {
 
 #[test]
 fn test_pade_order_selection() {
-    let test_cases = [(0.1, "[7/7]"), (0.4, "[5/5]"), (0.8, "[3/3]"), (2.0, "range")];
+    let test_cases = [
+        (0.1, "[7/7]"),
+        (0.4, "[5/5]"),
+        (0.8, "[3/3]"),
+        (2.0, "range"),
+    ];
 
     for &(x, _expected_order) in &test_cases {
         let result = PadeExp::exp(x);
         let expected_value = x.exp();
 
         let rel_error = ((result - expected_value) / expected_value).abs();
-        assert!(rel_error < 1e-5, "Failed for x={}, rel_error={}", x, rel_error);
+        assert!(
+            rel_error < 1e-5,
+            "Failed for x={}, rel_error={}",
+            x,
+            rel_error
+        );
     }
 }
 
@@ -551,7 +652,10 @@ fn test_exp_array() {
 
 #[test]
 fn test_numerical_stability() {
-    assert!(PadeExp::exp(100.0).is_finite(), "Large positive values should be clamped");
+    assert!(
+        PadeExp::exp(100.0).is_finite(),
+        "Large positive values should be clamped"
+    );
     assert!(
         PadeExp::exp(-100.0) > 0.0,
         "Large negative values should be clamped to small positive"
@@ -563,8 +667,16 @@ fn test_numerical_stability() {
         let pade_result = PadeExp::exp(x);
         let std_result = x.exp();
 
-        assert!(pade_result.is_finite(), "Result should be finite for moderate x={}", x);
-        assert!(std_result.is_finite(), "Std result should be finite for x={}", x);
+        assert!(
+            pade_result.is_finite(),
+            "Result should be finite for moderate x={}",
+            x
+        );
+        assert!(
+            std_result.is_finite(),
+            "Std result should be finite for x={}",
+            x
+        );
 
         let rel_error = ((pade_result - std_result) / std_result).abs();
         assert!(

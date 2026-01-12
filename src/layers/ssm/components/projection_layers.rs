@@ -4,7 +4,7 @@
 //! for state space models with optimized memory management.
 
 use ndarray::Array2;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::adam::Adam;
 
@@ -34,7 +34,7 @@ impl Default for ProjectionConfig {
 pub struct LinearProjection {
     pub weight: Array2<f32>,
     pub bias: Option<Array2<f32>>,
-    
+
     #[serde(skip_serializing)]
     opt_weight: Adam,
     #[serde(skip_serializing)]
@@ -49,7 +49,7 @@ impl LinearProjection {
         } else {
             (2.0 / (input_dim as f32)).sqrt()
         };
-        
+
         let weight = if config.small_init {
             Array2::zeros((input_dim, output_dim))
         } else {
@@ -57,20 +57,20 @@ impl LinearProjection {
                 rand::random::<f32>() * scale * 2.0 - scale
             })
         };
-        
+
         let bias = if config.use_bias {
             Some(Array2::zeros((1, output_dim)))
         } else {
             None
         };
-        
+
         let opt_weight = Adam::new((input_dim, output_dim));
         let opt_bias = if config.use_bias {
             Some(Adam::new((1, output_dim)))
         } else {
             None
         };
-        
+
         Self {
             weight,
             bias,
@@ -82,7 +82,7 @@ impl LinearProjection {
     /// Forward pass: y = x * weight + bias
     pub fn forward(&self, x: &Array2<f32>) -> Array2<f32> {
         let result = x.dot(&self.weight);
-        
+
         if let Some(bias) = &self.bias {
             result + bias
         } else {
@@ -91,14 +91,21 @@ impl LinearProjection {
     }
 
     /// Apply gradients to projection parameters
-    pub fn apply_gradients(&mut self, input_grad: &Array2<f32>, output_grad: &Array2<f32>, lr: f32) {
+    pub fn apply_gradients(
+        &mut self,
+        input_grad: &Array2<f32>,
+        output_grad: &Array2<f32>,
+        lr: f32,
+    ) {
         // Gradient for weight: dL/dW = x^T * dL/dy
         let weight_grad = input_grad.t().dot(output_grad);
         self.opt_weight.step(&mut self.weight, &weight_grad, lr);
-        
+
         // Gradient for bias: dL/db = sum(dL/dy)
         if let (Some(bias), Some(opt_bias)) = (&mut self.bias, &mut self.opt_bias) {
-            let bias_grad = output_grad.sum_axis(ndarray::Axis(0)).insert_axis(ndarray::Axis(0));
+            let bias_grad = output_grad
+                .sum_axis(ndarray::Axis(0))
+                .insert_axis(ndarray::Axis(0));
             opt_bias.step(bias, &bias_grad, lr);
         }
     }
@@ -116,13 +123,13 @@ impl LinearProjection {
     pub fn reset_parameters(&mut self, config: ProjectionConfig) {
         let input_dim = self.weight.nrows();
         let _output_dim = self.weight.ncols();
-        
+
         let scale = if config.small_init {
             config.init_scale
         } else {
             (2.0 / (input_dim as f32)).sqrt()
         };
-        
+
         if config.small_init {
             self.weight.fill(0.0);
         } else {
@@ -130,7 +137,7 @@ impl LinearProjection {
                 *val = rand::random::<f32>() * scale * 2.0 - scale;
             }
         }
-        
+
         if let Some(bias) = &mut self.bias {
             bias.fill(0.0);
         }
@@ -140,10 +147,10 @@ impl LinearProjection {
 /// Depthwise convolution layer for 1D sequences
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DepthwiseConv1D {
-    pub kernel: Array2<f32>,  // [kernel_size, input_dim]
-    pub bias: Option<Array2<f32>>,  // [1, input_dim]
+    pub kernel: Array2<f32>,       // [kernel_size, input_dim]
+    pub bias: Option<Array2<f32>>, // [1, input_dim]
     pub kernel_size: usize,
-    
+
     #[serde(skip_serializing)]
     opt_kernel: Adam,
     #[serde(skip_serializing)]
@@ -161,20 +168,20 @@ impl DepthwiseConv1D {
                 rand::random::<f32>() * scale * 2.0 - scale
             })
         };
-        
+
         let bias = if config.use_bias {
             Some(Array2::zeros((1, input_dim)))
         } else {
             None
         };
-        
+
         let opt_kernel = Adam::new((kernel_size, input_dim));
         let opt_bias = if config.use_bias {
             Some(Adam::new((1, input_dim)))
         } else {
             None
         };
-        
+
         Self {
             kernel,
             bias,
@@ -192,13 +199,13 @@ impl DepthwiseConv1D {
         let seq_len = x.nrows();
         let input_dim = x.ncols();
         let mut output = Array2::zeros((seq_len, input_dim));
-        
+
         for t in 0..seq_len {
             // Extract window [t+1-window_size..t], where window_size=min(t+1, kernel_size)
             // This avoids usize underflow for small t.
             let window_size = (t + 1).min(self.kernel_size);
             let start = (t + 1) - window_size;
-            
+
             // Apply depthwise convolution
             for d in 0..input_dim {
                 let mut sum = 0.0;
@@ -207,17 +214,17 @@ impl DepthwiseConv1D {
                     let kernel_idx = self.kernel_size - window_size + k;
                     sum += x[[input_idx, d]] * self.kernel[[kernel_idx, d]];
                 }
-                
+
                 let bias_val = if let Some(bias) = &self.bias {
                     bias[[0, d]]
                 } else {
                     0.0
                 };
-                
+
                 output[[t, d]] = sum + bias_val;
             }
         }
-        
+
         output
     }
 
@@ -228,16 +235,16 @@ impl DepthwiseConv1D {
         }
         let seq_len = input.nrows();
         let input_dim = input.ncols();
-        
+
         // Gradient for kernel
         let mut kernel_grad = Array2::zeros(self.kernel.raw_dim());
-        
+
         for t in 0..seq_len {
             for d in 0..input_dim {
                 // Compute gradient for each kernel position
                 let window_size = (t + 1).min(self.kernel_size);
                 let start = (t + 1) - window_size;
-                
+
                 for k in 0..window_size {
                     let input_idx = start + k;
                     let kernel_idx = self.kernel_size - window_size + k;
@@ -245,12 +252,14 @@ impl DepthwiseConv1D {
                 }
             }
         }
-        
+
         self.opt_kernel.step(&mut self.kernel, &kernel_grad, lr);
-        
+
         // Gradient for bias
         if let (Some(bias), Some(opt_bias)) = (&mut self.bias, &mut self.opt_bias) {
-            let bias_grad = output_grad.sum_axis(ndarray::Axis(0)).insert_axis(ndarray::Axis(0));
+            let bias_grad = output_grad
+                .sum_axis(ndarray::Axis(0))
+                .insert_axis(ndarray::Axis(0));
             opt_bias.step(bias, &bias_grad, lr);
         }
     }

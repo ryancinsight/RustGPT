@@ -46,6 +46,10 @@ harness = false
 name = "transformer_block"
 harness = false
 
+[[bench]]
+name = "mamba_scan"
+harness = false
+
 [[bin]]
 name = "main"
 path = "src/main.rs"

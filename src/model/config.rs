@@ -52,9 +52,10 @@ pub enum AttentionType {
 }
 
 /// Temporal mixing mechanism selection (attention vs recurrent/SSM-style).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TemporalMixingType {
     /// Attention-based temporal mixing (default)
+    #[default]
     Attention,
     /// Recurrent RG-LRU temporal mixing (Hawk/Griffin-style)
     RgLru,
@@ -64,12 +65,6 @@ pub enum TemporalMixingType {
 
     /// Mamba-2 style selective SSM (reference implementation)
     Mamba2,
-}
-
-impl Default for TemporalMixingType {
-    fn default() -> Self {
-        TemporalMixingType::Attention
-    }
 }
 
 /// Strategy for sampling diffusion timesteps during training

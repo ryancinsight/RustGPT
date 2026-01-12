@@ -15,6 +15,12 @@ pub struct AttentionContext {
     similarity_context_strength: Array2<f32>,
 }
 
+impl Default for AttentionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AttentionContext {
     pub fn new() -> Self {
         Self {
@@ -53,14 +59,14 @@ impl AttentionContext {
         if let Some(context) = &self.incoming_context {
             let strength = self.get_strength();
             let embed_dim = input.ncols();
-            
+
             if strength == 0.0 || embed_dim == 0 {
                 return input.clone();
             }
 
             let mut result = input.clone();
             let scale = strength / embed_dim as f32;
-            
+
             // Apply context mixing: X' = X + (strength / embed_dim) * X·S
             for i in 0..input.nrows() {
                 for j in 0..embed_dim {

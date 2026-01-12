@@ -6,11 +6,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    errors::Result,
-    layers::components::common::FeedForwardVariant,
-    network::Layer,
-};
+use crate::{errors::Result, layers::components::common::FeedForwardVariant, network::Layer};
 
 /// Shared feedforward component
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,10 +32,16 @@ impl SharedFeedforward {
     }
 
     /// Backward pass through the feedforward network
-    pub fn backward(&mut self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    pub fn backward(
+        &mut self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match &mut self.feedforward {
             FeedForwardVariant::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.compute_gradients(input, output_grads),
+            FeedForwardVariant::MixtureOfExperts(layer) => {
+                layer.compute_gradients(input, output_grads)
+            }
         }
     }
 

@@ -157,7 +157,7 @@ fn forward(&mut self, input: Array2<f32>) -> Array2<f32> {
 - **Cache**: O(T × D) for gradient computation
 
 #### Hardware Efficiency
-- **Parallel Scan**: GPU-friendly parallel prefix sum implementation
+- **Parallel Scan**: Chunk-parallel associative scan on CPU (Rayon); GPU prefix-sum backend is a future optimization
 - **Memory Access**: Sequential memory patterns for good cache utilization
 - **FLOPs**: ~24D² per token (competitive with attention)
 

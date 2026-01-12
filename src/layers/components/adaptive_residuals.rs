@@ -44,8 +44,8 @@ pub struct AdaptiveResiduals {
     pub activation_similarity_diag: Array2<f32>,
 
     /// EMA of per-channel mean absolute off-channel alignment.
-    /// This is an inexpensive sketch of "confusions" (how much channel i aligns with other channels).
-    /// Shape: (embed_dim × 1)
+    /// This is an inexpensive sketch of "confusions" (how much channel i aligns with other
+    /// channels). Shape: (embed_dim × 1)
     pub activation_similarity_off_abs_mean: Array2<f32>,
 
     /// Adaptive residual scaling for attention paths (embed_dim × 1)
@@ -102,7 +102,7 @@ impl AdaptiveResiduals {
             activation_similarity_off_abs_mean,
             attention_residual_scales: attn_scales,
             ffn_residual_scales: ffn_scales,
-            max_seq_len: max_seq_len,
+            max_seq_len,
             opt_scales_attention,
             opt_scales_ffn,
             config,
@@ -157,7 +157,8 @@ impl AdaptiveResiduals {
         // If there is no head-conditioning signal, use the simplest (and most learnable)
         // per-channel scaling path. This keeps gradients well-aligned with the update rule
         // used in compute_gradients() and improves convergence in unit tests.
-        let enable_contrast_conditioning = head_activity_ratio.is_some() || head_activity_vec.is_some();
+        let enable_contrast_conditioning =
+            head_activity_ratio.is_some() || head_activity_vec.is_some();
 
         // Apply MoH conditioning if available.
         // Optional: per-head activity vector can encode specialization/uncertainty.
@@ -211,7 +212,11 @@ impl AdaptiveResiduals {
 
         for channel in 0..embed_dim {
             let mut base_scale = self.attention_residual_scales[[channel, 0]];
-            base_scale = if base_scale.is_finite() { base_scale } else { 1.0 };
+            base_scale = if base_scale.is_finite() {
+                base_scale
+            } else {
+                1.0
+            };
             base_scale = base_scale.clamp(min_scale, threshold);
 
             if !enable_contrast_conditioning {
@@ -220,7 +225,11 @@ impl AdaptiveResiduals {
             }
 
             let diag = self.activation_similarity_diag[[channel, 0]];
-            let diag = if diag.is_finite() { diag.clamp(-1.0, 1.0) } else { 0.0 };
+            let diag = if diag.is_finite() {
+                diag.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
 
             let off_abs_mean = self.activation_similarity_off_abs_mean[[channel, 0]];
             let off_abs_mean = if off_abs_mean.is_finite() {
@@ -232,7 +241,8 @@ impl AdaptiveResiduals {
             let margin = diag - off_abs_mean;
             let contrast_factor = 1.0 + contrast_alpha * (margin / contrast_temperature).tanh();
 
-            let final_scale = (base_scale * contrast_factor * moh_scale_factor).clamp(min_scale, threshold);
+            let final_scale =
+                (base_scale * contrast_factor * moh_scale_factor).clamp(min_scale, threshold);
             adaptive_scales[[channel, 0]] = final_scale;
         }
 
@@ -244,7 +254,11 @@ impl AdaptiveResiduals {
                 let attn_val = attn_out[[seq, channel]];
                 let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
                 let input_val = input[[seq, channel]];
-                let input_val = if input_val.is_finite() { input_val } else { 0.0 };
+                let input_val = if input_val.is_finite() {
+                    input_val
+                } else {
+                    0.0
+                };
                 let scale = adaptive_scales[[channel, 0]];
 
                 // Apply scaled attention output
@@ -281,11 +295,19 @@ impl AdaptiveResiduals {
         self.scratch_channel_scales.fill(1.0f32);
         for channel in 0..embed_dim {
             let mut base_scale = ffn_scales[[channel, 0]];
-            base_scale = if base_scale.is_finite() { base_scale } else { 1.0 };
+            base_scale = if base_scale.is_finite() {
+                base_scale
+            } else {
+                1.0
+            };
             base_scale = base_scale.clamp(min_scale, threshold);
 
             let diag = self.activation_similarity_diag[[channel, 0]];
-            let diag = if diag.is_finite() { diag.clamp(-1.0, 1.0) } else { 0.0 };
+            let diag = if diag.is_finite() {
+                diag.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
 
             let off_abs_mean = self.activation_similarity_off_abs_mean[[channel, 0]];
             let off_abs_mean = if off_abs_mean.is_finite() {
@@ -344,7 +366,7 @@ impl AdaptiveResiduals {
         self.scratch_nx.fill(0.0f64);
         self.scratch_ny.resize(embed_dim, 0.0f64);
         self.scratch_ny.fill(0.0f64);
-        
+
         // Compute norms
         for seq_idx in (0..seq_len).step_by(step).take(sample) {
             for j in 0..embed_dim {
@@ -362,7 +384,7 @@ impl AdaptiveResiduals {
         // - off_abs_mean: mean |alignment| with a small deterministic sample of other channels
         let off_samples = 16usize.min(embed_dim.saturating_sub(1));
         let mut stride = (embed_dim / off_samples.max(1)).max(1);
-        if stride % 2 == 0 {
+        if stride.is_multiple_of(2) {
             stride += 1;
         }
 
@@ -381,8 +403,7 @@ impl AdaptiveResiduals {
             let denom_y = (self.scratch_ny[i] + 1e-6).sqrt();
             let cosine_diag = (dot_diag / (denom_x * denom_y + 1e-6)) as f32;
             let prev_diag = self.activation_similarity_diag[[i, 0]];
-            self.activation_similarity_diag[[i, 0]] =
-                rate * cosine_diag + (1.0 - rate) * prev_diag;
+            self.activation_similarity_diag[[i, 0]] = rate * cosine_diag + (1.0 - rate) * prev_diag;
 
             // Off-diagonal mean absolute cosine (sampled)
             if off_samples == 0 {
@@ -442,7 +463,11 @@ impl AdaptiveResiduals {
             entropy -= p * p.ln() + (1.0 - p) * (1.0 - p).ln();
             count += 1;
         }
-        self.similarity_entropy = if count > 0 { entropy / count as f32 } else { 0.0 };
+        self.similarity_entropy = if count > 0 {
+            entropy / count as f32
+        } else {
+            0.0
+        };
 
         // Compute residual variance
         let mut variance = 0.0;
@@ -480,14 +505,12 @@ impl AdaptiveResiduals {
             .reserve(self.config.embed_dim.saturating_mul(2));
         for &v in self.activation_similarity_diag.iter() {
             if v.is_finite() {
-                self.scratch_perf_values
-                    .push(v.clamp(-1.0, 1.0) as f64);
+                self.scratch_perf_values.push(v.clamp(-1.0, 1.0) as f64);
             }
         }
         for &v in self.activation_similarity_off_abs_mean.iter() {
             if v.is_finite() {
-                self.scratch_perf_values
-                    .push(-(v.clamp(0.0, 1.0) as f64));
+                self.scratch_perf_values.push(-(v.clamp(0.0, 1.0) as f64));
             }
         }
         let mut mean = 0.0f64;
@@ -517,7 +540,11 @@ impl AdaptiveResiduals {
             delta_mean += if d.is_finite() { d as f64 } else { 0.0 };
             dn += 1;
         }
-        let delta_mean = if dn > 0 { (delta_mean / dn as f64) as f32 } else { 0.0 };
+        let delta_mean = if dn > 0 {
+            (delta_mean / dn as f64) as f32
+        } else {
+            0.0
+        };
         let scale_stability = 1.0 + delta_mean;
 
         (affinity_entropy, similarity_std, scale_stability)
@@ -578,11 +605,19 @@ impl AdaptiveResiduals {
         let mut m = Array2::zeros((embed_dim, embed_dim));
         for i in 0..embed_dim {
             let d = self.activation_similarity_diag[[i, 0]];
-            m[[i, i]] = if d.is_finite() { d.clamp(-1.0, 1.0) } else { 0.0 };
+            m[[i, i]] = if d.is_finite() {
+                d.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
         }
         for i in 0..embed_dim {
             let off = self.activation_similarity_off_abs_mean[[i, 0]];
-            let off = if off.is_finite() { off.clamp(0.0, 1.0) } else { 0.0 };
+            let off = if off.is_finite() {
+                off.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             for j in 0..embed_dim {
                 if i == j {
                     continue;
@@ -638,7 +673,8 @@ impl AdaptiveResiduals {
             attention_scale_grads[[channel, 0]] = g;
         }
 
-        // Compute gradients for FFN residual scales (same chain rule: dL/dscale = ffn_out * dL/doutput)
+        // Compute gradients for FFN residual scales (same chain rule: dL/dscale = ffn_out *
+        // dL/doutput)
         let ffn_rows = ffn_out.nrows().min(residual_grads.nrows());
         let ffn_cols = ffn_out.ncols().min(residual_grads.ncols());
         for channel in 0..embed_dim.min(ffn_cols) {
@@ -687,13 +723,16 @@ impl AdaptiveResiduals {
         let scale_lr = (lr * 10.0).min(0.1);
 
         let clipped_attention = attention_scale_grads.mapv(|g| g.clamp(-grad_clip, grad_clip));
-        self.opt_scales_attention
-            .step(&mut self.attention_residual_scales, &clipped_attention, scale_lr);
+        self.opt_scales_attention.step(
+            &mut self.attention_residual_scales,
+            &clipped_attention,
+            scale_lr,
+        );
 
         // Ensure scales stay within reasonable bounds to prevent instability
         for i in 0..self.attention_residual_scales.nrows() {
-            self.attention_residual_scales[[i, 0]] = self.attention_residual_scales[[i, 0]]
-                .clamp(0.1, 3.0); // Keep scales between 0.1 and 3.0
+            self.attention_residual_scales[[i, 0]] =
+                self.attention_residual_scales[[i, 0]].clamp(0.1, 3.0); // Keep scales between 0.1 and 3.0
         }
 
         let clipped_ffn = ffn_scale_grads.mapv(|g| g.clamp(-grad_clip, grad_clip));
@@ -702,12 +741,12 @@ impl AdaptiveResiduals {
 
         // Ensure scales stay bounded to prevent instability
         for i in 0..self.attention_residual_scales.nrows() {
-            self.attention_residual_scales[[i, 0]] = self.attention_residual_scales[[i, 0]]
-            .clamp(0.1, threshold);
+            self.attention_residual_scales[[i, 0]] =
+                self.attention_residual_scales[[i, 0]].clamp(0.1, threshold);
         }
         for i in 0..self.ffn_residual_scales.nrows() {
-            self.ffn_residual_scales[[i, 0]] = self.ffn_residual_scales[[i, 0]]
-            .clamp(0.1, threshold);
+            self.ffn_residual_scales[[i, 0]] =
+                self.ffn_residual_scales[[i, 0]].clamp(0.1, threshold);
         }
 
         // Update gradient norm for monitoring

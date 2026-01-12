@@ -142,10 +142,7 @@ impl Adam {
 
         // Update moments in-place (no intermediate allocations).
         if self.use_amsgrad {
-            let v_hat_max = self
-                .v_hat_max
-                .as_mut()
-                .expect("AMSGrad buffer must exist");
+            let v_hat_max = self.v_hat_max.as_mut().expect("AMSGrad buffer must exist");
             Zip::from(&mut self.m)
                 .and(&mut self.v)
                 .and(&mut *v_hat_max)

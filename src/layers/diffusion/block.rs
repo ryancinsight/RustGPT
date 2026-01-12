@@ -1,5 +1,8 @@
 #![allow(dead_code)]
-use std::{f32::consts::PI, sync::{Arc, RwLock}};
+use std::{
+    f32::consts::PI,
+    sync::{Arc, RwLock},
+};
 
 use ndarray::{Array1, Array2, Axis, parallel::prelude::*, s};
 use rand_distr::{Distribution, Normal};
@@ -138,9 +141,10 @@ fn default_max_guidance() -> f32 {
 }
 
 /// Prediction target for the diffusion model
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub enum DiffusionPredictionTarget {
     /// Predict the noise (epsilon) added to the input
+    #[default]
     Epsilon,
     /// Predict the velocity (v) - see "Progressive Distillation for Fast Sampling of Diffusion
     /// Models"
@@ -155,14 +159,8 @@ pub enum DiffusionPredictionTarget {
     EdmX0,
 }
 
-impl Default for DiffusionPredictionTarget {
-    fn default() -> Self {
-        DiffusionPredictionTarget::Epsilon
-    }
-}
-
 /// Diffusion noise scheduler that manages variance schedules and cumulative products
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct NoiseScheduler {
     /// Type of noise schedule
     schedule_type: NoiseSchedule,
@@ -355,40 +353,47 @@ impl NoiseScheduler {
         eta: f32,
         random_sample: Option<&Array2<f32>>,
     ) -> Array2<f32> {
-        let alpha_cumprod_t = self.sqrt_alpha_cumprod(t).powi(2);
-        let alpha_cumprod_t_minus_1 = if t > 0 {
-            self.sqrt_alpha_cumprod(t - 1).powi(2)
-        } else {
-            1.0
-        };
+        let t_prev = t.saturating_sub(1);
+        self.ddim_step_between(x_t, t, t_prev, pred_epsilon, eta, random_sample)
+    }
 
-        let sqrt_alpha_cumprod_t_minus_1 = alpha_cumprod_t_minus_1.sqrt();
+    /// DDIM step generalized to an arbitrary previous timestep.
+    ///
+    /// This is required for numerically-correct reduced-step samplers (DDIM/PNDM/DPM-Solver).
+    pub fn ddim_step_between(
+        &self,
+        x_t: &Array2<f32>,
+        t: usize,
+        t_prev: usize,
+        pred_epsilon: &Array2<f32>,
+        eta: f32,
+        random_sample: Option<&Array2<f32>>,
+    ) -> Array2<f32> {
+        let alpha_cumprod_t = self.sqrt_alpha_cumprod(t).powi(2);
+        let alpha_cumprod_prev = self.sqrt_alpha_cumprod(t_prev).powi(2);
+
+        let sqrt_alpha_cumprod_prev = alpha_cumprod_prev.sqrt();
         let sqrt_alpha_cumprod_t = alpha_cumprod_t.sqrt();
 
         let sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alpha_cumprod(t);
-        let sqrt_one_minus_alpha_cumprod_t_minus_1 = if t > 0 {
-            self.sqrt_one_minus_alpha_cumprod(t - 1)
-        } else {
-            0.0
-        };
+        let sqrt_one_minus_alpha_cumprod_prev = self.sqrt_one_minus_alpha_cumprod(t_prev);
 
         // Coefficients for DDIM
-        let coeff1 = sqrt_alpha_cumprod_t_minus_1 / sqrt_alpha_cumprod_t;
-        let coeff2 = sqrt_one_minus_alpha_cumprod_t_minus_1 / sqrt_alpha_cumprod_t;
-        let _coeff3 = sqrt_one_minus_alpha_cumprod_t_minus_1;
+        let coeff1 = sqrt_alpha_cumprod_prev / sqrt_alpha_cumprod_t;
+        let coeff2 = sqrt_one_minus_alpha_cumprod_prev / sqrt_alpha_cumprod_t;
 
         // Deterministic component
-        let mut x_t_minus_1 = coeff1 * x_t - coeff2 * pred_epsilon;
+        let mut x_prev = coeff1 * x_t - coeff2 * pred_epsilon;
 
         // Stochastic component (if eta > 0)
-        if eta > 0.0 {
-            if let Some(z) = random_sample {
-                let sigma_t = eta * sqrt_one_minus_alpha_cumprod_t / sqrt_alpha_cumprod_t;
-                x_t_minus_1 = x_t_minus_1 + sigma_t * z;
-            }
+        if eta > 0.0
+            && let Some(z) = random_sample
+        {
+            let sigma_t = eta * sqrt_one_minus_alpha_cumprod_t / sqrt_alpha_cumprod_t;
+            x_prev = x_prev + sigma_t * z;
         }
 
-        x_t_minus_1
+        x_prev
     }
 
     /// P2 loss weighting from Nichol & Dhariwal 2021
@@ -400,11 +405,11 @@ impl NoiseScheduler {
         }
         let one_minus_alpha_cumprod_t = self.sqrt_one_minus_alpha_cumprod(t).powi(2);
         let one_minus_alpha_cumprod_t_minus_1 = self.sqrt_one_minus_alpha_cumprod(t - 1).powi(2);
-        
+
         if one_minus_alpha_cumprod_t < 1e-6 {
             return 1.0;
         }
-        
+
         (one_minus_alpha_cumprod_t_minus_1 / one_minus_alpha_cumprod_t).clamp(0.0, 10.0)
     }
 
@@ -422,6 +427,7 @@ impl NoiseScheduler {
         // Simple combination: geometric mean
         (p2_weight * snr_weight).sqrt().clamp(0.1, 10.0)
     }
+
     /// Get √(1-α_t)
     pub fn sqrt_one_minus_alpha(&self, t: usize) -> f32 {
         (1.0 - self.alpha(t)).sqrt()
@@ -1036,33 +1042,22 @@ impl DiffusionBlock {
             .forward(&time_embed, self.use_ema_for_sampling);
 
         let embed = self.config.embed_dim;
-        let raw_gamma_attn = gamma_beta.slice(s![.., 0..embed]).row(0).to_owned();
-        let raw_beta_attn = gamma_beta.slice(s![.., embed..2 * embed]).row(0).to_owned();
-        let raw_gamma_ffn = gamma_beta
-            .slice(s![.., 2 * embed..3 * embed])
-            .row(0)
-            .to_owned();
-        let raw_beta_ffn = gamma_beta
-            .slice(s![.., 3 * embed..4 * embed])
-            .row(0)
-            .to_owned();
         let tanh = crate::richards::RichardsCurve::tanh(false);
-        let g_attn = raw_gamma_attn.mapv(|x| tanh.forward_scalar_f32(x));
-        let b_attn = raw_beta_attn.mapv(|x| tanh.forward_scalar_f32(x));
-        let g_ffn = raw_gamma_ffn.mapv(|x| tanh.forward_scalar_f32(x));
-        let b_ffn = raw_beta_ffn.mapv(|x| tanh.forward_scalar_f32(x));
-        let gamma_attn_vec = g_attn
-            .mapv(|v| 1.0 + self.film_scale_gamma * v)
-            .insert_axis(Axis(0));
-        let beta_attn_vec = b_attn
-            .mapv(|v| self.film_scale_beta * v)
-            .insert_axis(Axis(0));
-        let gamma_ffn_vec = g_ffn
-            .mapv(|v| 1.0 + self.film_scale_gamma * v)
-            .insert_axis(Axis(0));
-        let beta_ffn_vec = b_ffn
-            .mapv(|v| self.film_scale_beta * v)
-            .insert_axis(Axis(0));
+        let mut gamma_attn_vec = Array2::<f32>::zeros((1, embed));
+        let mut beta_attn_vec = Array2::<f32>::zeros((1, embed));
+        let mut gamma_ffn_vec = Array2::<f32>::zeros((1, embed));
+        let mut beta_ffn_vec = Array2::<f32>::zeros((1, embed));
+        for j in 0..embed {
+            let g_attn = tanh.forward_scalar_f32(gamma_beta[[0, j]]);
+            let b_attn = tanh.forward_scalar_f32(gamma_beta[[0, embed + j]]);
+            let g_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 2 * embed + j]]);
+            let b_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 3 * embed + j]]);
+
+            gamma_attn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_attn;
+            beta_attn_vec[[0, j]] = self.film_scale_beta * b_attn;
+            gamma_ffn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_ffn;
+            beta_ffn_vec[[0, j]] = self.film_scale_beta * b_ffn;
+        }
 
         let (x_model_in, c_skip, c_out, edm_on) =
             if self.config.prediction_target == DiffusionPredictionTarget::EdmX0 {
@@ -1072,14 +1067,11 @@ impl DiffusionBlock {
                 (x_t.clone(), 0.0, 1.0, false)
             };
 
-        let mut norm1_out = self.pre_attention_norm.forward(&x_model_in);
-        Self::sanitize_tensor("norm1_out", &mut norm1_out);
-        let mut norm1_mod = Self::apply_film(&norm1_out, &gamma_attn_vec, &beta_attn_vec);
-        Self::sanitize_tensor("norm1_mod", &mut norm1_mod);
+        let norm1_out = self.pre_attention_norm.forward(&x_model_in);
+        let norm1_mod = Self::apply_film(&norm1_out, &gamma_attn_vec, &beta_attn_vec);
         let mut attn_out = self
             .temporal_mixing
             .forward_with_causal(&norm1_mod, self.config.causal_attention);
-        Self::sanitize_tensor("attn_out", &mut attn_out);
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
         }
@@ -1088,16 +1080,11 @@ impl DiffusionBlock {
             adaptive_residuals.apply_attention_residual(&x_model_in, &attn_out)
         } else {
             // Standard residual connection
-            let mut residual = &x_model_in + &attn_out;
-            Self::sanitize_tensor("residual1", &mut residual);
-            residual
+            &x_model_in + &attn_out
         };
-        let mut norm2_out = self.pre_ffn_norm.forward(&residual1);
-        Self::sanitize_tensor("norm2_out", &mut norm2_out);
-        let mut norm2_mod = Self::apply_film(&norm2_out, &gamma_ffn_vec, &beta_ffn_vec);
-        Self::sanitize_tensor("norm2_mod", &mut norm2_mod);
+        let norm2_out = self.pre_ffn_norm.forward(&residual1);
+        let norm2_mod = Self::apply_film(&norm2_out, &gamma_ffn_vec, &beta_ffn_vec);
         let mut ffn_out = self.feedforward.forward(&norm2_mod);
-        Self::sanitize_tensor("ffn_out", &mut ffn_out);
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut ffn_out, self.dropout_rate);
         }
@@ -1106,20 +1093,17 @@ impl DiffusionBlock {
             adaptive_residuals.apply_ffn_residual(&residual1, &ffn_out)
         } else {
             // Standard residual connection
-            let mut output = &residual1 + &ffn_out;
-            Self::sanitize_tensor("block_output", &mut output);
-            output
+            &residual1 + &ffn_out
         };
 
-        let mut prediction = if edm_on {
-            // EDM-preconditioned x0_hat in original x_t space.
-            let mut x0_hat = (x_t * c_skip) + (&output * c_out);
-            Self::sanitize_tensor("edm_x0_hat", &mut x0_hat);
-            x0_hat
+        let prediction = if edm_on {
+            (x_t * c_skip) + (&output * c_out)
         } else {
             output
         };
-        Self::sanitize_tensor("diffusion_prediction", &mut prediction);
+        if prediction.iter().any(|v| !v.is_finite()) {
+            panic!("DiffusionBlock forward produced non-finite prediction");
+        }
 
         // Store intermediates Arc-backed so cache clones are shallow (important for LRM replay).
         let h_vec = Array1::from_vec(h.row(0).to_vec());
@@ -1144,19 +1128,18 @@ impl DiffusionBlock {
             output: Arc::new(cached_output),
             timestep: t,
         });
-        if self.adaptive_window_on {
-            if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
-                if let Some(pn) = attn.last_pred_norm {
-                    let mut ws = self.current_window_size.unwrap_or(self.win_max);
-                    if pn > self.pred_up {
-                        ws = (ws + self.win_step_up).min(self.win_max);
-                    } else if pn < self.pred_down {
-                        ws = ws.saturating_sub(self.win_step_down).max(self.win_min);
-                    }
-                    self.current_window_size = Some(ws);
-                    attn.set_window_size(self.current_window_size);
-                }
+        if self.adaptive_window_on
+            && let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing
+            && let Some(pn) = attn.last_pred_norm
+        {
+            let mut ws = self.current_window_size.unwrap_or(self.win_max);
+            if pn > self.pred_up {
+                ws = (ws + self.win_step_up).min(self.win_max);
+            } else if pn < self.pred_down {
+                ws = ws.saturating_sub(self.win_step_down).max(self.win_min);
             }
+            self.current_window_size = Some(ws);
+            attn.set_window_size(self.current_window_size);
         }
         prediction
     }
@@ -1175,58 +1158,11 @@ impl DiffusionBlock {
 
     /// Sample from the reverse diffusion process (generative sampling)
     pub fn sample(&mut self, shape: (usize, usize), steps: Option<usize>) -> Array2<f32> {
-        let steps = steps.unwrap_or(self.config.num_timesteps);
-
-        // Start from pure noise: x_T ~ N(0, I)
-        let mut x_t = Array2::zeros(shape);
-        let normal = Normal::new(0.0, 1.0).unwrap();
-        let mut rng = get_rng();
-        if let Some(slice) = x_t.as_slice_mut() {
-            slice.par_iter_mut().for_each_init(
-                || get_rng(),
-                |rng, v| {
-                    *v = normal.sample(rng) as f32;
-                },
-            );
-        } else {
-            for v in x_t.iter_mut() {
-                *v = normal.sample(&mut rng) as f32;
-            }
-        }
-
-        // Reverse diffusion process
-        for t in (1..=steps).rev() {
-            let t_idx = t - 1; // Convert to 0-based indexing
-
-            // Predict noise (epsilon)
-            let predicted_noise = self.predict_epsilon_with_timestep(&x_t, t_idx);
-
-            // Compute posterior mean
-            let posterior_mean = self
-                .noise_scheduler
-                .posterior_mean(&x_t, t_idx, &predicted_noise);
-
-            // Sample from posterior (add noise except for t=0)
-            if t > 1 {
-                let mut noise = Array2::zeros(shape);
-                if let Some(slice) = noise.as_slice_mut() {
-                    slice.par_iter_mut().for_each(|v| {
-                        *v = normal.sample(&mut get_rng()) as f32;
-                    });
-                } else {
-                    for v in noise.iter_mut() {
-                        *v = normal.sample(&mut rng) as f32;
-                    }
-                }
-                let variance = self.noise_scheduler.posterior_variance(t_idx);
-                x_t = &posterior_mean + &noise * variance.sqrt();
-            } else {
-                // Deterministic for t=0
-                x_t = posterior_mean;
-            }
-        }
-
-        x_t
+        // Delegate to the sampler-aware implementation (DDPM/DDIM/PNDM/DPM-Solver++).
+        // Note: for DDPM we always run the full discrete chain (the posterior is defined
+        // for adjacent timesteps), so `steps` is only meaningful for reduced-step solvers.
+        let guidance = self.config.guidance.clone();
+        self.sample_with_guidance(shape, steps, guidance.as_ref(), None)
     }
 
     pub fn sample_ddim(&mut self, shape: (usize, usize), steps: Option<usize>) -> Array2<f32> {
@@ -1245,39 +1181,22 @@ impl DiffusionBlock {
             }
         }
 
-        let step_size = ((total - 1) / k).max(1);
-        let mut t = total - 1;
-        while t > 0 {
+        let timesteps = crate::layers::diffusion::solvers::make_discrete_timesteps(k, total);
+        for i in 0..(timesteps.len() - 1) {
+            let t = timesteps[i];
+            let t_prev = timesteps[i + 1];
             self.set_timestep(t);
             let pred = self.forward_with_timestep(&x_t, t);
-            let t_idx = t.min(total - 1);
-            match self.config.prediction_target {
-                DiffusionPredictionTarget::Epsilon => {
-                    x_t = self.noise_scheduler.ddim_step(&x_t, t_idx, &pred, 0.0, None);
-                }
-                DiffusionPredictionTarget::VPrediction => {
-                    let sa = self.noise_scheduler.sqrt_alpha_cumprod(t_idx).max(1e-6);
-                    let soa = self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t_idx);
-                    let x0_hat = (&x_t * sa) - (&pred * soa);
-                    let eps_hat = (&pred + (&x0_hat * soa)) / sa;
-                    x_t = self.noise_scheduler.ddim_step(&x_t, t_idx, &eps_hat, 0.0, None);
-                }
-                DiffusionPredictionTarget::Sample => {
-                    // If predicting sample directly, convert to epsilon for DDIM step
-                    let sa = self.noise_scheduler.sqrt_alpha_cumprod(t_idx).max(1e-6);
-                    let soa = self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t_idx);
-                    let eps_hat = (&x_t - (&pred * sa)) / soa;
-                    x_t = self.noise_scheduler.ddim_step(&x_t, t_idx, &eps_hat, 0.0, None);
-                }
-                DiffusionPredictionTarget::EdmX0 => {
-                    // EdmX0 returns x0_hat.
-                    let sa = self.noise_scheduler.sqrt_alpha_cumprod(t_idx).max(1e-6);
-                    let soa = self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t_idx);
-                    let eps_hat = (&x_t - (&pred * sa)) / soa;
-                    x_t = self.noise_scheduler.ddim_step(&x_t, t_idx, &eps_hat, 0.0, None);
-                }
-            }
-            t = t.saturating_sub(step_size);
+            let eps_hat = crate::layers::diffusion::solvers::epsilon_from_prediction_target(
+                pred,
+                &x_t,
+                t,
+                self.config.prediction_target.clone(),
+                &self.noise_scheduler,
+            );
+            x_t = self
+                .noise_scheduler
+                .ddim_step_between(&x_t, t, t_prev, &eps_hat, 0.0, None);
         }
         x_t
     }
@@ -1363,7 +1282,9 @@ impl DiffusionBlock {
             }
 
             // Accept speculative proposal: reuse draft to leap gamma steps ahead.
-            let mut x_draft = self.noise_scheduler.ddim_step(&x_t, t, &draft_pred, 0.0, None);
+            let mut x_draft = self
+                .noise_scheduler
+                .ddim_step(&x_t, t, &draft_pred, 0.0, None);
             let mut t_d = t.saturating_sub(1);
             let mut accepted = 1usize;
             for _ in 1..gamma {
@@ -1371,7 +1292,9 @@ impl DiffusionBlock {
                     break;
                 }
                 let pred_d = draft.predict_epsilon_with_timestep(&x_draft, t_d);
-                x_draft = self.noise_scheduler.ddim_step(&x_draft, t_d, &pred_d, 0.0, None);
+                x_draft = self
+                    .noise_scheduler
+                    .ddim_step(&x_draft, t_d, &pred_d, 0.0, None);
                 t_d = t_d.saturating_sub(1);
                 accepted += 1;
             }
@@ -1392,7 +1315,8 @@ impl DiffusionBlock {
     /// conditional_pred: Prediction from conditional model (ε or v)
     /// guidance_scale: Scale factor (typically 1.0-10.0)
     ///
-    /// Returns: Guided prediction ε_guided = unconditional + guidance_scale * (conditional - unconditional)
+    /// Returns: Guided prediction ε_guided = unconditional + guidance_scale * (conditional -
+    /// unconditional)
     pub fn apply_classifier_free_guidance(
         &self,
         unconditional_pred: &Array2<f32>,
@@ -1428,62 +1352,84 @@ impl DiffusionBlock {
         guidance_config: Option<&GuidanceConfig>,
         unconditional_input: Option<&Array2<f32>>,
     ) -> Array2<f32> {
-        let steps = steps.unwrap_or(self.config.num_timesteps);
+        let total = self.noise_scheduler.num_timesteps().max(1);
+        let steps = steps.unwrap_or(self.config.num_timesteps).max(1);
         let mut rng = get_rng();
         let normal = Normal::new(0.0, 1.0).unwrap();
 
         // Start with pure noise
         let mut x_t = Array2::from_shape_fn(shape, |_| normal.sample(&mut rng) as f32);
 
-        // Create timestep sequence
-        let timesteps: Vec<usize> = match self.config.timestep_strategy {
-            DiffusionTimestepStrategy::Uniform => (0..steps).rev().collect(),
-            DiffusionTimestepStrategy::MinSnr => (0..steps).rev().collect(),
-            DiffusionTimestepStrategy::EdmLogNormal => (0..steps).rev().collect(),
-        };
+        match self.config.sampler {
+            DiffusionSampler::DDPM => {
+                // DDPM posterior updates are defined for consecutive steps, so we always run
+                // the full discrete chain.
+                for t in (0..total).rev() {
+                    self.set_timestep(t);
 
-        for &t in timesteps.iter() {
-            self.set_timestep(t);
-
-            // Predict epsilon for this timestep
-            let conditional_pred = self.predict_epsilon_with_timestep(&x_t, t);
-
-            // Apply guidance if configured
-            let pred_epsilon = if let Some(guidance) = guidance_config {
-                if let Some(uncond_input) = unconditional_input {
-                    let uncond_pred = self.predict_epsilon_with_timestep(uncond_input, t);
-                    match guidance.guidance_type {
-                        GuidanceType::CFG => self.apply_classifier_free_guidance(
-                            &uncond_pred,
-                            &conditional_pred,
-                            guidance.scale,
-                        ),
-                        GuidanceType::Adaptive => {
-                            self.apply_adaptive_guidance(&uncond_pred, &conditional_pred, t)
+                    let conditional_pred = self.predict_epsilon_with_timestep(&x_t, t);
+                    let pred_epsilon = if let Some(guidance) = guidance_config {
+                        if let Some(uncond_input) = unconditional_input {
+                            let uncond_pred = self.predict_epsilon_with_timestep(uncond_input, t);
+                            match guidance.guidance_type {
+                                GuidanceType::Cfg | GuidanceType::CG => self
+                                    .apply_classifier_free_guidance(
+                                        &uncond_pred,
+                                        &conditional_pred,
+                                        guidance.scale,
+                                    ),
+                                GuidanceType::Adaptive => {
+                                    self.apply_adaptive_guidance(&uncond_pred, &conditional_pred, t)
+                                }
+                            }
+                        } else {
+                            conditional_pred
                         }
-                        GuidanceType::CG => self.apply_classifier_free_guidance(
-                            &uncond_pred,
-                            &conditional_pred,
-                            guidance.scale,
-                        ),
-                    }
-                } else {
-                    conditional_pred
-                }
-            } else {
-                conditional_pred
-            };
+                    } else {
+                        conditional_pred
+                    };
 
-            match self.config.sampler {
-                DiffusionSampler::DDPM | DiffusionSampler::PNDM | DiffusionSampler::DPMSolver => {
                     let noise =
                         Array2::from_shape_fn(x_t.raw_dim(), |_| normal.sample(&mut rng) as f32);
                     let sa = self.noise_scheduler.sqrt_alpha_cumprod(t).max(1e-6);
                     let soa = self.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
-                    let x0_hat = (&x_t - &(pred_epsilon.clone() * soa)) / sa;
-                    x_t = self.noise_scheduler.posterior_sample(&x_t, &x0_hat, t, &noise);
+                    let x0_hat = (&x_t - &(pred_epsilon * soa)) / sa;
+                    x_t = self
+                        .noise_scheduler
+                        .posterior_sample(&x_t, &x0_hat, t, &noise);
                 }
-                DiffusionSampler::DDIM { eta } => {
+            }
+
+            DiffusionSampler::DDIM { eta } => {
+                let timesteps =
+                    crate::layers::diffusion::solvers::make_discrete_timesteps(steps, total);
+                for i in 0..(timesteps.len() - 1) {
+                    let t = timesteps[i];
+                    let t_prev = timesteps[i + 1];
+                    self.set_timestep(t);
+
+                    let conditional_pred = self.predict_epsilon_with_timestep(&x_t, t);
+                    let pred_epsilon = if let Some(guidance) = guidance_config {
+                        if let Some(uncond_input) = unconditional_input {
+                            let uncond_pred = self.predict_epsilon_with_timestep(uncond_input, t);
+                            match guidance.guidance_type {
+                                GuidanceType::Cfg | GuidanceType::CG => self
+                                    .apply_classifier_free_guidance(
+                                        &uncond_pred,
+                                        &conditional_pred,
+                                        guidance.scale,
+                                    ),
+                                GuidanceType::Adaptive => {
+                                    self.apply_adaptive_guidance(&uncond_pred, &conditional_pred, t)
+                                }
+                            }
+                        } else {
+                            conditional_pred
+                        }
+                    } else {
+                        conditional_pred
+                    };
+
                     let noise = if eta > 0.0 {
                         Some(Array2::from_shape_fn(x_t.raw_dim(), |_| {
                             normal.sample(&mut rng) as f32
@@ -1491,10 +1437,110 @@ impl DiffusionBlock {
                     } else {
                         None
                     };
-                    x_t = self
-                        .noise_scheduler
-                        .ddim_step(&x_t, t, &pred_epsilon, eta, noise.as_ref());
+
+                    x_t = self.noise_scheduler.ddim_step_between(
+                        &x_t,
+                        t,
+                        t_prev,
+                        &pred_epsilon,
+                        eta,
+                        noise.as_ref(),
+                    );
                 }
+            }
+
+            DiffusionSampler::PNDM => {
+                let timesteps =
+                    crate::layers::diffusion::solvers::make_discrete_timesteps(steps, total);
+                let scheduler = self.noise_scheduler.clone();
+                let mut model_eps = |x: &Array2<f32>, t: usize| -> Array2<f32> {
+                    self.set_timestep(t);
+                    let conditional_pred = self.predict_epsilon_with_timestep(x, t);
+                    if let Some(guidance) = guidance_config {
+                        if let Some(uncond_input) = unconditional_input {
+                            let uncond_pred = self.predict_epsilon_with_timestep(uncond_input, t);
+                            match guidance.guidance_type {
+                                GuidanceType::Cfg | GuidanceType::CG => self
+                                    .apply_classifier_free_guidance(
+                                        &uncond_pred,
+                                        &conditional_pred,
+                                        guidance.scale,
+                                    ),
+                                GuidanceType::Adaptive => {
+                                    self.apply_adaptive_guidance(&uncond_pred, &conditional_pred, t)
+                                }
+                            }
+                        } else {
+                            conditional_pred
+                        }
+                    } else {
+                        conditional_pred
+                    }
+                };
+
+                x_t = crate::layers::diffusion::solvers::pndm_plms_sample(
+                    x_t,
+                    &timesteps,
+                    &scheduler,
+                    &mut model_eps,
+                );
+            }
+
+            DiffusionSampler::DPMSolver => {
+                let scheduler = self.noise_scheduler.clone();
+                let alpha_start = scheduler.sqrt_alpha_cumprod(total - 1).max(1e-12);
+                let sigma_start = scheduler.sqrt_one_minus_alpha_cumprod(total - 1).max(1e-12);
+                let alpha_end = scheduler.sqrt_alpha_cumprod(0).max(1e-12);
+                let sigma_end = scheduler.sqrt_one_minus_alpha_cumprod(0).max(1e-12);
+                let lambda_start = alpha_start.ln() - sigma_start.ln();
+                let lambda_end = alpha_end.ln() - sigma_end.ln();
+                let lambda_range = (lambda_end - lambda_start).abs().max(1e-3);
+
+                let cfg = crate::layers::diffusion::solvers::DpmSolverAdaptiveConfig {
+                    h_init: (lambda_range / steps as f32).clamp(1e-4, 1.0),
+                    ..Default::default()
+                };
+
+                let mut model_x0 = |x: &Array2<f32>, t: usize| -> Array2<f32> {
+                    self.set_timestep(t);
+                    let conditional_pred = self.predict_epsilon_with_timestep(x, t);
+                    let eps = if let Some(guidance) = guidance_config {
+                        if let Some(uncond_input) = unconditional_input {
+                            let uncond_pred = self.predict_epsilon_with_timestep(uncond_input, t);
+                            match guidance.guidance_type {
+                                GuidanceType::Cfg | GuidanceType::CG => self
+                                    .apply_classifier_free_guidance(
+                                        &uncond_pred,
+                                        &conditional_pred,
+                                        guidance.scale,
+                                    ),
+                                GuidanceType::Adaptive => {
+                                    self.apply_adaptive_guidance(&uncond_pred, &conditional_pred, t)
+                                }
+                            }
+                        } else {
+                            conditional_pred
+                        }
+                    } else {
+                        conditional_pred
+                    };
+
+                    // Convert eps -> x0 at this discrete timestep.
+                    crate::layers::diffusion::solvers::x0_from_prediction_target(
+                        eps,
+                        x,
+                        t,
+                        DiffusionPredictionTarget::Epsilon,
+                        &scheduler,
+                    )
+                };
+
+                x_t = crate::layers::diffusion::solvers::dpmsolverpp_adaptive_sample(
+                    x_t,
+                    &scheduler,
+                    &mut model_x0,
+                    cfg,
+                );
             }
         }
 
@@ -1518,7 +1564,7 @@ impl DiffusionBlock {
             match self.config.loss_weighting {
                 LossWeighting::Uniform => 1.0,
                 LossWeighting::P2 => self.noise_scheduler.p2_weight(t),
-                LossWeighting::SNR => self.noise_scheduler.snr_weight(t),
+                LossWeighting::Snr => self.noise_scheduler.snr_weight(t),
                 LossWeighting::Adaptive => {
                     let p2_w = self.noise_scheduler.p2_weight(t);
                     let snr_w = self.noise_scheduler.snr_weight(t);
@@ -1656,7 +1702,7 @@ impl Layer for DiffusionBlock {
             };
 
             let (norm2_grad, grad_gamma_ffn, grad_beta_ffn) =
-                Self::film_backward(&ffn_input_grad_mod, norm2_out, &gamma_ffn_vec);
+                Self::film_backward(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec);
 
             let (residual1_from_ffn, pre_ffn_param_grads) =
                 self.pre_ffn_norm.compute_gradients(residual1, &norm2_grad);
@@ -1672,7 +1718,7 @@ impl Layer for DiffusionBlock {
                 .compute_gradients(norm1_mod, attn_out_grads);
 
             let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
-                Self::film_backward(&attn_input_grad_mod, norm1_out, &gamma_attn_vec);
+                Self::film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);
 
             let (input_from_norm, pre_attn_param_grads) = self
                 .pre_attention_norm
@@ -1683,15 +1729,15 @@ impl Layer for DiffusionBlock {
             let mut final_input_grads = &residual1_total_grads + &input_from_norm;
 
             if let Some(extra_scale) = input_extra_scale {
-                final_input_grads = final_input_grads + &(output_grads * extra_scale);
+                final_input_grads += &(output_grads * extra_scale);
             }
 
             // EDM: x_model_in = c_in * x_t, plus a skip path x0_hat includes c_skip * x_t.
             if let Some(c_in) = edm_c_in {
-                final_input_grads = final_input_grads * c_in;
+                final_input_grads *= c_in;
             }
             if let Some(skip) = edm_skip_grad {
-                final_input_grads = final_input_grads + &skip;
+                final_input_grads += &skip;
             }
 
             let attn_grad_count = attn_param_grads.len();
@@ -1707,19 +1753,19 @@ impl Layer for DiffusionBlock {
             let embed = self.config.embed_dim;
             let g_t_attn = gamma_attn_vec.mapv(|x| {
                 let z = (x - 1.0) / self.film_scale_gamma;
-                z.max(-1.0).min(1.0)
+                z.clamp(-1.0, 1.0)
             });
             let b_t_attn = beta_attn_vec.mapv(|x| {
                 let z = x / self.film_scale_beta;
-                z.max(-1.0).min(1.0)
+                z.clamp(-1.0, 1.0)
             });
             let g_t_ffn = gamma_ffn_vec.mapv(|x| {
                 let z = (x - 1.0) / self.film_scale_gamma;
-                z.max(-1.0).min(1.0)
+                z.clamp(-1.0, 1.0)
             });
             let b_t_ffn = beta_ffn_vec.mapv(|x| {
                 let z = x / self.film_scale_beta;
-                z.max(-1.0).min(1.0)
+                z.clamp(-1.0, 1.0)
             });
             let d_g_attn_raw = grad_gamma_attn.mapv(|x| x * self.film_scale_gamma)
                 * (1.0 - g_t_attn.mapv(|x| x * x));
@@ -2100,9 +2146,10 @@ mod tests {
 }
 
 /// Sampling method for diffusion models
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub enum DiffusionSampler {
     /// Original DDPM sampling (stochastic)
+    #[default]
     DDPM,
     /// DDIM sampling (deterministic when eta=0, stochastic when eta>0)
     DDIM { eta: f32 },
@@ -2122,10 +2169,12 @@ pub struct GuidanceConfig {
 }
 
 /// Type of guidance to apply
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub enum GuidanceType {
     /// Classifier-Free Guidance (CFG)
-    CFG,
+    #[serde(rename = "CFG")]
+    #[default]
+    Cfg,
     /// Classifier Guidance (CG)
     CG,
     /// Adaptive Guidance
@@ -2133,41 +2182,25 @@ pub enum GuidanceType {
 }
 
 /// Loss weighting strategy
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub enum LossWeighting {
     /// Uniform weighting (original)
+    #[default]
     Uniform,
     /// P2 weighting from Nichol & Dhariwal 2021
     P2,
     /// SNR weighting (signal-to-noise ratio)
-    SNR,
+    #[serde(rename = "SNR")]
+    Snr,
     /// Adaptive weighting
     Adaptive,
-}
-
-impl Default for DiffusionSampler {
-    fn default() -> Self {
-        DiffusionSampler::DDPM
-    }
-}
-
-impl Default for GuidanceType {
-    fn default() -> Self {
-        GuidanceType::CFG
-    }
-}
-
-impl Default for LossWeighting {
-    fn default() -> Self {
-        LossWeighting::Uniform
-    }
 }
 
 impl GuidanceConfig {
     pub fn new_cfg(scale: f32) -> Self {
         Self {
             scale,
-            guidance_type: GuidanceType::CFG,
+            guidance_type: GuidanceType::Cfg,
         }
     }
 

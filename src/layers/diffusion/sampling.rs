@@ -13,10 +13,7 @@ pub enum DdimStepsPolicy {
     ///
     /// Heuristic: start from ~T/10 (so 100 for T=1000) and scale softly with
     /// max sequence length and prompt ratio, then clamp.
-    Auto {
-        min_steps: usize,
-        max_steps: usize,
-    },
+    Auto { min_steps: usize, max_steps: usize },
 }
 
 impl Default for DdimStepsPolicy {

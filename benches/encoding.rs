@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use llm::{SimpleTokenizer, Vocab};
 
 fn bench_tokenize(c: &mut Criterion) {
@@ -6,20 +6,7 @@ fn bench_tokenize(c: &mut Criterion) {
 
     // Small-ish vocab covering typical tokens in our simple tokenizer.
     let vocab = Vocab::new(vec![
-        "hello",
-        "world",
-        "this",
-        "is",
-        "rust",
-        "a",
-        "b",
-        "c",
-        ",",
-        ".",
-        "!",
-        "?",
-        "<unk>",
-        "</s>",
+        "hello", "world", "this", "is", "rust", "a", "b", "c", ",", ".", "!", "?", "<unk>", "</s>",
         "<mask>",
     ]);
 
@@ -49,20 +36,7 @@ fn bench_tokenize_into(c: &mut Criterion) {
     let tokenizer = SimpleTokenizer::new();
 
     let vocab = Vocab::new(vec![
-        "hello",
-        "world",
-        "this",
-        "is",
-        "rust",
-        "a",
-        "b",
-        "c",
-        ",",
-        ".",
-        "!",
-        "?",
-        "<unk>",
-        "</s>",
+        "hello", "world", "this", "is", "rust", "a", "b", "c", ",", ".", "!", "?", "<unk>", "</s>",
         "<mask>",
     ]);
 
@@ -85,20 +59,7 @@ fn bench_tokenize_into(c: &mut Criterion) {
 
 fn bench_decode(c: &mut Criterion) {
     let vocab = Vocab::new(vec![
-        "hello",
-        "world",
-        "this",
-        "is",
-        "rust",
-        "a",
-        "b",
-        "c",
-        ",",
-        ".",
-        "!",
-        "?",
-        "<unk>",
-        "</s>",
+        "hello", "world", "this", "is", "rust", "a", "b", "c", ",", ".", "!", "?", "<unk>", "</s>",
         "<mask>",
     ]);
 

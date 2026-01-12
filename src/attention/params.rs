@@ -1,6 +1,6 @@
 /// Parameter information tracking for attention layers
 /// Provides detailed breakdown of parameter counts for different components
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PolyAttentionParamInfo {
     /// Parameter count per head (w_q, w_k, w_v)
     pub head_params_per_head: usize,
@@ -81,21 +81,5 @@ impl PolyAttentionParamInfo {
             self.cope_params,
             self.total_params
         )
-    }
-}
-
-impl Default for PolyAttentionParamInfo {
-    fn default() -> Self {
-        Self {
-            head_params_per_head: 0,
-            head_params_total: 0,
-            output_projection_params: 0,
-            polynomial_params: 0,
-            gating_params: 0,
-            gate_poly_params: 0,
-            threshold_predictor_params: 0,
-            cope_params: 0,
-            total_params: 0,
-        }
     }
 }

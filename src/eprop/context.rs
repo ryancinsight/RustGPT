@@ -39,7 +39,8 @@ use super::{EligibilityTraces, EPropError, Result};
 /// Maintains one set of traces per layer, persisting across sequences
 /// within a single epoch. Thread-local ensures no cross-thread interference.
 thread_local! {
-    static EPROP_TRACES: RefCell<Option<Vec<EligibilityTraces>>> = RefCell::new(None);
+    #[allow(clippy::missing_const_for_thread_local)]
+    static EPROP_TRACES: RefCell<Option<Vec<EligibilityTraces>>> = const { RefCell::new(None) };
 }
 
 /// Thread-local context for e-prop trace management

@@ -205,11 +205,7 @@ impl MixtureMetrics {
         if !mean.is_finite() || mean <= 0.0 {
             return 0.0;
         }
-        let variance = importances
-            .iter()
-            .map(|&p| (p - mean).powi(2))
-            .sum::<f32>()
-            / k;
+        let variance = importances.iter().map(|&p| (p - mean).powi(2)).sum::<f32>() / k;
         let std = variance.sqrt();
         let cv = std / mean;
         if cv.is_finite() { cv.max(0.0) } else { 0.0 }

@@ -6,11 +6,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    errors::Result,
-    layers::components::common::TemporalMixingLayer,
-    network::Layer,
-};
+use crate::{errors::Result, layers::components::common::TemporalMixingLayer, network::Layer};
 
 /// Shared temporal processing component
 #[derive(Serialize, Deserialize, Debug)]
@@ -25,7 +21,11 @@ pub struct SharedTemporalProcessing {
 
 impl SharedTemporalProcessing {
     /// Create a new shared temporal processing component
-    pub fn new(temporal_mixing: TemporalMixingLayer, window_size: Option<usize>, use_adaptive_window: bool) -> Self {
+    pub fn new(
+        temporal_mixing: TemporalMixingLayer,
+        window_size: Option<usize>,
+        use_adaptive_window: bool,
+    ) -> Self {
         Self {
             temporal_mixing,
             window_size,
@@ -36,26 +36,29 @@ impl SharedTemporalProcessing {
     /// Forward pass through the temporal processing layer
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Set window size if using adaptive window and it's attention-based
-        if self.use_adaptive_window {
-            if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
-                if let Some(window_size) = self.window_size {
-                    attn.set_window_size(Some(window_size));
-                }
-            }
+        if self.use_adaptive_window
+            && let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing
+            && let Some(window_size) = self.window_size
+        {
+            attn.set_window_size(Some(window_size));
         }
 
         // Forward through the underlying layer
         match &mut self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::RgLru(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::Mamba(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::Mamba2(layer) => Layer::forward(layer, input),
-            TemporalMixingLayer::RgLruMoH(layer) => Layer::forward(layer, input),
+            TemporalMixingLayer::Attention(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
+            TemporalMixingLayer::Mamba(layer) => layer.forward(input),
+            TemporalMixingLayer::Mamba2(layer) => layer.forward(input),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
         }
     }
 
     /// Backward pass through the temporal processing layer
-    pub fn backward(&mut self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    pub fn backward(
+        &mut self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         match &mut self.temporal_mixing {
             TemporalMixingLayer::Attention(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::RgLru(layer) => layer.compute_gradients(input, output_grads),
@@ -150,6 +153,14 @@ impl SharedTemporalProcessing {
                 (ratio, rglru.last_head_activity_vec.as_deref())
             }
             _ => (Some(1.0), None),
+        }
+    }
+
+    pub fn get_token_head_activity_vec(&self) -> Option<&[f32]> {
+        match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.as_deref(),
+            _ => None,
         }
     }
 

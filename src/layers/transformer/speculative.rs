@@ -31,18 +31,13 @@ fn default_top_p() -> f32 {
 }
 
 /// Speculative sampling mode - determines which type of model uses speculative sampling
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SpeculativeMode {
     /// Speculative sampling for diffusion models (existing implementation)
+    #[default]
     Diffusion,
     /// Speculative sampling for transformer models (new implementation)
     Transformer,
-}
-
-impl Default for SpeculativeMode {
-    fn default() -> Self {
-        SpeculativeMode::Diffusion
-    }
 }
 
 impl fmt::Display for SpeculativeMode {

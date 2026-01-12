@@ -20,7 +20,7 @@ fn main() {
         println!("\nEpoch {}:", epoch);
         println!("  Before step - Weights count: {}", curve.weights().len());
 
-        if curve.weights().len() > 0 {
+        if !curve.weights().is_empty() {
             println!(
                 "  Before step - First 3 weights: {:?}",
                 &curve.weights()[..3.min(curve.weights().len())]
@@ -31,7 +31,7 @@ fn main() {
         curve.step(&gradients[..curve.weights().len()], learning_rate);
 
         println!("  After step - Weights count: {}", curve.weights().len());
-        if curve.weights().len() > 0 {
+        if !curve.weights().is_empty() {
             println!(
                 "  After step - First 3 weights: {:?}",
                 &curve.weights()[..3.min(curve.weights().len())]

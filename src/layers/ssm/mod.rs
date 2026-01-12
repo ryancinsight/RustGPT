@@ -2,7 +2,7 @@
 //!
 //! This module provides state space model implementations including:
 //! - Mamba: Full-featured selective SSM with attention mechanisms
-//! - Mamba2: Optimized version of Mamba with larger convolution kernels  
+//! - Mamba2: Optimized version of Mamba with larger convolution kernels
 //! - RG-LRU: Real-Gated Linear Recurrent Unit with diagonal recurrence
 //!
 //! The module also includes reusable components for building custom SSM architectures:
@@ -37,6 +37,6 @@ pub(crate) mod mamba2;
 pub(crate) mod rg_lru;
 
 pub use components::*;
-pub use mamba::Mamba;
+pub use mamba::{Mamba, MambaConfig};
 pub use mamba2::Mamba2;
 pub use rg_lru::{MoHRgLru, RgLru};

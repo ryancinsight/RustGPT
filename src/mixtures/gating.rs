@@ -38,13 +38,13 @@ pub enum GatingStrategy {
         sparsity_weight: f32,
         /// Weight for complexity alignment loss (aligns usage with predicted complexity)
         complexity_loss_weight: f32,
-    
+
         /// Weight for importance loss (balances soft routing mass across components).
         ///
         /// Uses MixtureMetrics.active_sum_per_component rather than token counts.
         #[serde(default)]
         importance_loss_weight: f32,
-    
+
         /// Weight for Switch/GShard-style combined load+importance loss.
         ///
         /// This is often a robust default for MoE routers.
@@ -92,11 +92,11 @@ pub struct GatingConfig {
     pub sparsity_weight: f32,
     /// Weight for complexity alignment loss
     pub complexity_loss_weight: f32,
-    
+
     /// Weight for importance loss (balances routing probability mass)
     #[serde(default)]
     pub importance_loss_weight: f32,
-    
+
     /// Weight for Switch/GShard-style combined balance loss
     #[serde(default)]
     pub switch_balance_weight: f32,

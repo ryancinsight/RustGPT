@@ -41,7 +41,7 @@ pub enum LayerEnum {
     RichardsGlu(Box<RichardsGlu>),
     MixtureOfExperts(Box<crate::mixtures::moe::MixtureOfExperts>),
 
-    DynamicTanhNorm(RichardsNorm),
+    DynamicTanhNorm(Box<RichardsNorm>),
     OutputProjection(OutputProjection),
 
     // Removed TRMBlock variant

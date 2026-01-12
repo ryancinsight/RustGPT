@@ -124,7 +124,7 @@ impl RichardsActivation {
             deriv.as_slice_mut().unwrap(),
         );
         for i in 0..x.len() {
-            out[i] = out[i] + x[i] * deriv[i];
+            out[i] += x[i] * deriv[i];
         }
         out
     }
@@ -142,7 +142,7 @@ impl RichardsActivation {
         // out = Richards(x), scratch = Richards'(x)
         self.richards_curve.eval_into_f32(x, out, scratch);
         for i in 0..x.len() {
-            out[i] = out[i] + x[i] * scratch[i];
+            out[i] += x[i] * scratch[i];
         }
     }
 
@@ -161,8 +161,7 @@ impl RichardsActivation {
     pub fn grad_weights_scalar(&self, x: f64, grad_output: f64) -> Vec<f64> {
         // For f(x) = x * Richards(x), we need:
         // df/dθ = x * dRichards/dθ where θ are the Richards parameters
-        let richards_grads = self.richards_curve.grad_weights_scalar(x, x * grad_output);
-        richards_grads
+        self.richards_curve.grad_weights_scalar(x, x * grad_output)
     }
 
     /// Update parameters using gradients

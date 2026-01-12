@@ -19,6 +19,7 @@ static SEED_SET: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Thread-local seeded RNG, initialized lazily when first accessed
+    #[allow(clippy::missing_const_for_thread_local)]
     static SEEDED_RNG: RefCell<Option<StdRng>> = const { RefCell::new(None) };
 }
 
@@ -70,7 +71,7 @@ pub fn get_seed() -> Option<u64> {
 /// This provides a uniform interface regardless of whether deterministic
 /// mode is enabled.
 pub enum DeterministicRng {
-    Seeded(StdRng),
+    Seeded(Box<StdRng>),
     Random(rand::rngs::ThreadRng),
 }
 
@@ -122,6 +123,7 @@ pub fn get_rng() -> DeterministicRng {
 
         // Use thread-local counter to generate unique seeds per call
         thread_local! {
+            #[allow(clippy::missing_const_for_thread_local)]
             static CALL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
         }
 
@@ -134,7 +136,7 @@ pub fn get_rng() -> DeterministicRng {
         // Mix seed with counter using a simple hash-like operation
         let mixed_seed = base_seed.wrapping_add(counter.wrapping_mul(0x9E3779B97F4A7C15));
 
-        DeterministicRng::Seeded(StdRng::seed_from_u64(mixed_seed))
+        DeterministicRng::Seeded(Box::new(StdRng::seed_from_u64(mixed_seed)))
     } else {
         DeterministicRng::Random(rand::rng())
     }

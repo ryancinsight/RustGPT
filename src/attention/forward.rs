@@ -47,9 +47,8 @@ pub struct ForwardResult {
     pub tau_metrics: Option<(f32, f32)>,
     pub pred_norm: Option<f32>,
     pub avg_active_heads: Option<f32>,
-    /// Mean gating/selection value per head for this forward pass.
-    /// Length = num_heads when available.
     pub head_activity_vec: Option<Array1<f32>>,
+    pub token_head_activity_vec: Option<Array1<f32>>,
 }
 
 /// Compute polynomial attention forward pass
@@ -176,130 +175,124 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         (tau_min_local, tau_max_local, tau_sum_local, tau_count_local),
         (g_sq_sum_local, g_count_local),
         projections_acc,
-    ) = ctx
-        .heads
-        .iter()
-        .enumerate()
-        .map(|(h_idx, head)| {
-            // Project to Q, K, V using zero-copy views
-            let q: Array2<f32> = ctx.input.dot(&head.w_q); // (N, d_h)
-            let k: Array2<f32> = ctx.input.dot(&head.w_k); // (N, d_h)
-            let v: Array2<f32> = ctx.input.dot(&head.w_v); // (N, d_h)
+    ) =
+        ctx.heads
+            .iter()
+            .enumerate()
+            .map(|(h_idx, head)| {
+                // Project to Q, K, V using zero-copy views
+                let q: Array2<f32> = ctx.input.dot(&head.w_q); // (N, d_h)
+                let k: Array2<f32> = ctx.input.dot(&head.w_k); // (N, d_h)
+                let v: Array2<f32> = ctx.input.dot(&head.w_v); // (N, d_h)
 
-            // Compute per-token gating for this head: g = Richards(alpha * (X·w_g_col) + beta)
-            let w_g_col = ctx.w_g.slice(s![.., h_idx..h_idx + 1]); // (D,1)
-            let xw_col = ctx.input.dot(&w_g_col); // (N,1)
-            let a_h = ctx.alpha_g[[0, h_idx]];
-            let b_h = ctx.beta_g[[0, h_idx]];
+                // Compute per-token gating for this head: g = Richards(alpha * (X·w_g_col) + beta)
+                let w_g_col = ctx.w_g.slice(s![.., h_idx..h_idx + 1]); // (D,1)
+                let xw_col = ctx.input.dot(&w_g_col); // (N,1)
+                let a_h = ctx.alpha_g[[0, h_idx]];
+                let b_h = ctx.beta_g[[0, h_idx]];
 
-            // Compute gate values and metrics using iterator chains
-            let max_abs_z = xw_col
-                .iter()
-                .fold(0.0_f32, |m, &v| m.max((a_h * v + b_h).abs()));
+                // Compute gate values and metrics using iterator chains
+                let max_abs_z = xw_col
+                    .iter()
+                    .fold(0.0_f32, |m, &v| m.max((a_h * v + b_h).abs()));
 
-            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
 
-            let gate_input = xw_col.mapv(|xw| a_h * xw + b_h);
-            let mut g_col = ndarray::Array2::<f32>::zeros(gate_input.raw_dim());
-            gate_poly.forward_matrix_f32_into(&gate_input, &mut g_col);
+                let gate_input = xw_col.mapv(|xw| a_h * xw + b_h);
+                let mut g_col = ndarray::Array2::<f32>::zeros(gate_input.raw_dim());
+                gate_poly.forward_matrix_f32_into(&gate_input, &mut g_col);
 
-            // RMS tracking for gating predictor
-            let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
-            let g_count = n;
+                // RMS tracking for gating predictor
+                let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
+                let g_count = n;
 
-            // Learned threshold predictor or soft top-p selection
-            let (tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
-                if ctx.head_selection_config.gating.use_learned_predictor {
-                    // Use learned thresholds per head (n_tokens x n_heads)
-                    let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
-                    let threshold_sum: f32 = head_thresholds.iter().sum();
-                    let threshold_min = head_thresholds
-                        .iter()
-                        .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
-                    let threshold_max = head_thresholds
-                        .iter()
-                        .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
-                    let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
-                    let mut eff_col = g_col;
-                    ndarray::Zip::from(&mut eff_col)
-                        .and(&head_thresholds)
-                        .for_each(|e, &t| {
-                            *e *= t;
-                        });
-                    (tau_metrics, eff_col)
-                } else if ctx.head_selection_config.gating.use_soft_top_p {
-                    // Use soft top-p selection (2D array: n_tokens x n_heads)
-                    let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
-                    let threshold_sum: f32 = head_thresholds.iter().sum();
-                    let threshold_min = head_thresholds
-                        .iter()
-                        .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
-                    let threshold_max = head_thresholds
-                        .iter()
-                        .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
-                    let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
-                    let mut eff_col = g_col;
-                    ndarray::Zip::from(&mut eff_col)
-                        .and(&head_thresholds)
-                        .for_each(|e, &t| {
-                            *e *= t;
-                        });
-                    (tau_metrics, eff_col)
+                // Learned threshold predictor or soft top-p selection
+                let (tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
+                    if ctx.head_selection_config.gating.use_learned_predictor {
+                        // Use learned thresholds per head (n_tokens x n_heads)
+                        let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
+                        let threshold_sum: f32 = head_thresholds.iter().sum();
+                        let threshold_min = head_thresholds
+                            .iter()
+                            .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
+                        let threshold_max = head_thresholds
+                            .iter()
+                            .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
+                        let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
+                        let mut eff_col = g_col;
+                        ndarray::Zip::from(&mut eff_col)
+                            .and(&head_thresholds)
+                            .for_each(|e, &t| {
+                                *e *= t;
+                            });
+                        (tau_metrics, eff_col)
+                    } else if ctx.head_selection_config.gating.use_soft_top_p {
+                        // Use soft top-p selection (2D array: n_tokens x n_heads)
+                        let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
+                        let threshold_sum: f32 = head_thresholds.iter().sum();
+                        let threshold_min = head_thresholds
+                            .iter()
+                            .fold(f32::INFINITY, |m: f32, &z: &f32| m.min(z));
+                        let threshold_max = head_thresholds
+                            .iter()
+                            .fold(f32::NEG_INFINITY, |m: f32, &z: &f32| m.max(z));
+                        let tau_metrics = (threshold_min, threshold_max, threshold_sum, n);
+                        let mut eff_col = g_col;
+                        ndarray::Zip::from(&mut eff_col)
+                            .and(&head_thresholds)
+                            .for_each(|e, &t| {
+                                *e *= t;
+                            });
+                        (tau_metrics, eff_col)
+                    } else {
+                        // Fallback
+                        let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
+                        (tau_metrics, g_col)
+                    }
                 } else {
-                    // Fallback
+                    // No learned thresholds: m = 1, so eff = g
                     let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
                     (tau_metrics, g_col)
-                }
-            } else {
-                // No learned thresholds: m = 1, so eff = g
-                let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
-                (tau_metrics, g_col)
-            };
-            let active_sum = eff_col.sum();
-            let token_count = n;
+                };
+                let active_sum = eff_col.sum();
+                let token_count = n;
 
-            // Return (projections, gates, metrics) for this head
-            (
-                (q, k, v, eff_col),
-                (active_sum, token_count),
-                (g_sq_sum, g_count),
-                tau_metrics,
-            )
-        })
-        .fold(
-            (
-                vec![],
-                vec![],
-                (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
-                (0.0, 0),
-                vec![],
-            ),
-            |(
-                mut active_acc,
-                mut token_acc,
-                mut tau_acc,
-                mut g_acc,
-                mut projections_acc,
-            ),
-             (
-                (q, k, v, eff_col),
-                (active_sum, token_count),
-                (g_sq_sum, g_count),
-                tau_metrics,
-            )| {
-                active_acc.push(active_sum);
-                token_acc.push(token_count);
-                tau_acc = (
-                    tau_acc.0.min(tau_metrics.0),
-                    tau_acc.1.max(tau_metrics.1),
-                    tau_acc.2 + tau_metrics.2,
-                    tau_acc.3 + tau_metrics.3,
-                );
-                g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
-                projections_acc.push((q, k, v, eff_col));
-                (active_acc, token_acc, tau_acc, g_acc, projections_acc)
-            },
-        );
+                // Return (projections, gates, metrics) for this head
+                (
+                    (q, k, v, eff_col),
+                    (active_sum, token_count),
+                    (g_sq_sum, g_count),
+                    tau_metrics,
+                )
+            })
+            .fold(
+                (
+                    vec![],
+                    vec![],
+                    (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
+                    (0.0, 0),
+                    vec![],
+                ),
+                |(mut active_acc, mut token_acc, mut tau_acc, mut g_acc, mut projections_acc),
+                 (
+                    (q, k, v, eff_col),
+                    (active_sum, token_count),
+                    (g_sq_sum, g_count),
+                    tau_metrics,
+                )| {
+                    active_acc.push(active_sum);
+                    token_acc.push(token_count);
+                    tau_acc = (
+                        tau_acc.0.min(tau_metrics.0),
+                        tau_acc.1.max(tau_metrics.1),
+                        tau_acc.2 + tau_metrics.2,
+                        tau_acc.3 + tau_metrics.3,
+                    );
+                    g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
+                    projections_acc.push((q, k, v, eff_col));
+                    (active_acc, token_acc, tau_acc, g_acc, projections_acc)
+                },
+            );
 
     // Extract projections for the attention computation loop
     let head_projections = projections_acc;
@@ -344,8 +337,8 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                     let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
                     let q_row_i = q.row(i);
                     with_tls_qpe(max_pos + 1, |q_pe| {
-                        for pos in 0..=max_pos {
-                            q_pe[pos] = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
+                        for (pos, q_pe_val) in q_pe.iter_mut().enumerate() {
+                            *q_pe_val = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
                         }
 
                         let k_slice = k.slice(s![j_start..j_end_excl, ..]);
@@ -439,16 +432,36 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         None
     };
 
-    let head_activity_vec = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-        let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
-        let mut v = sanitized
-            .mean_axis(Axis(0))
-            .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
-        v.mapv_inplace(|x| if x.is_finite() { x.max(0.0) } else { 0.0 });
-        Some(v)
-    } else {
-        None
-    };
+    let (head_activity_vec, token_head_activity_vec) =
+        if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+            let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
+
+            let mut head_v = sanitized
+                .mean_axis(Axis(0))
+                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
+            head_v.mapv_inplace(|x| {
+                if x.is_finite() {
+                    x.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            });
+
+            let mut tok_v = sanitized
+                .mean_axis(Axis(1))
+                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.nrows()));
+            tok_v.mapv_inplace(|x| {
+                if x.is_finite() {
+                    x.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            });
+
+            (Some(head_v), Some(tok_v))
+        } else {
+            (None, None)
+        };
 
     ForwardResult {
         output: out,
@@ -456,6 +469,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         pred_norm,
         avg_active_heads,
         head_activity_vec,
+        token_head_activity_vec,
     }
 }
 
@@ -477,71 +491,65 @@ pub fn compute_poly_attention_forward_baseline(
         (tau_min_local, tau_max_local, tau_sum_local, tau_count_local),
         (g_sq_sum_local, g_count_local),
         projections_acc,
-    ) = ctx
-        .heads
-        .iter()
-        .enumerate()
-        .map(|(h_idx, head)| {
-            let q: Array2<f32> = ctx.input.dot(&head.w_q);
-            let k: Array2<f32> = ctx.input.dot(&head.w_k);
-            let v: Array2<f32> = ctx.input.dot(&head.w_v);
-            let w_g_col = ctx.w_g.slice(s![.., h_idx..h_idx + 1]);
-            let xw_col = ctx.input.dot(&w_g_col);
-            let a_h = ctx.alpha_g[[0, h_idx]];
-            let b_h = ctx.beta_g[[0, h_idx]];
-            let max_abs_z = xw_col
-                .iter()
-                .fold(0.0_f32, |m, &v| m.max((a_h * v + b_h).abs()));
-            let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
-            let gate_input = xw_col.mapv(|xw| a_h * xw + b_h);
-            let mut g_col = ndarray::Array2::<f32>::zeros(gate_input.raw_dim());
-            gate_poly.forward_matrix_f32_into(&gate_input, &mut g_col);
-            let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
-            let g_count = n;
-            let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
-            let eff_col = g_col;
-            let active_sum = eff_col.sum();
-            (
-                (q, k, v, eff_col),
-                (active_sum, n),
-                (g_sq_sum, g_count),
-                tau_metrics,
-            )
-        })
-        .fold(
-            (
-                vec![],
-                vec![],
-                (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
-                (0.0, 0),
-                vec![],
-            ),
-            |(
-                mut active_acc,
-                mut token_acc,
-                mut tau_acc,
-                mut g_acc,
-                mut projections_acc,
-            ),
-             (
-                (q, k, v, eff_col),
-                (active_sum, token_count),
-                (g_sq_sum, g_count),
-                tau_metrics,
-            )| {
-                active_acc.push(active_sum);
-                token_acc.push(token_count);
-                tau_acc = (
-                    tau_acc.0.min(tau_metrics.0),
-                    tau_acc.1.max(tau_metrics.1),
-                    tau_acc.2 + tau_metrics.2,
-                    tau_acc.3 + tau_metrics.3,
-                );
-                g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
-                projections_acc.push((q, k, v, eff_col));
-                (active_acc, token_acc, tau_acc, g_acc, projections_acc)
-            },
-        );
+    ) =
+        ctx.heads
+            .iter()
+            .enumerate()
+            .map(|(h_idx, head)| {
+                let q: Array2<f32> = ctx.input.dot(&head.w_q);
+                let k: Array2<f32> = ctx.input.dot(&head.w_k);
+                let v: Array2<f32> = ctx.input.dot(&head.w_v);
+                let w_g_col = ctx.w_g.slice(s![.., h_idx..h_idx + 1]);
+                let xw_col = ctx.input.dot(&w_g_col);
+                let a_h = ctx.alpha_g[[0, h_idx]];
+                let b_h = ctx.beta_g[[0, h_idx]];
+                let max_abs_z = xw_col
+                    .iter()
+                    .fold(0.0_f32, |m, &v| m.max((a_h * v + b_h).abs()));
+                let gate_poly = ctx.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let gate_input = xw_col.mapv(|xw| a_h * xw + b_h);
+                let mut g_col = ndarray::Array2::<f32>::zeros(gate_input.raw_dim());
+                gate_poly.forward_matrix_f32_into(&gate_input, &mut g_col);
+                let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
+                let g_count = n;
+                let tau_metrics = (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0);
+                let eff_col = g_col;
+                let active_sum = eff_col.sum();
+                (
+                    (q, k, v, eff_col),
+                    (active_sum, n),
+                    (g_sq_sum, g_count),
+                    tau_metrics,
+                )
+            })
+            .fold(
+                (
+                    vec![],
+                    vec![],
+                    (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0),
+                    (0.0, 0),
+                    vec![],
+                ),
+                |(mut active_acc, mut token_acc, mut tau_acc, mut g_acc, mut projections_acc),
+                 (
+                    (q, k, v, eff_col),
+                    (active_sum, token_count),
+                    (g_sq_sum, g_count),
+                    tau_metrics,
+                )| {
+                    active_acc.push(active_sum);
+                    token_acc.push(token_count);
+                    tau_acc = (
+                        tau_acc.0.min(tau_metrics.0),
+                        tau_acc.1.max(tau_metrics.1),
+                        tau_acc.2 + tau_metrics.2,
+                        tau_acc.3 + tau_metrics.3,
+                    );
+                    g_acc = (g_acc.0 + g_sq_sum, g_acc.1 + g_count);
+                    projections_acc.push((q, k, v, eff_col));
+                    (active_acc, token_acc, tau_acc, g_acc, projections_acc)
+                },
+            );
 
     let mut gate_values = ndarray::Array2::<f32>::zeros((n, ctx.num_heads));
     for (h_idx, (_q, _k, _v, eff_col)) in projections_acc.iter().enumerate() {
@@ -581,8 +589,8 @@ pub fn compute_poly_attention_forward_baseline(
                 let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
                 let q_row_i = q.row(i);
                 with_tls_qpe(max_pos + 1, |q_pe| {
-                    for pos in 0..=max_pos {
-                        q_pe[pos] = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
+                    for (pos, q_pe_val) in q_pe.iter_mut().enumerate() {
+                        *q_pe_val = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
                     }
 
                     let k_slice = k.slice(s![j_start..j_end_excl, ..]);
@@ -662,16 +670,36 @@ pub fn compute_poly_attention_forward_baseline(
     } else {
         None
     };
-    let head_activity_vec = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-        let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
-        let mut v = sanitized
-            .mean_axis(Axis(0))
-            .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
-        v.mapv_inplace(|x| if x.is_finite() { x.max(0.0) } else { 0.0 });
-        Some(v)
-    } else {
-        None
-    };
+    let (head_activity_vec, token_head_activity_vec) =
+        if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+            let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
+
+            let mut head_v = sanitized
+                .mean_axis(Axis(0))
+                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
+            head_v.mapv_inplace(|x| {
+                if x.is_finite() {
+                    x.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            });
+
+            let mut tok_v = sanitized
+                .mean_axis(Axis(1))
+                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.nrows()));
+            tok_v.mapv_inplace(|x| {
+                if x.is_finite() {
+                    x.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            });
+
+            (Some(head_v), Some(tok_v))
+        } else {
+            (None, None)
+        };
 
     ForwardResult {
         output: out,
@@ -679,6 +707,7 @@ pub fn compute_poly_attention_forward_baseline(
         pred_norm,
         avg_active_heads,
         head_activity_vec,
+        token_head_activity_vec,
     }
 }
 

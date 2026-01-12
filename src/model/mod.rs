@@ -7,5 +7,4 @@
 //
 // Persistence is implemented as inherent methods on `LLM` and is kept internal.
 
-pub use crate::model_builder as builder;
-pub use crate::model_config as config;
+pub use crate::{model_builder as builder, model_config as config};

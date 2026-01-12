@@ -22,6 +22,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{network::Layer, rng::get_rng};
 
+type ThresholdParamGrads = (
+    ndarray::Array2<f32>,
+    ndarray::Array1<f32>,
+    ndarray::Array2<f32>,
+    ndarray::Array1<f32>,
+    Option<ndarray::Array2<f32>>,
+    Vec<f64>,
+);
+
+type ThresholdParamAndInputGrads = (
+    ndarray::Array2<f32>,
+    ndarray::Array2<f32>,
+    ndarray::Array1<f32>,
+    ndarray::Array2<f32>,
+    ndarray::Array1<f32>,
+    Option<ndarray::Array2<f32>>,
+    Vec<f64>,
+);
+
 /// Enhanced threshold predictor inspired by AutoDeco
 ///
 /// This implements a two-layer neural network for threshold prediction with proper
@@ -164,7 +183,8 @@ impl ThresholdPredictor {
 
         // Richards sigmoid activation to get values in [0, 1] range
         let mut out_sigmoid = ndarray::Array2::<f32>::zeros(output.raw_dim());
-        self.sigmoid.forward_matrix_f32_into(&output, &mut out_sigmoid);
+        self.sigmoid
+            .forward_matrix_f32_into(&output, &mut out_sigmoid);
         out_sigmoid
     }
 
@@ -181,14 +201,16 @@ impl ThresholdPredictor {
 
         // Learned Richards activation replacing ReLU
         let mut activated = ndarray::Array2::<f32>::zeros(normalized.raw_dim());
-        self.activation.forward_matrix_f32_into(&normalized, &mut activated);
+        self.activation
+            .forward_matrix_f32_into(&normalized, &mut activated);
 
         // Second layer: W2 * activated + b2
         let output = activated.dot(&self.weights2) + &self.bias2;
 
         // Richards sigmoid activation to get values in [0, 1] range
         let mut out_sigmoid = ndarray::Array2::<f32>::zeros(output.raw_dim());
-        self.sigmoid.forward_matrix_f32_into(&output, &mut out_sigmoid);
+        self.sigmoid
+            .forward_matrix_f32_into(&output, &mut out_sigmoid);
         out_sigmoid
     }
 
@@ -199,17 +221,7 @@ impl ThresholdPredictor {
     /// Compute gradients for the two-layer threshold network
     ///
     /// Returns gradients for (weights1, bias1, weights2, bias2, activation_params)
-    pub fn compute_gradients(
-        &self,
-        output_grads: &ndarray::Array2<f32>,
-    ) -> (
-        ndarray::Array2<f32>,
-        ndarray::Array1<f32>,
-        ndarray::Array2<f32>,
-        ndarray::Array1<f32>,
-        Option<ndarray::Array2<f32>>,
-        Vec<f64>,
-    ) {
+    pub fn compute_gradients(&self, output_grads: &ndarray::Array2<f32>) -> ThresholdParamGrads {
         // Retrieve cached activations
         let cached_input = self
             .cached_input
@@ -250,8 +262,11 @@ impl ThresholdPredictor {
 
         // Gradient through Richards activation (replacing ReLU)
         let mut d_normalized = ndarray::Array2::<f32>::zeros(cached_normalized.raw_dim());
-        self.activation
-            .backward_matrix_f32_into(cached_normalized, &d_activated, &mut d_normalized);
+        self.activation.backward_matrix_f32_into(
+            cached_normalized,
+            &d_activated,
+            &mut d_normalized,
+        );
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -287,15 +302,7 @@ impl ThresholdPredictor {
     pub fn compute_gradients_with_input(
         &self,
         output_grads: &ndarray::Array2<f32>,
-    ) -> (
-        ndarray::Array2<f32>,
-        ndarray::Array2<f32>,
-        ndarray::Array1<f32>,
-        ndarray::Array2<f32>,
-        ndarray::Array1<f32>,
-        Option<ndarray::Array2<f32>>,
-        Vec<f64>,
-    ) {
+    ) -> ThresholdParamAndInputGrads {
         // Retrieve cached activations
         let cached_input = self
             .cached_input
@@ -332,8 +339,11 @@ impl ThresholdPredictor {
 
         // Gradient through Richards activation
         let mut d_normalized = ndarray::Array2::<f32>::zeros(cached_normalized.raw_dim());
-        self.activation
-            .backward_matrix_f32_into(cached_normalized, &d_activated, &mut d_normalized);
+        self.activation.backward_matrix_f32_into(
+            cached_normalized,
+            &d_activated,
+            &mut d_normalized,
+        );
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -413,7 +423,7 @@ mod tests {
 
         // Check values are in [0, 1] range (sigmoid output)
         for &val in thresholds.iter() {
-            assert!(val >= 0.0 && val <= 1.0);
+            assert!((0.0..=1.0).contains(&val));
         }
     }
 
@@ -427,7 +437,7 @@ mod tests {
 
         // Check values are in [0, 1] range (sigmoid output)
         for &val in thresholds.iter() {
-            assert!(val >= 0.0 && val <= 1.0);
+            assert!((0.0..=1.0).contains(&val));
         }
     }
 
@@ -441,7 +451,7 @@ mod tests {
 
         // Check values are in [0, 1] range (sigmoid output)
         for &val in thresholds.iter() {
-            assert!(val >= 0.0 && val <= 1.0);
+            assert!((0.0..=1.0).contains(&val));
         }
     }
 
