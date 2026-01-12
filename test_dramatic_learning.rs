@@ -100,9 +100,9 @@ fn main() {
     println!();
 
     // Calculate parameter changes
-    let sigmoid_initial = vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
-    let none_initial = vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
-    let fully_initial = vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+    let sigmoid_initial = [1.0f64, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+    let none_initial = [1.0f64, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+    let fully_initial = [1.0f64, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
 
     println!("4. Parameter Change Magnitudes:");
 

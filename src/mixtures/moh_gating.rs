@@ -153,7 +153,8 @@ fn enforce_min_max_heads_inplace(
             }
         }
         if active > max_h {
-            let mut candidates: Vec<(f32, usize)> = Vec::with_capacity(active.saturating_sub(always.len()));
+            let mut candidates: Vec<(f32, usize)> =
+                Vec::with_capacity(active.saturating_sub(always.len()));
             for h in 0..h_total {
                 if m_mat[[i, h]] > 0.0 && !always.contains(&h) {
                     let v = g_mat[[i, h]];
@@ -920,49 +921,50 @@ impl MoHGating {
         self.opt_beta_g.step(&mut self.beta_g, &grads[idx + 2], lr);
         idx += 3;
         let grad_gate_poly = &grads[idx];
-        let _ = self.gate.apply_gradients(&[grad_gate_poly.clone()], lr);
+        let _ = self
+            .gate
+            .apply_gradients(std::slice::from_ref(grad_gate_poly), lr);
         idx += 1;
 
-        if self.head_selection_config.gating.use_learned_predictor {
-            if let (Some(pred), Some(opt_w1), Some(opt_b1), Some(opt_w2), Some(opt_b2)) = (
+        if self.head_selection_config.gating.use_learned_predictor
+            && let (Some(pred), Some(opt_w1), Some(opt_b1), Some(opt_w2), Some(opt_b2)) = (
                 &mut self.threshold_predictor,
                 &mut self.opt_w_tau,
                 &mut self.opt_b_tau,
                 &mut self.opt_w2_tau,
                 &mut self.opt_b2_tau,
-            ) {
-                if grads.len() < idx + 6 {
-                    return Err(crate::errors::ModelError::GradientError {
-                        message: format!("MoHGating expected predictor grads, got {}", grads.len()),
-                    });
-                }
-                opt_w1.step(&mut pred.weights1, &grads[idx], lr);
-                let mut bias1_reshaped = pred
-                    .bias1
-                    .clone()
-                    .to_shape((pred.bias1.len(), 1))
-                    .unwrap()
-                    .to_owned();
-                opt_b1.step(&mut bias1_reshaped, &grads[idx + 1], lr);
-                pred.bias1
-                    .assign(&bias1_reshaped.view().to_shape(pred.bias1.len()).unwrap());
-                opt_w2.step(&mut pred.weights2, &grads[idx + 2], lr);
-                let mut bias2_reshaped = pred
-                    .bias2
-                    .clone()
-                    .to_shape((pred.bias2.len(), 1))
-                    .unwrap()
-                    .to_owned();
-                opt_b2.step(&mut bias2_reshaped, &grads[idx + 3], lr);
-                pred.bias2
-                    .assign(&bias2_reshaped.view().to_shape(pred.bias2.len()).unwrap());
-                if let Some(opt_cond) = &mut self.opt_cond_w_tau {
-                    opt_cond.step(&mut pred.cond_w, &grads[idx + 4], lr);
-                }
-                let grad_activation_vec: Vec<f64> =
-                    grads[idx + 5].iter().map(|&x| x as f64).collect();
-                pred.activation.step(&grad_activation_vec, lr as f64);
+            )
+        {
+            if grads.len() < idx + 6 {
+                return Err(crate::errors::ModelError::GradientError {
+                    message: format!("MoHGating expected predictor grads, got {}", grads.len()),
+                });
             }
+            opt_w1.step(&mut pred.weights1, &grads[idx], lr);
+            let mut bias1_reshaped = pred
+                .bias1
+                .clone()
+                .to_shape((pred.bias1.len(), 1))
+                .unwrap()
+                .to_owned();
+            opt_b1.step(&mut bias1_reshaped, &grads[idx + 1], lr);
+            pred.bias1
+                .assign(&bias1_reshaped.view().to_shape(pred.bias1.len()).unwrap());
+            opt_w2.step(&mut pred.weights2, &grads[idx + 2], lr);
+            let mut bias2_reshaped = pred
+                .bias2
+                .clone()
+                .to_shape((pred.bias2.len(), 1))
+                .unwrap()
+                .to_owned();
+            opt_b2.step(&mut bias2_reshaped, &grads[idx + 3], lr);
+            pred.bias2
+                .assign(&bias2_reshaped.view().to_shape(pred.bias2.len()).unwrap());
+            if let Some(opt_cond) = &mut self.opt_cond_w_tau {
+                opt_cond.step(&mut pred.cond_w, &grads[idx + 4], lr);
+            }
+            let grad_activation_vec: Vec<f64> = grads[idx + 5].iter().map(|&x| x as f64).collect();
+            pred.activation.step(&grad_activation_vec, lr as f64);
         }
 
         Ok(())
@@ -979,8 +981,9 @@ impl MoHGating {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
+
+    use super::*;
 
     #[test]
     fn fixed_strategy_enforces_exact_num_active_heads() {

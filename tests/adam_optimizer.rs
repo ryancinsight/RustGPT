@@ -1,7 +1,6 @@
 use approx::assert_abs_diff_eq;
-use ndarray::Array2;
-
 use llm::Adam;
+use ndarray::Array2;
 
 #[test]
 fn adam_first_step_matches_bias_corrected_sign_update() {

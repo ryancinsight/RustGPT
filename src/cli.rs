@@ -208,7 +208,8 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub residual_decorrelation_adaptive: bool,
 
-    /// Auxiliary hard-negative residual repulsion weight (cosine-based, memory-bank hard negatives).
+    /// Auxiliary hard-negative residual repulsion weight (cosine-based, memory-bank hard
+    /// negatives).
     ///
     /// When > 0, penalizes residual representations that are too similar to recent representations
     /// from other examples, using hard-negative top-k mining. This explicitly teaches “what it is

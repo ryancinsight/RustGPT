@@ -1,14 +1,20 @@
-use std::{cell::RefCell, thread_local};
+use std::cell::RefCell;
 
 use ndarray::Array2;
 
 thread_local! {
-    static TLS_SCORES: RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
-    static TLS_WORK:   RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, N)
-    static TLS_YH:     RefCell<Option<Array2<f32>>> = RefCell::new(None); // (N, d_h)
-    static TLS_PHI:    RefCell<Option<ndarray::Array1<f32>>> = RefCell::new(None); // (w)
-    static TLS_ACC_F64: RefCell<Option<Vec<f64>>> = RefCell::new(None); // (d_h)
-    static TLS_QPE: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_SCORES: RefCell<Option<Array2<f32>>> = const { RefCell::new(None) }; // (N, N)
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_WORK:   RefCell<Option<Array2<f32>>> = const { RefCell::new(None) }; // (N, N)
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_YH:     RefCell<Option<Array2<f32>>> = const { RefCell::new(None) }; // (N, d_h)
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_PHI:    RefCell<Option<ndarray::Array1<f32>>> = const { RefCell::new(None) }; // (w)
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_ACC_F64: RefCell<Option<Vec<f64>>> = const { RefCell::new(None) }; // (d_h)
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_QPE: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Get or create a thread-local scratch buffer for attention scores (N×N matrices)

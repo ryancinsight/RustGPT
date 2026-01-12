@@ -23,7 +23,9 @@ fn main() -> crate::Result<()> {
         // reduction order, which can cause large run-to-run variability in MoE routing
         // even with a fixed seed. When the user requests determinism (by setting a seed),
         // force a single-thread pool.
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build_global();
     }
 
     // Initialize tracing subscriber

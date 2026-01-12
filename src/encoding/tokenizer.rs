@@ -26,7 +26,11 @@ fn is_ascii_punct(b: u8) -> bool {
 /// - Otherwise emit maximal spans of non-ws, non-punct bytes
 /// - If a substring beginning with '<' matches a vocab entry up to the next '>', emit it as a
 ///   single token (to support special tokens like `</s>`, `<unk>`, `<mask>`).
-fn for_each_token_with_vocab<'a>(text: &'a str, vocab: &super::Vocab, mut emit: impl FnMut(&'a str)) {
+fn for_each_token_with_vocab<'a>(
+    text: &'a str,
+    vocab: &super::Vocab,
+    mut emit: impl FnMut(&'a str),
+) {
     let bytes = text.as_bytes();
     let mut i = 0usize;
     'outer: while i < bytes.len() {

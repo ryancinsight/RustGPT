@@ -42,6 +42,15 @@ fn default_true() -> bool {
     true
 }
 
+type RouterParamGrads = (
+    ndarray::Array2<f32>,
+    ndarray::Array1<f32>,
+    ndarray::Array2<f32>,
+    ndarray::Array1<f32>,
+    Vec<f64>,
+);
+
+type RouterParamShapes<'a> = (&'a [(usize, usize)], &'a [usize], usize, usize, usize);
 
 /// Strategy for selecting which experts to activate
 ///
@@ -118,20 +127,15 @@ pub enum ExpertRouter {
 }
 
 /// Routing mode for sparse Mixture-of-Experts.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ExpertRoutingMode {
     /// Token chooses its top-k experts.
+    #[default]
     TokenChoiceTopK,
     /// Token chooses its top-k experts and a per-expert capacity is enforced.
     TokenChoiceTopKWithCapacity,
     /// Each expert chooses its top tokens (then tokens may be top-k filtered).
     ExpertChoice,
-}
-
-impl Default for ExpertRoutingMode {
-    fn default() -> Self {
-        Self::TokenChoiceTopK
-    }
 }
 
 /// Configuration for expert routing metrics and learned parameters
@@ -292,11 +296,9 @@ pub struct LearnedKAdapter {
 
 impl LearnedKAdapter {
     pub fn new() -> Self {
-        // Initialize close to the old behavior (alpha ≈ head_activity) around 0.5.
-        // sigmoid(4*h - 2) has midpoint at h=0.5.
         let mut w = ndarray::Array2::<f32>::zeros((2, 1));
-        w[[0, 0]] = 0.0; // entropy weight starts neutral
-        w[[1, 0]] = 4.0; // head activity drives alpha initially
+        w[[0, 0]] = 0.0;
+        w[[1, 0]] = 4.0;
         let mut b = ndarray::Array2::<f32>::zeros((1, 1));
         b[[0, 0]] = -2.0;
         Self { w, b }
@@ -316,6 +318,12 @@ impl LearnedKAdapter {
         };
         let z = self.w[[0, 0]] * e + self.w[[1, 0]] * h + self.b[[0, 0]];
         RichardsCurve::sigmoid(false).forward_scalar_f32(z)
+    }
+}
+
+impl Default for LearnedKAdapter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -781,11 +789,11 @@ impl ExpertSelector {
             .as_ref()
             .expect("predict must cache activated values");
         let mut logits = activated_ref.dot(&self.weights2) + &self.bias2;
-        if let Some(h) = head_activity {
-            if !h.is_empty() {
-                let bias = self.compute_head_bias(h, self.bias2.len());
-                logits = logits + &bias;
-            }
+        if let Some(h) = head_activity
+            && !h.is_empty()
+        {
+            let bias = self.compute_head_bias(h, self.bias2.len());
+            logits += &bias;
         }
         self.cached_logits = Some(logits);
 
@@ -866,16 +874,7 @@ impl ExpertSelector {
     }
 
     /// Compute gradients for the two-layer routing network
-    pub fn compute_gradients(
-        &mut self,
-        output_grads: &ndarray::Array2<f32>,
-    ) -> (
-        ndarray::Array2<f32>,
-        ndarray::Array1<f32>,
-        ndarray::Array2<f32>,
-        ndarray::Array1<f32>,
-        Vec<f64>,
-    ) {
+    pub fn compute_gradients(&mut self, output_grads: &ndarray::Array2<f32>) -> RouterParamGrads {
         // Retrieve cached activations
         let cached_input = self
             .cached_input
@@ -906,9 +905,11 @@ impl ExpertSelector {
 
         // Gradient through Richards activation (replacing ReLU)
         let mut d_normalized = ndarray::Array2::<f32>::zeros(cached_normalized.raw_dim());
-        self.activation
-            .curve
-            .backward_matrix_f32_into(cached_normalized, &d_activated, &mut d_normalized);
+        self.activation.curve.backward_matrix_f32_into(
+            cached_normalized,
+            &d_activated,
+            &mut d_normalized,
+        );
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self.norm.compute_gradients(cached_hidden, &d_normalized);
@@ -999,7 +1000,7 @@ impl ExpertSelector {
     }
 
     /// Get parameter shapes for gradient computation
-    pub fn param_shapes(&mut self) -> (&[(usize, usize)], &[usize], usize, usize, usize) {
+    pub fn param_shapes(&mut self) -> RouterParamShapes<'_> {
         let info = self.get_param_info();
         (
             &info.weight_shapes,
@@ -1173,10 +1174,10 @@ pub struct MixtureOfExperts {
 
     /// Cached alpha used for k-adaptation in the last forward pass.
     #[serde(skip)]
-    cached_k_alpha: Option<f32>,
+    cached_k_alpha: Option<Vec<f32>>,
     /// Cached features (entropy_norm, head_activity) for k-adaptation gradients.
     #[serde(skip)]
-    cached_k_features: Option<(f32, f32)>,
+    cached_k_features: Option<Vec<(f32, f32)>>,
     /// Cached delta probabilities (p_topk - p_top1) used for d(alpha).
     #[serde(skip)]
     cached_k_delta_probs: Option<ndarray::Array2<f32>>,
@@ -1239,6 +1240,16 @@ impl MixtureOfExperts {
         // Intentionally no-op.
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_cached_router_input(&self) -> Option<&ndarray::Array2<f32>> {
+        self.cached_router_input.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_cached_k_alpha(&self) -> Option<&[f32]> {
+        self.cached_k_alpha.as_deref()
+    }
+
     /// Forward pass: predict routing → all experts process → weighted sum
     pub fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
         self.forward_with_head_activity(input, None)
@@ -1274,6 +1285,21 @@ impl MixtureOfExperts {
         head_activity: Option<f32>,
         head_activity_vec: Option<&[f32]>,
     ) -> ndarray::Array2<f32> {
+        self.forward_with_head_features_and_token_activity(
+            input,
+            head_activity,
+            head_activity_vec,
+            None,
+        )
+    }
+
+    pub fn forward_with_head_features_and_token_activity(
+        &mut self,
+        input: &ndarray::Array2<f32>,
+        head_activity: Option<f32>,
+        head_activity_vec: Option<&[f32]>,
+        token_head_activity: Option<&[f32]>,
+    ) -> ndarray::Array2<f32> {
         // Cache input for gradient computation
         self.cached_input = Some(input.to_owned());
 
@@ -1297,12 +1323,22 @@ impl MixtureOfExperts {
             router_in = ndarray::Array2::<f32>::zeros((desired_rows, desired_cols));
         }
         if cond == 1 {
-            let h = head_activity.unwrap_or(0.0);
-            let h = if h.is_finite() { h } else { 0.0 };
-            let h = h.clamp(0.0, 1.0);
             router_in.slice_mut(ndarray::s![.., 0..d]).assign(input);
-            for i in 0..n {
-                router_in[[i, d]] = h;
+            if let Some(hv) = token_head_activity
+                && hv.len() == n
+            {
+                for i in 0..n {
+                    let h = hv[i];
+                    let h = if h.is_finite() { h } else { 0.0 };
+                    router_in[[i, d]] = h.clamp(0.0, 1.0);
+                }
+            } else {
+                let h = head_activity.unwrap_or(0.0);
+                let h = if h.is_finite() { h } else { 0.0 };
+                let h = h.clamp(0.0, 1.0);
+                for i in 0..n {
+                    router_in[[i, d]] = h;
+                }
             }
         } else {
             router_in.assign(input);
@@ -1360,19 +1396,30 @@ impl MixtureOfExperts {
             }
             ExpertRoutingMode::TokenChoiceTopK | ExpertRoutingMode::TokenChoiceTopKWithCapacity => {
                 // Token-choice routing with optional MoH coupling (existing behavior).
-                if self.config.use_learned_k_adaptation && head_activity.is_some() {
+                if self.config.use_learned_k_adaptation
+                    && (head_activity.is_some()
+                        || token_head_activity
+                            .is_some_and(|hv| hv.len() == routing_probs_full.nrows()))
+                {
                     if self.k_adapter.is_none() {
                         self.k_adapter = Some(LearnedKAdapter::new());
                     }
-                    let h = head_activity.unwrap_or(0.0);
-                    let h = if h.is_finite() { h } else { 0.0 };
-                    let h = h.clamp(0.0, 1.0);
-
-                    // Mean routing entropy across tokens (from full softmax probs), normalized by log(E).
-                    let n_tok = routing_probs_full.nrows().max(1) as f32;
                     let denom = (self.config.num_experts.max(2) as f32).ln();
-                    let mut entropy_sum = 0.0f32;
-                    for t in 0..routing_probs_full.nrows() {
+                    let denom = if denom.is_finite() && denom > 0.0 {
+                        denom
+                    } else {
+                        1.0
+                    };
+
+                    // Blend between top-1 and configured top-k.
+                    let (p_top1, m_top1) = masked_top_k_from_logits_and_active(cached_logits, 1);
+                    let (p_topk, m_topk) =
+                        masked_top_k_from_logits_and_active(cached_logits, base_k);
+
+                    let n_tok = routing_probs_full.nrows();
+                    let mut alpha_vec = vec![0.0f32; n_tok];
+                    let mut features = Vec::with_capacity(n_tok);
+                    for t in 0..n_tok {
                         let mut ent = 0.0f32;
                         for e in 0..self.config.num_experts {
                             let mut p = routing_probs_full[[t, e]];
@@ -1381,33 +1428,43 @@ impl MixtureOfExperts {
                                 ent -= p * p.ln();
                             }
                         }
-                        entropy_sum += ent;
+                        let entropy_norm = (ent / denom).clamp(0.0, 1.0);
+                        let h = if let Some(hv) = token_head_activity
+                            && hv.len() == n_tok
+                        {
+                            let h = hv[t];
+                            if h.is_finite() { h } else { 0.0 }
+                        } else {
+                            head_activity.unwrap_or(0.0)
+                        };
+                        let h = if h.is_finite() { h } else { 0.0 };
+                        let h = h.clamp(0.0, 1.0);
+                        let alpha = self
+                            .k_adapter
+                            .as_ref()
+                            .expect("k_adapter must exist")
+                            .alpha(entropy_norm, h);
+                        alpha_vec[t] = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        features.push((entropy_norm, h));
                     }
-                    let entropy = entropy_sum / n_tok;
-                    let entropy_norm = if denom.is_finite() && denom > 0.0 {
-                        (entropy / denom).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-
-                    let alpha = self
-                        .k_adapter
-                        .as_ref()
-                        .expect("k_adapter must exist")
-                        .alpha(entropy_norm, h);
-
-                    // Blend between top-1 and configured top-k.
-                    let (p_top1, m_top1) = masked_top_k_from_logits_and_active(cached_logits, 1);
-                    let (p_topk, m_topk) = masked_top_k_from_logits_and_active(cached_logits, base_k);
 
                     let mut p = p_top1.clone();
-                    p.zip_mut_with(&p_topk, |a, &b| {
-                        *a = (1.0 - alpha) * (*a) + alpha * b;
-                    });
+                    for t in 0..n_tok {
+                        let a = alpha_vec[t];
+                        for e in 0..self.config.num_experts {
+                            let v1 = p_top1[[t, e]];
+                            let vk = p_topk[[t, e]];
+                            p[[t, e]] = (1.0 - a) * v1 + a * vk;
+                        }
+                    }
 
                     let mut delta = p_topk;
                     delta.zip_mut_with(&p_top1, |a, &b| {
-                        *a = *a - b;
+                        *a -= b;
                     });
 
                     let mut m = m_top1;
@@ -1415,13 +1472,14 @@ impl MixtureOfExperts {
                         m[i] = m[i] || m_topk[i];
                     }
 
-                    self.cached_k_alpha = Some(alpha);
-                    self.cached_k_features = Some((entropy_norm, h));
+                    self.cached_k_alpha = Some(alpha_vec);
+                    self.cached_k_features = Some(features);
                     self.cached_k_delta_probs = Some(delta);
 
                     (p, m)
                 } else if let Some(h) = head_activity {
-                    // Heuristic smooth coupling (no cliff): interpolate between k=floor(kf) and k=ceil(kf).
+                    // Heuristic smooth coupling (no cliff): interpolate between k=floor(kf) and
+                    // k=ceil(kf).
                     let h = if h.is_finite() { h } else { 0.0 };
                     let h = h.clamp(0.0, 1.0);
                     let kf = 1.0 + (base_k.saturating_sub(1) as f32) * h;
@@ -1433,8 +1491,10 @@ impl MixtureOfExperts {
                     if k_low == k_high || alpha == 0.0 {
                         masked_top_k_from_logits_and_active(cached_logits, k_low)
                     } else {
-                        let (p_low, m_low) = masked_top_k_from_logits_and_active(cached_logits, k_low);
-                        let (p_high, m_high) = masked_top_k_from_logits_and_active(cached_logits, k_high);
+                        let (p_low, m_low) =
+                            masked_top_k_from_logits_and_active(cached_logits, k_low);
+                        let (p_high, m_high) =
+                            masked_top_k_from_logits_and_active(cached_logits, k_high);
 
                         // Blend probabilities; both are already per-row renormalized.
                         let mut p = p_low;
@@ -1442,7 +1502,8 @@ impl MixtureOfExperts {
                             *a = (1.0 - alpha) * (*a) + alpha * b;
                         });
 
-                        // Union the expert-activity masks so we compute any expert needed by either path.
+                        // Union the expert-activity masks so we compute any expert needed by either
+                        // path.
                         let mut m = m_low;
                         for i in 0..m.len().min(m_high.len()) {
                             m[i] = m[i] || m_high[i];
@@ -1544,9 +1605,12 @@ impl MixtureOfExperts {
 
         // Weighted sum of expert outputs using masked routing probabilities.
         let mut output = ndarray::Array2::zeros(input.raw_dim());
-        for e in 0..self.config.num_experts {
+        for (e, expert_out) in expert_outputs
+            .iter()
+            .enumerate()
+            .take(self.config.num_experts)
+        {
             let routing_col = masked_probs.column(e);
-            let expert_out = &expert_outputs[e];
             output
                 .outer_iter_mut()
                 .zip(expert_out.outer_iter())
@@ -1635,10 +1699,7 @@ impl Layer for MixtureOfExperts {
 
         let mut total_grad_input = ndarray::Array2::zeros(grads.raw_dim());
 
-        let active_mask = self
-            .cached_active_expert_mask
-            .as_ref()
-            .map(|m| m.as_slice());
+        let active_mask = self.cached_active_expert_mask.as_deref();
 
         let shared_scale = if self.config.shared_expert_scale.is_finite() {
             self.config.shared_expert_scale
@@ -1673,10 +1734,11 @@ impl Layer for MixtureOfExperts {
         }
 
         for (expert_idx, expert) in self.experts.iter_mut().enumerate() {
-            if let Some(m) = active_mask {
-                if expert_idx < m.len() && !m[expert_idx] {
-                    continue;
-                }
+            if let Some(m) = active_mask
+                && expert_idx < m.len()
+                && !m[expert_idx]
+            {
+                continue;
             }
 
             let routing_col = routing_probs.column(expert_idx);
@@ -1785,10 +1847,7 @@ impl Layer for MixtureOfExperts {
             .as_ref()
             .expect("forward must be called before compute_gradients");
 
-        let active_mask = self
-            .cached_active_expert_mask
-            .as_ref()
-            .map(|m| m.as_slice());
+        let active_mask = self.cached_active_expert_mask.as_deref();
 
         let shared_scale = if self.config.shared_expert_scale.is_finite() {
             self.config.shared_expert_scale
@@ -1816,10 +1875,11 @@ impl Layer for MixtureOfExperts {
         let mut expert_output_grads =
             vec![ndarray::Array2::zeros(output_grads.raw_dim()); self.config.num_experts];
         for expert_idx in 0..self.config.num_experts {
-            if let Some(m) = active_mask {
-                if expert_idx < m.len() && !m[expert_idx] {
-                    continue;
-                }
+            if let Some(m) = active_mask
+                && expert_idx < m.len()
+                && !m[expert_idx]
+            {
+                continue;
             }
             let shared_bonus = if expert_idx < shared_flags.len() && shared_flags[expert_idx] {
                 shared_per_expert
@@ -1865,11 +1925,12 @@ impl Layer for MixtureOfExperts {
         };
 
         for (expert_idx, expert) in self.experts.iter().enumerate() {
-            if let Some(m) = active_mask {
-                if expert_idx < m.len() && !m[expert_idx] {
-                    all_param_grads.extend(zero_expert_grads(expert));
-                    continue;
-                }
+            if let Some(m) = active_mask
+                && expert_idx < m.len()
+                && !m[expert_idx]
+            {
+                all_param_grads.extend(zero_expert_grads(expert));
+                continue;
             }
             let expert_grads = &expert_output_grads[expert_idx];
             let (expert_input_grad, expert_param_grads) =
@@ -1884,7 +1945,11 @@ impl Layer for MixtureOfExperts {
             // Weight input gradients by routing probabilities
             for token_idx in 0..expert_input_grad.nrows() {
                 let mut routing_weight = cached_routing_probs[[token_idx, expert_idx]];
-                routing_weight = if routing_weight.is_finite() { routing_weight } else { 0.0 };
+                routing_weight = if routing_weight.is_finite() {
+                    routing_weight
+                } else {
+                    0.0
+                };
                 routing_weight += shared_bonus;
                 if !routing_weight.is_finite() {
                     routing_weight = 0.0;
@@ -1906,14 +1971,38 @@ impl Layer for MixtureOfExperts {
         let adapter_grads = if self.config.use_learned_k_adaptation {
             match (
                 self.k_adapter.as_ref(),
-                self.cached_k_alpha,
-                self.cached_k_features,
+                self.cached_k_alpha.as_ref(),
+                self.cached_k_features.as_ref(),
                 self.cached_k_delta_probs.as_ref(),
             ) {
-                (Some(_), Some(alpha), Some((entropy_norm, head_activity)), Some(delta)) => {
-                    let mut d_alpha = 0.0f32;
+                (Some(_), Some(alpha_vec), Some(features), Some(delta))
+                    if alpha_vec.len() == output_grads.nrows()
+                        && features.len() == output_grads.nrows() =>
+                {
+                    let mut g_w = ndarray::Array2::<f32>::zeros((2, 1));
+                    let mut g_b = ndarray::Array2::<f32>::zeros((1, 1));
+
                     for t in 0..output_grads.nrows() {
+                        let alpha = alpha_vec[t];
+                        let alpha = if alpha.is_finite() {
+                            alpha.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let (entropy_norm, head_activity) = features[t];
+                        let entropy_norm = if entropy_norm.is_finite() {
+                            entropy_norm.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let head_activity = if head_activity.is_finite() {
+                            head_activity.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+
                         let token_output_grad = output_grads.row(t);
+                        let mut d_alpha_t = 0.0f32;
                         for e in 0..self.config.num_experts {
                             let dp = delta[[t, e]];
                             let dp = if dp.is_finite() { dp } else { 0.0 };
@@ -1931,16 +2020,15 @@ impl Layer for MixtureOfExperts {
                                     g * o
                                 })
                                 .sum::<f32>();
-                            d_alpha += g * dp;
+                            d_alpha_t += g * dp;
                         }
+
+                        let dz = d_alpha_t * alpha * (1.0 - alpha);
+                        g_w[[0, 0]] += dz * entropy_norm;
+                        g_w[[1, 0]] += dz * head_activity;
+                        g_b[[0, 0]] += dz;
                     }
 
-                    let dz = d_alpha * alpha * (1.0 - alpha);
-                    let mut g_w = ndarray::Array2::<f32>::zeros((2, 1));
-                    g_w[[0, 0]] = dz * entropy_norm;
-                    g_w[[1, 0]] = dz * head_activity;
-                    let mut g_b = ndarray::Array2::<f32>::zeros((1, 1));
-                    g_b[[0, 0]] = dz;
                     Some((g_w, g_b))
                 }
                 _ => None,
@@ -2044,8 +2132,10 @@ impl Layer for MixtureOfExperts {
         let d_activated = d_logits.dot(&self.router.weights2.t());
 
         // Gradient through Richards activation (replacing ReLU)
-        let (d_normalized, activation_param_grads) =
-            self.router.activation.compute_gradients(cached_normalized, &d_activated);
+        let (d_normalized, activation_param_grads) = self
+            .router
+            .activation
+            .compute_gradients(cached_normalized, &d_activated);
 
         // Gradient through Richards normalization
         let (d_hidden, _) = self
@@ -2170,13 +2260,12 @@ impl Layer for MixtureOfExperts {
         router_grad_idx += 4;
 
         // Optional head_to_expert gradient (if present in param_grads and router has the param)
-        if let Some(w) = self.router.head_to_expert.as_mut() {
-            if router_grad_idx < param_grads.len()
-                && param_grads[router_grad_idx].raw_dim() == w.raw_dim()
-            {
-                w.scaled_add(-lr, &param_grads[router_grad_idx]);
-                router_grad_idx += 1;
-            }
+        if let Some(w) = self.router.head_to_expert.as_mut()
+            && router_grad_idx < param_grads.len()
+            && param_grads[router_grad_idx].raw_dim() == w.raw_dim()
+        {
+            w.scaled_add(-lr, &param_grads[router_grad_idx]);
+            router_grad_idx += 1;
         }
 
         // Apply activation parameter gradients (4 separate arrays: nu, k, m, temperature)
@@ -2196,14 +2285,13 @@ impl Layer for MixtureOfExperts {
         grad_idx = router_grad_idx;
 
         // Optional learned-k adapter (2 grads: w,b).
-        if let Some(adapter) = self.k_adapter.as_mut() {
-            if grad_idx + 2 <= param_grads.len()
-                && param_grads[grad_idx].raw_dim() == adapter.w.raw_dim()
-                && param_grads[grad_idx + 1].raw_dim() == adapter.b.raw_dim()
-            {
-                adapter.w.scaled_add(-lr, &param_grads[grad_idx]);
-                adapter.b.scaled_add(-lr, &param_grads[grad_idx + 1]);
-            }
+        if let Some(adapter) = self.k_adapter.as_mut()
+            && grad_idx + 2 <= param_grads.len()
+            && param_grads[grad_idx].raw_dim() == adapter.w.raw_dim()
+            && param_grads[grad_idx + 1].raw_dim() == adapter.b.raw_dim()
+        {
+            adapter.w.scaled_add(-lr, &param_grads[grad_idx]);
+            adapter.b.scaled_add(-lr, &param_grads[grad_idx + 1]);
         }
 
         Ok(())
@@ -2693,6 +2781,47 @@ mod tests {
         let out_high = moe.forward_with_head_activity(&input, Some(0.9));
         assert_eq!(out_low.shape(), input.shape());
         assert_eq!(out_high.shape(), input.shape());
+    }
+
+    #[test]
+    fn test_moe_token_head_activity_affects_k_adaptation_and_router_input() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 4,
+            expert_hidden_dim: 16,
+            diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 3,
+                load_balance_weight: 0.01,
+                sparsity_weight: 0.001,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.use_head_conditioning = true;
+        config.use_learned_k_adaptation = true;
+
+        let mut moe = MixtureOfExperts::new(32, 8, config);
+        moe.k_adapter = Some(LearnedKAdapter {
+            w: ndarray::Array2::from_shape_vec((2, 1), vec![0.0, 20.0]).unwrap(),
+            b: ndarray::Array2::from_shape_vec((1, 1), vec![-10.0]).unwrap(),
+        });
+
+        let input = ndarray::Array2::<f32>::from_shape_vec((2, 32), vec![0.1; 64]).unwrap();
+        let token_h = vec![0.0f32, 1.0f32];
+        let _out = moe.forward_with_head_features_and_token_activity(
+            &input,
+            Some(0.0),
+            None,
+            Some(token_h.as_slice()),
+        );
+
+        let router_in = moe.cached_router_input.as_ref().unwrap();
+        assert!(approx_eq(router_in[[0, 32]], 0.0, 1e-6));
+        assert!(approx_eq(router_in[[1, 32]], 1.0, 1e-6));
+
+        let alpha = moe.cached_k_alpha.as_ref().unwrap();
+        assert!(alpha[0] < 0.01);
+        assert!(alpha[1] > 0.99);
     }
 
     #[test]

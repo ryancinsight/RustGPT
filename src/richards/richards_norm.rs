@@ -1,8 +1,10 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::richards::{RichardsCurve, Variant};
-use crate::network::Layer;
+use crate::{
+    network::Layer,
+    richards::{RichardsCurve, Variant},
+};
 
 // EMA smoothing factor for gradient norm tracking inside RichardsNorm
 const EMA_BETA_GRAD: f32 = 0.9;
@@ -143,7 +145,7 @@ impl RichardsNorm {
         // Adaptive temperature scaling (inspired by DyT's α parameter)
         // Higher activation scale → sharper transitions (higher temperature)
         // Additionally, damp aggressiveness when recent gradient norms are large
-        let scale_ratio = (frob_norm / target_scale).max(1e-6).min(1e6);
+        let scale_ratio = (frob_norm / target_scale).clamp(1e-6, 1e6);
         let grad_ema = self.grad_norm_ema.unwrap_or(1.0) as f64;
         // Stability factor reduces temperature when gradients are high
         let stability_factor = 1.0 / (1.0 + 0.25 * grad_ema.max(1e-6));

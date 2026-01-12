@@ -28,17 +28,21 @@ impl SharedResidualConnection {
     }
 
     /// Apply similarity context to input
-    pub fn apply_similarity_context(&self, input: &Array2<f32>, context: &Array2<f32>) -> Array2<f32> {
+    pub fn apply_similarity_context(
+        &self,
+        input: &Array2<f32>,
+        context: &Array2<f32>,
+    ) -> Array2<f32> {
         let strength = self.similarity_context_strength[[0, 0]];
         let embed_dim = input.ncols();
-        
+
         if strength == 0.0 || embed_dim == 0 {
             return input.clone();
         }
 
         let mut result = input.clone();
         let scale = strength / embed_dim as f32;
-        
+
         // Apply context mixing: X' = X + (strength / embed_dim) * X·S
         for i in 0..input.nrows() {
             for j in 0..embed_dim {
@@ -54,14 +58,21 @@ impl SharedResidualConnection {
     }
 
     /// Update activation similarity matrix
-    pub fn update_activation_similarity_matrix(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
+    pub fn update_activation_similarity_matrix(
+        &mut self,
+        input: &Array2<f32>,
+        output: &Array2<f32>,
+    ) {
         let rate = self.similarity_update_rate.clamp(0.0, 1.0);
         if rate <= 0.0 {
             return;
         }
 
         let seq_len = input.nrows().min(output.nrows());
-        let embed_dim = input.ncols().min(output.ncols()).min(self.activation_similarity_matrix.ncols());
+        let embed_dim = input
+            .ncols()
+            .min(output.ncols())
+            .min(self.activation_similarity_matrix.ncols());
         if seq_len == 0 || embed_dim == 0 {
             return;
         }
@@ -71,7 +82,7 @@ impl SharedResidualConnection {
 
         let mut nx = vec![0.0f64; embed_dim];
         let mut ny = vec![0.0f64; embed_dim];
-        
+
         // Compute norms for normalization
         for seq_idx in (0..seq_len).step_by(step).take(sample) {
             for j in 0..embed_dim {
@@ -95,15 +106,14 @@ impl SharedResidualConnection {
                     let ys = if y.is_finite() { y as f64 } else { 0.0 };
                     dot += xs * ys;
                 }
-                
+
                 let denom_x = (nx[i] + 1e-6).sqrt();
                 let denom_y = (ny[j] + 1e-6).sqrt();
                 let cosine = (dot / (denom_x * denom_y + 1e-6)) as f32;
-                
+
                 // EMA update
                 let current = self.activation_similarity_matrix[[i, j]];
-                self.activation_similarity_matrix[[i, j]] = 
-                    rate * cosine + (1.0 - rate) * current;
+                self.activation_similarity_matrix[[i, j]] = rate * cosine + (1.0 - rate) * current;
             }
         }
     }

@@ -9,7 +9,7 @@ This document describes the enhanced Mamba implementation in RustGPT, which incl
 ### 1. Parallel Scan Implementation
 
 **Original**: Sequential state computation O(T×D×N)
-**Enhanced**: Parallel scan using associative property
+**Enhanced**: Chunk-parallel associative scan (CPU, Rayon)
 
 ```rust
 fn parallel_selective_scan(
@@ -23,14 +23,18 @@ fn parallel_selective_scan(
 ```
 
 **Benefits**:
-- **2-4× speedup potential** on GPU hardware
-- **Mathematical equivalence** with sequential scan
-- **Ready for GPU acceleration** with proper backend
+- **Mathematical equivalence** with sequential scan (same recurrence, different evaluation order)
+- **CPU speedups** by parallelizing across time chunks with Rayon
+- **GPU-ready formulation**: the same associative (A,B) composition can be implemented with a Blelloch scan backend
 
 **Mathematical Formulation**:
 ```
 // Sequential: H_t = Ã·H_{t-1} + B̃·U_t
-// Parallel: Use associative property (Ã·H_{t-1} + B̃·U_t) = Ã^(t)·H_0 + Σ_{i=1}^t Ã^(t-i)·B̃·U_i
+// Parallel: represent each step as an affine transform (A_t, B_t)
+//   H_t = A_t * H_{t-1} + B_t
+// Compose transforms associatively:
+//   (A2,B2) ⊕ (A1,B1) = (A2*A1, A2*B1 + B2)
+// Then compute prefix transforms (chunk-parallel on CPU).
 ```
 
 ### 2. Block-Diagonal A Matrix

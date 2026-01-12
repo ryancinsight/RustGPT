@@ -106,10 +106,7 @@ impl Layer for TokenEmbeddings {
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let token_ids = if input.is_empty() {
-            self.cached_token_ids
-                .as_ref()
-                .cloned()
-                .unwrap_or_default()
+            self.cached_token_ids.as_ref().cloned().unwrap_or_default()
         } else {
             Self::token_ids_from_input(input, self.token_embeddings.nrows())
         };
@@ -128,8 +125,7 @@ impl Layer for TokenEmbeddings {
         }
 
         let seq_len = token_ids.len().min(grads.nrows());
-        for i in 0..seq_len {
-            let token_id = token_ids[i];
+        for (i, &token_id) in token_ids.iter().enumerate().take(seq_len) {
             // Clamp token_id to valid range
             let safe_token_id = token_id.min(self.token_embeddings.nrows().saturating_sub(1));
             let grad_row = grads.row(i);

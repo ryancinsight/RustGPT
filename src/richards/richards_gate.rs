@@ -280,14 +280,12 @@ impl RichardsGate {
 
     /// Get weight norm for regularization
     pub fn weight_norm(&self) -> f32 {
-        // Calculate weight norm from curve weights (includes temperature when learnable)
-        let curve_weights = self.curve.weights();
-        let curve_norm = curve_weights
+        self.curve
+            .weights()
             .iter()
             .map(|&w| (w as f32) * (w as f32))
             .sum::<f32>()
-            .sqrt();
-        curve_norm
+            .sqrt()
     }
 
     /// Get weights as a vector (for compatibility with RichardsCurve interface)
@@ -355,6 +353,12 @@ impl RichardsGate {
     pub fn zero_gradients(&mut self) {
         // RichardsGate doesn't maintain internal gradient state
         // Gradients are computed on-demand
+    }
+}
+
+impl Default for RichardsGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -431,7 +435,7 @@ mod tests {
         // Allow a tiny numerical tolerance.
         for &val in output.iter() {
             assert!(
-                val >= -1e-4 && val <= 1.0 + 1e-4,
+                (-1e-4..=1.0 + 1e-4).contains(&val),
                 "Gate output {} not near [0,1] range",
                 val
             );
@@ -476,8 +480,14 @@ mod tests {
 
         // Lower temperature should give sharper transitions
         // (more extreme values closer to 0 or 1)
-        let low_extremes = output_low.iter().filter(|&&x| x < 0.1 || x > 0.9).count();
-        let high_extremes = output_high.iter().filter(|&&x| x < 0.1 || x > 0.9).count();
+        let low_extremes = output_low
+            .iter()
+            .filter(|&&x| !(0.1..=0.9).contains(&x))
+            .count();
+        let high_extremes = output_high
+            .iter()
+            .filter(|&&x| !(0.1..=0.9).contains(&x))
+            .count();
 
         // Lower temperature should have more extreme values
         assert!(
@@ -502,7 +512,7 @@ mod tests {
         // Invariant 1: Range constraint ∀x ∈ ℝ, g(x) ∈ [0,1]
         for &val in output.iter() {
             assert!(
-                val >= 0.0 && val <= 1.0,
+                (0.0..=1.0).contains(&val),
                 "Gate output {} violates range constraint [0,1]",
                 val
             );
@@ -615,7 +625,7 @@ mod tests {
         // Test parameter clamping
         gate.set_temperature(100.0); // Way outside bounds
         let _ = gate.apply_gradients(
-            &vec![
+            &[
                 Array2::zeros((1, 1)), // nu grad
                 Array2::zeros((1, 1)), // k grad
                 Array2::zeros((1, 1)), // m grad

@@ -35,7 +35,11 @@ impl PadeExp {
         }
 
         if x.is_infinite() {
-            return if x.is_sign_positive() { f64::INFINITY } else { 0.0 };
+            return if x.is_sign_positive() {
+                f64::INFINITY
+            } else {
+                0.0
+            };
         }
 
         // Underflow to 0 only below the smallest positive subnormal.
@@ -69,7 +73,11 @@ impl PadeExp {
         }
 
         if x.is_infinite() {
-            return if x.is_sign_positive() { f64::INFINITY } else { 0.0 };
+            return if x.is_sign_positive() {
+                f64::INFINITY
+            } else {
+                0.0
+            };
         }
 
         if x < -745.133_219_101_941_1 {

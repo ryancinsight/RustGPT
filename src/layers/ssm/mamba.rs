@@ -1,5 +1,6 @@
 use ndarray::{Array1, Array2, Axis};
 use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
@@ -14,13 +15,13 @@ use crate::{
 enum MambaCachedKind {
     Mamba1,
     Mamba2,
-    Mamba2Parallel,  // Enhanced with parallel scan
+    Mamba2Parallel, // Enhanced with parallel scan
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum AMatrixType {
-    Diagonal,        // Original: diagonal A matrix
-    BlockDiagonal,   // Enhanced: block-diagonal A matrix
+    Diagonal,      // Original: diagonal A matrix
+    BlockDiagonal, // Enhanced: block-diagonal A matrix
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +34,8 @@ enum ScanMethod {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ScanConfig {
     method: ScanMethod,
-    block_size: Option<usize>,  // For block-diagonal A
-    chunk_size: Option<usize>,  // For memory-efficient scan
+    block_size: Option<usize>, // For block-diagonal A
+    chunk_size: Option<usize>, // For memory-efficient scan
 }
 
 impl Default for ScanConfig {
@@ -279,9 +280,7 @@ impl<'de> Deserialize<'de> for Mamba {
             b_out: data.b_out,
             richards_act: data.richards_act.unwrap_or_else(mamba_default_act),
             richards_gate: data.richards_gate.unwrap_or_else(mamba_default_gate),
-            richards_tanh: data
-                .richards_tanh
-                .unwrap_or_else(mamba_default_tanh_curve),
+            richards_tanh: data.richards_tanh.unwrap_or_else(mamba_default_tanh_curve),
             opt_w_in: Adam::new((d, 2 * d)),
             opt_b_in: Adam::new((1, 2 * d)),
             opt_w_dt: Adam::new((d, d)),
@@ -332,19 +331,19 @@ impl Mamba {
     #[inline]
     fn desired_state_dim(embed_dim: usize) -> usize {
         // Canonical Mamba typically uses a small state dim (e.g., 16). We cap for CPU cost.
-        embed_dim.min(16).max(1)
+        embed_dim.clamp(1, 16)
     }
 
     #[inline]
     fn desired_state_dim_mamba2(embed_dim: usize) -> usize {
         // Mamba-2 / SSD typically benefits from larger state sizes.
-        embed_dim.min(32).max(16)
+        embed_dim.clamp(16, 32)
     }
 
     #[inline]
     fn head_dim_mamba2(embed_dim: usize) -> usize {
         // Typical SSD head dimension is ~64.
-        embed_dim.min(64).max(1)
+        embed_dim.clamp(1, 64)
     }
 
     #[inline]
@@ -353,7 +352,7 @@ impl Mamba {
             return vec![0];
         }
         let hd = head_dim.max(1);
-        let num_heads = (d + hd - 1) / hd;
+        let num_heads = d.div_ceil(hd);
         let mut offs = Vec::with_capacity(num_heads + 1);
         offs.push(0);
         for h in 0..num_heads {
@@ -396,7 +395,11 @@ impl Mamba {
                     let v = p[[j, k]];
                     norm2 += v * v;
                 }
-                let inv = if norm2 > 1e-12 { 1.0 / norm2.sqrt() } else { 1.0 };
+                let inv = if norm2 > 1e-12 {
+                    1.0 / norm2.sqrt()
+                } else {
+                    1.0
+                };
                 for j in 0..d {
                     p[[j, k]] *= inv;
                 }
@@ -441,7 +444,11 @@ impl Mamba {
                     let v = p[[j, k]];
                     norm2 += v * v;
                 }
-                let inv = if norm2 > 1e-12 { 1.0 / norm2.sqrt() } else { 1.0 };
+                let inv = if norm2 > 1e-12 {
+                    1.0 / norm2.sqrt()
+                } else {
+                    1.0
+                };
                 for j in 0..d {
                     p[[j, k]] *= inv;
                 }
@@ -586,14 +593,11 @@ impl Mamba {
 
         let mut out = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
-            let start = if ti + 1 >= k { ti + 1 - k } else { 0 };
-            let mut kk = 0usize;
-            for tj in start..=ti {
-                let wrow = kk;
+            let start = (ti + 1).saturating_sub(k);
+            for (wrow, tj) in (start..=ti).enumerate() {
                 for j in 0..d {
                     out[[ti, j]] += self.conv_w[[wrow, j]] * u[[tj, j]];
                 }
-                kk += 1;
             }
         }
         for ti in 0..t {
@@ -633,8 +637,9 @@ impl Mamba {
         let u_act = self.richards_act.forward_matrix_f32(&u_pre);
         let gate = self.richards_gate.forward_const(&gate_logits);
 
-        // Canonical-style dt: learned via the in-projection stream (u_pre), not via an extra D×D projection.
-        // This keeps parameter count unchanged while allowing per-token/per-channel dt.
+        // Canonical-style dt: learned via the in-projection stream (u_pre), not via an extra D×D
+        // projection. This keeps parameter count unchanged while allowing
+        // per-token/per-channel dt.
         let dt_logits = u_pre.clone();
         let dt = dt_logits.mapv(|x| softplus(x) + 1e-6);
 
@@ -642,15 +647,18 @@ impl Mamba {
         let b_full = input.dot(&self.w_b) + self.b_b.broadcast((t, d)).unwrap();
         let b_logits = b_full.dot(proj_state);
         let mut b_t = Array2::<f32>::zeros(b_logits.raw_dim());
-        self.richards_tanh.forward_matrix_f32_into(&b_logits, &mut b_t);
+        self.richards_tanh
+            .forward_matrix_f32_into(&b_logits, &mut b_t);
 
         let c_full = input.dot(&self.w_c) + self.b_c.broadcast((t, d)).unwrap();
         let c_logits = c_full.dot(proj_state);
         let mut c_t = Array2::<f32>::zeros(c_logits.raw_dim());
-        self.richards_tanh.forward_matrix_f32_into(&c_logits, &mut c_t);
+        self.richards_tanh
+            .forward_matrix_f32_into(&c_logits, &mut c_t);
 
-        // Build A logits/state scales using w_out (and biases) mapped into (D×N) via a fixed projection.
-        // A_scale is positive; we use ZOH discretization with a = exp(-dt * A_scale).
+        // Build A logits/state scales using w_out (and biases) mapped into (D×N) via a fixed
+        // projection. A_scale is positive; we use ZOH discretization with a = exp(-dt *
+        // A_scale).
         let mut a_logits_state = self.w_out.dot(proj_a); // [D, N]
         let bias_d = self.a_log.row(0).to_owned() + self.b_out.row(0).to_owned();
         for j in 0..d {
@@ -667,7 +675,6 @@ impl Mamba {
         let mut state = Array2::<f32>::zeros((t, d * n));
         let mut z = Array2::<f32>::zeros((t, d));
         let mut y_pre = Array2::<f32>::zeros((t, d));
-
 
         let d_skip_row = self.d_skip.row(0).to_owned();
         let mut s = Array1::<f32>::zeros(d * n);
@@ -699,7 +706,8 @@ impl Mamba {
             }
         }
 
-        // Output projection uses the existing (w_dt, b_dt) tensors to keep parameter count unchanged.
+        // Output projection uses the existing (w_dt, b_dt) tensors to keep parameter count
+        // unchanged.
         let out_pre = y_pre.dot(&self.w_dt) + self.b_dt.broadcast((t, d)).unwrap();
 
         self.cached_input = Some(input.clone());
@@ -730,60 +738,152 @@ impl Mamba {
     /// Based on Mamba-2 optimizations for better hardware utilization
     fn parallel_selective_scan(
         &self,
-        dt: &Array2<f32>,           // [T, D]
+        dt: &Array2<f32>,            // [T, D]
         a_scale_state: &Array2<f32>, // [D, N]
-        b_t: &Array2<f32>,          // [T, N]
-        c_t: &Array2<f32>,          // [T, N]
-        u_conv: &Array2<f32>,       // [T, D]
+        b_t: &Array2<f32>,           // [T, N]
+        c_t: &Array2<f32>,           // [T, N]
+        u_conv: &Array2<f32>,        // [T, D]
     ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
         let t = dt.nrows();
         let d = dt.ncols();
         let n = b_t.ncols();
-        
+
         let mut state = Array2::<f32>::zeros((t, d * n));
         let mut z = Array2::<f32>::zeros((t, d));
         let y_pre = Array2::<f32>::zeros((t, d));
-        
-        // Parallel scan using associative property
-        // This is a simplified version - full implementation would use parallel prefix sum
+
+        if t == 0 || d == 0 || n == 0 {
+            return (state, z, y_pre);
+        }
+
+        let d_skip_row = self.d_skip.row(0).to_owned();
+        let chunk_size = self.scan_config.chunk_size.unwrap_or(256).max(1).min(t);
+        let num_chunks = t.div_ceil(chunk_size);
+
+        // For each feature dimension j, run a chunk-parallel associative scan over time.
+        // Each state component follows an affine recurrence:
+        //   s_t = A_t * s_{t-1} + B_t
+        // and compositions are associative:
+        //   (A2,B2) ⊕ (A1,B1) = (A2*A1, A2*B1 + B2)
         for j in 0..d {
-            let dt_col = dt.column(j);
-            let u_conv_col = u_conv.column(j);
-            
-            for k in 0..n {
-                let idx = j * n + k;
-                let a_scale = a_scale_state[[j, k]];
-                
-                // Compute state updates in parallel
-                for ti in 0..t {
-                    let dt_val = dt_col[ti];
-                    let u_val = u_conv_col[ti];
-                    let b_val = b_t[[ti, k]];
-                    
-                    let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
-                    let k_val = (1.0 - a_val) / a_scale;
-                    
-                    // Sequential update (parallel version would use prefix sum)
-                    let prev = if ti == 0 { 0.0 } else { state[[ti-1, idx]] };
-                    let current = a_val * prev + k_val * b_val * u_val;
-                    
-                    state[[ti, idx]] = current;
-                    z[[ti, j]] += c_t[[ti, k]] * current;
+            // 1) Compute per-chunk totals in parallel over time chunks.
+            // Stored as flat arrays to avoid Vec<Vec<..>> cloning.
+            let mut chunk_a = vec![0.0f32; num_chunks * n];
+            let mut chunk_b = vec![0.0f32; num_chunks * n];
+
+            chunk_a
+                .par_chunks_mut(n)
+                .zip(chunk_b.par_chunks_mut(n))
+                .enumerate()
+                .for_each(|(chunk_idx, (a_out, b_out))| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(t);
+
+                    let mut a_tot = vec![1.0f32; n];
+                    let mut b_tot = vec![0.0f32; n];
+
+                    for ti in start..end {
+                        let dt_val = dt[[ti, j]];
+                        let u_val = u_conv[[ti, j]];
+                        for k in 0..n {
+                            let a_scale = a_scale_state[[j, k]].max(1e-6);
+                            let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
+                            let b_step = ((1.0 - a_val) / a_scale) * b_t[[ti, k]] * u_val;
+
+                            b_tot[k] = a_val * b_tot[k] + b_step;
+                            a_tot[k] *= a_val;
+                        }
+                    }
+
+                    a_out.copy_from_slice(&a_tot);
+                    b_out.copy_from_slice(&b_tot);
+                });
+
+            // 2) Prefix over chunk totals (sequential; num_chunks is small), producing
+            // initial state for each chunk.
+            let mut prefix_b = vec![0.0f32; num_chunks * n];
+            let mut b_prefix = vec![0.0f32; n];
+            for chunk_idx in 0..num_chunks {
+                let base = chunk_idx * n;
+                prefix_b[base..(base + n)].copy_from_slice(&b_prefix[..n]);
+
+                for k in 0..n {
+                    let a_chunk = chunk_a[base + k];
+                    let b_chunk = chunk_b[base + k];
+                    b_prefix[k] = a_chunk * b_prefix[k] + b_chunk;
+                }
+            }
+
+            // 3) Compute per-time states within each chunk in parallel, then write out.
+            let chunk_outputs: Vec<(Vec<f32>, Vec<f32>)> = (0..num_chunks)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(t);
+                    let len = end - start;
+
+                    let pre_b = {
+                        let base = chunk_idx * n;
+                        &prefix_b[base..(base + n)]
+                    };
+                    let mut a_loc = vec![1.0f32; n];
+                    let mut b_loc = vec![0.0f32; n];
+
+                    let mut state_flat = vec![0.0f32; len * n];
+                    let mut z_col = vec![0.0f32; len];
+
+                    for (off, ti) in (start..end).enumerate() {
+                        let dt_val = dt[[ti, j]];
+                        let u_val = u_conv[[ti, j]];
+
+                        let mut z_sum = d_skip_row[j] * u_val;
+                        for k in 0..n {
+                            let a_scale = a_scale_state[[j, k]].max(1e-6);
+                            let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
+                            let b_step = ((1.0 - a_val) / a_scale) * b_t[[ti, k]] * u_val;
+
+                            b_loc[k] = a_val * b_loc[k] + b_step;
+                            a_loc[k] *= a_val;
+
+                            let s = a_loc[k] * pre_b[k] + b_loc[k];
+                            state_flat[off * n + k] = s;
+                            z_sum += c_t[[ti, k]] * s;
+                        }
+                        z_col[off] = z_sum;
+                    }
+
+                    (state_flat, z_col)
+                })
+                .collect();
+
+            // Combine chunk outputs into the final state and z for this j.
+            for (chunk_idx, (state_flat, z_col)) in chunk_outputs.iter().enumerate() {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(t);
+                let len = end - start;
+                let idx0 = j * n;
+
+                for off in 0..len {
+                    let ti = start + off;
+                    for k in 0..n {
+                        state[[ti, idx0 + k]] = state_flat[off * n + k];
+                    }
+                    z[[ti, j]] = z_col[off];
                 }
             }
         }
-        
+
         (state, z, y_pre)
     }
 
     /// Block-diagonal A matrix computation
     fn compute_block_diagonal_a(
         &self,
-        a_log: &Array2<f32>,      // [1, D] or [D, D] for block-diagonal
-        proj_a: &Array2<f32>,     // [D, N]
+        a_log: &Array2<f32>,  // [1, D] or [D, D] for block-diagonal
+        proj_a: &Array2<f32>, // [D, N]
         d: usize,
         n: usize,
-    ) -> Array2<f32> {
+    ) -> (Array2<f32>, Array2<f32>) {
         match self.a_matrix_type {
             AMatrixType::Diagonal => {
                 // Original diagonal implementation
@@ -795,25 +895,26 @@ impl Mamba {
                         a_logits_state[[j, k]] += bj;
                     }
                 }
-                a_logits_state.mapv(|x| softplus(x) + 1e-6)
+                let a_scale_state = a_logits_state.mapv(|x| softplus(x) + 1e-6);
+                (a_logits_state, a_scale_state)
             }
             AMatrixType::BlockDiagonal => {
                 // Enhanced block-diagonal implementation
-                let block_size = self.scan_config.block_size.unwrap_or(4);
-                let num_blocks = (d + block_size - 1) / block_size;
-                
+                let block_size = self.scan_config.block_size.unwrap_or(4).max(1);
+                let num_blocks = d.div_ceil(block_size);
+
                 let mut a_logits_state = Array2::<f32>::zeros((d, n));
-                
+
                 // Create block-diagonal structure
                 for block_idx in 0..num_blocks {
                     let start = block_idx * block_size;
                     let end = (start + block_size).min(d);
                     let _block_d = end - start;
-                    
+
                     for j in start..end {
                         let block_j = j - start;
                         let bias = a_log[[0, j]];
-                        
+
                         for k in 0..n {
                             // Block-diagonal contribution
                             let block_contrib = self.w_out[[block_j, k]] * proj_a[[j, k]];
@@ -821,8 +922,9 @@ impl Mamba {
                         }
                     }
                 }
-                
-                a_logits_state.mapv(|x| softplus(x) + 1e-6)
+
+                let a_scale_state = a_logits_state.mapv(|x| softplus(x) + 1e-6);
+                (a_logits_state, a_scale_state)
             }
         }
     }
@@ -861,15 +963,18 @@ impl Mamba {
         let b_full = input.dot(&self.w_b) + self.b_b.broadcast((t, d)).unwrap();
         let b_logits = b_full.dot(proj_state);
         let mut b_t = Array2::<f32>::zeros(b_logits.raw_dim());
-        self.richards_tanh.forward_matrix_f32_into(&b_logits, &mut b_t);
+        self.richards_tanh
+            .forward_matrix_f32_into(&b_logits, &mut b_t);
 
         let c_full = input.dot(&self.w_c) + self.b_c.broadcast((t, d)).unwrap();
         let c_logits = c_full.dot(proj_state);
         let mut c_t = Array2::<f32>::zeros(c_logits.raw_dim());
-        self.richards_tanh.forward_matrix_f32_into(&c_logits, &mut c_t);
+        self.richards_tanh
+            .forward_matrix_f32_into(&c_logits, &mut c_t);
 
         // Enhanced A computation with block-diagonal support
-        let a_scale_state = self.compute_block_diagonal_a(&self.a_log, proj_a, d, n);
+        let (a_logits_state, a_scale_state) =
+            self.compute_block_diagonal_a(&self.a_log, proj_a, d, n);
 
         let u_conv = self.depthwise_causal_conv(&u_act);
 
@@ -910,11 +1015,15 @@ impl Mamba {
         self.cached_b_t = Some(b_t);
         self.cached_c_logits = Some(c_logits);
         self.cached_c_t = Some(c_t);
-        self.cached_a_logits_state = Some(self.w_out.dot(proj_a));
+        self.cached_a_logits_state = Some(a_logits_state);
         self.cached_a_scale_state = Some(a_scale_state);
         self.cached_a = None;
         self.cached_u_conv = Some(u_conv);
-        self.cached_state_prev = None; // Not computed in parallel version
+        let mut state_prev = Array2::<f32>::zeros(state.raw_dim());
+        for ti in 1..t {
+            state_prev.row_mut(ti).assign(&state.row(ti - 1));
+        }
+        self.cached_state_prev = Some(state_prev);
         self.cached_state = Some(state);
         self.cached_z = Some(z);
         self.cached_y_pre = Some(y_pre);
@@ -935,19 +1044,20 @@ impl Mamba {
         let t = dt.nrows();
         let d = dt.ncols();
         let n = b_t.ncols();
-        
+
         let mut state_prev = Array2::<f32>::zeros((t, d * n));
         let mut state = Array2::<f32>::zeros((t, d * n));
         let mut z = Array2::<f32>::zeros((t, d));
         let y_pre = Array2::<f32>::zeros((t, d));
-        
+
+        let d_skip_row = self.d_skip.row(0).to_owned();
         let mut s = Array1::<f32>::zeros(d * n);
 
         for ti in 0..t {
             for j in 0..d {
                 let dtj = dt[[ti, j]];
                 let uj = u_conv[[ti, j]];
-                let mut zj = 0.0;
+                let mut zj = d_skip_row[j] * uj;
 
                 for k in 0..n {
                     let idx = j * n + k;
@@ -968,7 +1078,7 @@ impl Mamba {
                 z[[ti, j]] = zj;
             }
         }
-        
+
         (state, z, y_pre)
     }
 
@@ -985,35 +1095,38 @@ impl Mamba {
         let d = dt.ncols();
         let n = b_t.ncols();
         let chunk_size = self.scan_config.chunk_size.unwrap_or(128);
-        
+
         let mut state = Array2::<f32>::zeros((t, d * n));
         let mut z = Array2::<f32>::zeros((t, d));
         let y_pre = Array2::<f32>::zeros((t, d));
-        
+
+        let d_skip_row = self.d_skip.row(0).to_owned();
+        for ti in 0..t {
+            for j in 0..d {
+                z[[ti, j]] = d_skip_row[j] * u_conv[[ti, j]];
+            }
+        }
+
         // Process in chunks to reduce memory usage
         for chunk_start in (0..t).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(t);
-            
+
             for j in 0..d {
                 for k in 0..n {
                     let idx = j * n + k;
                     let a_scale = a_scale_state[[j, k]];
-                    
+
                     // Process chunk with reduced memory footprint
                     for ti in chunk_start..chunk_end {
                         let dt_val = dt[[ti, j]];
                         let u_val = u_conv[[ti, j]];
                         let b_val = b_t[[ti, k]];
-                        
+
                         let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
                         let k_val = (1.0 - a_val) / a_scale;
-                        
-                        let prev = if ti == 0 || chunk_start == 0 {
-                            0.0
-                        } else {
-                            state[[ti-1, idx]]
-                        };
-                        
+
+                        let prev = if ti == 0 { 0.0 } else { state[[ti - 1, idx]] };
+
                         let current = a_val * prev + k_val * b_val * u_val;
                         state[[ti, idx]] = current;
                         z[[ti, j]] += c_t[[ti, k]] * current;
@@ -1021,7 +1134,7 @@ impl Mamba {
                 }
             }
         }
-        
+
         (state, z, y_pre)
     }
 
@@ -1352,7 +1465,8 @@ impl Mamba {
         let mut d_dt_logits = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                d_dt_logits[[ti, j]] = d_dt[[ti, j]] * sigmoid.forward_scalar_f32(dt_logits[[ti, j]]);
+                d_dt_logits[[ti, j]] =
+                    d_dt[[ti, j]] * sigmoid.forward_scalar_f32(dt_logits[[ti, j]]);
             }
         }
 
@@ -1374,16 +1488,13 @@ impl Mamba {
         let grad_conv_b = d_u_conv.sum_axis(Axis(0)).insert_axis(Axis(0));
         let mut d_u_act = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
-            let start = if ti + 1 >= k { ti + 1 - k } else { 0 };
-            let mut kk = 0usize;
-            for tj in start..=ti {
-                let wrow = kk;
+            let start = (ti + 1).saturating_sub(k);
+            for (wrow, tj) in (start..=ti).enumerate() {
                 for j in 0..d {
                     let g = d_u_conv[[ti, j]];
                     grad_conv_w[[wrow, j]] += g * u_act[[tj, j]];
                     d_u_act[[tj, j]] += g * self.conv_w[[wrow, j]];
                 }
-                kk += 1;
             }
         }
 
@@ -1513,6 +1624,9 @@ impl Layer for Mamba {
             + self.conv_b.len()
             + self.w_out.len()
             + self.b_out.len()
+            + self.richards_act.weights().len()
+            + self.richards_tanh.weights().len()
+            + self.richards_gate.parameters()
     }
 
     fn weight_norm(&self) -> f32 {
@@ -1535,6 +1649,19 @@ impl Layer for Mamba {
         ] {
             sumsq += a.iter().map(|&x| x * x).sum::<f32>();
         }
+        sumsq += self
+            .richards_act
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>();
+        sumsq += self
+            .richards_tanh
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>();
+        sumsq += self.richards_gate.weight_norm().powi(2);
         sumsq.sqrt()
     }
 
@@ -1550,6 +1677,7 @@ impl Layer for Mamba {
         let u_pre = self.cached_u_pre.as_ref().expect("cache u_pre");
         let u_act = self.cached_u_act.as_ref().expect("cache u_act");
         let gate = self.cached_gate.as_ref().expect("cache gate");
+        let gate_logits = self.cached_gate_logits.as_ref().expect("cache gate_logits");
         let dt_logits = self.cached_dt_logits.as_ref().expect("cache dt_logits");
         let dt = self.cached_dt.as_ref().expect("cache dt");
         let b_logits = self.cached_b_logits.as_ref().expect("cache b_logits");
@@ -1577,7 +1705,6 @@ impl Layer for Mamba {
         }
 
         let sigmoid = RichardsCurve::sigmoid(false);
-        let tanh = RichardsCurve::tanh(false);
 
         let n = Self::desired_state_dim(d);
         let proj_state = self
@@ -1591,15 +1718,14 @@ impl Layer for Mamba {
         let grad_b_dt = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0));
         let d_y_pre = output_grads.dot(&self.w_dt.t());
 
-        // gate = sigmoid(gate_logits)
-        // d/dgate_logits [ gate * z ] = (d_y_pre * z) * gate * (1-gate)
-        let mut d_gate_logits = Array2::<f32>::zeros((t, d));
+        let mut d_gate = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                let gt = gate[[ti, j]];
-                d_gate_logits[[ti, j]] = (d_y_pre[[ti, j]] * z[[ti, j]]) * gt * (1.0 - gt);
+                d_gate[[ti, j]] = d_y_pre[[ti, j]] * z[[ti, j]];
             }
         }
+        let (d_gate_logits, gate_param_grads) =
+            self.richards_gate.compute_gradients(gate_logits, &d_gate);
 
         // z = sum_k c_k * state_k + d_skip*u_conv
         let d_skip_row = self.d_skip.row(0).to_owned();
@@ -1688,7 +1814,8 @@ impl Layer for Mamba {
         let mut d_dt_logits = Array2::<f32>::zeros((t, d));
         for ti in 0..t {
             for j in 0..d {
-                d_dt_logits[[ti, j]] = d_dt[[ti, j]] * sigmoid.forward_scalar_f32(dt_logits[[ti, j]]);
+                d_dt_logits[[ti, j]] =
+                    d_dt[[ti, j]] * sigmoid.forward_scalar_f32(dt_logits[[ti, j]]);
             }
         }
 
@@ -1699,8 +1826,10 @@ impl Layer for Mamba {
             for k in 0..n {
                 let db = d_b[[ti, k]];
                 let dc = d_c[[ti, k]];
-                d_b_logits[[ti, k]] = db * tanh.derivative_scalar_f32(b_logits[[ti, k]]);
-                d_c_logits[[ti, k]] = dc * tanh.derivative_scalar_f32(c_logits[[ti, k]]);
+                d_b_logits[[ti, k]] =
+                    db * self.richards_tanh.derivative_scalar_f32(b_logits[[ti, k]]);
+                d_c_logits[[ti, k]] =
+                    dc * self.richards_tanh.derivative_scalar_f32(c_logits[[ti, k]]);
             }
         }
 
@@ -1711,28 +1840,51 @@ impl Layer for Mamba {
         let mut d_u_act = Array2::<f32>::zeros((t, d));
 
         for ti in 0..t {
-            let start = if ti + 1 >= k { ti + 1 - k } else { 0 };
-            let mut kk = 0usize;
-            for tj in start..=ti {
+            let start = (ti + 1).saturating_sub(k);
+            for (kk, tj) in (start..=ti).enumerate() {
                 let wrow = kk;
                 for j in 0..d {
                     let g = d_u_conv[[ti, j]];
                     grad_conv_w[[wrow, j]] += g * u_act[[tj, j]];
                     d_u_act[[tj, j]] += g * self.conv_w[[wrow, j]];
                 }
-                kk += 1;
             }
         }
 
-        // u_act = silu(u_pre)
+        let curve_output_grads = u_pre * &d_u_act;
+        let u_act_param_grads = self
+            .richards_act
+            .richards_curve
+            .grad_weights_matrix_f32(u_pre, &curve_output_grads);
+        let mut u_act_param_grads_sum = Array2::<f32>::zeros((1, u_act_param_grads.len()));
+        for (k, &g) in u_act_param_grads.iter().enumerate() {
+            u_act_param_grads_sum[[0, k]] = g as f32;
+        }
+
+        let b_param_grads = self.richards_tanh.grad_weights_matrix_f32(b_logits, &d_b);
+        let c_param_grads = self.richards_tanh.grad_weights_matrix_f32(c_logits, &d_c);
+        let mut tanh_param_grads_sum = Array2::<f32>::zeros((1, b_param_grads.len()));
+        for k in 0..b_param_grads.len() {
+            tanh_param_grads_sum[[0, k]] = (b_param_grads[k] + c_param_grads[k]) as f32;
+        }
+
+        // u_act = richards_act(u_pre)
         let mut d_u_pre = Array2::<f32>::zeros((t, d));
-        for ti in 0..t {
+        let mut act_deriv_row: Vec<f32> = Vec::new();
+        let mut act_deriv_tmp: Vec<f32> = Vec::new();
+        for (ti, row) in u_pre.outer_iter().enumerate() {
+            let x_row = row.as_slice().unwrap();
+            if act_deriv_row.len() != x_row.len() {
+                act_deriv_row.resize(x_row.len(), 0.0);
+                act_deriv_tmp.resize(x_row.len(), 0.0);
+            }
+            self.richards_act.derivative_into_f32_with_scratch(
+                x_row,
+                &mut act_deriv_row,
+                &mut act_deriv_tmp,
+            );
             for j in 0..d {
-                let x = u_pre[[ti, j]];
-                let s = sigmoid.forward_scalar_f32(x);
-                let ds = sigmoid.derivative_scalar_f32(x);
-                let d_silu = s + x * ds;
-                d_u_pre[[ti, j]] = d_u_act[[ti, j]] * d_silu;
+                d_u_pre[[ti, j]] = d_u_act[[ti, j]] * act_deriv_row[j];
             }
         }
 
@@ -1771,31 +1923,34 @@ impl Layer for Mamba {
         let dx_c = d_c_full.dot(&self.w_c.t());
         let grad_input = dx_in + dx_b + dx_c;
 
-        (
-            grad_input,
-            vec![
-                grad_w_in,
-                grad_b_in,
-                grad_w_dt,
-                grad_b_dt,
-                grad_w_b,
-                grad_b_b,
-                grad_w_c,
-                grad_b_c,
-                grad_a_log,
-                grad_d_skip,
-                grad_conv_w,
-                grad_conv_b,
-                grad_w_out,
-                grad_b_out,
-            ],
-        )
+        let mut param_grads = vec![
+            grad_w_in,
+            grad_b_in,
+            grad_w_dt,
+            grad_b_dt,
+            grad_w_b,
+            grad_b_b,
+            grad_w_c,
+            grad_b_c,
+            grad_a_log,
+            grad_d_skip,
+            grad_conv_w,
+            grad_conv_b,
+            grad_w_out,
+            grad_b_out,
+            u_act_param_grads_sum,
+            tanh_param_grads_sum,
+        ];
+        param_grads.extend(gate_param_grads);
+
+        (grad_input, param_grads)
     }
 
     fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<()> {
         // Expected order:
-        // w_in, b_in, w_dt, b_dt, w_b, b_b, w_c, b_c, a_log, d_skip, conv_w, conv_b, w_out, b_out
-        if gradients.len() < 14 {
+        // w_in, b_in, w_dt, b_dt, w_b, b_b, w_c, b_c, a_log, d_skip, conv_w, conv_b, w_out, b_out,
+        // richards_act, richards_tanh, richards_gate...
+        if gradients.len() < 16 {
             return Ok(());
         }
 
@@ -1828,6 +1983,21 @@ impl Layer for Mamba {
         self.opt_b_out
             .step(&mut self.b_out, &gradients[13], learning_rate);
 
+        let mut idx = 14usize;
+        let grad_act_vec: Vec<f64> = gradients[idx].iter().map(|&x| x as f64).collect();
+        self.richards_act.step(&grad_act_vec, learning_rate as f64);
+        idx += 1;
+
+        let grad_tanh_vec: Vec<f64> = gradients[idx].iter().map(|&x| x as f64).collect();
+        self.richards_tanh
+            .step(&grad_tanh_vec, learning_rate as f64);
+        idx += 1;
+
+        if gradients.len() > idx {
+            self.richards_gate
+                .apply_gradients(&gradients[idx..], learning_rate)?;
+        }
+
         Ok(())
     }
 
@@ -1837,6 +2007,7 @@ impl Layer for Mamba {
         self.cached_u_pre = None;
         self.cached_u_act = None;
         self.cached_gate = None;
+        self.cached_gate_logits = None;
         self.cached_dt_logits = None;
         self.cached_dt = None;
         self.cached_b_logits = None;
@@ -1945,5 +2116,88 @@ mod tests {
         let y = layer.forward_enhanced(&x);
         assert_eq!(y.shape(), [128, 16]);
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential_fallback() {
+        let config = MambaConfig::enhanced();
+        let layer = Mamba::new_with_config(8, 3, config);
+
+        let t = 64usize;
+        let d = 8usize;
+        let n = 4usize;
+
+        let dt = Array2::from_shape_fn((t, d), |(ti, j)| 0.01 + (ti + j) as f32 * 1e-4);
+        let a_scale_state = Array2::from_shape_fn((d, n), |(j, k)| 0.25 + (j + k) as f32 * 1e-2);
+        let b_t = Array2::from_shape_fn((t, n), |(ti, k)| {
+            ((ti as f32 * 0.03 + k as f32 * 0.7).sin() * 0.2).tanh()
+        });
+        let c_t = Array2::from_shape_fn((t, n), |(ti, k)| {
+            ((ti as f32 * 0.02 + k as f32 * 0.5).cos() * 0.2).tanh()
+        });
+        let u_conv = Array2::from_shape_fn((t, d), |(ti, j)| {
+            ((ti as f32 * 0.01 + j as f32 * 0.2).sin() * 0.5).tanh()
+        });
+
+        let (state_seq, z_seq, _) =
+            layer.sequential_scan_fallback(&dt, &a_scale_state, &b_t, &c_t, &u_conv);
+        let (state_par, z_par, _) =
+            layer.parallel_selective_scan(&dt, &a_scale_state, &b_t, &c_t, &u_conv);
+        let (state_mem, z_mem, _) =
+            layer.memory_efficient_scan(&dt, &a_scale_state, &b_t, &c_t, &u_conv);
+
+        let state_diff = (&state_seq - &state_par)
+            .mapv(|v| v.abs())
+            .mean()
+            .unwrap_or(0.0);
+        let z_diff = (&z_seq - &z_par).mapv(|v| v.abs()).mean().unwrap_or(0.0);
+
+        assert!(
+            state_diff < 1e-4,
+            "state mismatch too large (mean abs diff={state_diff})"
+        );
+        assert!(
+            z_diff < 1e-4,
+            "z mismatch too large (mean abs diff={z_diff})"
+        );
+
+        let mem_state_diff = (&state_seq - &state_mem)
+            .mapv(|v| v.abs())
+            .mean()
+            .unwrap_or(0.0);
+        let mem_z_diff = (&z_seq - &z_mem).mapv(|v| v.abs()).mean().unwrap_or(0.0);
+        assert!(
+            mem_state_diff < 1e-4,
+            "memory state mismatch too large (mean abs diff={mem_state_diff})"
+        );
+        assert!(
+            mem_z_diff < 1e-4,
+            "memory z mismatch too large (mean abs diff={mem_z_diff})"
+        );
+
+        let d_skip_row = layer.d_skip.row(0).to_owned();
+        for (state, z) in [
+            (&state_seq, &z_seq),
+            (&state_par, &z_par),
+            (&state_mem, &z_mem),
+        ] {
+            let mut mean_abs = 0.0f32;
+            let mut count = 0.0f32;
+            for ti in 0..t {
+                for j in 0..d {
+                    let mut expected = d_skip_row[j] * u_conv[[ti, j]];
+                    for kk in 0..n {
+                        expected += c_t[[ti, kk]] * state[[ti, j * n + kk]];
+                    }
+                    mean_abs += (z[[ti, j]] - expected).abs();
+                    count += 1.0;
+                }
+            }
+            mean_abs /= count.max(1.0);
+            assert!(
+                mean_abs < 1e-4,
+                "z missing skip or state contribution (mean abs err={mean_abs})"
+            );
+        }
     }
 }

@@ -58,8 +58,7 @@ impl DiscreteMaskScheduler {
         let random_salt = rng.random::<u64>();
         indices.sort_by_key(|&i| mix64(self.seed ^ random_salt, i as u64));
         let mut masked = ids.clone();
-        for i in 0..k {
-            let pos = indices[i];
+        for &pos in indices.iter().take(k) {
             masked[[0, pos]] = mask_token_id as f32;
         }
         (masked, t_ratio)
@@ -83,8 +82,7 @@ impl DiscreteMaskScheduler {
         let random_salt = rng.random::<u64>();
         indices.sort_by_key(|&i| mix64_with_t(self.seed ^ random_salt, t as u64, i as u64));
         let mut masked = ids.clone();
-        for i in 0..k {
-            let pos = indices[i];
+        for &pos in indices.iter().take(k) {
             masked[[0, pos]] = mask_token_id as f32;
         }
         masked
@@ -135,8 +133,7 @@ impl DiscreteMaskScheduler {
         masked_positions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut out = ids.clone();
         let mut rng = get_rng();
-        for k in 0..need.min(masked_positions.len()) {
-            let pos = masked_positions[k].0;
+        for &(pos, _) in masked_positions.iter().take(need) {
             let row = probs.row(pos);
             let mut indexed: Vec<(usize, f32)> = row
                 .iter()

@@ -26,7 +26,7 @@ use crate::{
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "data")]
 pub enum TemporalMixingLayer {
-    Attention(PolyAttention),
+    Attention(Box<PolyAttention>),
     RgLruMoH(MoHRgLru),
     RgLru(RgLru),
     Mamba(Mamba),
@@ -214,7 +214,7 @@ impl CommonLayers {
                     config.window_size,
                 );
                 attention.set_head_selection_config(&config.head_selection);
-                TemporalMixingLayer::Attention(attention)
+                TemporalMixingLayer::Attention(Box::new(attention))
             }
             TemporalMixingType::RgLru => TemporalMixingLayer::RgLruMoH(MoHRgLru::new(
                 config.embed_dim,

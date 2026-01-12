@@ -3,6 +3,15 @@ use crate::{errors::Result, llm::LLM};
 /// Training functionality for language models
 pub struct Trainer;
 
+pub struct DiffusionCeTrainConfig {
+    pub epochs: usize,
+    pub lr: f32,
+    pub batch_size: usize,
+    pub ce_weight: f32,
+    pub validation_ratio: f32,
+    pub min_snr_gamma: f32,
+}
+
 impl Trainer {
     /// Basic training method
     pub fn train(llm: &mut LLM, data: Vec<&str>, epochs: usize, lr: f32) -> Result<()> {
@@ -65,21 +74,16 @@ impl Trainer {
     pub fn train_diffusion_ce(
         llm: &mut LLM,
         data: Vec<&str>,
-        epochs: usize,
-        lr: f32,
-        batch_size: usize,
-        ce_weight: f32,
-        validation_ratio: f32,
-        min_snr_gamma: f32,
+        config: DiffusionCeTrainConfig,
     ) -> Result<()> {
         llm.train_diffusion_ce(
             data,
-            epochs,
-            lr,
-            batch_size,
-            ce_weight,
-            validation_ratio,
-            min_snr_gamma,
+            config.epochs,
+            config.lr,
+            config.batch_size,
+            config.ce_weight,
+            config.validation_ratio,
+            config.min_snr_gamma,
         )
     }
 }

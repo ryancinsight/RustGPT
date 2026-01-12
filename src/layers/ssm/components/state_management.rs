@@ -3,8 +3,9 @@
 //! Provides efficient state management with automatic cache invalidation
 //! and memory optimization for state space models.
 
-use ndarray::Array2;
 use std::collections::HashMap;
+
+use ndarray::Array2;
 
 /// State cache with automatic invalidation
 #[derive(Debug, Clone)]
@@ -34,7 +35,7 @@ impl StateCache {
     pub fn invalidate_if_needed(&mut self, input: &Array2<f32>) {
         let new_seq_len = input.nrows();
         let new_embed_dim = input.ncols();
-        
+
         if new_embed_dim != self.embed_dim || Some(new_seq_len) != self.seq_len {
             self.invalidate();
             self.embed_dim = new_embed_dim;
@@ -76,7 +77,8 @@ impl StateCache {
 
     /// Get current memory usage in bytes
     pub fn memory_usage(&self) -> usize {
-        self.states.values()
+        self.states
+            .values()
             .map(|arr| arr.len() * std::mem::size_of::<f32>())
             .sum()
     }
@@ -89,10 +91,12 @@ impl StateCache {
         }
 
         // Sort states by size (descending) and remove largest first
-        let mut states_by_size: Vec<_> = self.states.iter()
+        let mut states_by_size: Vec<_> = self
+            .states
+            .iter()
             .map(|(k, v)| (k.clone(), v.len() * std::mem::size_of::<f32>()))
             .collect();
-        
+
         states_by_size.sort_by(|a, b| b.1.cmp(&a.1));
 
         for (key, size) in states_by_size {
@@ -102,7 +106,7 @@ impl StateCache {
             self.states.remove(&key);
             total_size -= size;
         }
-        
+
         if self.states.is_empty() {
             self.valid = false;
         }

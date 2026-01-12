@@ -4,7 +4,7 @@
 //! enabling learnable, adaptive activation functions for state space models.
 
 use ndarray::Array2;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::richards::{RichardsActivation, Variant};
 
@@ -57,7 +57,9 @@ impl SsmRichardsActivation {
         } else {
             // Just apply Richards curve without elementwise multiplication
             let mut result = Array2::zeros(x.raw_dim());
-            self.activation.richards_curve.forward_matrix_f32_into(x, &mut result);
+            self.activation
+                .richards_curve
+                .forward_matrix_f32_into(x, &mut result);
             result
         }
     }
@@ -67,7 +69,9 @@ impl SsmRichardsActivation {
         if self.use_elementwise_mult {
             self.activation.forward_matrix_f32_into(x, out);
         } else {
-            self.activation.richards_curve.forward_matrix_f32_into(x, out);
+            self.activation
+                .richards_curve
+                .forward_matrix_f32_into(x, out);
         }
     }
 
@@ -103,9 +107,9 @@ pub struct SsmActivationConfig {
 impl Default for SsmActivationConfig {
     fn default() -> Self {
         Self {
-            variant: Variant::Sigmoid, // Default to sigmoid-like activation
+            variant: Variant::Sigmoid,  // Default to sigmoid-like activation
             use_elementwise_mult: true, // Default to Swish-like behavior
-            learnable: true, // Default to learnable parameters
+            learnable: true,            // Default to learnable parameters
         }
     }
 }
@@ -141,9 +145,13 @@ impl SsmActivationConfig {
     /// Create from the config
     pub fn create_activation(&self) -> SsmRichardsActivation {
         match self.variant {
-            Variant::Sigmoid => SsmRichardsActivation::sigmoid(self.learnable, self.use_elementwise_mult),
+            Variant::Sigmoid => {
+                SsmRichardsActivation::sigmoid(self.learnable, self.use_elementwise_mult)
+            }
             Variant::Tanh => SsmRichardsActivation::tanh(self.learnable, self.use_elementwise_mult),
-            Variant::Gompertz => SsmRichardsActivation::gompertz(self.learnable, self.use_elementwise_mult),
+            Variant::Gompertz => {
+                SsmRichardsActivation::gompertz(self.learnable, self.use_elementwise_mult)
+            }
             _ => SsmRichardsActivation::new(self.variant, self.use_elementwise_mult),
         }
     }

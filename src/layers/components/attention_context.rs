@@ -15,6 +15,12 @@ pub struct SharedAttentionContext {
     pub similarity_context_strength: Array2<f32>,
 }
 
+impl Default for SharedAttentionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedAttentionContext {
     /// Create a new shared attention context component
     pub fn new() -> Self {
@@ -63,14 +69,14 @@ impl SharedAttentionContext {
         if let Some(context) = &self.incoming_context {
             let strength = self.get_strength();
             let embed_dim = input.ncols();
-            
+
             if strength == 0.0 || embed_dim == 0 {
                 return input.clone();
             }
 
             let mut result = input.clone();
             let scale = strength / embed_dim as f32;
-            
+
             // Apply context mixing: X' = X + (strength / embed_dim) * X·S
             for i in 0..input.nrows() {
                 for j in 0..embed_dim {

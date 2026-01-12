@@ -25,12 +25,20 @@ impl NormalizationLayer {
     }
 
     /// Backward pass through the normalization layer
-    pub fn backward(&mut self, input: &Array2<f32>, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    pub fn backward(
+        &mut self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         self.norm.compute_gradients(input, output_grads)
     }
 
     /// Apply gradients to the normalization layer
-    pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
+    pub fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::errors::Result<()> {
         self.norm.apply_gradients(param_grads, lr)
     }
 

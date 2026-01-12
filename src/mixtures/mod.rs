@@ -1,5 +1,5 @@
-pub mod gating;
 pub mod depth;
+pub mod gating;
 pub mod metrics;
 pub mod moe;
 pub mod moh;
@@ -8,8 +8,8 @@ pub mod routing;
 pub mod threshold;
 
 // Re-export shared gating types
-pub use gating::{GatingConfig, GatingStrategy};
 pub use depth::{DepthDistribution, MixtureOfDepthsConfig};
+pub use gating::{GatingConfig, GatingStrategy};
 // Re-export shared metrics
 pub use metrics::MixtureMetrics;
 // Re-export MoE types for convenience

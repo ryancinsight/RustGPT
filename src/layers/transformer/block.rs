@@ -7,6 +7,15 @@ use std::{
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
+// Import the new modular components
+use crate::layers::transformer::components::{
+    attention_context::AttentionContext,
+    feedforward_processor::FeedforwardProcessor,
+    normalization_layer::NormalizationLayer,
+    residual_connection::ResidualConnection,
+    temporal_mixing_wrapper::TemporalMixingWrapper,
+    window_adaptation::{WindowAdaptation, WindowAdaptationConfig},
+};
 use crate::{
     adam::Adam,
     attention::poly_attention::PolyAttention,
@@ -22,16 +31,6 @@ use crate::{
     model_config::{ModelConfig, TemporalMixingType, WindowAdaptationStrategy},
     network::Layer,
     richards::RichardsNorm,
-};
-
-// Import the new modular components
-use crate::layers::transformer::components::{
-    attention_context::AttentionContext,
-    feedforward_processor::FeedforwardProcessor,
-    normalization_layer::NormalizationLayer,
-    residual_connection::ResidualConnection,
-    temporal_mixing_wrapper::TemporalMixingWrapper,
-    window_adaptation::{WindowAdaptation, WindowAdaptationConfig},
 };
 
 fn default_similarity_context_strength() -> Array2<f32> {
@@ -115,7 +114,6 @@ pub struct TransformerBlock {
     /// Adaptive residuals component for similarity-based residual connections
     #[serde(skip_serializing, skip_deserializing)]
     adaptive_residuals: Option<AdaptiveResiduals>,
-
 }
 
 // Custom deserialization to ensure runtime-only buffers/optimizers are initialized with
@@ -130,7 +128,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
         enum TransformerBlockSerdeCompat {
             V1 {
                 pre_attention_norm: RichardsNorm,
-                attention: PolyAttention,
+                attention: Box<PolyAttention>,
                 pre_ffn_norm: RichardsNorm,
                 feedforward: FeedForwardVariant,
                 config: TransformerBlockConfig,
@@ -140,7 +138,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             },
             V2 {
                 pre_attention_norm: RichardsNorm,
-                temporal_mixing: TemporalMixingLayer,
+                temporal_mixing: Box<TemporalMixingLayer>,
                 pre_ffn_norm: RichardsNorm,
                 feedforward: FeedForwardVariant,
                 config: TransformerBlockConfig,
@@ -182,7 +180,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 similarity_context_strength,
             } => (
                 pre_attention_norm,
-                temporal_mixing,
+                *temporal_mixing,
                 pre_ffn_norm,
                 feedforward,
                 config,
@@ -350,6 +348,7 @@ impl TransformerBlock {
     /// - Attention split: residual1 = input + attn_out → d_input_direct and d_attn_out both receive
     ///   d_residual1_total
     /// - Final input grads: d_input = d_input_direct + pre_attention_norm.backward(d_norm1_out)
+    ///
     /// Create a new transformer block with the given configuration
     pub fn new(config: TransformerBlockConfig) -> Self {
         let embed_dim = config.embed_dim;
@@ -466,7 +465,11 @@ impl TransformerBlock {
                 } else {
                     0.0
                 };
-                let sim = if sim.is_finite() { tanh.forward_scalar_f32(sim) } else { 0.0 };
+                let sim = if sim.is_finite() {
+                    tanh.forward_scalar_f32(sim)
+                } else {
+                    0.0
+                };
 
                 let prev = self.activation_similarity_matrix[[i, j]];
                 self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
@@ -522,7 +525,7 @@ impl TransformerBlock {
             moe_config: config
                 .moe_router
                 .as_ref()
-                .map(|router| ExpertRouterConfig::from_router(router)),
+                .map(ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
             temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
@@ -697,14 +700,18 @@ impl Layer for TransformerBlock {
             _ => 1.0,
         };
 
-        // Own the head-activity vector so we don't hold an immutable borrow of
-        // self.temporal_mixing across calls that need &mut self.
         let head_activity_vec_owned: Option<Vec<f32>> = match &self.temporal_mixing {
             TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.clone(),
             TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.clone(),
             _ => None,
         };
         let head_activity_vec = head_activity_vec_owned.as_deref();
+        let token_head_activity_vec_owned: Option<Vec<f32>> = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.clone(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.clone(),
+            _ => None,
+        };
+        let token_head_activity_vec = token_head_activity_vec_owned.as_deref();
 
         // Update per-layer similarity representation matrix (input→mix-output channel similarity).
         self.update_activation_similarity_matrix(input_used_arc.as_ref(), &mix_out);
@@ -730,11 +737,13 @@ impl Layer for TransformerBlock {
         // Feedforward with residual connection
         let mut ffn_out = match &mut self.feedforward {
             FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_out),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward_with_head_features(
-                &norm2_out,
-                Some(head_activity_ratio),
-                head_activity_vec,
-            ),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer
+                .forward_with_head_features_and_token_activity(
+                    &norm2_out,
+                    Some(head_activity_ratio),
+                    head_activity_vec,
+                    token_head_activity_vec,
+                ),
         };
 
         // Cache FFN output *before* the residual addition.
@@ -786,8 +795,15 @@ impl Layer for TransformerBlock {
         // Access cached intermediates without cloning the entire tuple.
         // The Arc<Array2> for input enables zero-copy access.
         let guard = self.cached_intermediates.read().unwrap();
-        if let Some((input_original_arc, input_used_arc, norm1_out_arc, mix_out_arc, residual1_arc, norm2_out_arc, ffn_out_arc)) =
-            guard.as_ref()
+        if let Some((
+            input_original_arc,
+            input_used_arc,
+            norm1_out_arc,
+            mix_out_arc,
+            residual1_arc,
+            norm2_out_arc,
+            ffn_out_arc,
+        )) = guard.as_ref()
         {
             let input_original: &Array2<f32> = input_original_arc.as_ref();
             let input_used: &Array2<f32> = input_used_arc.as_ref();
@@ -839,36 +855,38 @@ impl Layer for TransformerBlock {
             // X' = X + (s/d) * (X·S)
             // dL/ds = (1/d) * sum(dX' ⊙ (X·S))
             let mut similarity_strength_grad = Array2::zeros((1, 1));
-            if let Some(ctx) = self.incoming_similarity_context.as_ref() {
-                if ctx.nrows() == self.config.embed_dim && ctx.ncols() == self.config.embed_dim {
-                    let d = (self.config.embed_dim.max(1)) as f32;
-                    let mixed = input_original.dot(ctx);
-                    let mut acc = 0.0f64;
-                    for (&g, &m) in final_input_used_grads.iter().zip(mixed.iter()) {
-                        let gs: f64 = if g.is_finite() { g as f64 } else { 0.0 };
-                        let ms: f64 = if m.is_finite() { m as f64 } else { 0.0 };
-                        acc += gs * ms;
-                    }
-                    similarity_strength_grad[[0, 0]] = (acc as f32) / d;
+            if let Some(ctx) = self.incoming_similarity_context.as_ref()
+                && ctx.nrows() == self.config.embed_dim
+                && ctx.ncols() == self.config.embed_dim
+            {
+                let d = (self.config.embed_dim.max(1)) as f32;
+                let mixed = input_original.dot(ctx);
+                let mut acc = 0.0f64;
+                for (&g, &m) in final_input_used_grads.iter().zip(mixed.iter()) {
+                    let gs: f64 = if g.is_finite() { g as f64 } else { 0.0 };
+                    let ms: f64 = if m.is_finite() { m as f64 } else { 0.0 };
+                    acc += gs * ms;
                 }
+                similarity_strength_grad[[0, 0]] = (acc as f32) / d;
             }
 
             // Backprop through similarity-context mixing for upstream gradient.
             // If X' = X + k * X·S, then dX = dX' + k * dX'·S^T.
             let mut final_input_grads = final_input_used_grads;
-            if let Some(ctx) = self.incoming_similarity_context.as_ref() {
-                if ctx.nrows() == self.config.embed_dim && ctx.ncols() == self.config.embed_dim {
-                    let d = (self.config.embed_dim.max(1)) as f32;
-                    let s = self.similarity_context_strength[[0, 0]];
-                    let s = if s.is_finite() { s } else { 0.0 };
-                    let k = s / d;
-                    if k != 0.0 {
-                        let corr = final_input_grads.dot(&ctx.t());
-                        final_input_grads.zip_mut_with(&corr, |g, &c| {
-                            let cs = if c.is_finite() { c } else { 0.0 };
-                            *g += k * cs;
-                        });
-                    }
+            if let Some(ctx) = self.incoming_similarity_context.as_ref()
+                && ctx.nrows() == self.config.embed_dim
+                && ctx.ncols() == self.config.embed_dim
+            {
+                let d = (self.config.embed_dim.max(1)) as f32;
+                let s = self.similarity_context_strength[[0, 0]];
+                let s = if s.is_finite() { s } else { 0.0 };
+                let k = s / d;
+                if k != 0.0 {
+                    let corr = final_input_grads.dot(&ctx.t());
+                    final_input_grads.zip_mut_with(&corr, |g, &c| {
+                        let cs = if c.is_finite() { c } else { 0.0 };
+                        *g += k * cs;
+                    });
                 }
             }
 
@@ -876,12 +894,7 @@ impl Layer for TransformerBlock {
             // Compute adaptive-residual gradients first, but append them *last* so the
             // gradient ordering matches apply_gradients().
             let adaptive_param_grads = if let Some(residuals) = self.adaptive_residuals.as_ref() {
-                residuals.compute_gradients(
-                    input_used,
-                    mix_out,
-                    ffn_out,
-                    output_grads,
-                )
+                residuals.compute_gradients(input_used, mix_out, ffn_out, output_grads)
             } else {
                 Vec::new()
             };
@@ -1051,24 +1064,22 @@ impl Layer for TransformerBlock {
 
         // Apply learned similarity-context strength gradient (scalar)
         let ctx_range = next_range(partitions.similarity_context_strength);
-        if !ctx_range.is_empty() {
-            if let Some(g) = sanitized.get(ctx_range.start) {
-                self.opt_similarity_context_strength.step(
-                    &mut self.similarity_context_strength,
-                    g.as_ref(),
-                    lr,
-                );
-            }
+        if !ctx_range.is_empty()
+            && let Some(g) = sanitized.get(ctx_range.start)
+        {
+            self.opt_similarity_context_strength.step(
+                &mut self.similarity_context_strength,
+                g.as_ref(),
+                lr,
+            );
         }
 
         // Apply adaptive residuals gradients
         let adaptive_range = next_range(partitions.adaptive_residuals);
         let adaptive_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[adaptive_range.clone()].to_vec();
         if !adaptive_grads.is_empty() && self.adaptive_residuals.is_some() {
-            let owned_grads: Vec<Array2<f32>> = adaptive_grads
-                .iter()
-                .map(|c| c.as_ref().clone())
-                .collect();
+            let owned_grads: Vec<Array2<f32>> =
+                adaptive_grads.iter().map(|c| c.as_ref().clone()).collect();
             if let Some(ref mut residuals) = self.adaptive_residuals {
                 residuals.apply_gradients(&owned_grads, lr)?;
             }
@@ -1097,10 +1108,7 @@ impl Layer for TransformerBlock {
 mod tests {
     use super::*;
     use crate::{
-        layers::components::adaptive_residuals::{
-            AdaptiveResiduals,
-        },
-        model_config::ModelConfig,
+        layers::components::adaptive_residuals::AdaptiveResiduals, model_config::ModelConfig,
     };
 
     #[test]
@@ -1330,7 +1338,7 @@ mod tests {
 
         // Check parameter counts
         let param_count = residuals.parameter_count();
-        let expected = (2 * embed_dim) as usize;
+        let expected = 2 * embed_dim;
         assert_eq!(param_count, expected);
 
         // Check dimensions
@@ -1403,7 +1411,7 @@ mod tests {
 
         // Check similarity bounds (-1 to 1 for cosine similarity)
         for &val in similarity_matrix.iter() {
-            assert!(val >= -1.0 && val <= 1.0);
+            assert!((-1.0..=1.0).contains(&val));
             assert!(val.is_finite());
         }
     }
@@ -1472,10 +1480,10 @@ mod tests {
         assert!(scale_stability.is_finite());
 
         // Affinity entropy should be reasonable (< log(2) for binary-like)
-        assert!(affinity_entropy >= 0.0 && affinity_entropy <= 1.0);
+        assert!((0.0..=1.0).contains(&affinity_entropy));
 
         // Scale stability should be reasonable (close to 1.0 for initialized scales)
-        assert!(scale_stability >= 0.5 && scale_stability <= 2.0);
+        assert!((0.5..=2.0).contains(&scale_stability));
     }
 
     #[test]
@@ -1816,12 +1824,14 @@ impl ModularTransformerBlock {
         let temporal_mixing = TemporalMixingWrapper::new(layers.temporal_mixing);
         let pre_ffn_norm = NormalizationLayer::new(layers.pre_ffn_norm);
         let feedforward = FeedforwardProcessor::new(layers.feedforward);
-        
+
         // Create window adaptation component
         let window_adaptation = WindowAdaptation::new(WindowAdaptationConfig::new(
             config.use_adaptive_window,
             config.window_adaptation_strategy,
-            config.window_size.unwrap_or(config.max_pos.saturating_add(1)),
+            config
+                .window_size
+                .unwrap_or(config.max_pos.saturating_add(1)),
             config.min_window_size,
             config.max_window_size,
             config.entropy_ema_alpha,
@@ -1849,16 +1859,15 @@ impl ModularTransformerBlock {
     pub fn forward_modular(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Apply incoming similarity context from the previous transformer layer
         let input_original_arc = Arc::new(input.clone());
-        let input_used_arc: Arc<Array2<f32>> = 
-            if self.attention_context.has_context() {
-                let context = self.attention_context.get_incoming_context().unwrap();
-                Arc::new(self.residual_connection.apply_similarity_context(
-                    input_original_arc.as_ref(), 
-                    context
-                ))
-            } else {
-                input_original_arc.clone()
-            };
+        let input_used_arc: Arc<Array2<f32>> = if self.attention_context.has_context() {
+            let context = self.attention_context.get_incoming_context().unwrap();
+            Arc::new(
+                self.residual_connection
+                    .apply_similarity_context(input_original_arc.as_ref(), context),
+            )
+        } else {
+            input_original_arc.clone()
+        };
 
         // Pre-attention normalization using modular component
         let norm1_out = self.pre_attention_norm.forward(input_used_arc.as_ref());
@@ -1866,8 +1875,10 @@ impl ModularTransformerBlock {
         // Calculate adaptive window size using window adaptation component
         let seq_len = input_used_arc.nrows();
         let temporal_mixing_ref = &self.temporal_mixing.temporal_mixing;
-        let dynamic_w = self.window_adaptation.calculate_window_size(seq_len, temporal_mixing_ref);
-        
+        let dynamic_w = self
+            .window_adaptation
+            .calculate_window_size(seq_len, temporal_mixing_ref);
+
         // Set window size for attention-based temporal mixing
         self.temporal_mixing.set_window_size(Some(dynamic_w));
 
@@ -1875,10 +1886,8 @@ impl ModularTransformerBlock {
         let mix_out = self.temporal_mixing.forward(&norm1_out);
 
         // Update similarity matrix using residual connection component
-        self.residual_connection.update_activation_similarity_matrix(
-            input_used_arc.as_ref(), 
-            &mix_out
-        );
+        self.residual_connection
+            .update_activation_similarity_matrix(input_used_arc.as_ref(), &mix_out);
 
         // In-place residual connection (keep mix_out for caching)
         let mut residual1 = mix_out.clone();
@@ -1890,12 +1899,14 @@ impl ModularTransformerBlock {
         // Get head activity metrics from temporal mixing component
         let head_activity_ratio = self.temporal_mixing.get_head_activity_ratio();
         let head_activity_vec = self.temporal_mixing.get_head_activity_vec();
+        let token_head_activity_vec = self.temporal_mixing.get_token_head_activity_vec();
 
         // Feedforward processing using modular component
-        let mut ffn_out = self.feedforward.forward(
+        let mut ffn_out = self.feedforward.forward_with_token_head_activity(
             &norm2_out,
             head_activity_ratio,
-            head_activity_vec
+            head_activity_vec,
+            token_head_activity_vec,
         );
 
         // Cache FFN output *before* the residual addition.
@@ -1982,7 +1993,7 @@ impl ModularTransformerBlock {
             moe_config: config
                 .moe_router
                 .as_ref()
-                .map(|router| ExpertRouterConfig::from_router(router)),
+                .map(ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
             temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
@@ -1992,7 +2003,7 @@ impl ModularTransformerBlock {
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true, // Enable by default
         };
-        
+
         Self::new_modular(block_config)
     }
 }
@@ -2002,7 +2013,11 @@ impl Layer for ModularTransformerBlock {
         self.forward_modular(input)
     }
 
-    fn compute_gradients(&self, input: &Array2<f32>, _output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         // For now, use a simplified gradient computation
         // In a full implementation, this would compute gradients for each component
         let input_grads = Array2::zeros(input.raw_dim());
@@ -2051,16 +2066,16 @@ impl<'de> Deserialize<'de> for ModularTransformerBlock {
         // For now, deserialize as regular TransformerBlock and convert
         // In a full implementation, this would handle the modular structure properly
         let regular_block = TransformerBlock::deserialize(deserializer)?;
-        
+
         // Convert to modular block (simplified conversion)
         let config = regular_block.config.clone();
         let mut modular_block = Self::new_modular(config);
-        
+
         // Copy over the similarity context strength
-        modular_block.attention_context.set_strength(
-            regular_block.similarity_context_strength[[0, 0]]
-        );
-        
+        modular_block
+            .attention_context
+            .set_strength(regular_block.similarity_context_strength[[0, 0]]);
+
         Ok(modular_block)
     }
 }
@@ -2116,16 +2131,16 @@ fn test_modular_transformer_block_forward() {
 
     let mut block = ModularTransformerBlock::new_modular(config);
     let input = Array2::ones((4, 32)); // 4 tokens, 32 dimensions
-    
+
     let output = block.forward_modular(&input);
-    
+
     assert_eq!(output.nrows(), 4);
     assert_eq!(output.ncols(), 32);
-    
+
     // Check that output is not all zeros (indicating forward pass worked)
     let sum: f32 = output.iter().sum();
     assert!(sum != 0.0, "Output should not be all zeros");
-    
+
     // Check that values are reasonable (not NaN or infinite)
     for &val in output.iter() {
         assert!(val.is_finite(), "Output should contain only finite values");
@@ -2154,23 +2169,23 @@ fn test_modular_transformer_block_components() {
     };
 
     let mut block = ModularTransformerBlock::new_modular(config);
-    
+
     // Test window adaptation
     let seq_len = 10;
     let dynamic_w = block
         .window_adaptation
         .calculate_window_size(seq_len, &block.temporal_mixing.temporal_mixing);
-    assert!(dynamic_w >= 4 && dynamic_w <= 16);
-    
+    assert!((4..=16).contains(&dynamic_w));
+
     // Test attention context
     block.attention_context.set_strength(0.5);
     assert_eq!(block.attention_context.get_strength(), 0.5);
-    
+
     // Test similarity matrix
     let similarity_matrix = block.activation_similarity_matrix();
     assert_eq!(similarity_matrix.nrows(), 16);
     assert_eq!(similarity_matrix.ncols(), 16);
-    
+
     // Test component parameter counts
     assert!(block.pre_attention_norm.parameters() > 0);
     assert!(block.temporal_mixing.parameters() > 0);

@@ -1,7 +1,5 @@
+use llm::{Vocab, embeddings::TokenEmbeddings, network::Layer};
 use ndarray::Array2;
-
-use llm::{network::Layer, Vocab};
-use llm::embeddings::TokenEmbeddings;
 
 #[test]
 fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
@@ -21,10 +19,16 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
     let last = vocab_size - 1;
 
     assert_eq!(out[[0, 0]], 0.0);
-    assert_eq!(out[[0, llm::EMBEDDING_DIM - 1]], (llm::EMBEDDING_DIM - 1) as f32);
+    assert_eq!(
+        out[[0, llm::EMBEDDING_DIM - 1]],
+        (llm::EMBEDDING_DIM - 1) as f32
+    );
 
     assert_eq!(out[[1, 0]], 0.0);
-    assert_eq!(out[[1, llm::EMBEDDING_DIM - 1]], (llm::EMBEDDING_DIM - 1) as f32);
+    assert_eq!(
+        out[[1, llm::EMBEDDING_DIM - 1]],
+        (llm::EMBEDDING_DIM - 1) as f32
+    );
 
     assert_eq!(out[[2, 0]], (last * 1000) as f32);
     assert_eq!(

@@ -3,16 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::rng;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
 pub enum DepthDistribution {
     /// Uniformly sample an integer depth in [min_steps, max_steps].
+    #[default]
     Uniform,
-}
-
-impl Default for DepthDistribution {
-    fn default() -> Self {
-        Self::Uniform
-    }
 }
 
 /// Mixture-of-Depths: sample a compute depth (number of refinement steps)

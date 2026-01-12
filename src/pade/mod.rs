@@ -3,8 +3,7 @@
 pub mod api;
 pub mod exp;
 
-pub use api::{exp, ExpScalar};
-
+pub use api::{ExpScalar, exp};
 #[allow(deprecated)]
 pub use api::{exp_f32, exp_f64};
 pub use exp::{PadeExp, PrecisionLevel};

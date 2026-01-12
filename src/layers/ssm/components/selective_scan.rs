@@ -4,7 +4,6 @@
 //! with support for different scanning strategies and parallelization.
 
 use ndarray::Array2;
-use rayon::prelude::*;
 
 /// Selective scan configuration
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +29,12 @@ impl Default for SelectiveScanConfig {
 /// Selective scan implementation
 pub struct SelectiveScanner {
     config: SelectiveScanConfig,
+}
+
+impl Default for SelectiveScanner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SelectiveScanner {
