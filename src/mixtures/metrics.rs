@@ -140,35 +140,44 @@ impl MixtureMetrics {
 
     /// Get load balancing loss for training (prevents single component dominance)
     pub fn compute_load_balance_loss(&self) -> f32 {
-        if self.token_count_per_component.is_empty() || self.total_decisions == 0 {
+        if self.active_sum_per_component.is_empty() || self.total_decisions == 0 {
             return 0.0;
         }
 
-        let total_tokens = self.total_decisions as f32;
-        let expected_per_component = total_tokens / self.active_sum_per_component.len() as f32;
-
-        // Coefficient of variation across components using iterator chains
-        let component_count = self.active_sum_per_component.len() as f32;
-        let counts_f32: Vec<f32> = self
-            .token_count_per_component
-            .iter()
-            .map(|&x| x as f32)
-            .collect();
-
-        let mean_count = counts_f32.iter().sum::<f32>() / component_count;
-
-        if mean_count == 0.0 {
+        let k = self.active_sum_per_component.len() as f32;
+        if !k.is_finite() || k <= 0.0 {
             return 0.0;
         }
 
-        let variance = counts_f32
+        let mut total = 0.0f32;
+        let mut loads: Vec<f32> = Vec::with_capacity(self.active_sum_per_component.len());
+        for &v in &self.active_sum_per_component {
+            let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+            loads.push(v);
+            total += v;
+        }
+
+        if !total.is_finite() || total <= 0.0 {
+            return 0.0;
+        }
+
+        let mean = total / k;
+        if !mean.is_finite() || mean <= 0.0 {
+            return 0.0;
+        }
+
+        let variance = loads
             .iter()
-            .map(|&count| (count - expected_per_component).powi(2))
+            .map(|&x| {
+                let d = x - mean;
+                d * d
+            })
             .sum::<f32>()
-            / component_count;
+            / k;
 
         let std_dev = variance.sqrt();
-        std_dev / mean_count // Coefficient of variation
+        let cv = std_dev / mean;
+        if cv.is_finite() { cv.max(0.0) } else { 0.0 }
     }
 
     /// Importance loss based on the *soft* routing mass per component.
@@ -435,6 +444,7 @@ mod tests {
     fn test_load_balance_loss() {
         let mut metrics = MixtureMetrics::new(4);
         // Simulate unbalanced: component 0 gets all tokens, others get none
+        metrics.active_sum_per_component = vec![100.0, 0.0, 0.0, 0.0];
         metrics.token_count_per_component = vec![100, 0, 0, 0];
         metrics.total_decisions = 100;
 

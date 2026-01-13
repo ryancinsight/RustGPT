@@ -10,6 +10,9 @@ pub struct DiffusionCeTrainConfig {
     pub ce_weight: f32,
     pub validation_ratio: f32,
     pub min_snr_gamma: f32,
+    pub checkpoint_every: Option<usize>,
+    pub checkpoint_dir: Option<String>,
+    pub checkpoint_stage: Option<String>,
 }
 
 impl Trainer {
@@ -84,6 +87,9 @@ impl Trainer {
             config.ce_weight,
             config.validation_ratio,
             config.min_snr_gamma,
+            config.checkpoint_every,
+            config.checkpoint_dir,
+            config.checkpoint_stage,
         )
     }
 }

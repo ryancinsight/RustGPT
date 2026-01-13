@@ -28,7 +28,7 @@ use crate::{
         },
     },
     mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
-    model_config::{ModelConfig, TemporalMixingType, WindowAdaptationStrategy},
+    model_config::{ModelConfig, TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy},
     network::Layer,
     richards::RichardsNorm,
 };
@@ -280,6 +280,9 @@ pub struct TransformerBlockConfig {
 
     /// Enable advanced weight similarity-based adaptive residuals (enabled by default)
     pub use_advanced_adaptive_residuals: bool,
+
+    #[serde(default)]
+    pub titan_memory: TitanMemoryConfig,
 }
 
 /// Pre-allocated workspace for transformer block operations.
@@ -335,6 +338,7 @@ impl From<&TransformerBlockConfig> for CommonLayerConfig {
             moe_config: config.moe_config.clone(),
             head_selection: config.head_selection.clone(),
             temporal_mixing: config.temporal_mixing,
+            titan_memory: config.titan_memory.clone(),
         }
     }
 }
@@ -534,6 +538,7 @@ impl TransformerBlock {
             window_adaptation_strategy: config.window_adaptation_strategy,
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true, // Enable by default
+            titan_memory: config.titan_memory.clone(),
         };
 
         Self::new(block_config)
@@ -1133,6 +1138,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
 
         let block = TransformerBlock::new(config);
@@ -1173,6 +1179,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
 
         let mut block = TransformerBlock::new(config);
@@ -1209,6 +1216,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1241,6 +1249,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1276,6 +1285,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1318,6 +1328,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
 
         let mut block = TransformerBlock::new(config);
@@ -2002,6 +2013,7 @@ impl ModularTransformerBlock {
             window_adaptation_strategy: config.window_adaptation_strategy,
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true, // Enable by default
+            titan_memory: config.titan_memory.clone(),
         };
 
         Self::new_modular(block_config)
@@ -2100,6 +2112,7 @@ fn test_modular_transformer_block_creation() {
         window_adaptation_strategy: WindowAdaptationStrategy::Fixed,
         entropy_ema_alpha: 0.1,
         use_advanced_adaptive_residuals: false,
+        titan_memory: crate::model_config::TitanMemoryConfig::default(),
     };
 
     let block = ModularTransformerBlock::new_modular(config);
@@ -2127,6 +2140,7 @@ fn test_modular_transformer_block_forward() {
         window_adaptation_strategy: WindowAdaptationStrategy::Fixed,
         entropy_ema_alpha: 0.1,
         use_advanced_adaptive_residuals: false,
+        titan_memory: crate::model_config::TitanMemoryConfig::default(),
     };
 
     let mut block = ModularTransformerBlock::new_modular(config);
@@ -2166,6 +2180,7 @@ fn test_modular_transformer_block_components() {
         window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
         entropy_ema_alpha: 0.1,
         use_advanced_adaptive_residuals: false,
+        titan_memory: crate::model_config::TitanMemoryConfig::default(),
     };
 
     let mut block = ModularTransformerBlock::new_modular(config);

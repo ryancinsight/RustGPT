@@ -155,6 +155,9 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         args.diffusion_ce_weight,
         args.validation_ratio,
         args.diffusion_min_snr_gamma,
+        args.save_every.map(|n| n.get()),
+        Some(args.checkpoint_dir.clone()),
+        Some("pretrain".to_string()),
     )?;
 
     let chat_texts: Vec<&str> = dataset
@@ -171,6 +174,9 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         args.diffusion_ce_weight,
         args.validation_ratio,
         args.diffusion_min_snr_gamma,
+        args.save_every.map(|n| n.get()),
+        Some(args.checkpoint_dir.clone()),
+        Some("instruction".to_string()),
     )?;
 
     Ok(())

@@ -1921,16 +1921,14 @@ impl LLM {
                     match &*guard {
                         crate::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
                             if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
-                                let target_avg_experts = moe.config.gating.num_active as f32;
-                                moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                                moe.last_aux_loss()
                             } else {
                                 0.0
                             }
                         }
                         crate::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
                             if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
-                                let target_avg_experts = moe.config.gating.num_active as f32;
-                                moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                                moe.last_aux_loss()
                             } else {
                                 0.0
                             }
@@ -2380,16 +2378,14 @@ impl LLM {
                         match &*guard {
                             crate::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
                                 if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
-                                    let target_avg_experts = moe.config.gating.num_active as f32;
-                                    moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                                    moe.last_aux_loss()
                                 } else {
                                     0.0
                                 }
                             }
                             crate::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
                                 if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
-                                    let target_avg_experts = moe.config.gating.num_active as f32;
-                                    moe.config.compute_moe_aux_weighted_total(target_avg_experts)
+                                    moe.last_aux_loss()
                                 } else {
                                     0.0
                                 }
@@ -2907,6 +2903,9 @@ impl LLM {
         ce_weight: f32,
         validation_ratio: f32,
         min_snr_gamma: f32,
+        checkpoint_every: Option<usize>,
+        checkpoint_dir: Option<String>,
+        checkpoint_stage: Option<String>,
     ) -> Result<()> {
         let tokenized_data = data
             .par_iter()
@@ -3294,10 +3293,11 @@ impl LLM {
                         match b0.prediction_target() {
                             crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
                                 let sa = sqrt_a.max(1e-6);
-                                (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
+                                let pred_scaled = &pred * sqrt_one_minus_a;
+                                (&x_t - &pred_scaled) / sa
                             }
                             crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
-                                (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
+                                (&x_t * sqrt_a) - (&pred * sqrt_one_minus_a)
                             }
                             crate::layers::diffusion::DiffusionPredictionTarget::Sample => {
                                 pred.clone()
@@ -3830,10 +3830,11 @@ impl LLM {
                     match b0.prediction_target() {
                         crate::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
                             let sa = sqrt_a.max(1e-6);
-                            (&x_t - &(pred.clone() * sqrt_one_minus_a)) / sa
+                            let pred_scaled = &pred * sqrt_one_minus_a;
+                            (&x_t - &pred_scaled) / sa
                         }
                         crate::layers::diffusion::DiffusionPredictionTarget::VPrediction => {
-                            (x_t.clone() * sqrt_a) - (pred.clone() * sqrt_one_minus_a)
+                            (&x_t * sqrt_a) - (&pred * sqrt_one_minus_a)
                         }
                         crate::layers::diffusion::DiffusionPredictionTarget::Sample => pred.clone(),
                         crate::layers::diffusion::DiffusionPredictionTarget::EdmX0 => pred.clone(),
@@ -3997,6 +3998,36 @@ impl LLM {
                     );
                 }
                 plateau_epochs = 0;
+            }
+
+            if let Some(every) = checkpoint_every
+                && every > 0
+                && (epoch + 1) % every == 0
+            {
+                let dir = checkpoint_dir.as_deref().unwrap_or("models");
+                std::fs::create_dir_all(dir).map_err(ModelError::from)?;
+
+                let stage = checkpoint_stage.as_deref().unwrap_or("diffusion");
+                let checkpoint_path = diffusion_checkpoint_path(
+                    std::path::Path::new(dir),
+                    &ts,
+                    stage,
+                    epoch + 1,
+                    epochs,
+                );
+                let checkpoint_path_str = checkpoint_path.to_string_lossy().to_string();
+                let description = format!(
+                    "Diffusion checkpoint stage={} epoch={}/{}",
+                    stage,
+                    epoch + 1,
+                    epochs
+                );
+                self.save_versioned(&checkpoint_path_str, Some(description))?;
+                info!(
+                    epoch = epoch,
+                    path = checkpoint_path_str,
+                    "Saved diffusion checkpoint"
+                );
             }
         }
 
@@ -4467,6 +4498,29 @@ impl LLM {
     }
 }
 
+fn diffusion_checkpoint_path(
+    checkpoint_dir: &std::path::Path,
+    run_tag: &str,
+    stage: &str,
+    epoch_1_based: usize,
+    total_epochs: usize,
+) -> std::path::PathBuf {
+    let safe_stage: String = stage
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    checkpoint_dir.join(format!(
+        "rustgpt-{}-{}-epoch{:04}-of{:04}.bin",
+        safe_stage, run_tag, epoch_1_based, total_epochs
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4583,6 +4637,19 @@ mod tests {
                 .iter()
                 .all(|grad| grad.iter().all(|&v| (v - 1.0).abs() < 1e-6))
         );
+    }
+
+    #[test]
+    fn test_diffusion_checkpoint_path_format() {
+        let p = diffusion_checkpoint_path(
+            std::path::Path::new("models"),
+            "20260101-000000",
+            "pre train",
+            3,
+            10,
+        );
+        let fname = p.file_name().unwrap().to_string_lossy();
+        assert!(fname.contains("rustgpt-pre_train-20260101-000000-epoch0003-of0010.bin"));
     }
 }
 #[test]

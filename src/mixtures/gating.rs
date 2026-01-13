@@ -323,6 +323,7 @@ mod tests {
         let mut config = GatingConfig::default();
         // Simulate unbalanced gating: component 0 gets all tokens, others get none
         config.metrics.resize(8);
+        config.metrics.active_sum_per_component = vec![100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         config.metrics.token_count_per_component = vec![100, 0, 0, 0, 0, 0, 0, 0];
         config.metrics.total_decisions = 100;
 

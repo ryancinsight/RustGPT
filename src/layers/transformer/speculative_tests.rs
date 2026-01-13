@@ -9,7 +9,7 @@ mod tests {
             transformer::speculative::SpeculativeSamplingConfig,
         },
         mixtures::HeadSelectionStrategy,
-        model_config::{DiffusionTimestepStrategy, TemporalMixingType},
+        model_config::{DiffusionTimestepStrategy, TemporalMixingType, TitanMemoryConfig},
     };
     fn create_dummy_block() -> DiffusionBlock {
         let config = DiffusionBlockConfig {
@@ -33,6 +33,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            titan_memory: TitanMemoryConfig::default(),
             time_embed_dim: 16,
             mask_token_id: None,
             temporal_mixing: TemporalMixingType::Attention,

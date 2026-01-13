@@ -5,6 +5,29 @@ use crate::{
     mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy},
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TitanMemoryConfig {
+    #[serde(default = "titan_memory_enabled_default")]
+    pub enabled: bool,
+    #[serde(default = "titan_memory_scale_default")]
+    pub scale: f32,
+    #[serde(default = "titan_memory_eta_default")]
+    pub eta: f32,
+    #[serde(default = "titan_memory_decay_default")]
+    pub decay: f32,
+}
+
+impl Default for TitanMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: titan_memory_enabled_default(),
+            scale: titan_memory_scale_default(),
+            eta: titan_memory_eta_default(),
+            decay: titan_memory_decay_default(),
+        }
+    }
+}
+
 /// Architecture type for model configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArchitectureType {
@@ -192,6 +215,9 @@ pub struct ModelConfig {
     /// Default: None (use standard feedforward)
     pub moe_router: Option<ExpertRouter>,
 
+    #[serde(default)]
+    pub titan_memory: TitanMemoryConfig,
+
     /// Use diffusion-conditioned blocks inside TRM when architecture=TRM
     pub trm_use_diffusion: bool,
 
@@ -311,6 +337,7 @@ impl ModelConfig {
             attention: AttentionType::SelfAttention,
             temporal_mixing: TemporalMixingType::Attention,
             moe_router: None, // Default: no MoE (standard feedforward)
+            titan_memory: TitanMemoryConfig::default(),
             trm_use_diffusion: false,
             trm_num_recursions: None,
             trm_max_supervision_steps: None,
@@ -352,6 +379,22 @@ fn diffusion_noise_schedule_default() -> NoiseSchedule {
 
 fn diffusion_timestep_strategy_default() -> DiffusionTimestepStrategy {
     DiffusionTimestepStrategy::Uniform
+}
+
+fn titan_memory_enabled_default() -> bool {
+    true
+}
+
+fn titan_memory_scale_default() -> f32 {
+    0.1
+}
+
+fn titan_memory_eta_default() -> f32 {
+    0.2
+}
+
+fn titan_memory_decay_default() -> f32 {
+    0.001
 }
 
 fn residual_decorrelation_weight_default() -> f32 {

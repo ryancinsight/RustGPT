@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use clap::{Parser, ValueEnum};
 
 use crate::{
@@ -87,6 +89,14 @@ pub struct Args {
 
     #[arg(long, default_value_t = 0.10)]
     pub validation_ratio: f32,
+
+    /// Save a versioned model checkpoint every N epochs during training.
+    #[arg(long)]
+    pub save_every: Option<NonZeroUsize>,
+
+    /// Directory where checkpoints are saved.
+    #[arg(long, default_value = "models")]
+    pub checkpoint_dir: String,
 
     #[arg(long)]
     pub trm_recursions: Option<usize>,

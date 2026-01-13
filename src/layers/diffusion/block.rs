@@ -22,7 +22,7 @@ use crate::{
         transformer::TransformerBlockConfig,
     },
     mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
-    model_config::{DiffusionTimestepStrategy, TemporalMixingType},
+    model_config::{DiffusionTimestepStrategy, TemporalMixingType, TitanMemoryConfig},
     network::Layer,
     richards::RichardsNorm,
     rng::get_rng,
@@ -77,6 +77,8 @@ pub struct DiffusionBlockConfig {
     pub use_moe: bool,
     pub moe_config: Option<ExpertRouterConfig>,
     pub head_selection: HeadSelectionStrategy,
+    #[serde(default)]
+    pub titan_memory: TitanMemoryConfig,
     pub time_embed_dim: usize,
     pub mask_token_id: Option<usize>,
 
@@ -204,18 +206,17 @@ impl NoiseScheduler {
         let sqrt_recip_one_minus_alphas_cumprod =
             (&alphas_cumprod * -1.0 + 1.0).mapv(|x| 1.0 / x.sqrt());
 
-        // Compute posterior variance for reverse process
-        // σ_t² = β_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
         let mut posterior_variance = Array1::zeros(num_timesteps);
-        for t in 1..num_timesteps {
-            let beta_t = betas[t];
-            let alpha_cumprod_t_minus_1 = alphas_cumprod[t - 1];
-            let alpha_cumprod_t = alphas_cumprod[t];
-            posterior_variance[t] =
-                beta_t * (1.0 - alpha_cumprod_t_minus_1) / (1.0 - alpha_cumprod_t);
+        if num_timesteps > 0 {
+            posterior_variance[0] = 0.0;
         }
-        // For t = 0, variance is 0 (deterministic)
-        posterior_variance[0] = 0.0;
+        for t in 1..num_timesteps {
+            let beta = betas[t - 1].clamp(0.0, 1.0);
+            let alpha_bar_prev = alphas_cumprod[t - 1].clamp(0.0, 1.0);
+            let alpha_bar_t = alphas_cumprod[t].clamp(0.0, 1.0);
+            let denom = (1.0 - alpha_bar_t).max(1e-12);
+            posterior_variance[t] = (beta * (1.0 - alpha_bar_prev) / denom).clamp(0.0, 1.0);
+        }
 
         Self {
             schedule_type,
@@ -233,6 +234,12 @@ impl NoiseScheduler {
 
     /// Compute β_t values according to the schedule type
     fn compute_betas(schedule: &NoiseSchedule, num_timesteps: usize) -> Array1<f32> {
+        if num_timesteps == 0 {
+            return Array1::zeros(0);
+        }
+        if num_timesteps == 1 {
+            return Array1::zeros(1);
+        }
         match schedule {
             NoiseSchedule::Linear { beta_min, beta_max } => {
                 let mut betas = Array1::zeros(num_timesteps);
@@ -467,12 +474,21 @@ impl NoiseScheduler {
             "x_t and predicted_noise must have same shape"
         );
 
-        // Compute per-step α_t and ᾱ_t
-        let alpha_t = 1.0 - self.betas[t];
+        if t == 0 {
+            return x_t.clone();
+        }
+
+        let beta = self
+            .betas
+            .get(t - 1)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let alpha_t = (1.0 - beta).clamp(1e-12, 1.0);
         let sqrt_alpha_t = alpha_t.sqrt();
-        let sqrt_recip_alpha_t = 1.0 / sqrt_alpha_t;
-        let alpha_bar_t = self.sqrt_alphas_cumprod[t].powi(2);
-        let sqrt_one_minus_alpha_bar_t = (1.0 - alpha_bar_t).sqrt();
+        let sqrt_recip_alpha_t = 1.0 / sqrt_alpha_t.max(1e-12);
+        let alpha_bar_t = self.sqrt_alphas_cumprod[t].powi(2).clamp(1e-12, 1.0);
+        let sqrt_one_minus_alpha_bar_t = (1.0 - alpha_bar_t).max(1e-12).sqrt();
 
         // μ_θ(x_t, t) = 1/√α_t * (x_t − (1−α_t)/√(1−ᾱ_t) · ε_θ)
         let coeff_eps = (1.0 - alpha_t) / sqrt_one_minus_alpha_bar_t;
@@ -487,13 +503,20 @@ impl NoiseScheduler {
         t: usize,
         noise: &Array2<f32>,
     ) -> Array2<f32> {
+        if t == 0 {
+            return x_0.clone();
+        }
+
         // Compute predicted noise: ε = (x_t - √ᾱ_t * x_0) / √(1-ᾱ_t)
         let sqrt_alpha_cumprod = self.sqrt_alpha_cumprod(t);
         let sqrt_one_minus_cumprod = self.sqrt_one_minus_alpha_cumprod(t);
+        if !(sqrt_one_minus_cumprod.is_finite()) || sqrt_one_minus_cumprod.abs() < 1e-12 {
+            return x_0.clone();
+        }
         let predicted_noise = (x_t - &(x_0 * sqrt_alpha_cumprod)) / sqrt_one_minus_cumprod;
 
         let mean = self.posterior_mean(x_t, t, &predicted_noise);
-        let variance = self.posterior_variance(t);
+        let variance = self.posterior_variance(t).max(0.0);
 
         if variance == 0.0 {
             // Deterministic case (t = 0)
@@ -786,6 +809,7 @@ impl DiffusionBlock {
             moe_config: config.moe_config.clone(),
             head_selection: config.head_selection.clone(),
             temporal_mixing: config.temporal_mixing,
+            titan_memory: config.titan_memory.clone(),
         };
         let layers = CommonLayers::new(&common_config);
 
@@ -1364,7 +1388,7 @@ impl DiffusionBlock {
             DiffusionSampler::DDPM => {
                 // DDPM posterior updates are defined for consecutive steps, so we always run
                 // the full discrete chain.
-                for t in (0..total).rev() {
+                for t in (1..total).rev() {
                     self.set_timestep(t);
 
                     let conditional_pred = self.predict_epsilon_with_timestep(&x_t, t);
@@ -1974,6 +1998,7 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
             use_moe: t.use_moe,
             moe_config: t.moe_config,
             head_selection: t.head_selection,
+            titan_memory: t.titan_memory,
             time_embed_dim: t.embed_dim * 4,
             mask_token_id: None,
             temporal_mixing: t.temporal_mixing,
@@ -1993,9 +2018,60 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_relative_eq;
     use ndarray::Array1;
 
     use super::*;
+
+    #[test]
+    fn test_scheduler_handles_single_timestep() {
+        let sched = NoiseScheduler::new(
+            NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            1,
+        );
+        assert_eq!(sched.num_timesteps(), 1);
+        assert!(sched.beta(0).is_finite());
+        assert_relative_eq!(sched.sqrt_alpha_cumprod(0), 1.0, epsilon = 1e-6);
+        assert_relative_eq!(sched.sqrt_one_minus_alpha_cumprod(0), 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_q_sample_t0_is_identity() {
+        let sched = NoiseScheduler::new(
+            NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            8,
+        );
+        let x0 = Array2::from_elem((2, 3), 0.25);
+        let noise = Array2::from_elem((2, 3), -0.75);
+        let xt = sched.q_sample(&x0, 0, &noise);
+        for (a, b) in xt.iter().zip(x0.iter()) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_posterior_sample_t0_returns_x0() {
+        let sched = NoiseScheduler::new(
+            NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            8,
+        );
+        let x0 = Array2::from_elem((2, 3), 1.25);
+        let xt = x0.clone();
+        let noise = Array2::from_elem((2, 3), 0.5);
+        let x_prev = sched.posterior_sample(&xt, &x0, 0, &noise);
+        for (a, b) in x_prev.iter().zip(x0.iter()) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6);
+        }
+    }
 
     #[test]
     fn test_karras_schedule_produces_reasonable_betas() {
@@ -2018,6 +2094,125 @@ mod tests {
             let ab = sched.sqrt_alpha_cumprod(t).powi(2);
             assert!(ab <= prev + 1e-6);
             prev = ab;
+        }
+    }
+
+    #[test]
+    fn test_linear_and_cosine_schedules_produce_monotone_alpha_bar() {
+        let schedules = [
+            NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            NoiseSchedule::Cosine { s: 0.008 },
+            NoiseSchedule::Quadratic {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+        ];
+
+        for schedule in schedules {
+            let sched = NoiseScheduler::new(schedule, 128);
+            let mut prev = 1.0f32;
+            for t in 0..sched.num_timesteps() {
+                let ab = sched.sqrt_alpha_cumprod(t).powi(2);
+                assert!(ab.is_finite());
+                assert!(ab > 0.0 && ab <= 1.0);
+                assert!(ab <= prev + 1e-6);
+                prev = ab;
+            }
+        }
+    }
+
+    #[test]
+    fn test_q_sample_matches_closed_form() {
+        let sched = NoiseScheduler::new(
+            NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            32,
+        );
+        let x0 = Array2::from_elem((2, 3), 2.0);
+        let noise = Array2::from_elem((2, 3), -1.0);
+        let t = 7;
+        let xt = sched.q_sample(&x0, t, &noise);
+        let sa = sched.sqrt_alpha_cumprod(t);
+        let soa = sched.sqrt_one_minus_alpha_cumprod(t);
+        let expected = (&x0 * sa) + (&noise * soa);
+        for (a, b) in xt.iter().zip(expected.iter()) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6);
+        }
+    }
+
+    fn make_test_diffusion_block(prediction_target: DiffusionPredictionTarget) -> DiffusionBlock {
+        let config = DiffusionBlockConfig {
+            embed_dim: 8,
+            hidden_dim: 16,
+            num_heads: 2,
+            num_timesteps: 64,
+            noise_schedule: NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            prediction_target,
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
+            causal_attention: false,
+            window_size: None,
+            use_adaptive_window: false,
+            discrete_masked: false,
+            poly_degree: 1,
+            max_pos: 32,
+            use_moe: false,
+            moe_config: None,
+            head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            titan_memory: TitanMemoryConfig::default(),
+            time_embed_dim: 8,
+            mask_token_id: None,
+            temporal_mixing: TemporalMixingType::Attention,
+            use_advanced_adaptive_residuals: false,
+            edm_sigma_data: edm::EDM_SIGMA_DATA_DEFAULT,
+            sampler: DiffusionSampler::DDPM,
+            guidance: None,
+            loss_weighting: LossWeighting::default(),
+            use_p2_weighting: false,
+            use_snr_weighting: false,
+            adaptive_guidance: false,
+            min_guidance_scale: 1.0,
+            max_guidance_scale: 10.0,
+            ddim_steps_policy: Default::default(),
+        };
+        DiffusionBlock::new(config)
+    }
+
+    #[test]
+    fn test_min_snr_weight_bounds_across_targets() {
+        let gamma = 3.0;
+        let t = 10;
+
+        let block_eps = make_test_diffusion_block(DiffusionPredictionTarget::Epsilon);
+        let w_eps = block_eps.min_snr_weight(t, gamma);
+        assert!(w_eps.is_finite());
+        assert!(w_eps > 0.0 && w_eps <= 1.0 + 1e-6);
+
+        let block_v = make_test_diffusion_block(DiffusionPredictionTarget::VPrediction);
+        let w_v = block_v.min_snr_weight(t, gamma);
+        assert!(w_v.is_finite());
+        assert!(w_v > 0.0 && w_v < 1.0);
+
+        let block_x0 = make_test_diffusion_block(DiffusionPredictionTarget::Sample);
+        let w_x0 = block_x0.min_snr_weight(t, gamma);
+        assert!(w_x0.is_finite());
+        assert!(w_x0 > 0.0 && w_x0 <= gamma + 1e-6);
+    }
+
+    #[test]
+    fn test_edm_loss_weight_is_finite_and_positive() {
+        let block = make_test_diffusion_block(DiffusionPredictionTarget::EdmX0);
+        for t in 0..block.noise_scheduler.num_timesteps() {
+            let w = block.edm_loss_weight(t);
+            assert!(w.is_finite());
+            assert!(w > 0.0);
         }
     }
 
@@ -2142,6 +2337,49 @@ mod tests {
         let param_count = residuals.parameter_count();
         let expected = 2 * embed_dim;
         assert_eq!(param_count, expected);
+    }
+
+    #[test]
+    fn test_ddpm_sampling_produces_finite_output() {
+        let config = DiffusionBlockConfig {
+            embed_dim: 8,
+            hidden_dim: 16,
+            num_heads: 2,
+            num_timesteps: 8,
+            noise_schedule: NoiseSchedule::Linear {
+                beta_min: 1e-4,
+                beta_max: 0.02,
+            },
+            prediction_target: DiffusionPredictionTarget::Epsilon,
+            timestep_strategy: DiffusionTimestepStrategy::Uniform,
+            causal_attention: false,
+            window_size: None,
+            use_adaptive_window: false,
+            discrete_masked: false,
+            poly_degree: 1,
+            max_pos: 32,
+            use_moe: false,
+            moe_config: None,
+            head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            titan_memory: TitanMemoryConfig::default(),
+            time_embed_dim: 8,
+            mask_token_id: None,
+            temporal_mixing: TemporalMixingType::Attention,
+            use_advanced_adaptive_residuals: false,
+            edm_sigma_data: edm::EDM_SIGMA_DATA_DEFAULT,
+            sampler: DiffusionSampler::DDPM,
+            guidance: None,
+            loss_weighting: LossWeighting::default(),
+            use_p2_weighting: false,
+            use_snr_weighting: false,
+            adaptive_guidance: false,
+            min_guidance_scale: 1.0,
+            max_guidance_scale: 10.0,
+            ddim_steps_policy: Default::default(),
+        };
+        let mut block = DiffusionBlock::new(config);
+        let out = block.sample_with_guidance((4, 8), None, None, None);
+        assert!(out.iter().all(|x| x.is_finite()));
     }
 }
 
