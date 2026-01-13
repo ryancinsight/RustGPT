@@ -109,6 +109,7 @@ impl HRM {
             window_adaptation_strategy: config.window_adaptation_strategy,
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true,
+            titan_memory: config.titan_memory.clone(),
         };
 
         // Top block might have larger effective window or different capacity
@@ -472,6 +473,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.1,
             use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
         let top_cfg = bottom_cfg.clone();
 
@@ -510,6 +512,7 @@ mod tests {
             window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.1,
             use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
         };
         let top_cfg = bottom_cfg.clone();
 

@@ -11,7 +11,7 @@ use crate::{
         HeadSelectionStrategy,
         moe::{ExpertRouterConfig, MixtureOfExperts},
     },
-    model_config::TemporalMixingType,
+    model_config::{TemporalMixingType, TitanMemoryConfig},
     network::Layer,
     richards::{RichardsGlu, RichardsNorm},
 };
@@ -188,6 +188,8 @@ pub struct CommonLayerConfig {
     pub moe_config: Option<ExpertRouterConfig>,
     pub head_selection: HeadSelectionStrategy,
     #[serde(default)]
+    pub titan_memory: TitanMemoryConfig,
+    #[serde(default)]
     pub temporal_mixing: TemporalMixingType,
 }
 
@@ -213,6 +215,7 @@ impl CommonLayers {
                     config.max_pos,
                     config.window_size,
                 );
+                attention.set_titan_memory_config(config.titan_memory.clone());
                 attention.set_head_selection_config(&config.head_selection);
                 TemporalMixingLayer::Attention(Box::new(attention))
             }

@@ -18,6 +18,7 @@ use crate::{
         MoHGating,
         moh::{HeadSelectionConfig, HeadSelectionStrategy},
     },
+    model_config::TitanMemoryConfig,
     network::Layer,
 };
 
@@ -220,6 +221,9 @@ pub struct PolyAttention {
     cope: CoPE,
     window_size: Option<usize>,
 
+    #[serde(default)]
+    titan_memory: TitanMemoryConfig,
+
     // training cache
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>, // (N, embed_dim)
@@ -338,6 +342,7 @@ impl PolyAttention {
             moh,
             cope,
             window_size,
+            titan_memory: TitanMemoryConfig::default(),
             cached_input: None,
             last_causal: true,
             param_info: None,
@@ -353,6 +358,40 @@ impl PolyAttention {
             eff_skip_threshold: 1e-4,
             parallel_batch_size: 32,
             parallel_timeout_ms: 0,
+        }
+    }
+
+    pub fn set_titan_memory_config(&mut self, cfg: TitanMemoryConfig) {
+        assert!(cfg.scale.is_finite());
+        assert!(cfg.eta.is_finite());
+        assert!(cfg.decay.is_finite());
+        assert!(cfg.eta >= 0.0);
+        assert!(cfg.decay >= 0.0 && cfg.decay <= 1.0);
+        self.titan_memory = cfg;
+    }
+
+    fn apply_titan_memory_into(&self, out: &mut Array2<f32>, input: &Array2<f32>) {
+        if !self.titan_memory.enabled {
+            return;
+        }
+        let n = input.nrows();
+        let d = input.ncols();
+        assert_eq!(d, self.embed_dim);
+        assert_eq!(out.nrows(), n);
+        assert_eq!(out.ncols(), d);
+        assert!(self.titan_memory.scale.is_finite());
+        assert!(self.titan_memory.eta.is_finite());
+        assert!(self.titan_memory.decay.is_finite());
+        assert!(self.titan_memory.eta >= 0.0);
+        assert!(self.titan_memory.decay >= 0.0 && self.titan_memory.decay <= 1.0);
+
+        let retain = 1.0 - self.titan_memory.decay;
+        let mut acc = vec![0.0f32; d];
+        for i in 0..n {
+            for j in 0..d {
+                acc[j] = retain * acc[j] + self.titan_memory.eta * input[[i, j]];
+                out[[i, j]] += self.titan_memory.scale * acc[j];
+            }
         }
     }
 
@@ -494,7 +533,8 @@ impl PolyAttention {
             parallel_timeout_ms: self.parallel_timeout_ms,
         };
 
-        let result = compute_poly_attention_forward(&mut ctx, causal);
+        let mut result = compute_poly_attention_forward(&mut ctx, causal);
+        self.apply_titan_memory_into(&mut result.output, input);
 
         // Update metrics from the result
         if let Some((tmin, tmax)) = result.tau_metrics {
@@ -542,8 +582,9 @@ impl PolyAttention {
             parallel_batch_size: self.parallel_batch_size,
             parallel_timeout_ms: self.parallel_timeout_ms,
         };
-        let result =
+        let mut result =
             crate::attention::forward::compute_poly_attention_forward_baseline(&mut ctx, causal);
+        self.apply_titan_memory_into(&mut result.output, input);
 
         // Update metrics from the result (baseline path)
         if let Some((tmin, tmax)) = result.tau_metrics {
@@ -1965,6 +2006,26 @@ impl PolyAttention {
             }
         }
         all_param_grads.push(grad_cope_pos);
+
+        if self.titan_memory.enabled {
+            assert!(self.titan_memory.scale.is_finite());
+            assert!(self.titan_memory.eta.is_finite());
+            assert!(self.titan_memory.decay.is_finite());
+            assert!(self.titan_memory.eta >= 0.0);
+            assert!(self.titan_memory.decay >= 0.0 && self.titan_memory.decay <= 1.0);
+
+            let retain = 1.0 - self.titan_memory.decay;
+            let mut dacc = vec![0.0f32; self.embed_dim];
+            for i in (0..n).rev() {
+                for j in 0..self.embed_dim {
+                    dacc[j] = dacc[j] * retain + self.titan_memory.scale * output_grads[[i, j]];
+                }
+                for j in 0..self.embed_dim {
+                    grad_input_total[[i, j]] += self.titan_memory.eta * dacc[j];
+                }
+            }
+        }
+
         if gradient_anomaly_detected {
             for grad in &mut all_param_grads {
                 grad.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
@@ -2288,10 +2349,15 @@ mod tests {
     use ndarray::Array2;
 
     use super::{AdaptiveDegreeConfig, DegreeAdaptationMetrics, PolyAttention};
+    use crate::model_config::TitanMemoryConfig;
 
     #[test]
     fn gradients_parallel_match_sequential_small() {
         let mut pa = PolyAttention::new(16, 4, 3, 64, Some(4));
+        pa.set_titan_memory_config(TitanMemoryConfig {
+            enabled: false,
+            ..TitanMemoryConfig::default()
+        });
         let n = 8;
         let d = 16;
         let mut input = Array2::<f32>::zeros((n, d));
@@ -2382,6 +2448,10 @@ mod tests {
     #[test]
     fn eff_skip_threshold_skips_computation() {
         let mut pa = PolyAttention::new(64, 4, 3, 64, Some(16));
+        pa.set_titan_memory_config(TitanMemoryConfig {
+            enabled: false,
+            ..TitanMemoryConfig::default()
+        });
         let n = 8;
         let d = 64;
         let mut input = Array2::<f32>::zeros((n, d));

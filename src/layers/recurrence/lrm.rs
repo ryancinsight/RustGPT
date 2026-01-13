@@ -117,6 +117,7 @@ impl Default for LRMConfig {
                     crate::model_config::WindowAdaptationStrategy::SequenceLengthBased,
                 entropy_ema_alpha: 0.2,
                 use_advanced_adaptive_residuals: true,
+                titan_memory: crate::model_config::TitanMemoryConfig::default(),
             }),
             embed_dim: 64,
             num_recursions: 1,
@@ -385,6 +386,7 @@ impl LRM {
             window_adaptation_strategy: config.window_adaptation_strategy,
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true,
+            titan_memory: config.titan_memory.clone(),
         });
 
         let c = LRMConfig {

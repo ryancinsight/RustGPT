@@ -208,7 +208,7 @@ impl Default for ExpertRouterConfig {
             gating: GatingConfig::default(),
             num_experts: 4,
             expert_hidden_dim: 64,
-            use_head_conditioning: false,
+            use_head_conditioning: true,
             use_learned_k_adaptation: true,
             routing_mode: ExpertRoutingMode::default(),
             capacity_factor: 0.0,
@@ -1185,6 +1185,9 @@ pub struct MixtureOfExperts {
     /// Cached per-expert weighted grad buffers for backward() to reduce allocations
     #[serde(skip)]
     cached_weighted_grads: Option<Vec<ndarray::Array2<f32>>>,
+
+    #[serde(skip)]
+    cached_aux_loss: f32,
 }
 
 impl MixtureOfExperts {
@@ -1228,6 +1231,7 @@ impl MixtureOfExperts {
             cached_k_features: None,
             cached_k_delta_probs: None,
             cached_weighted_grads: None,
+            cached_aux_loss: 0.0,
         }
     }
 
@@ -1248,6 +1252,14 @@ impl MixtureOfExperts {
     #[cfg(test)]
     pub(crate) fn test_cached_k_alpha(&self) -> Option<&[f32]> {
         self.cached_k_alpha.as_deref()
+    }
+
+    pub fn last_aux_loss(&self) -> f32 {
+        if self.cached_aux_loss.is_finite() {
+            self.cached_aux_loss.max(0.0)
+        } else {
+            0.0
+        }
     }
 
     /// Forward pass: predict routing → all experts process → weighted sum
@@ -1324,6 +1336,9 @@ impl MixtureOfExperts {
         }
         if cond == 1 {
             router_in.slice_mut(ndarray::s![.., 0..d]).assign(input);
+            if let Some(hv) = token_head_activity {
+                debug_assert_eq!(hv.len(), n);
+            }
             if let Some(hv) = token_head_activity
                 && hv.len() == n
             {
@@ -1379,9 +1394,12 @@ impl MixtureOfExperts {
         // This can be weighted into the training loss via config.z_loss_weight.
         update_router_z_loss_metrics(&mut self.config, cached_logits);
 
-        // Clear learned-k caches by default; we'll fill them only when learned adaptation is used.
-        self.cached_k_alpha = None;
-        self.cached_k_features = None;
+        let mut k_alpha_scratch = self.cached_k_alpha.take().unwrap_or_default();
+        k_alpha_scratch.clear();
+        self.cached_k_alpha = Some(k_alpha_scratch);
+        let mut k_feat_scratch = self.cached_k_features.take().unwrap_or_default();
+        k_feat_scratch.clear();
+        self.cached_k_features = Some(k_feat_scratch);
         self.cached_k_delta_probs = None;
 
         let (mut masked_probs, mut active_mask) = match self.config.routing_mode {
@@ -1417,8 +1435,11 @@ impl MixtureOfExperts {
                         masked_top_k_from_logits_and_active(cached_logits, base_k);
 
                     let n_tok = routing_probs_full.nrows();
-                    let mut alpha_vec = vec![0.0f32; n_tok];
-                    let mut features = Vec::with_capacity(n_tok);
+                    let mut alpha_vec = self.cached_k_alpha.take().unwrap_or_default();
+                    alpha_vec.resize(n_tok, 0.0);
+                    let mut features = self.cached_k_features.take().unwrap_or_default();
+                    features.clear();
+                    features.reserve(n_tok);
                     for t in 0..n_tok {
                         let mut ent = 0.0f32;
                         for e in 0..self.config.num_experts {
@@ -1452,20 +1473,20 @@ impl MixtureOfExperts {
                         features.push((entropy_norm, h));
                     }
 
-                    let mut p = p_top1.clone();
+                    let mut delta = p_topk.clone();
+                    delta.zip_mut_with(&p_top1, |a, &b| {
+                        *a -= b;
+                    });
+
+                    let mut p = p_top1;
                     for t in 0..n_tok {
                         let a = alpha_vec[t];
                         for e in 0..self.config.num_experts {
-                            let v1 = p_top1[[t, e]];
+                            let v1 = p[[t, e]];
                             let vk = p_topk[[t, e]];
                             p[[t, e]] = (1.0 - a) * v1 + a * vk;
                         }
                     }
-
-                    let mut delta = p_topk;
-                    delta.zip_mut_with(&p_top1, |a, &b| {
-                        *a -= b;
-                    });
 
                     let mut m = m_top1;
                     for i in 0..m.len().min(m_topk.len()) {
@@ -1572,6 +1593,15 @@ impl MixtureOfExperts {
 
         // Update routing metrics for training based on *active* routing.
         self.config.update_metrics(&masked_probs.view());
+        self.cached_aux_loss = compute_moe_aux_loss_from_probs_and_logits(
+            masked_probs,
+            cached_logits,
+            self.config.num_experts,
+            self.config.gating.num_active as f32,
+            &self.config.gating,
+            self.config.z_loss_weight,
+            self.config.diversity_weight,
+        );
 
         let active_experts: Vec<usize> = self
             .cached_active_expert_mask
@@ -1605,22 +1635,42 @@ impl MixtureOfExperts {
 
         // Weighted sum of expert outputs using masked routing probabilities.
         let mut output = ndarray::Array2::zeros(input.raw_dim());
-        for (e, expert_out) in expert_outputs
-            .iter()
-            .enumerate()
-            .take(self.config.num_experts)
-        {
-            let routing_col = masked_probs.column(e);
-            output
-                .outer_iter_mut()
-                .zip(expert_out.outer_iter())
-                .zip(routing_col.iter())
-                .for_each(|((mut out_row, expert_row), &w)| {
-                    let ws = if w.is_finite() { w } else { 0.0 };
-                    if ws != 0.0 {
-                        out_row.scaled_add(ws, &expert_row);
-                    }
-                });
+        if let Some(active_mask) = self.cached_active_expert_mask.as_deref() {
+            for e in 0..self.config.num_experts {
+                if e >= active_mask.len() || !active_mask[e] {
+                    continue;
+                }
+                let expert_out = &expert_outputs[e];
+                let routing_col = masked_probs.column(e);
+                output
+                    .outer_iter_mut()
+                    .zip(expert_out.outer_iter())
+                    .zip(routing_col.iter())
+                    .for_each(|((mut out_row, expert_row), &w)| {
+                        let ws = if w.is_finite() { w } else { 0.0 };
+                        if ws != 0.0 {
+                            out_row.scaled_add(ws, &expert_row);
+                        }
+                    });
+            }
+        } else {
+            for (e, expert_out) in expert_outputs
+                .iter()
+                .enumerate()
+                .take(self.config.num_experts)
+            {
+                let routing_col = masked_probs.column(e);
+                output
+                    .outer_iter_mut()
+                    .zip(expert_out.outer_iter())
+                    .zip(routing_col.iter())
+                    .for_each(|((mut out_row, expert_row), &w)| {
+                        let ws = if w.is_finite() { w } else { 0.0 };
+                        if ws != 0.0 {
+                            out_row.scaled_add(ws, &expert_row);
+                        }
+                    });
+            }
         }
 
         // Add shared experts as an always-on path.
@@ -2068,19 +2118,115 @@ impl Layer for MixtureOfExperts {
             .expect("routing probs must be cached");
         let mut d_logits = ndarray::Array2::zeros(routing_probs.raw_dim());
 
-        for token_idx in 0..routing_probs.nrows() {
+        let n_tok = routing_probs.nrows();
+        let n_exp = self.config.num_experts;
+        let ln_n_exp = if n_exp >= 2 { (n_exp as f32).ln() } else { 1.0 };
+        let inv_n_tok = if n_tok > 0 { 1.0 / (n_tok as f32) } else { 0.0 };
+
+        let lb_w = if self.config.gating.load_balance_weight.is_finite() {
+            self.config.gating.load_balance_weight.max(0.0)
+        } else {
+            0.0
+        };
+        let sp_w = if self.config.gating.sparsity_weight.is_finite() {
+            self.config.gating.sparsity_weight.max(0.0)
+        } else {
+            0.0
+        };
+        let cx_w = if self.config.gating.complexity_loss_weight.is_finite() {
+            self.config.gating.complexity_loss_weight.max(0.0)
+        } else {
+            0.0
+        };
+        let imp_w = if self.config.gating.importance_loss_weight.is_finite() {
+            self.config.gating.importance_loss_weight.max(0.0)
+        } else {
+            0.0
+        };
+        let sw_w = if self.config.gating.switch_balance_weight.is_finite() {
+            self.config.gating.switch_balance_weight.max(0.0)
+        } else {
+            0.0
+        };
+        let dv_w = if self.config.diversity_weight.is_finite() {
+            self.config.diversity_weight.max(0.0)
+        } else {
+            0.0
+        };
+        let z_w = if self.config.z_loss_weight.is_finite() {
+            self.config.z_loss_weight.max(0.0)
+        } else {
+            0.0
+        };
+
+        let bal_w = lb_w + imp_w + sw_w;
+        let target_avg_experts = self.config.gating.num_active as f32;
+
+        let mut importance: Vec<f32> = vec![0.0; n_exp];
+        if bal_w != 0.0 && n_tok > 0 && n_exp > 0 {
+            for t in 0..n_tok {
+                for e in 0..n_exp {
+                    let p = routing_probs[[t, e]];
+                    let p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+                    importance[e] += p;
+                }
+            }
+            for v in importance.iter_mut().take(n_exp) {
+                *v *= inv_n_tok;
+            }
+        }
+
+        let mut k_eff_per_token: Vec<f32> = Vec::new();
+        let mut mean_k_eff = 0.0f32;
+        if cx_w != 0.0 && n_tok > 0 && n_exp > 0 {
+            k_eff_per_token.resize(n_tok, 0.0);
+            for t in 0..n_tok {
+                let mut h = 0.0f32;
+                for e in 0..n_exp {
+                    let p = routing_probs[[t, e]];
+                    let p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+                    if p > 0.0 {
+                        h -= p * p.ln();
+                    }
+                }
+                let k_eff = crate::pade::PadeExp::exp(h as f64) as f32;
+                let k_eff = if k_eff.is_finite() {
+                    k_eff.clamp(1.0, n_exp as f32)
+                } else {
+                    1.0
+                };
+                k_eff_per_token[t] = k_eff;
+                mean_k_eff += k_eff;
+            }
+            mean_k_eff *= inv_n_tok;
+        }
+
+        let cx_coeff_base = if cx_w != 0.0 && n_tok > 0 {
+            2.0 * (mean_k_eff - target_avg_experts) * inv_n_tok
+        } else {
+            0.0
+        };
+
+        let dv_norm = if dv_w != 0.0 && n_tok > 0 && n_exp > 1 {
+            (n_exp as f32) * ((n_exp - 1) as f32)
+        } else {
+            1.0
+        };
+
+        let mut active_pairs: Vec<(usize, f32, f32)> = Vec::new();
+        for token_idx in 0..n_tok {
             let token_output_grad = output_grads.row(token_idx);
             let mut dot_gy = 0.0f32;
-            let mut active_pairs: Vec<(usize, f32, f32)> = Vec::new();
+            active_pairs.clear();
 
-            for expert_idx in 0..self.config.num_experts {
+            for expert_idx in 0..n_exp {
                 let y = routing_probs[[token_idx, expert_idx]];
                 let y = if y.is_finite() { y } else { 0.0 };
                 if y == 0.0 {
                     continue;
                 }
                 let expert_output = cached_expert_outputs[expert_idx].row(token_idx);
-                let g = token_output_grad
+                let g_main = token_output_grad
                     .iter()
                     .zip(expert_output.iter())
                     .map(|(&g, &o)| {
@@ -2089,12 +2235,105 @@ impl Layer for MixtureOfExperts {
                         g * o
                     })
                     .sum::<f32>();
+
+                let mut g_aux = 0.0f32;
+                if bal_w != 0.0 && n_tok > 0 {
+                    let d_lb = (2.0 * (n_exp as f32) * inv_n_tok) * importance[expert_idx];
+                    if d_lb.is_finite() {
+                        g_aux += bal_w * d_lb;
+                    }
+                }
+
+                if (sp_w != 0.0 || cx_w != 0.0) && n_tok > 0 {
+                    let p = y;
+                    let ln_p = p.ln();
+                    let d_h = -(ln_p + 1.0);
+                    if sp_w != 0.0 && ln_n_exp > 0.0 {
+                        let d_sp = d_h * inv_n_tok / ln_n_exp;
+                        if d_sp.is_finite() {
+                            g_aux += sp_w * d_sp;
+                        }
+                    }
+                    if cx_w != 0.0 {
+                        let k_eff = if token_idx < k_eff_per_token.len() {
+                            k_eff_per_token[token_idx]
+                        } else {
+                            1.0
+                        };
+                        let d_cx = cx_coeff_base * k_eff * d_h;
+                        if d_cx.is_finite() {
+                            g_aux += cx_w * d_cx;
+                        }
+                    }
+                }
+
+                if dv_w != 0.0 && n_tok > 0 && n_exp > 1 {
+                    let d_dv = (-2.0 * y) * inv_n_tok / dv_norm;
+                    if d_dv.is_finite() {
+                        g_aux += dv_w * d_dv;
+                    }
+                }
+
+                let g = g_main + g_aux;
                 active_pairs.push((expert_idx, g, y));
                 dot_gy += g * y;
             }
 
-            for (expert_idx, g, y) in active_pairs {
+            for &(expert_idx, g, y) in &active_pairs {
                 d_logits[[token_idx, expert_idx]] = y * (g - dot_gy);
+            }
+        }
+
+        if z_w != 0.0 && n_tok > 0 && n_exp > 0 {
+            let cached_logits = self
+                .router
+                .cached_logits
+                .as_ref()
+                .expect("Router predict must cache logits");
+            let y_full = self
+                .router
+                .cached_output
+                .as_ref()
+                .expect("Router predict must cache full softmax output");
+
+            for t in 0..n_tok {
+                let row = cached_logits.row(t);
+                let mut max_v = f32::NEG_INFINITY;
+                let mut any = false;
+                for &v in row.iter() {
+                    if v.is_finite() {
+                        any = true;
+                        max_v = max_v.max(v);
+                    }
+                }
+                if !any {
+                    continue;
+                }
+
+                let mut sum_exp: f64 = 0.0;
+                for &v in row.iter() {
+                    if v.is_finite() {
+                        sum_exp += crate::pade::PadeExp::exp((v - max_v) as f64);
+                    }
+                }
+                if !sum_exp.is_finite() || sum_exp <= 0.0 {
+                    continue;
+                }
+                let z = (sum_exp.ln() as f32) + max_v;
+                if !z.is_finite() {
+                    continue;
+                }
+
+                let coeff = (2.0 * z_w * z) * inv_n_tok;
+                if !coeff.is_finite() {
+                    continue;
+                }
+
+                for e in 0..n_exp {
+                    let p = y_full[[t, e]];
+                    let p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+                    d_logits[[t, e]] += coeff * p;
+                }
             }
         }
 
@@ -2466,6 +2705,190 @@ fn update_router_z_loss_metrics(config: &mut ExpertRouterConfig, logits: &ndarra
     }
 }
 
+fn compute_moe_aux_loss_from_probs_and_logits(
+    masked_probs: &ndarray::Array2<f32>,
+    logits: &ndarray::Array2<f32>,
+    num_experts: usize,
+    target_avg_experts: f32,
+    gating: &GatingConfig,
+    z_loss_weight: f32,
+    diversity_weight: f32,
+) -> f32 {
+    let n_tok = masked_probs.nrows();
+    if n_tok == 0 || num_experts == 0 {
+        return 0.0;
+    }
+
+    let n_exp_f = num_experts as f32;
+    let inv_n = 1.0 / (n_tok as f32);
+    let ln_n = if num_experts >= 2 {
+        (num_experts as f32).ln()
+    } else {
+        1.0
+    };
+
+    let bal_w = (if gating.load_balance_weight.is_finite() {
+        gating.load_balance_weight.max(0.0)
+    } else {
+        0.0
+    }) + (if gating.importance_loss_weight.is_finite() {
+        gating.importance_loss_weight.max(0.0)
+    } else {
+        0.0
+    }) + (if gating.switch_balance_weight.is_finite() {
+        gating.switch_balance_weight.max(0.0)
+    } else {
+        0.0
+    });
+
+    let sp_w = if gating.sparsity_weight.is_finite() {
+        gating.sparsity_weight.max(0.0)
+    } else {
+        0.0
+    };
+
+    let cx_w = if gating.complexity_loss_weight.is_finite() {
+        gating.complexity_loss_weight.max(0.0)
+    } else {
+        0.0
+    };
+
+    let dv_w = if diversity_weight.is_finite() {
+        diversity_weight.max(0.0)
+    } else {
+        0.0
+    };
+
+    let z_w = if z_loss_weight.is_finite() {
+        z_loss_weight.max(0.0)
+    } else {
+        0.0
+    };
+
+    let mut loss = 0.0f32;
+
+    if bal_w != 0.0 {
+        let mut imp = vec![0.0f32; num_experts];
+        for t in 0..n_tok {
+            for e in 0..num_experts {
+                let p = masked_probs[[t, e]];
+                let p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+                imp[e] += p;
+            }
+        }
+        for v in imp.iter_mut().take(num_experts) {
+            *v *= inv_n;
+        }
+        let sum_sq = imp.iter().map(|&x| x * x).sum::<f32>();
+        let bal = (n_exp_f * sum_sq) - 1.0;
+        if bal.is_finite() {
+            loss += bal_w * bal.max(0.0);
+        }
+    }
+
+    if sp_w != 0.0 || cx_w != 0.0 || dv_w != 0.0 {
+        let mut entropy_sum = 0.0f32;
+        let mut k_eff_sum = 0.0f32;
+        let mut diversity_sum = 0.0f32;
+        let dv_norm = if num_experts > 1 {
+            n_exp_f * ((num_experts - 1) as f32)
+        } else {
+            1.0
+        };
+
+        for t in 0..n_tok {
+            let mut h = 0.0f32;
+            let mut sum_p2 = 0.0f32;
+            for e in 0..num_experts {
+                let p = masked_probs[[t, e]];
+                let p = if p.is_finite() { p.max(0.0) } else { 0.0 };
+                if p > 0.0 {
+                    h -= p * p.ln();
+                }
+                sum_p2 += p * p;
+            }
+            entropy_sum += h;
+            if cx_w != 0.0 {
+                let k_eff = crate::pade::PadeExp::exp(h as f64) as f32;
+                let k_eff = if k_eff.is_finite() {
+                    k_eff.clamp(1.0, n_exp_f)
+                } else {
+                    1.0
+                };
+                k_eff_sum += k_eff;
+            }
+            if dv_w != 0.0 && num_experts > 1 {
+                let dv = (1.0 - sum_p2) / dv_norm;
+                if dv.is_finite() {
+                    diversity_sum += dv.max(0.0);
+                }
+            }
+        }
+
+        if sp_w != 0.0 && ln_n > 0.0 {
+            let ent = (entropy_sum * inv_n) / ln_n;
+            if ent.is_finite() {
+                loss += sp_w * ent.max(0.0);
+            }
+        }
+        if cx_w != 0.0 {
+            let mean_k = k_eff_sum * inv_n;
+            let cx = (mean_k - target_avg_experts).powi(2);
+            if cx.is_finite() {
+                loss += cx_w * cx.max(0.0);
+            }
+        }
+        if dv_w != 0.0 && num_experts > 1 {
+            let dv = diversity_sum * inv_n;
+            if dv.is_finite() {
+                loss += dv_w * dv.max(0.0);
+            }
+        }
+    }
+
+    if z_w != 0.0 && logits.nrows() == n_tok && logits.ncols() == num_experts {
+        let mut z_sum = 0.0f32;
+        let mut z_cnt = 0usize;
+        for row in logits.outer_iter() {
+            let mut max_v = f32::NEG_INFINITY;
+            let mut any = false;
+            for &v in row.iter() {
+                if v.is_finite() {
+                    any = true;
+                    max_v = max_v.max(v);
+                }
+            }
+            if !any {
+                continue;
+            }
+
+            let mut sum_exp: f64 = 0.0;
+            for &v in row.iter() {
+                if v.is_finite() {
+                    sum_exp += crate::pade::PadeExp::exp((v - max_v) as f64);
+                }
+            }
+            if sum_exp <= 0.0 || !sum_exp.is_finite() {
+                continue;
+            }
+
+            let z = (sum_exp.ln() as f32) + max_v;
+            if z.is_finite() {
+                z_sum += z * z;
+                z_cnt += 1;
+            }
+        }
+        if z_cnt > 0 {
+            let z = z_sum / (z_cnt as f32);
+            if z.is_finite() {
+                loss += z_w * z.max(0.0);
+            }
+        }
+    }
+
+    if loss.is_finite() { loss.max(0.0) } else { 0.0 }
+}
+
 fn compute_expert_capacity(
     n_tokens: usize,
     k: usize,
@@ -2728,6 +3151,7 @@ mod tests {
         assert_eq!(config.gating.num_active, 2);
         assert_eq!(config.expert_hidden_dim, 64);
         assert_eq!(config.gating.load_balance_weight, 0.0);
+        assert!(config.use_head_conditioning);
     }
 
     #[test]
@@ -2873,6 +3297,7 @@ mod tests {
         let mut config = ExpertRouterConfig::default();
         // Simulate unbalanced routing: expert 0 gets all tokens, others get none
         config.gating.metrics.resize(4);
+        config.gating.metrics.active_sum_per_component = vec![100.0, 0.0, 0.0, 0.0];
         config.gating.metrics.token_count_per_component = vec![100, 0, 0, 0];
         config.gating.metrics.total_decisions = 100;
 
@@ -3226,5 +3651,113 @@ mod tests {
             l1 += (a - b).abs();
         }
         assert!(l1 > 1e-6);
+    }
+
+    #[test]
+    fn test_compute_moe_aux_loss_balance_zero_for_uniform() {
+        let probs = ndarray::Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                0.25, 0.25, 0.25, 0.25, //
+                0.25, 0.25, 0.25, 0.25, //
+                0.25, 0.25, 0.25, 0.25, //
+                0.25, 0.25, 0.25, 0.25, //
+            ],
+        )
+        .unwrap();
+        let logits = ndarray::Array2::<f32>::zeros((4, 4));
+        let gating = GatingConfig {
+            num_active: 2,
+            load_balance_weight: 1.0,
+            ..Default::default()
+        };
+        let loss =
+            compute_moe_aux_loss_from_probs_and_logits(&probs, &logits, 4, 2.0, &gating, 0.0, 0.0);
+        assert!(approx_eq(loss, 0.0, 1e-6));
+    }
+
+    #[test]
+    fn test_compute_moe_aux_loss_balance_positive_for_collapsed() {
+        let probs = ndarray::Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+            ],
+        )
+        .unwrap();
+        let logits = ndarray::Array2::<f32>::zeros((4, 4));
+        let gating = GatingConfig {
+            num_active: 2,
+            load_balance_weight: 1.0,
+            ..Default::default()
+        };
+        let loss =
+            compute_moe_aux_loss_from_probs_and_logits(&probs, &logits, 4, 2.0, &gating, 0.0, 0.0);
+        assert!(approx_eq(loss, 3.0, 1e-6));
+    }
+
+    #[test]
+    fn test_compute_moe_aux_loss_z_loss_matches_ln_e_sq() {
+        let probs = ndarray::Array2::from_shape_vec(
+            (4, 3),
+            vec![
+                1.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+            ],
+        )
+        .unwrap();
+        let logits = ndarray::Array2::<f32>::zeros((4, 3));
+        let gating = GatingConfig {
+            num_active: 1,
+            ..Default::default()
+        };
+        let loss =
+            compute_moe_aux_loss_from_probs_and_logits(&probs, &logits, 3, 1.0, &gating, 1.0, 0.0);
+        let expected = (3.0f32).ln().powi(2);
+        assert!(approx_eq(loss, expected, 1e-5));
+    }
+
+    #[test]
+    fn test_moe_router_receives_aux_grads_when_output_grads_zero() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 4,
+            expert_hidden_dim: 16,
+            diversity_weight: 0.0,
+            gating: GatingConfig {
+                num_active: 2,
+                load_balance_weight: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.z_loss_weight = 0.0;
+
+        let mut moe = MixtureOfExperts::new(8, 8, config);
+        moe.router.bias2.fill(0.0);
+        moe.router.bias2[0] = 10.0;
+
+        let input = ndarray::Array2::<f32>::zeros((4, 8));
+        let _out = moe.forward(&input);
+
+        let output_grads = ndarray::Array2::<f32>::zeros((4, 8));
+        let (_grad_in, grads) = moe.compute_gradients(&input, &output_grads);
+
+        let mut found_bias2 = false;
+        let mut sum_abs = 0.0f32;
+        for g in &grads {
+            if g.nrows() == 1 && g.ncols() == moe.config.num_experts {
+                found_bias2 = true;
+                for &v in g.iter() {
+                    sum_abs += v.abs();
+                }
+            }
+        }
+        assert!(found_bias2);
+        assert!(sum_abs > 0.0);
     }
 }

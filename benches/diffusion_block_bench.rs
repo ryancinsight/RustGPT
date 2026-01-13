@@ -25,6 +25,7 @@ fn bench_forward(c: &mut Criterion) {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
+        titan_memory: llm::model_config::TitanMemoryConfig::default(),
         time_embed_dim: 128 * 4,
         num_timesteps: 1000,
         noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
@@ -76,6 +77,7 @@ fn bench_forward_vs_transformer(c: &mut Criterion) {
         head_selection: HeadSelectionStrategy::Fixed {
             num_active: num_heads,
         },
+        titan_memory: llm::model_config::TitanMemoryConfig::default(),
         time_embed_dim: embed_dim * 4,
         num_timesteps: 1000,
         noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
@@ -117,6 +119,7 @@ fn bench_forward_vs_transformer(c: &mut Criterion) {
         window_adaptation_strategy: WindowAdaptationStrategy::Fixed,
         entropy_ema_alpha: 0.1,
         use_advanced_adaptive_residuals: true,
+        titan_memory: llm::model_config::TitanMemoryConfig::default(),
     };
 
     let mut diffusion_block = DiffusionBlock::new(diffusion_config);
@@ -169,6 +172,7 @@ fn bench_sample(c: &mut Criterion) {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+        titan_memory: llm::model_config::TitanMemoryConfig::default(),
         time_embed_dim: 64 * 4,
         num_timesteps: 200,
         noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
