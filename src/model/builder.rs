@@ -282,7 +282,13 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                         "RgLruMoH"
                     }
                     crate::layers::components::common::TemporalMixingLayer::RgLru(_) => "RgLru",
+                    crate::layers::components::common::TemporalMixingLayer::MambaMoH(_) => {
+                        "MambaMoH"
+                    }
                     crate::layers::components::common::TemporalMixingLayer::Mamba(_) => "Mamba",
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
+                        "Mamba2MoH"
+                    }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
                 };
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
@@ -296,7 +302,13 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                         "RgLruMoH"
                     }
                     crate::layers::components::common::TemporalMixingLayer::RgLru(_) => "RgLru",
+                    crate::layers::components::common::TemporalMixingLayer::MambaMoH(_) => {
+                        "MambaMoH"
+                    }
                     crate::layers::components::common::TemporalMixingLayer::Mamba(_) => "Mamba",
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
+                        "Mamba2MoH"
+                    }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
                 };
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);

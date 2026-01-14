@@ -2,6 +2,80 @@ use tracing::warn;
 
 use crate::{Vocab, cli::Args, dataset_loader::Dataset, llm::LLM};
 
+pub fn configure_speculative_sampling_from_args(
+    args: &Args,
+    config: &crate::model_config::ModelConfig,
+    llm: &mut LLM,
+) {
+    if !args.speculative {
+        return;
+    }
+
+    let gamma = args.speculative_gamma.max(1);
+    let tau = args.speculative_tau.max(1e-6);
+    let draft_layers = args
+        .speculative_draft_layers
+        .unwrap_or_else(|| config.num_layers.max(1))
+        .max(1);
+
+    let (mode, auto_detect_msg) = if let Some(ref mode_str) = args.speculative_mode {
+        match mode_str.to_lowercase().as_str() {
+            "transformer" | "trans" | "t" => (
+                crate::layers::transformer::speculative::SpeculativeMode::Transformer,
+                None,
+            ),
+            "diffusion" | "diff" | "d" => (
+                crate::layers::transformer::speculative::SpeculativeMode::Diffusion,
+                None,
+            ),
+            _ => {
+                warn!(
+                    "Unknown speculative mode '{}', auto-detecting from model type",
+                    mode_str
+                );
+                (
+                    if args.diffusion {
+                        crate::layers::transformer::speculative::SpeculativeMode::Diffusion
+                    } else {
+                        crate::layers::transformer::speculative::SpeculativeMode::Transformer
+                    },
+                    None,
+                )
+            }
+        }
+    } else if args.diffusion {
+        (
+            crate::layers::transformer::speculative::SpeculativeMode::Diffusion,
+            Some("Auto-detected speculative mode: Diffusion (based on --diffusion flag)"),
+        )
+    } else {
+        (
+            crate::layers::transformer::speculative::SpeculativeMode::Transformer,
+            Some("Auto-detected speculative mode: Transformer (default model type)"),
+        )
+    };
+
+    if let Some(existing) = llm.speculative_config() {
+        let same_mode = llm.speculative_mode() == mode;
+        let same_gamma = existing.gamma == gamma;
+        let same_tau = (existing.tau - tau).abs() <= 1e-6;
+        let same_draft_layers = existing.draft_layers == draft_layers;
+        if same_mode && same_gamma && same_tau && same_draft_layers {
+            return;
+        }
+    }
+
+    if let Some(msg) = auto_detect_msg {
+        println!("{msg}");
+    }
+
+    println!(
+        "Enabling speculative sampling (mode={:?}, gamma={}, tau={}, draft_layers={})",
+        mode, gamma, tau, draft_layers
+    );
+    llm.enable_speculative_sampling(gamma, tau, draft_layers, mode);
+}
+
 /// Orchestrate the complete training pipeline
 pub fn run_training_pipeline(
     args: &Args,
@@ -27,53 +101,7 @@ pub fn run_training_pipeline(
 
     // Configure speculative sampling if enabled
     if args.speculative {
-        let gamma = args.speculative_gamma.max(1);
-        let tau = args.speculative_tau.max(1e-6);
-        let draft_layers = args
-            .speculative_draft_layers
-            .unwrap_or_else(|| config.num_layers.max(1))
-            .max(1);
-
-        // Auto-detect speculative mode from model type if not explicitly specified
-        // --diffusion flag → diffusion speculation
-        // otherwise (transformer/TRM) → transformer speculation
-        let mode = if let Some(ref mode_str) = args.speculative_mode {
-            // User explicitly specified a mode
-            match mode_str.to_lowercase().as_str() {
-                "transformer" | "trans" | "t" => {
-                    crate::layers::transformer::speculative::SpeculativeMode::Transformer
-                }
-                "diffusion" | "diff" | "d" => {
-                    crate::layers::transformer::speculative::SpeculativeMode::Diffusion
-                }
-                _ => {
-                    warn!(
-                        "Unknown speculative mode '{}', auto-detecting from model type",
-                        mode_str
-                    );
-                    if args.diffusion {
-                        crate::layers::transformer::speculative::SpeculativeMode::Diffusion
-                    } else {
-                        crate::layers::transformer::speculative::SpeculativeMode::Transformer
-                    }
-                }
-            }
-        } else {
-            // Auto-detect from model type
-            if args.diffusion {
-                println!("Auto-detected speculative mode: Diffusion (based on --diffusion flag)");
-                crate::layers::transformer::speculative::SpeculativeMode::Diffusion
-            } else {
-                println!("Auto-detected speculative mode: Transformer (default model type)");
-                crate::layers::transformer::speculative::SpeculativeMode::Transformer
-            }
-        };
-
-        println!(
-            "Enabling speculative sampling (mode={:?}, gamma={}, tau={}, draft_layers={})",
-            mode, gamma, tau, draft_layers
-        );
-        llm.enable_speculative_sampling(gamma, tau, draft_layers, mode);
+        configure_speculative_sampling_from_args(args, config, &mut llm);
     }
 
     // Determine training mode and run appropriate training

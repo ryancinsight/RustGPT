@@ -1,4 +1,6 @@
-use ndarray::{Array1, Array2, Axis};
+use std::cell::RefCell;
+
+use ndarray::{Array1, Array2, Axis, Zip, s};
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -6,10 +8,40 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{
     adam::Adam,
     errors::Result,
+    mixtures::{HeadSelectionStrategy, MoHGating},
     network::Layer,
     richards::{RichardsActivation, RichardsCurve, RichardsGate},
     rng::get_rng,
 };
+
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_SCAN_A: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TLS_SCAN_B: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn with_tls_scan_a<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    TLS_SCAN_A.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() != len {
+            buf.resize(len, 0.0);
+        }
+        f(buf.as_mut_slice())
+    })
+}
+
+#[inline]
+fn with_tls_scan_b<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    TLS_SCAN_B.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() != len {
+            buf.resize(len, 0.0);
+        }
+        f(buf.as_mut_slice())
+    })
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MambaCachedKind {
@@ -51,6 +83,26 @@ impl Default for ScanConfig {
 #[inline]
 fn softplus(x: f32) -> f32 {
     crate::soft::softplus(x)
+}
+
+#[inline]
+fn array2_bitwise_eq_f32(a: &Array2<f32>, b: &Array2<f32>) -> bool {
+    if a.dim() != b.dim() {
+        return false;
+    }
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    match (a.as_slice_memory_order(), b.as_slice_memory_order()) {
+        (Some(sa), Some(sb)) => sa
+            .iter()
+            .zip(sb.iter())
+            .all(|(&x, &y)| x.to_bits() == y.to_bits()),
+        _ => a
+            .iter()
+            .zip(b.iter())
+            .all(|(&x, &y)| x.to_bits() == y.to_bits()),
+    }
 }
 
 fn mamba_default_gate() -> RichardsGate {
@@ -765,12 +817,18 @@ impl Mamba {
         //   s_t = A_t * s_{t-1} + B_t
         // and compositions are associative:
         //   (A2,B2) ⊕ (A1,B1) = (A2*A1, A2*B1 + B2)
+        let mut chunk_a = vec![0.0f32; num_chunks * n];
+        let mut chunk_b = vec![0.0f32; num_chunks * n];
+        let mut prefix_b = vec![0.0f32; num_chunks * n];
+        let mut b_prefix = vec![0.0f32; n];
         for j in 0..d {
+            chunk_a.fill(0.0);
+            chunk_b.fill(0.0);
+            prefix_b.fill(0.0);
+            b_prefix.fill(0.0);
+
             // 1) Compute per-chunk totals in parallel over time chunks.
             // Stored as flat arrays to avoid Vec<Vec<..>> cloning.
-            let mut chunk_a = vec![0.0f32; num_chunks * n];
-            let mut chunk_b = vec![0.0f32; num_chunks * n];
-
             chunk_a
                 .par_chunks_mut(n)
                 .zip(chunk_b.par_chunks_mut(n))
@@ -778,31 +836,32 @@ impl Mamba {
                 .for_each(|(chunk_idx, (a_out, b_out))| {
                     let start = chunk_idx * chunk_size;
                     let end = (start + chunk_size).min(t);
+                    with_tls_scan_a(n, |a_tot| {
+                        a_tot.fill(1.0);
+                        with_tls_scan_b(n, |b_tot| {
+                            b_tot.fill(0.0);
 
-                    let mut a_tot = vec![1.0f32; n];
-                    let mut b_tot = vec![0.0f32; n];
+                            for ti in start..end {
+                                let dt_val = dt[[ti, j]];
+                                let u_val = u_conv[[ti, j]];
+                                for k in 0..n {
+                                    let a_scale = a_scale_state[[j, k]].max(1e-6);
+                                    let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
+                                    let b_step = ((1.0 - a_val) / a_scale) * b_t[[ti, k]] * u_val;
 
-                    for ti in start..end {
-                        let dt_val = dt[[ti, j]];
-                        let u_val = u_conv[[ti, j]];
-                        for k in 0..n {
-                            let a_scale = a_scale_state[[j, k]].max(1e-6);
-                            let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
-                            let b_step = ((1.0 - a_val) / a_scale) * b_t[[ti, k]] * u_val;
+                                    b_tot[k] = a_val * b_tot[k] + b_step;
+                                    a_tot[k] *= a_val;
+                                }
+                            }
 
-                            b_tot[k] = a_val * b_tot[k] + b_step;
-                            a_tot[k] *= a_val;
-                        }
-                    }
-
-                    a_out.copy_from_slice(&a_tot);
-                    b_out.copy_from_slice(&b_tot);
+                            a_out.copy_from_slice(a_tot);
+                            b_out.copy_from_slice(b_tot);
+                        })
+                    });
                 });
 
             // 2) Prefix over chunk totals (sequential; num_chunks is small), producing
             // initial state for each chunk.
-            let mut prefix_b = vec![0.0f32; num_chunks * n];
-            let mut b_prefix = vec![0.0f32; n];
             for chunk_idx in 0..num_chunks {
                 let base = chunk_idx * n;
                 prefix_b[base..(base + n)].copy_from_slice(&b_prefix[..n]);
@@ -826,31 +885,36 @@ impl Mamba {
                         let base = chunk_idx * n;
                         &prefix_b[base..(base + n)]
                     };
-                    let mut a_loc = vec![1.0f32; n];
-                    let mut b_loc = vec![0.0f32; n];
 
                     let mut state_flat = vec![0.0f32; len * n];
                     let mut z_col = vec![0.0f32; len];
 
-                    for (off, ti) in (start..end).enumerate() {
-                        let dt_val = dt[[ti, j]];
-                        let u_val = u_conv[[ti, j]];
+                    with_tls_scan_a(n, |a_loc| {
+                        a_loc.fill(1.0);
+                        with_tls_scan_b(n, |b_loc| {
+                            b_loc.fill(0.0);
 
-                        let mut z_sum = d_skip_row[j] * u_val;
-                        for k in 0..n {
-                            let a_scale = a_scale_state[[j, k]].max(1e-6);
-                            let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
-                            let b_step = ((1.0 - a_val) / a_scale) * b_t[[ti, k]] * u_val;
+                            for (off, ti) in (start..end).enumerate() {
+                                let dt_val = dt[[ti, j]];
+                                let u_val = u_conv[[ti, j]];
 
-                            b_loc[k] = a_val * b_loc[k] + b_step;
-                            a_loc[k] *= a_val;
+                                let mut z_sum = d_skip_row[j] * u_val;
+                                for k in 0..n {
+                                    let a_scale = a_scale_state[[j, k]].max(1e-6);
+                                    let a_val = crate::pade::exp(-dt_val * a_scale).clamp(0.0, 1.0);
+                                    let b_step = ((1.0 - a_val) / a_scale) * b_t[[ti, k]] * u_val;
 
-                            let s = a_loc[k] * pre_b[k] + b_loc[k];
-                            state_flat[off * n + k] = s;
-                            z_sum += c_t[[ti, k]] * s;
-                        }
-                        z_col[off] = z_sum;
-                    }
+                                    b_loc[k] = a_val * b_loc[k] + b_step;
+                                    a_loc[k] *= a_val;
+
+                                    let s = a_loc[k] * pre_b[k] + b_loc[k];
+                                    state_flat[off * n + k] = s;
+                                    z_sum += c_t[[ti, k]] * s;
+                                }
+                                z_col[off] = z_sum;
+                            }
+                        })
+                    });
 
                     (state_flat, z_col)
                 })
@@ -1947,6 +2011,43 @@ impl Layer for Mamba {
     }
 
     fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<()> {
+        if self.cached_kind == MambaCachedKind::Mamba2 {
+            if gradients.len() < 14 {
+                return Ok(());
+            }
+
+            self.opt_w_in
+                .step(&mut self.w_in, &gradients[0], learning_rate);
+            self.opt_b_in
+                .step(&mut self.b_in, &gradients[1], learning_rate);
+            self.opt_w_dt
+                .step(&mut self.w_dt, &gradients[2], learning_rate);
+            self.opt_b_dt
+                .step(&mut self.b_dt, &gradients[3], learning_rate);
+            self.opt_w_b
+                .step(&mut self.w_b, &gradients[4], learning_rate);
+            self.opt_b_b
+                .step(&mut self.b_b, &gradients[5], learning_rate);
+            self.opt_w_c
+                .step(&mut self.w_c, &gradients[6], learning_rate);
+            self.opt_b_c
+                .step(&mut self.b_c, &gradients[7], learning_rate);
+            self.opt_a_log
+                .step(&mut self.a_log, &gradients[8], learning_rate);
+            self.opt_d_skip
+                .step(&mut self.d_skip, &gradients[9], learning_rate);
+            self.opt_conv_w
+                .step(&mut self.conv_w, &gradients[10], learning_rate);
+            self.opt_conv_b
+                .step(&mut self.conv_b, &gradients[11], learning_rate);
+            self.opt_w_out
+                .step(&mut self.w_out, &gradients[12], learning_rate);
+            self.opt_b_out
+                .step(&mut self.b_out, &gradients[13], learning_rate);
+
+            return Ok(());
+        }
+
         // Expected order:
         // w_in, b_in, w_dt, b_dt, w_b, b_b, w_c, b_c, a_log, d_skip, conv_w, conv_b, w_out, b_out,
         // richards_act, richards_tanh, richards_gate...
@@ -2028,6 +2129,343 @@ impl Layer for Mamba {
         self.cached_dt_head = None;
         self.cached_a_head = None;
         self.cached_a_scale_head = None;
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MoHMamba {
+    pub embed_dim: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub gating_embed_dim: usize,
+
+    #[serde(flatten)]
+    pub moh: MoHGating,
+
+    pub inner: Mamba,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_input: Option<Array2<f32>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_eff: Option<Array2<f32>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    cached_inner_out: Option<Array2<f32>>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    pub last_avg_active_heads: Option<f32>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub last_head_activity_vec: Option<Vec<f32>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub last_token_head_activity_vec: Option<Vec<f32>>,
+}
+
+impl MoHMamba {
+    pub fn new(embed_dim: usize, num_heads: usize, head_selection: &HeadSelectionStrategy) -> Self {
+        let mut nh = num_heads.max(1);
+        if embed_dim == 0 || !embed_dim.is_multiple_of(nh) {
+            nh = 1;
+        }
+        let head_dim = if nh > 0 { embed_dim / nh } else { embed_dim };
+
+        let budget = 1000usize;
+        let gate_params = crate::richards::RichardsGate::new().parameters();
+        let overhead = 2usize.saturating_mul(nh).saturating_add(gate_params);
+        let max_wg = budget.saturating_sub(overhead);
+        let gating_embed_dim = (max_wg / nh).max(1).min(embed_dim.max(1));
+
+        let mut moh = MoHGating::new(gating_embed_dim, nh);
+        moh.set_head_selection_config(head_selection);
+        moh.head_selection_config.gating.use_learned_predictor = false;
+        moh.threshold_predictor = None;
+        moh.opt_w_tau = None;
+        moh.opt_b_tau = None;
+        moh.opt_w2_tau = None;
+        moh.opt_b2_tau = None;
+        moh.opt_cond_w_tau = None;
+
+        let inner = Mamba::new(embed_dim);
+
+        Self {
+            embed_dim,
+            num_heads: nh,
+            head_dim,
+            gating_embed_dim,
+            moh,
+            inner,
+            cached_input: None,
+            cached_eff: None,
+            cached_inner_out: None,
+            last_avg_active_heads: None,
+            last_head_activity_vec: None,
+            last_token_head_activity_vec: None,
+        }
+    }
+
+    #[inline]
+    fn clear_caches(&mut self) {
+        self.cached_input = None;
+        self.cached_eff = None;
+        self.cached_inner_out = None;
+        self.last_avg_active_heads = None;
+        self.last_head_activity_vec = None;
+        self.last_token_head_activity_vec = None;
+    }
+
+    pub fn take_tau_metrics(&mut self) -> Option<(f32, f32)> {
+        self.moh.take_tau_metrics()
+    }
+
+    pub fn take_pred_norm(&mut self) -> Option<f32> {
+        self.moh.take_pred_norm()
+    }
+
+    pub fn get_head_metrics_and_reset(&mut self) -> Vec<(f32, usize)> {
+        self.moh.get_head_metrics_and_reset()
+    }
+}
+
+impl Layer for MoHMamba {
+    fn layer_type(&self) -> &str {
+        "MoHMamba"
+    }
+
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        let t = input.nrows();
+        let d = input.ncols();
+        if t == 0 || d == 0 || self.num_heads == 0 || self.head_dim == 0 {
+            self.clear_caches();
+            self.cached_input = Some(input.clone());
+            return Array2::<f32>::zeros((t, d));
+        }
+
+        self.cached_input = Some(input.clone());
+
+        let gd = self.gating_embed_dim.min(d);
+        let gate_input = input.slice(s![.., 0..gd]).to_owned();
+        let eff = self.moh.forward_weights(&gate_input, None, None);
+        self.cached_eff = Some(eff.clone());
+
+        let y_inner = self.inner.forward(input);
+        self.cached_inner_out = Some(y_inner.clone());
+
+        let mut out = y_inner;
+        for h in 0..self.num_heads {
+            let c0 = h * self.head_dim;
+            let c1 = c0 + self.head_dim;
+            let eff_col = eff.column(h);
+            let eff_col = eff_col.insert_axis(Axis(1));
+            let eff_col = eff_col
+                .broadcast((t, self.head_dim))
+                .expect("broadcast must succeed for (t, head_dim)");
+            let mut out_block = out.slice_mut(s![.., c0..c1]);
+            Zip::from(&mut out_block).and(eff_col).for_each(|o, &w| {
+                *o *= w;
+            });
+        }
+
+        let avg = self
+            .moh
+            .head_selection_config
+            .gating
+            .get_avg_active_components();
+        self.last_avg_active_heads = Some(avg);
+
+        let mut hv = Vec::with_capacity(self.num_heads);
+        for h in 0..self.num_heads {
+            let mean = eff.column(h).iter().map(|&x| x.max(0.0)).sum::<f32>() / (t.max(1) as f32);
+            hv.push(mean);
+        }
+        self.last_head_activity_vec = Some(hv);
+        let mut tv = Vec::with_capacity(t);
+        for i in 0..t {
+            let mut sum = 0.0f32;
+            for h in 0..self.num_heads {
+                let w = eff[[i, h]];
+                sum += w.max(0.0);
+            }
+            let denom = self.num_heads.max(1) as f32;
+            let v = if denom > 0.0 { sum / denom } else { 0.0 };
+            tv.push(v.clamp(0.0, 1.0));
+        }
+        self.last_token_head_activity_vec = Some(tv);
+
+        out
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before backward");
+        let (grad_input, param_grads) = self.compute_gradients(input, grads);
+        let _ = self.apply_gradients(&param_grads, lr);
+        grad_input
+    }
+
+    fn parameters(&self) -> usize {
+        let heads_params: usize = self.inner.parameters();
+        let mut moh_params = self.moh.w_g.len()
+            + self.moh.alpha_g.len()
+            + self.moh.beta_g.len()
+            + self.moh.gate.parameters();
+        if let Some(pred) = &self.moh.threshold_predictor {
+            moh_params +=
+                pred.weights1.len() + pred.bias1.len() + pred.weights2.len() + pred.bias2.len();
+            moh_params += pred.cond_w.len();
+            moh_params += pred.activation.scalar_weights_len();
+        }
+        heads_params + moh_params
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let mut sumsq = 0.0f32;
+        let wn = self.inner.weight_norm();
+        sumsq += wn * wn;
+        sumsq += self.moh.w_g.iter().map(|&x| x * x).sum::<f32>();
+        sumsq += self.moh.alpha_g.iter().map(|&x| x * x).sum::<f32>();
+        sumsq += self.moh.beta_g.iter().map(|&x| x * x).sum::<f32>();
+        for w in self.moh.gate.curve.weights() {
+            let wf = w as f32;
+            sumsq += wf * wf;
+        }
+        if let Some(pred) = &self.moh.threshold_predictor {
+            sumsq += pred.weights1.iter().map(|&x| x * x).sum::<f32>();
+            sumsq += pred.bias1.iter().map(|&x| x * x).sum::<f32>();
+            sumsq += pred.weights2.iter().map(|&x| x * x).sum::<f32>();
+            sumsq += pred.bias2.iter().map(|&x| x * x).sum::<f32>();
+            sumsq += pred.cond_w.iter().map(|&x| x * x).sum::<f32>();
+            for w in pred.activation.weights() {
+                let wf = w as f32;
+                sumsq += wf * wf;
+            }
+        }
+        sumsq.sqrt()
+    }
+
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        let t = input.nrows();
+        let d = input.ncols();
+        if t == 0 || d == 0 || self.num_heads == 0 || self.head_dim == 0 {
+            return (Array2::<f32>::zeros(input.raw_dim()), vec![]);
+        }
+
+        let can_use_cache = self
+            .cached_input
+            .as_ref()
+            .is_some_and(|x| x.dim() == input.dim())
+            && self
+                .cached_input
+                .as_ref()
+                .is_some_and(|x| array2_bitwise_eq_f32(x, input));
+
+        let eff_local: Array2<f32>;
+        let eff: &Array2<f32> = if can_use_cache
+            && let Some(e) = self
+                .cached_eff
+                .as_ref()
+                .filter(|e| e.dim() == (t, self.num_heads))
+        {
+            e
+        } else {
+            let mut moh_tmp = self.moh.clone();
+            let gd = self.gating_embed_dim.min(d);
+            let gate_input = input.slice(s![.., 0..gd]).to_owned();
+            eff_local = moh_tmp.forward_weights(&gate_input, None, None);
+            &eff_local
+        };
+
+        let inner_out_local: Array2<f32>;
+        let inner_out: &Array2<f32> = if can_use_cache
+            && let Some(y) = self.cached_inner_out.as_ref().filter(|y| y.dim() == (t, d))
+        {
+            y
+        } else {
+            let mut inner = self.inner.clone();
+            inner_out_local = inner.forward(input);
+            &inner_out_local
+        };
+
+        let mut eff_grads = Array2::<f32>::zeros((t, self.num_heads));
+        for h in 0..self.num_heads {
+            let c0 = h * self.head_dim;
+            for i in 0..t {
+                let mut acc = 0.0f32;
+                for j in 0..self.head_dim {
+                    acc += output_grads[[i, c0 + j]] * inner_out[[i, c0 + j]];
+                }
+                eff_grads[[i, h]] = acc;
+            }
+        }
+
+        let mut scaled_grads = Array2::<f32>::zeros((t, d));
+        for h in 0..self.num_heads {
+            let c0 = h * self.head_dim;
+            let c1 = c0 + self.head_dim;
+            let eff_col = eff.column(h);
+            let eff_col = eff_col.insert_axis(Axis(1));
+            let eff_col = eff_col
+                .broadcast((t, self.head_dim))
+                .expect("broadcast must succeed for (t, head_dim)");
+            let og_block = output_grads.slice(s![.., c0..c1]);
+            let mut sg_block = scaled_grads.slice_mut(s![.., c0..c1]);
+            Zip::from(&mut sg_block)
+                .and(og_block)
+                .and(eff_col)
+                .for_each(|sg, &og, &w| {
+                    *sg = og * w;
+                });
+        }
+
+        let (mut grad_input, mut grads) = if can_use_cache {
+            self.inner.compute_gradients(input, &scaled_grads)
+        } else {
+            let mut inner = self.inner.clone();
+            inner.forward(input);
+            inner.compute_gradients(input, &scaled_grads)
+        };
+
+        let (dx_moh, moh_grads) = {
+            let mut moh_local = self.moh.clone();
+            let gd = self.gating_embed_dim.min(d);
+            let gate_input = input.slice(s![.., 0..gd]).to_owned();
+            moh_local.compute_gradients_from_eff(&gate_input, &eff_grads)
+        };
+        {
+            let gd = self.gating_embed_dim.min(d);
+            let mut gi = grad_input.slice_mut(s![.., 0..gd]);
+            gi += &dx_moh;
+        }
+        grads.extend(moh_grads);
+
+        (grad_input, grads)
+    }
+
+    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<()> {
+        let inner_n = if self.inner.cached_kind == MambaCachedKind::Mamba2 {
+            14usize
+        } else {
+            16usize + self.inner.richards_gate.parameters()
+        };
+        let moh_n = self.moh.grad_arrays_len();
+        if gradients.len() < inner_n + moh_n {
+            return Ok(());
+        }
+
+        self.inner
+            .apply_gradients(&gradients[..inner_n], learning_rate)?;
+        self.moh
+            .apply_gradients(&gradients[inner_n..], learning_rate)?;
+        Ok(())
+    }
+
+    fn zero_gradients(&mut self) {
+        self.inner.zero_gradients();
+        self.moh.cached_soft_top_p_mask = None;
+        self.clear_caches();
     }
 }
 
@@ -2199,5 +2637,78 @@ mod tests {
                 "z missing skip or state contribution (mean abs err={mean_abs})"
             );
         }
+    }
+
+    #[test]
+    fn moh_mamba_forward_shape() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut layer = MoHMamba::new(16, 4, &cfg);
+        let x = Array2::<f32>::from_elem((7, 16), 0.1);
+        let y = layer.forward(&x);
+        assert_eq!(y.dim(), (7, 16));
+        assert!(layer.last_avg_active_heads.is_some());
+        assert!(
+            layer
+                .last_head_activity_vec
+                .as_ref()
+                .is_some_and(|v| v.len() == 4)
+        );
+    }
+
+    #[test]
+    fn moh_mamba_grad_shapes() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut layer = MoHMamba::new(12, 3, &cfg);
+        let x = Array2::<f32>::from_elem((5, 12), 0.2);
+        let y = layer.forward(&x);
+        let grads = Array2::<f32>::from_elem(y.dim(), 0.1);
+
+        let (dx, pgrads) = layer.compute_gradients(&x, &grads);
+        assert_eq!(dx.dim(), x.dim());
+        assert!(pgrads.len() >= 16 + layer.inner.richards_gate.parameters() + 4);
+    }
+
+    #[test]
+    fn moh_mamba_compute_gradients_without_forward_is_finite() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let layer = MoHMamba::new(12, 3, &cfg);
+        let x = Array2::from_shape_fn((7, 12), |(i, j)| ((i * 12 + j) as f32 * 0.013).sin());
+        let grads = Array2::<f32>::from_elem((7, 12), 0.1);
+
+        let expected_len =
+            16 + layer.inner.richards_gate.parameters() + layer.moh.grad_arrays_len();
+        let (dx, pgrads) = layer.compute_gradients(&x, &grads);
+
+        assert_eq!(dx.dim(), x.dim());
+        assert!(dx.iter().all(|v| v.is_finite()));
+        assert_eq!(pgrads.len(), expected_len);
+        assert!(pgrads.iter().all(|g| g.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn moh_mamba_parameter_delta_within_1000() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let baseline = Mamba::new(64).parameters();
+        let moh = MoHMamba::new(64, 16, &cfg).parameters();
+        assert!(moh >= baseline);
+        assert!(moh - baseline <= 1000);
+    }
+
+    #[test]
+    fn moh_mamba_backward_updates_output() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut layer = MoHMamba::new(12, 3, &cfg);
+        let x = Array2::from_shape_fn((9, 12), |(i, j)| ((i * 12 + j) as f32 * 0.011).sin());
+        let y0 = layer.forward(&x);
+
+        let grads = Array2::<f32>::from_elem(y0.dim(), 0.1);
+        let dx = layer.backward(&grads, 1e-2);
+        assert_eq!(dx.dim(), x.dim());
+        assert!(dx.iter().all(|v| v.is_finite()));
+
+        let y1 = layer.forward(&x);
+        let delta: f32 = (&y1 - &y0).mapv(|v| v.abs()).sum();
+        assert!(delta.is_finite());
+        assert!(delta > 0.0);
     }
 }

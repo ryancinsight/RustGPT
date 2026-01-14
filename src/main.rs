@@ -9,7 +9,7 @@ use llm::{
     llm::LLM,
     model_builder::{build_network, print_architecture_summary},
     rng::set_seed,
-    training::run_training_pipeline,
+    training::{configure_speculative_sampling_from_args, run_training_pipeline},
 };
 
 fn main() -> crate::Result<()> {
@@ -66,6 +66,8 @@ fn main() -> crate::Result<()> {
 
     // If the user provided an explicit DDIM steps override, apply it for diffusion sampling.
     llm.set_diffusion_steps_override(args.ddim_steps);
+
+    configure_speculative_sampling_from_args(&args, &config, &mut llm);
 
     println!("\n=== MODEL INFORMATION ===");
     println!("Network architecture: {}", llm.network_description());

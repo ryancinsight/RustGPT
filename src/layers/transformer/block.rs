@@ -24,7 +24,7 @@ use crate::{
         adaptive_residuals::AdaptiveResiduals,
         common::{
             CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
-            apply_adaptive_gradients,
+            TitanMemoryWorkspace, apply_adaptive_gradients,
         },
     },
     mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
@@ -114,6 +114,9 @@ pub struct TransformerBlock {
     /// Adaptive residuals component for similarity-based residual connections
     #[serde(skip_serializing, skip_deserializing)]
     adaptive_residuals: Option<AdaptiveResiduals>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    titan_memory_workspace: TitanMemoryWorkspace,
 }
 
 // Custom deserialization to ensure runtime-only buffers/optimizers are initialized with
@@ -219,6 +222,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             } else {
                 None
             },
+            titan_memory_workspace: TitanMemoryWorkspace::default(),
         })
     }
 }
@@ -385,6 +389,7 @@ impl TransformerBlock {
             } else {
                 None
             },
+            titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
 
@@ -672,7 +677,14 @@ impl Layer for TransformerBlock {
         }
 
         // Temporal mixing forward
-        let mix_out = self.temporal_mixing.forward(&norm1_out);
+        let mut mix_out = self.temporal_mixing.forward(&norm1_out);
+        if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+            self.config.titan_memory.apply_into_out_with_workspace(
+                &mut mix_out,
+                &norm1_out,
+                &mut self.titan_memory_workspace,
+            );
+        }
 
         // Head activity ratio from MoH (avg active heads / num_heads).
         let head_activity_ratio = match &self.temporal_mixing {
@@ -845,9 +857,17 @@ impl Layer for TransformerBlock {
             let input_grads_ref = &residual1_total_grads;
 
             // Get attention gradients
-            let (mix_input_grad, mix_param_grads) = self
+            let (mut mix_input_grad, mix_param_grads) = self
                 .temporal_mixing
                 .compute_gradients(norm1_out, &residual1_total_grads);
+            if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+                self.config
+                    .titan_memory
+                    .add_input_grads_from_output_grads_into(
+                        &residual1_total_grads,
+                        &mut mix_input_grad,
+                    );
+            }
 
             let (norm1_input_grad, pre_attn_param_grads) = self
                 .pre_attention_norm
@@ -1821,6 +1841,9 @@ pub struct ModularTransformerBlock {
     /// Cached gradient partition sizes so apply_gradients can route slices correctly
     #[serde(skip_serializing, skip_deserializing)]
     param_partitions: RwLock<Option<ParamPartitions>>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    titan_memory_workspace: TitanMemoryWorkspace,
 }
 
 impl ModularTransformerBlock {
@@ -1863,6 +1886,7 @@ impl ModularTransformerBlock {
             config,
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
+            titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
 
@@ -1894,7 +1918,17 @@ impl ModularTransformerBlock {
         self.temporal_mixing.set_window_size(Some(dynamic_w));
 
         // Temporal mixing forward using modular component
-        let mix_out = self.temporal_mixing.forward(&norm1_out);
+        let mut mix_out = self.temporal_mixing.forward(&norm1_out);
+        if !matches!(
+            self.temporal_mixing.temporal_mixing,
+            TemporalMixingLayer::Attention(_)
+        ) {
+            self.config.titan_memory.apply_into_out_with_workspace(
+                &mut mix_out,
+                &norm1_out,
+                &mut self.titan_memory_workspace,
+            );
+        }
 
         // Update similarity matrix using residual connection component
         self.residual_connection

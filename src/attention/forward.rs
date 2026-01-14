@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array2, s};
 
 use crate::{
     attention::{
@@ -47,8 +47,8 @@ pub struct ForwardResult {
     pub tau_metrics: Option<(f32, f32)>,
     pub pred_norm: Option<f32>,
     pub avg_active_heads: Option<f32>,
-    pub head_activity_vec: Option<Array1<f32>>,
-    pub token_head_activity_vec: Option<Array1<f32>>,
+    pub head_activity_vec: Option<Vec<f32>>,
+    pub token_head_activity_vec: Option<Vec<f32>>,
 }
 
 /// Compute polynomial attention forward pass
@@ -434,29 +434,27 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
 
     let (head_activity_vec, token_head_activity_vec) =
         if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-            let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
-
-            let mut head_v = sanitized
-                .mean_axis(Axis(0))
-                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
-            head_v.mapv_inplace(|x| {
-                if x.is_finite() {
-                    x.clamp(0.0, 1.0)
-                } else {
-                    0.0
+            let n = gate_values.nrows();
+            let h = gate_values.ncols();
+            let mut head_v = vec![0.0f32; h];
+            let inv_n = 1.0 / (n as f32);
+            for head in 0..h {
+                let mut sum = 0.0f32;
+                for tok in 0..n {
+                    sum += gate_values[[tok, head]];
                 }
-            });
+                head_v[head] = (sum * inv_n).clamp(0.0, 1.0);
+            }
 
-            let mut tok_v = sanitized
-                .mean_axis(Axis(1))
-                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.nrows()));
-            tok_v.mapv_inplace(|x| {
-                if x.is_finite() {
-                    x.clamp(0.0, 1.0)
-                } else {
-                    0.0
+            let mut tok_v = vec![0.0f32; n];
+            let inv_h = 1.0 / (h as f32);
+            for tok in 0..n {
+                let mut sum = 0.0f32;
+                for head in 0..h {
+                    sum += gate_values[[tok, head]];
                 }
-            });
+                tok_v[tok] = (sum * inv_h).clamp(0.0, 1.0);
+            }
 
             (Some(head_v), Some(tok_v))
         } else {
@@ -672,29 +670,27 @@ pub fn compute_poly_attention_forward_baseline(
     };
     let (head_activity_vec, token_head_activity_vec) =
         if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-            let sanitized = gate_values.mapv(|x| if x.is_finite() { x } else { 0.0 });
-
-            let mut head_v = sanitized
-                .mean_axis(Axis(0))
-                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.ncols()));
-            head_v.mapv_inplace(|x| {
-                if x.is_finite() {
-                    x.clamp(0.0, 1.0)
-                } else {
-                    0.0
+            let n = gate_values.nrows();
+            let h = gate_values.ncols();
+            let mut head_v = vec![0.0f32; h];
+            let inv_n = 1.0 / (n as f32);
+            for head in 0..h {
+                let mut sum = 0.0f32;
+                for tok in 0..n {
+                    sum += gate_values[[tok, head]];
                 }
-            });
+                head_v[head] = (sum * inv_n).clamp(0.0, 1.0);
+            }
 
-            let mut tok_v = sanitized
-                .mean_axis(Axis(1))
-                .unwrap_or_else(|| Array1::<f32>::zeros(gate_values.nrows()));
-            tok_v.mapv_inplace(|x| {
-                if x.is_finite() {
-                    x.clamp(0.0, 1.0)
-                } else {
-                    0.0
+            let mut tok_v = vec![0.0f32; n];
+            let inv_h = 1.0 / (h as f32);
+            for tok in 0..n {
+                let mut sum = 0.0f32;
+                for head in 0..h {
+                    sum += gate_values[[tok, head]];
                 }
-            });
+                tok_v[tok] = (sum * inv_h).clamp(0.0, 1.0);
+            }
 
             (Some(head_v), Some(tok_v))
         } else {
