@@ -37,6 +37,6 @@ pub(crate) mod mamba2;
 pub(crate) mod rg_lru;
 
 pub use components::*;
-pub use mamba::{Mamba, MambaConfig};
-pub use mamba2::Mamba2;
+pub use mamba::{Mamba, MambaConfig, MoHMamba};
+pub use mamba2::{Mamba2, MoHMamba2};
 pub use rg_lru::{MoHRgLru, RgLru};

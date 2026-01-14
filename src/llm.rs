@@ -1064,6 +1064,52 @@ impl LLM {
                                 total_heads_sum += per_head.len();
                             }
                         }
+                        crate::layers::components::common::TemporalMixingLayer::MambaMoH(m) => {
+                            if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
+                                tau_available = true;
+                                if min_tau < tau_min_epoch {
+                                    tau_min_epoch = min_tau;
+                                }
+                                if max_tau > tau_max_epoch {
+                                    tau_max_epoch = max_tau;
+                                }
+                            }
+                            if let Some(rms_g) = m.take_pred_norm() {
+                                pred_norm_sum += rms_g;
+                                pred_norm_count += 1;
+                            }
+                            let per_head = m.get_head_metrics_and_reset();
+                            if !per_head.is_empty() {
+                                let layer_avg_active_heads =
+                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                avg_heads_per_token_sum += layer_avg_active_heads;
+                                heads_layers_count += 1;
+                                total_heads_sum += per_head.len();
+                            }
+                        }
+                        crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(m) => {
+                            if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
+                                tau_available = true;
+                                if min_tau < tau_min_epoch {
+                                    tau_min_epoch = min_tau;
+                                }
+                                if max_tau > tau_max_epoch {
+                                    tau_max_epoch = max_tau;
+                                }
+                            }
+                            if let Some(rms_g) = m.take_pred_norm() {
+                                pred_norm_sum += rms_g;
+                                pred_norm_count += 1;
+                            }
+                            let per_head = m.get_head_metrics_and_reset();
+                            if !per_head.is_empty() {
+                                let layer_avg_active_heads =
+                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                avg_heads_per_token_sum += layer_avg_active_heads;
+                                heads_layers_count += 1;
+                                total_heads_sum += per_head.len();
+                            }
+                        }
                         _ => {}
                     }
 

@@ -1,4 +1,6 @@
-use ndarray::{Array1, Array2, Axis, s};
+use std::borrow::Cow;
+
+use ndarray::{Array1, Array2, Axis, Zip, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -10,6 +12,42 @@ use crate::{
     richards::RichardsCurve,
     rng::get_rng,
 };
+
+type GatesAndState<'a> = (
+    Cow<'a, Array2<f32>>,
+    Cow<'a, Array2<f32>>,
+    Cow<'a, Array2<f32>>,
+    Cow<'a, Array2<f32>>,
+);
+
+#[inline]
+fn array2_bitwise_eq_f32(a: &Array2<f32>, b: &Array2<f32>) -> bool {
+    if a.dim() != b.dim() {
+        return false;
+    }
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    match (a.as_slice_memory_order(), b.as_slice_memory_order()) {
+        (Some(sa), Some(sb)) => sa
+            .iter()
+            .zip(sb.iter())
+            .all(|(&x, &y)| x.to_bits() == y.to_bits()),
+        _ => a
+            .iter()
+            .zip(b.iter())
+            .all(|(&x, &y)| x.to_bits() == y.to_bits()),
+    }
+}
+
+#[derive(Copy, Clone)]
+struct GatesParams<'a> {
+    w_a: &'a Array2<f32>,
+    b_a: &'a Array2<f32>,
+    w_x: &'a Array2<f32>,
+    b_x: &'a Array2<f32>,
+    lambda: &'a Array2<f32>,
+}
 
 #[inline]
 fn softplus(x: f32) -> f32 {
@@ -56,10 +94,6 @@ pub struct RgLru {
     cached_a: Option<Array2<f32>>,
     #[serde(skip_serializing)]
     cached_hprev: Option<Array2<f32>>, // h_{t-1} per t (hprev[0]=0)
-
-    // Cheap cache key to avoid reusing stale caches on different inputs with same shape.
-    #[serde(skip_serializing)]
-    cached_input_sum: Option<f32>,
 }
 
 /// Multi-head RG-LRU with shared Mixture-of-Heads (MoH) gating.
@@ -90,6 +124,9 @@ pub struct MoHRgLru {
     pub last_head_activity_vec: Option<Vec<f32>>,
     #[serde(skip_serializing, skip_deserializing)]
     pub last_token_head_activity_vec: Option<Vec<f32>>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    head_input_scratch: Vec<Array2<f32>>,
 }
 
 impl MoHRgLru {
@@ -100,8 +137,25 @@ impl MoHRgLru {
         }
         let head_dim = if nh > 0 { embed_dim / nh } else { embed_dim };
 
-        let mut moh = MoHGating::new(embed_dim, nh);
+        let budget = 1000usize;
+        let gate_params = crate::richards::RichardsGate::new().parameters();
+        let overhead = 2usize.saturating_mul(nh).saturating_add(gate_params);
+        let max_wg = budget.saturating_sub(overhead);
+        let gating_embed_dim = if nh > 0 {
+            (max_wg / nh).max(1).min(embed_dim.max(1))
+        } else {
+            embed_dim.max(1)
+        };
+
+        let mut moh = MoHGating::new(gating_embed_dim, nh);
         moh.set_head_selection_config(head_selection);
+        moh.head_selection_config.gating.use_learned_predictor = false;
+        moh.threshold_predictor = None;
+        moh.opt_w_tau = None;
+        moh.opt_b_tau = None;
+        moh.opt_w2_tau = None;
+        moh.opt_b2_tau = None;
+        moh.opt_cond_w_tau = None;
 
         let mut heads = Vec::with_capacity(nh);
         for _ in 0..nh {
@@ -120,6 +174,27 @@ impl MoHRgLru {
             last_avg_active_heads: None,
             last_head_activity_vec: None,
             last_token_head_activity_vec: None,
+            head_input_scratch: Vec::new(),
+        }
+    }
+
+    fn ensure_head_input_scratch(&mut self, t: usize) {
+        if self.num_heads == 0 || self.head_dim == 0 {
+            self.head_input_scratch.clear();
+            return;
+        }
+
+        if self.head_input_scratch.len() != self.num_heads {
+            self.head_input_scratch = (0..self.num_heads)
+                .map(|_| Array2::<f32>::zeros((t, self.head_dim)))
+                .collect();
+            return;
+        }
+
+        for buf in &mut self.head_input_scratch {
+            if buf.dim() != (t, self.head_dim) {
+                *buf = Array2::<f32>::zeros((t, self.head_dim));
+            }
         }
     }
 
@@ -181,7 +256,6 @@ impl<'de> Deserialize<'de> for RgLru {
             cached_i: None,
             cached_a: None,
             cached_hprev: None,
-            cached_input_sum: None,
         })
     }
 }
@@ -219,52 +293,87 @@ impl RgLru {
             cached_i: None,
             cached_a: None,
             cached_hprev: None,
-            cached_input_sum: None,
         }
-    }
-
-    #[inline]
-    fn input_cache_key(input: &Array2<f32>) -> f32 {
-        // Deterministic (iteration order fixed) and cheap vs. matmul; enough to prevent
-        // obvious wrong-cache reuse when shapes match but content differs.
-        input.iter().copied().sum::<f32>()
     }
 
     #[inline]
     fn compute_gates(&self, input: &Array2<f32>) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
-        // Returns (r, i, a)
         let t = input.nrows();
         let d = input.ncols();
 
-        let sigmoid = RichardsCurve::sigmoid(false);
-
-        // z_r = X W_a + b_a; z_i = X W_x + b_x
-        let mut z_r = input.dot(&self.w_a);
-        let mut z_i = input.dot(&self.w_x);
-        if self.b_a.ncols() == d {
-            z_r += &self.b_a.broadcast((t, d)).unwrap();
-        }
-        if self.b_x.ncols() == d {
-            z_i += &self.b_x.broadcast((t, d)).unwrap();
-        }
-
-        let r = z_r.mapv(|x| sigmoid.forward_scalar_f32(x));
-        let i = z_i.mapv(|x| sigmoid.forward_scalar_f32(x));
-
-        // log_base_a = log(sigmoid(lambda)) = -softplus(-lambda)
-        // a_t = exp(c * r_t * log_base_a)
-        let c: f32 = 8.0;
-        let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
-
+        let mut r = Array2::<f32>::zeros((t, d));
+        let mut i = Array2::<f32>::zeros((t, d));
         let mut a = Array2::<f32>::zeros((t, d));
+        Self::compute_gates_into_parts(
+            input,
+            GatesParams {
+                w_a: &self.w_a,
+                b_a: &self.b_a,
+                w_x: &self.w_x,
+                b_x: &self.b_x,
+                lambda: &self.lambda,
+            },
+            &mut r,
+            &mut i,
+            &mut a,
+        );
+        (r, i, a)
+    }
+
+    #[inline]
+    fn compute_gates_into_parts(
+        input: &Array2<f32>,
+        p: GatesParams<'_>,
+        r: &mut Array2<f32>,
+        i: &mut Array2<f32>,
+        a: &mut Array2<f32>,
+    ) {
+        let t = input.nrows();
+        let d = input.ncols();
+
+        if r.dim() != (t, d) {
+            *r = Array2::<f32>::zeros((t, d));
+        }
+        if i.dim() != (t, d) {
+            *i = Array2::<f32>::zeros((t, d));
+        }
+        if a.dim() != (t, d) {
+            *a = Array2::<f32>::zeros((t, d));
+        }
+
+        ndarray::linalg::general_mat_mul(1.0, input, p.w_a, 0.0, r);
+        if p.b_a.ncols() == d {
+            for ti in 0..t {
+                for j in 0..d {
+                    r[[ti, j]] += p.b_a[[0, j]];
+                }
+            }
+        }
+        ndarray::linalg::general_mat_mul(1.0, input, p.w_x, 0.0, i);
+        if p.b_x.ncols() == d {
+            for ti in 0..t {
+                for j in 0..d {
+                    i[[ti, j]] += p.b_x[[0, j]];
+                }
+            }
+        }
+
+        let sigmoid = RichardsCurve::sigmoid(false);
+        for ti in 0..t {
+            for j in 0..d {
+                r[[ti, j]] = sigmoid.forward_scalar_f32(r[[ti, j]]);
+                i[[ti, j]] = sigmoid.forward_scalar_f32(i[[ti, j]]);
+            }
+        }
+
+        let c: f32 = 8.0;
+        let log_base_a: Array1<f32> = p.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
         for ti in 0..t {
             for j in 0..d {
                 let lt = (c * r[[ti, j]] * log_base_a[j]).clamp(-80.0, 0.0);
                 a[[ti, j]] = crate::pade::exp(lt);
             }
         }
-
-        (r, i, a)
     }
 
     #[inline]
@@ -274,11 +383,31 @@ impl RgLru {
         i: &Array2<f32>,
         a: &Array2<f32>,
     ) -> (Array2<f32>, Array2<f32>) {
-        // Returns (hprev, h)
         let t = input.nrows();
         let d = input.ncols();
         let mut hprev = Array2::<f32>::zeros((t, d));
         let mut h = Array2::<f32>::zeros((t, d));
+        Self::compute_state_into(input, i, a, &mut hprev, &mut h);
+        (hprev, h)
+    }
+
+    #[inline]
+    fn compute_state_into(
+        input: &Array2<f32>,
+        i: &Array2<f32>,
+        a: &Array2<f32>,
+        hprev: &mut Array2<f32>,
+        h: &mut Array2<f32>,
+    ) {
+        let t = input.nrows();
+        let d = input.ncols();
+
+        if hprev.dim() != (t, d) {
+            *hprev = Array2::<f32>::zeros((t, d));
+        }
+        if h.dim() != (t, d) {
+            *h = Array2::<f32>::zeros((t, d));
+        }
 
         for ti in 0..t {
             for j in 0..d {
@@ -287,14 +416,11 @@ impl RgLru {
 
                 let at = a[[ti, j]];
                 let u = i[[ti, j]] * input[[ti, j]];
-                // Convex-combination form (stable): h_t = a_t * h_{t-1} + (1-a_t) * u_t
                 let one_minus_a = 1.0 - at;
                 let val = at * prev + one_minus_a * u;
-                h[[ti, j]] = if val.is_finite() { val } else { 0.0 };
+                h[[ti, j]] = val;
             }
         }
-
-        (hprev, h)
     }
 
     #[inline]
@@ -303,58 +429,85 @@ impl RgLru {
         let d = input.ncols();
         if t == 0 || d == 0 {
             self.cached_input = Some(input.clone());
-            self.cached_r = Some(Array2::zeros((t, d)));
-            self.cached_i = Some(Array2::zeros((t, d)));
-            self.cached_a = Some(Array2::zeros((t, d)));
-            self.cached_hprev = Some(Array2::zeros((t, d)));
-            self.cached_input_sum = Some(Self::input_cache_key(input));
-            return Array2::zeros((t, d));
+            self.cached_r = Some(Array2::<f32>::zeros((t, d)));
+            self.cached_i = Some(Array2::<f32>::zeros((t, d)));
+            self.cached_a = Some(Array2::<f32>::zeros((t, d)));
+            self.cached_hprev = Some(Array2::<f32>::zeros((t, d)));
+            return Array2::<f32>::zeros((t, d));
         }
 
-        let (r, i, a) = self.compute_gates(input);
-        let (hprev, h) = self.compute_state(input, &i, &a);
+        if self.cached_r.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_r = Some(Array2::<f32>::zeros((t, d)));
+        }
+        if self.cached_i.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_i = Some(Array2::<f32>::zeros((t, d)));
+        }
+        if self.cached_a.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_a = Some(Array2::<f32>::zeros((t, d)));
+        }
+        if self.cached_hprev.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_hprev = Some(Array2::<f32>::zeros((t, d)));
+        }
+
+        let r = self.cached_r.as_mut().expect("cached_r must exist");
+        let i = self.cached_i.as_mut().expect("cached_i must exist");
+        let a = self.cached_a.as_mut().expect("cached_a must exist");
+        let hprev = self.cached_hprev.as_mut().expect("cached_hprev must exist");
+
+        let p = GatesParams {
+            w_a: &self.w_a,
+            b_a: &self.b_a,
+            w_x: &self.w_x,
+            b_x: &self.b_x,
+            lambda: &self.lambda,
+        };
+        Self::compute_gates_into_parts(input, p, r, i, a);
+        let mut h = Array2::<f32>::zeros((t, d));
+        Self::compute_state_into(input, i, a, hprev, &mut h);
 
         self.cached_input = Some(input.clone());
-        self.cached_r = Some(r);
-        self.cached_i = Some(i);
-        self.cached_a = Some(a);
-        self.cached_hprev = Some(hprev);
-        self.cached_input_sum = Some(Self::input_cache_key(input));
-
         h
     }
 
     #[inline]
-    fn compute_gates_and_state_from_cache_or_recompute(
-        &self,
+    fn compute_gates_and_state_from_cache_or_recompute<'a>(
+        &'a self,
         input: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>) {
-        // Returns (r, i, a, hprev)
+    ) -> GatesAndState<'a> {
         let can_use = self
             .cached_input
             .as_ref()
             .is_some_and(|x| x.dim() == input.dim());
-        if can_use {
-            let key = Self::input_cache_key(input);
-            let key_ok = self
-                .cached_input_sum
-                .is_some_and(|k| (k - key).abs() <= (1e-5 * k.abs().max(1.0) + 1e-6));
-            if key_ok
-                && let (Some(r), Some(i), Some(a), Some(hp)) = (
-                    self.cached_r.as_ref(),
-                    self.cached_i.as_ref(),
-                    self.cached_a.as_ref(),
-                    self.cached_hprev.as_ref(),
-                )
-            {
-                return (r.clone(), i.clone(), a.clone(), hp.clone());
-            }
+        let same_input = can_use
+            && self
+                .cached_input
+                .as_ref()
+                .is_some_and(|x| std::ptr::eq(x, input) || array2_bitwise_eq_f32(x, input));
+        if same_input
+            && let (Some(r), Some(i), Some(a), Some(hp)) = (
+                self.cached_r.as_ref(),
+                self.cached_i.as_ref(),
+                self.cached_a.as_ref(),
+                self.cached_hprev.as_ref(),
+            )
+        {
+            return (
+                Cow::Borrowed(r),
+                Cow::Borrowed(i),
+                Cow::Borrowed(a),
+                Cow::Borrowed(hp),
+            );
         }
 
         // Recompute forward pieces (without mutating self).
         let (r, i, a) = self.compute_gates(input);
         let (hprev, _h) = self.compute_state(input, &i, &a);
-        (r, i, a, hprev)
+        (
+            Cow::Owned(r),
+            Cow::Owned(i),
+            Cow::Owned(a),
+            Cow::Owned(hprev),
+        )
     }
 
     fn opt_init_if_needed(&mut self) {
@@ -416,6 +569,10 @@ impl Layer for RgLru {
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let (r, i, a, hprev) = self.compute_gates_and_state_from_cache_or_recompute(input);
+        let r = r.as_ref();
+        let i = i.as_ref();
+        let a = a.as_ref();
+        let hprev = hprev.as_ref();
 
         let t = input.nrows();
         let d = input.ncols();
@@ -450,12 +607,10 @@ impl Layer for RgLru {
 
         for ti in (0..t).rev() {
             for j in 0..d {
-                let mut g = output_grads[[ti, j]];
-                g = if g.is_finite() { g } else { 0.0 };
+                let g = output_grads[[ti, j]];
 
                 // Add gradient arriving through time from h_{t} -> h_{t-1}.
-                let mut dh = g + dh_next[j];
-                dh = if dh.is_finite() { dh } else { 0.0 };
+                let dh = g + dh_next[j];
 
                 let at = a[[ti, j]];
                 let it = i[[ti, j]];
@@ -469,7 +624,7 @@ impl Layer for RgLru {
                 // dh/du
                 let du = dh * one_minus_a;
                 // direct dL/dx via u = i ⊙ x
-                d_x_from_u[[ti, j]] = if (du * it).is_finite() { du * it } else { 0.0 };
+                d_x_from_u[[ti, j]] = du * it;
                 // dL/di
                 let di = du * xt;
 
@@ -477,7 +632,7 @@ impl Layer for RgLru {
                 let da = dh * (prev - u);
 
                 // Propagate to previous hidden state: h_t = a_t ⊙ h_{t-1} + ...
-                dh_next[j] = if (dh * at).is_finite() { dh * at } else { 0.0 };
+                dh_next[j] = dh * at;
 
                 // a_t = exp(clamp(k_t, -80, 0)), k_t = c * r_t * log_base_a
                 let k = c * rt * log_base_a[j];
@@ -490,11 +645,11 @@ impl Layer for RgLru {
 
                 // r = sigmoid(z_r)
                 let zr_grad = dr * rt * (1.0 - rt);
-                dlogits_r[[ti, j]] = if zr_grad.is_finite() { zr_grad } else { 0.0 };
+                dlogits_r[[ti, j]] = zr_grad;
 
                 // i = sigmoid(z_i)
                 let zi_grad = di * it * (1.0 - it);
-                dlogits_i[[ti, j]] = if zi_grad.is_finite() { zi_grad } else { 0.0 };
+                dlogits_i[[ti, j]] = zi_grad;
             }
         }
 
@@ -502,7 +657,7 @@ impl Layer for RgLru {
         let mut d_lambda = Array2::<f32>::zeros((1, d));
         for j in 0..d {
             let dl = dlog_base_a[j] * dlogsig_dlambda[j];
-            d_lambda[[0, j]] = if dl.is_finite() { dl } else { 0.0 };
+            d_lambda[[0, j]] = dl;
         }
 
         // Weight/bias grads: X^T dot dlogits
@@ -550,7 +705,6 @@ impl Layer for RgLru {
         self.cached_i = None;
         self.cached_a = None;
         self.cached_hprev = None;
-        self.cached_input_sum = None;
     }
 }
 
@@ -571,26 +725,44 @@ impl Layer for MoHRgLru {
         // Cache input for backward.
         self.cached_input = Some(input.clone());
 
-        // Compute MoH effective weights on the full embedding.
-        let eff = self.moh.forward_weights(input, None, None);
+        let gd = self.moh.w_g.nrows().min(d);
+        let gate_input = input.slice(s![.., 0..gd]).to_owned();
+        let eff = self.moh.forward_weights(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 
         let mut out = Array2::<f32>::zeros((t, d));
-        let mut head_outs: Vec<Array2<f32>> = Vec::with_capacity(self.num_heads);
-
-        // Compute per-head outputs and apply per-token scaling.
-        for h in 0..self.num_heads {
+        self.ensure_head_input_scratch(t);
+        for (h, buf) in self.head_input_scratch.iter_mut().enumerate() {
             let c0 = h * self.head_dim;
             let c1 = c0 + self.head_dim;
-            let x_h = input.slice(s![.., c0..c1]).to_owned();
-            let y_h = self.heads[h].forward(&x_h);
-            for i in 0..t {
-                let w = eff[[i, h]];
-                for j in 0..self.head_dim {
-                    out[[i, c0 + j]] = y_h[[i, j]] * w;
-                }
-            }
-            head_outs.push(y_h);
+            let x_view = input.slice(s![.., c0..c1]);
+            buf.assign(&x_view);
+        }
+
+        use rayon::prelude::*;
+        let head_outs: Vec<Array2<f32>> = self
+            .heads
+            .par_iter_mut()
+            .zip(self.head_input_scratch.par_iter())
+            .map(|(head, x_h)| head.forward(x_h))
+            .collect();
+
+        // Compute per-head outputs and apply per-token scaling.
+        for (h, y_h) in head_outs.iter().enumerate().take(self.num_heads) {
+            let c0 = h * self.head_dim;
+            let c1 = c0 + self.head_dim;
+            let eff_col = eff.column(h);
+            let eff_col = eff_col.insert_axis(Axis(1));
+            let eff_col = eff_col
+                .broadcast((t, self.head_dim))
+                .expect("broadcast must succeed for (t, head_dim)");
+            let mut out_block = out.slice_mut(s![.., c0..c1]);
+            Zip::from(&mut out_block)
+                .and(y_h)
+                .and(eff_col)
+                .for_each(|o, &y, &w| {
+                    *o = y * w;
+                });
         }
 
         // Cache head outputs for dEff computation in backward.
@@ -602,16 +774,12 @@ impl Layer for MoHRgLru {
             .head_selection_config
             .gating
             .get_avg_active_components();
-        self.last_avg_active_heads = if avg.is_finite() {
-            Some(avg)
-        } else {
-            Some(0.0)
-        };
+        self.last_avg_active_heads = Some(avg);
 
         let mut hv = Vec::with_capacity(self.num_heads);
         for h in 0..self.num_heads {
             let mean = eff.column(h).iter().map(|&x| x.max(0.0)).sum::<f32>() / (t.max(1) as f32);
-            hv.push(if mean.is_finite() { mean } else { 0.0 });
+            hv.push(mean);
         }
         self.last_head_activity_vec = Some(hv);
         let mut tv = Vec::with_capacity(t);
@@ -619,16 +787,11 @@ impl Layer for MoHRgLru {
             let mut sum = 0.0f32;
             for h in 0..self.num_heads {
                 let w = eff[[i, h]];
-                let w = if w.is_finite() { w } else { 0.0 };
                 sum += w.max(0.0);
             }
             let denom = self.num_heads.max(1) as f32;
             let v = if denom > 0.0 { sum / denom } else { 0.0 };
-            tv.push(if v.is_finite() {
-                v.clamp(0.0, 1.0)
-            } else {
-                0.0
-            });
+            tv.push(v.clamp(0.0, 1.0));
         }
         self.last_token_head_activity_vec = Some(tv);
 
@@ -698,27 +861,52 @@ impl Layer for MoHRgLru {
             return (Array2::<f32>::zeros(input.raw_dim()), vec![]);
         }
 
+        let can_use_cache = self
+            .cached_input
+            .as_ref()
+            .is_some_and(|x| x.dim() == input.dim())
+            && self
+                .cached_input
+                .as_ref()
+                .is_some_and(|x| array2_bitwise_eq_f32(x, input));
+
         // Prefer cached forward intermediates when available; fall back to recompute.
         let eff_local: Array2<f32>;
-        let eff: &Array2<f32> = if let Some(e) = self
-            .cached_eff
-            .as_ref()
-            .filter(|e| e.dim() == (t, self.num_heads))
+        let eff: &Array2<f32> = if can_use_cache
+            && let Some(e) = self
+                .cached_eff
+                .as_ref()
+                .filter(|e| e.dim() == (t, self.num_heads))
         {
             e
         } else {
             // Recompute eff weights without mutating gating caches.
             let mut moh_tmp = self.moh.clone();
-            eff_local = moh_tmp.forward_weights(input, None, None);
+            let gd = moh_tmp.w_g.nrows().min(d);
+            let gate_input = input.slice(s![.., 0..gd]).to_owned();
+            eff_local = moh_tmp.forward_weights(&gate_input, None, None);
             &eff_local
         };
 
         let head_outputs_local: Vec<Array2<f32>>;
-        let head_outputs: &Vec<Array2<f32>> = if let Some(v) = self.cached_head_out.as_ref() {
-            let ok_len = v.len() == self.num_heads;
-            let ok_dims = ok_len && v.iter().all(|y| y.dim() == (t, self.head_dim));
-            if ok_dims {
-                v
+        let head_outputs: &Vec<Array2<f32>> =
+            if can_use_cache && let Some(v) = self.cached_head_out.as_ref() {
+                let ok_len = v.len() == self.num_heads;
+                let ok_dims = ok_len && v.iter().all(|y| y.dim() == (t, self.head_dim));
+                if ok_dims {
+                    v
+                } else {
+                    head_outputs_local = (0..self.num_heads)
+                        .map(|h| {
+                            let c0 = h * self.head_dim;
+                            let c1 = c0 + self.head_dim;
+                            let x_h = input.slice(s![.., c0..c1]).to_owned();
+                            let mut head = self.heads[h].clone();
+                            head.forward(&x_h)
+                        })
+                        .collect();
+                    &head_outputs_local
+                }
             } else {
                 head_outputs_local = (0..self.num_heads)
                     .map(|h| {
@@ -730,19 +918,7 @@ impl Layer for MoHRgLru {
                     })
                     .collect();
                 &head_outputs_local
-            }
-        } else {
-            head_outputs_local = (0..self.num_heads)
-                .map(|h| {
-                    let c0 = h * self.head_dim;
-                    let c1 = c0 + self.head_dim;
-                    let x_h = input.slice(s![.., c0..c1]).to_owned();
-                    let mut head = self.heads[h].clone();
-                    head.forward(&x_h)
-                })
-                .collect();
-            &head_outputs_local
-        };
+            };
 
         // dEff: per token/head scalar gradient from y = eff * y_h.
         let mut eff_grads = Array2::<f32>::zeros((t, self.num_heads));
@@ -753,7 +929,7 @@ impl Layer for MoHRgLru {
                 for j in 0..self.head_dim {
                     acc += output_grads[[i, c0 + j]] * head_outputs[h][[i, j]];
                 }
-                eff_grads[[i, h]] = if acc.is_finite() { acc } else { 0.0 };
+                eff_grads[[i, h]] = acc;
             }
         }
 
@@ -764,30 +940,50 @@ impl Layer for MoHRgLru {
         for h in 0..self.num_heads {
             let c0 = h * self.head_dim;
             let c1 = c0 + self.head_dim;
-            let x_h = input.slice(s![.., c0..c1]).to_owned();
+            let x_h_owned: Array2<f32>;
+            let x_h: &Array2<f32> = if can_use_cache
+                && let Some(x) = self.heads[h]
+                    .cached_input
+                    .as_ref()
+                    .filter(|x| x.dim() == (t, self.head_dim))
+            {
+                x
+            } else {
+                x_h_owned = input.slice(s![.., c0..c1]).to_owned();
+                &x_h_owned
+            };
             let mut scaled_grads = Array2::<f32>::zeros((t, self.head_dim));
-            for i in 0..t {
-                let w = eff[[i, h]];
-                for j in 0..self.head_dim {
-                    scaled_grads[[i, j]] = output_grads[[i, c0 + j]] * w;
-                }
-            }
+            let eff_col = eff.column(h);
+            let eff_col = eff_col.insert_axis(Axis(1));
+            let eff_col = eff_col
+                .broadcast((t, self.head_dim))
+                .expect("broadcast must succeed for (t, head_dim)");
+            let og_block = output_grads.slice(s![.., c0..c1]);
+            Zip::from(&mut scaled_grads)
+                .and(og_block)
+                .and(eff_col)
+                .for_each(|sg, &og, &w| {
+                    *sg = og * w;
+                });
 
-            let (dx_h, pgrads_h) = self.heads[h].compute_gradients(&x_h, &scaled_grads);
-            for i in 0..t {
-                for j in 0..self.head_dim {
-                    grad_input[[i, c0 + j]] += dx_h[[i, j]];
-                }
-            }
+            let (dx_h, pgrads_h) = self.heads[h].compute_gradients(x_h, &scaled_grads);
+            let mut gi_block = grad_input.slice_mut(s![.., c0..c1]);
+            gi_block += &dx_h;
             grads.extend(pgrads_h);
         }
 
         // MoH gating gradients from dEff.
         let (dx_moh, moh_grads) = {
             let mut moh_local = self.moh.clone();
-            moh_local.compute_gradients_from_eff(input, &eff_grads)
+            let gd = moh_local.w_g.nrows().min(d);
+            let gate_input = input.slice(s![.., 0..gd]).to_owned();
+            moh_local.compute_gradients_from_eff(&gate_input, &eff_grads)
         };
-        grad_input += &dx_moh;
+        {
+            let gd = self.moh.w_g.nrows().min(d);
+            let mut gi = grad_input.slice_mut(s![.., 0..gd]);
+            gi += &dx_moh;
+        }
         grads.extend(moh_grads);
 
         (grad_input, grads)
@@ -796,7 +992,7 @@ impl Layer for MoHRgLru {
     fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<()> {
         let per_head = 5usize;
         let needed_heads = self.num_heads * per_head;
-        if gradients.len() < needed_heads {
+        if gradients.len() < needed_heads + 4 {
             return Ok(());
         }
 
@@ -851,6 +1047,70 @@ mod tests {
     }
 
     #[test]
+    fn test_rg_lru_gate_ranges() {
+        let layer = RgLru::new(16);
+        let x = Array2::<f32>::from_shape_fn((11, 16), |(t, d)| {
+            ((t as f32) - 0.5) * (d as f32 + 1.0) * 0.01
+        });
+        let (r, i, a) = layer.compute_gates(&x);
+
+        for v in r.iter() {
+            assert!(*v >= 0.0 && *v <= 1.0);
+        }
+        for v in i.iter() {
+            assert!(*v >= 0.0 && *v <= 1.0);
+        }
+        for v in a.iter() {
+            assert!(*v > 0.0 && *v <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_rg_lru_recurrence_matches_state_computation() {
+        let layer = RgLru::new(8);
+        let x =
+            Array2::<f32>::from_shape_fn((9, 8), |(t, d)| (t as f32 * 0.03) - (d as f32 * 0.01));
+        let (r, i, a) = layer.compute_gates(&x);
+        let (_hprev, h) = layer.compute_state(&x, &i, &a);
+        let _ = r;
+
+        for ti in 0..x.nrows() {
+            for j in 0..x.ncols() {
+                let prev = if ti == 0 { 0.0 } else { h[[ti - 1, j]] };
+                let u = i[[ti, j]] * x[[ti, j]];
+                let at = a[[ti, j]];
+                let expected = at * prev + (1.0 - at) * u;
+                assert!((h[[ti, j]] - expected).abs() <= 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rg_lru_cached_vs_clone_gradients_match() {
+        let mut layer = RgLru::new(8);
+        let x = Array2::<f32>::from_shape_fn((6, 8), |(t, d)| {
+            (t as f32 + 1.0) * (d as f32 + 2.0) * 0.001
+        });
+        let y = layer.forward(&x);
+        let grads = Array2::<f32>::from_elem(y.dim(), 0.1);
+
+        let cached = layer
+            .cached_input
+            .as_ref()
+            .expect("cached_input must exist");
+        let (dx_cached, pg_cached) = layer.compute_gradients(cached, &grads);
+
+        let x_clone = x.clone();
+        let (dx_clone, pg_clone) = layer.compute_gradients(&x_clone, &grads);
+
+        assert_eq!(dx_cached, dx_clone);
+        assert_eq!(pg_cached.len(), pg_clone.len());
+        for (a, b) in pg_cached.iter().zip(pg_clone.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
     fn test_moh_rg_lru_forward_shape() {
         let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
         let mut layer = MoHRgLru::new(16, 4, &cfg);
@@ -878,5 +1138,42 @@ mod tests {
         assert_eq!(dx.dim(), x.dim());
         // 3 heads * 5 grads + MoH grads (>=4)
         assert!(pgrads.len() >= 3 * 5 + 4);
+    }
+
+    #[test]
+    fn test_moh_rg_lru_cache_not_reused_for_different_input() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut layer = MoHRgLru::new(12, 3, &cfg);
+        let x1 = Array2::<f32>::from_shape_fn((5, 12), |(t, d)| {
+            (t as f32 + 1.0) * (d as f32 + 1.0) * 0.01
+        });
+        let _ = layer.forward(&x1);
+
+        let x2 = Array2::<f32>::from_shape_fn((5, 12), |(t, d)| {
+            (t as f32 + 2.0) * (d as f32 + 3.0) * 0.02
+        });
+        let grads = Array2::<f32>::from_elem((5, 12), 0.1);
+
+        let (dx_cached, pg_cached) = layer.compute_gradients(&x2, &grads);
+
+        let mut layer_nocache = layer.clone();
+        layer_nocache.clear_caches();
+        let (dx_fresh, pg_fresh) = layer_nocache.compute_gradients(&x2, &grads);
+
+        assert_eq!(dx_cached, dx_fresh);
+        assert_eq!(pg_cached.len(), pg_fresh.len());
+        for (a, b) in pg_cached.iter().zip(pg_fresh.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn moh_rg_lru_parameter_delta_within_1000() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let layer = MoHRgLru::new(64, 16, &cfg);
+        let baseline: usize = layer.heads.iter().map(|h| h.parameters()).sum();
+        let moh_total = layer.parameters();
+        assert!(moh_total >= baseline);
+        assert!(moh_total - baseline <= 1000);
     }
 }

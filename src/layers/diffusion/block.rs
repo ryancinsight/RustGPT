@@ -15,7 +15,7 @@ use crate::{
             adaptive_residuals::AdaptiveResiduals,
             common::{
                 CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
-                apply_adaptive_gradients, sanitize_and_clip_gradients,
+                TitanMemoryWorkspace, apply_adaptive_gradients, sanitize_and_clip_gradients,
             },
         },
         diffusion::edm,
@@ -794,6 +794,8 @@ pub struct DiffusionBlock {
     pub param_partitions: RwLock<Option<DiffusionParamPartitions>>,
     #[serde(skip)]
     pub adaptive_residuals: Option<AdaptiveResiduals>,
+    #[serde(skip)]
+    titan_memory_workspace: TitanMemoryWorkspace,
 }
 
 impl DiffusionBlock {
@@ -868,6 +870,7 @@ impl DiffusionBlock {
             } else {
                 None
             },
+            titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
 
@@ -1096,6 +1099,13 @@ impl DiffusionBlock {
         let mut attn_out = self
             .temporal_mixing
             .forward_with_causal(&norm1_mod, self.config.causal_attention);
+        if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+            self.config.titan_memory.apply_into_out_with_workspace(
+                &mut attn_out,
+                &norm1_mod,
+                &mut self.titan_memory_workspace,
+            );
+        }
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
         }
@@ -1737,9 +1747,17 @@ impl Layer for DiffusionBlock {
             // residual1 = input + attn_out: propagate full upstream gradient to both branches
             let attn_out_grads = &residual1_total_grads;
 
-            let (attn_input_grad_mod, attn_param_grads) = self
+            let (mut attn_input_grad_mod, attn_param_grads) = self
                 .temporal_mixing
                 .compute_gradients(norm1_mod, attn_out_grads);
+            if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+                self.config
+                    .titan_memory
+                    .add_input_grads_from_output_grads_into(
+                        attn_out_grads,
+                        &mut attn_input_grad_mod,
+                    );
+            }
 
             let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
                 Self::film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);

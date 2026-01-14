@@ -386,13 +386,15 @@ impl PolyAttention {
         assert!(self.titan_memory.decay >= 0.0 && self.titan_memory.decay <= 1.0);
 
         let retain = 1.0 - self.titan_memory.decay;
-        let mut acc = vec![0.0f32; d];
-        for i in 0..n {
-            for j in 0..d {
-                acc[j] = retain * acc[j] + self.titan_memory.eta * input[[i, j]];
-                out[[i, j]] += self.titan_memory.scale * acc[j];
+        crate::attention::memory::with_tls_qpe(d, |acc| {
+            acc.fill(0.0);
+            for i in 0..n {
+                for j in 0..d {
+                    acc[j] = retain * acc[j] + self.titan_memory.eta * input[[i, j]];
+                    out[[i, j]] += self.titan_memory.scale * acc[j];
+                }
             }
-        }
+        });
     }
 
     pub fn set_window_size(&mut self, ws: Option<usize>) {
@@ -544,9 +546,8 @@ impl PolyAttention {
         }
         self.last_pred_norm = result.pred_norm;
         self.last_avg_active_heads = result.avg_active_heads;
-        self.last_head_activity_vec = result.head_activity_vec.as_ref().map(|v| v.to_vec());
-        self.last_token_head_activity_vec =
-            result.token_head_activity_vec.as_ref().map(|v| v.to_vec());
+        self.last_head_activity_vec = result.head_activity_vec.take();
+        self.last_token_head_activity_vec = result.token_head_activity_vec.take();
 
         self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
         result.output
@@ -594,9 +595,8 @@ impl PolyAttention {
         }
         self.last_pred_norm = result.pred_norm;
         self.last_avg_active_heads = result.avg_active_heads;
-        self.last_head_activity_vec = result.head_activity_vec.as_ref().map(|v| v.to_vec());
-        self.last_token_head_activity_vec =
-            result.token_head_activity_vec.as_ref().map(|v| v.to_vec());
+        self.last_head_activity_vec = result.head_activity_vec.take();
+        self.last_token_head_activity_vec = result.token_head_activity_vec.take();
 
         self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
         result.output
@@ -776,6 +776,7 @@ impl PolyAttention {
                 let mut grad_v: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
                 let mut grad_p_local: Array2<f32> =
                     Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
+                let mut q_pe: Vec<f32> = Vec::new();
 
                 for i in 0..n {
                     // g_yh_gated_row from output_grads and W_out block
@@ -793,7 +794,12 @@ impl PolyAttention {
 
                     // CoPE q·p_pos caching for row i
                     let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
-                    let mut q_pe = vec![0.0f32; max_pos + 1];
+                    let q_pe_len = max_pos + 1;
+                    if q_pe.len() != q_pe_len {
+                        q_pe.resize(q_pe_len, 0.0);
+                    } else {
+                        q_pe.fill(0.0);
+                    }
                     for (pos, qpe) in q_pe.iter_mut().enumerate() {
                         *qpe = q.row(i).dot(&self.cope.pos_embeddings.row(pos));
                     }
@@ -1550,6 +1556,7 @@ impl PolyAttention {
                         None
                     };
                 let mut anomaly = false;
+                let mut q_pe: Vec<f32> = Vec::new();
 
                 for i in 0..n {
                     let out_row = output_grads.slice(s![i..i + 1, ..]);
@@ -1562,7 +1569,12 @@ impl PolyAttention {
                     };
                     let j_end = if self.last_causal { i } else { n - 1 };
                     let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
-                    let mut q_pe = vec![0.0f32; max_pos + 1];
+                    let q_pe_len = max_pos + 1;
+                    if q_pe.len() != q_pe_len {
+                        q_pe.resize(q_pe_len, 0.0);
+                    } else {
+                        q_pe.fill(0.0);
+                    }
                     for (pos, qpe) in q_pe.iter_mut().enumerate() {
                         *qpe = q.row(i).dot(&self.cope.pos_embeddings.row(pos));
                     }
@@ -2015,15 +2027,17 @@ impl PolyAttention {
             assert!(self.titan_memory.decay >= 0.0 && self.titan_memory.decay <= 1.0);
 
             let retain = 1.0 - self.titan_memory.decay;
-            let mut dacc = vec![0.0f32; self.embed_dim];
-            for i in (0..n).rev() {
-                for j in 0..self.embed_dim {
-                    dacc[j] = dacc[j] * retain + self.titan_memory.scale * output_grads[[i, j]];
+            crate::attention::memory::with_tls_qpe(self.embed_dim, |dacc| {
+                dacc.fill(0.0);
+                for i in (0..n).rev() {
+                    for j in 0..self.embed_dim {
+                        dacc[j] = dacc[j] * retain + self.titan_memory.scale * output_grads[[i, j]];
+                    }
+                    for j in 0..self.embed_dim {
+                        grad_input_total[[i, j]] += self.titan_memory.eta * dacc[j];
+                    }
                 }
-                for j in 0..self.embed_dim {
-                    grad_input_total[[i, j]] += self.titan_memory.eta * dacc[j];
-                }
-            }
+            });
         }
 
         if gradient_anomaly_detected {

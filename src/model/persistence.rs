@@ -331,7 +331,9 @@ impl LLM {
             Attention,
             RgLruMoH,
             RgLru,
+            MambaMoH,
             Mamba,
+            Mamba2MoH,
             Mamba2,
         }
 
@@ -353,8 +355,14 @@ impl LLM {
                     crate::layers::components::common::TemporalMixingLayer::Mamba(_) => {
                         Some(TM::Mamba)
                     }
+                    crate::layers::components::common::TemporalMixingLayer::MambaMoH(_) => {
+                        Some(TM::MambaMoH)
+                    }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => {
                         Some(TM::Mamba2)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
+                        Some(TM::Mamba2MoH)
                     }
                 },
                 crate::LayerEnum::DiffusionBlock(db) => match &db.temporal_mixing {
@@ -370,8 +378,14 @@ impl LLM {
                     crate::layers::components::common::TemporalMixingLayer::Mamba(_) => {
                         Some(TM::Mamba)
                     }
+                    crate::layers::components::common::TemporalMixingLayer::MambaMoH(_) => {
+                        Some(TM::MambaMoH)
+                    }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => {
                         Some(TM::Mamba2)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
+                        Some(TM::Mamba2MoH)
                     }
                 },
                 _ => None,
@@ -395,7 +409,9 @@ impl LLM {
                 Some(TM::Attention) => Some("Attention"),
                 Some(TM::RgLruMoH) => Some("RgLruMoH"),
                 Some(TM::RgLru) => Some("RgLru"),
+                Some(TM::MambaMoH) => Some("MambaMoH"),
                 Some(TM::Mamba) => Some("Mamba"),
+                Some(TM::Mamba2MoH) => Some("Mamba2MoH"),
                 Some(TM::Mamba2) => Some("Mamba2"),
                 None => None,
             }

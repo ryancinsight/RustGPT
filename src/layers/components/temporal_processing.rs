@@ -50,6 +50,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(layer) => layer.forward(input),
             TemporalMixingLayer::Mamba2(layer) => layer.forward(input),
             TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
+            TemporalMixingLayer::MambaMoH(layer) => layer.forward(input),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward(input),
         }
     }
 
@@ -65,6 +67,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::Mamba2(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::RgLruMoH(layer) => layer.compute_gradients(input, output_grads),
+            TemporalMixingLayer::MambaMoH(layer) => layer.compute_gradients(input, output_grads),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -76,6 +80,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(layer) => layer.apply_gradients(param_grads, lr),
             TemporalMixingLayer::Mamba2(layer) => layer.apply_gradients(param_grads, lr),
             TemporalMixingLayer::RgLruMoH(layer) => layer.apply_gradients(param_grads, lr),
+            TemporalMixingLayer::MambaMoH(layer) => layer.apply_gradients(param_grads, lr),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.apply_gradients(param_grads, lr),
         }
     }
 
@@ -87,6 +93,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(layer) => layer.parameters(),
             TemporalMixingLayer::Mamba2(layer) => layer.parameters(),
             TemporalMixingLayer::RgLruMoH(layer) => layer.parameters(),
+            TemporalMixingLayer::MambaMoH(layer) => layer.parameters(),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.parameters(),
         }
     }
 
@@ -98,6 +106,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(layer) => layer.weight_norm(),
             TemporalMixingLayer::Mamba2(layer) => layer.weight_norm(),
             TemporalMixingLayer::RgLruMoH(layer) => layer.weight_norm(),
+            TemporalMixingLayer::MambaMoH(layer) => layer.weight_norm(),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.weight_norm(),
         }
     }
 
@@ -109,6 +119,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(layer) => layer.zero_gradients(),
             TemporalMixingLayer::Mamba2(layer) => layer.zero_gradients(),
             TemporalMixingLayer::RgLruMoH(layer) => layer.zero_gradients(),
+            TemporalMixingLayer::MambaMoH(layer) => layer.zero_gradients(),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.zero_gradients(),
         }
     }
 
@@ -120,6 +132,8 @@ impl SharedTemporalProcessing {
             TemporalMixingLayer::Mamba(_) => "Mamba",
             TemporalMixingLayer::Mamba2(_) => "Mamba2",
             TemporalMixingLayer::RgLruMoH(_) => "RG-LRU-MoH",
+            TemporalMixingLayer::MambaMoH(_) => "Mamba-MoH",
+            TemporalMixingLayer::Mamba2MoH(_) => "Mamba2-MoH",
         }
     }
 
@@ -152,6 +166,24 @@ impl SharedTemporalProcessing {
                 };
                 (ratio, rglru.last_head_activity_vec.as_deref())
             }
+            TemporalMixingLayer::MambaMoH(m) => {
+                let ratio = if let Some(avg) = m.last_avg_active_heads {
+                    let num_heads = m.num_heads as f32;
+                    Some((avg / num_heads.max(1.0)).clamp(0.0, 1.0))
+                } else {
+                    Some(1.0)
+                };
+                (ratio, m.last_head_activity_vec.as_deref())
+            }
+            TemporalMixingLayer::Mamba2MoH(m) => {
+                let ratio = if let Some(avg) = m.last_avg_active_heads {
+                    let num_heads = m.num_heads as f32;
+                    Some((avg / num_heads.max(1.0)).clamp(0.0, 1.0))
+                } else {
+                    Some(1.0)
+                };
+                (ratio, m.last_head_activity_vec.as_deref())
+            }
             _ => (Some(1.0), None),
         }
     }
@@ -160,6 +192,8 @@ impl SharedTemporalProcessing {
         match &self.temporal_mixing {
             TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
             TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::MambaMoH(m) => m.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::Mamba2MoH(m) => m.last_token_head_activity_vec.as_deref(),
             _ => None,
         }
     }
