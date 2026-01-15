@@ -134,7 +134,15 @@ fn get_data_from_csv(path: &str) -> Result<Vec<String>> {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         })?;
         // Each record is a row, join all columns into a single string
-        data.push(record.iter().collect::<Vec<_>>().join(","));
+        let capacity = record.iter().map(|s| s.len()).sum::<usize>() + record.len().saturating_sub(1);
+        let mut line = String::with_capacity(capacity);
+        for (i, field) in record.iter().enumerate() {
+            if i > 0 {
+                line.push(',');
+            }
+            line.push_str(field);
+        }
+        data.push(line);
     }
     Ok(data)
 }
