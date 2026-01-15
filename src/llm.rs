@@ -749,14 +749,10 @@ impl LLM {
             let mut input = token_input;
 
             // Forward pass through all layers except output projection to get hidden states
-            let network_len = self.network.len();
-            let mut hidden_states = input.clone();
-            let mut logits = Array2::zeros((1, self.vocab.size()));
-
             // Similarity context threaded across successive TransformerBlock layers.
             let mut similarity_ctx: Option<Array2<f32>> = None;
 
-            for (i, layer) in self.network.iter_mut().enumerate() {
+            for layer in self.network.iter_mut() {
                 input = match layer {
                     LayerEnum::TransformerBlock(block) => {
                         block.set_incoming_similarity_context(similarity_ctx.as_ref());
@@ -773,17 +769,9 @@ impl LLM {
                         layer.forward(&input)
                     }
                 };
-
-                // Capture hidden states before output projection (second-to-last layer)
-                if i == network_len - 2 {
-                    hidden_states = input.clone();
-                }
-
-                // Get logits from output projection (last layer)
-                if i == network_len - 1 {
-                    logits = input.clone();
-                }
             }
+
+            let logits = input;
 
             // Safety check: ensure we have at least one token
             if logits.shape()[0] == 0 {
@@ -791,9 +779,6 @@ impl LLM {
             }
 
             let last_logit_row = logits.row(logits.shape()[0] - 1);
-
-            // Get hidden states for the last position
-            let _last_hidden = hidden_states.row(hidden_states.shape()[0] - 1).to_owned();
 
             let next_token = if let (Some(cfg), SpeculativeMode::Transformer) =
                 (self.speculative_config, self.speculative_mode)
@@ -3081,13 +3066,14 @@ impl LLM {
         let mse_weight_ema_decay: f32 = 0.995;
         let mse_weight_min: f32 = 0.1;
         let mse_weight_max: f32 = 10.0;
+        let richards_sigmoid = crate::richards::RichardsCurve::sigmoid(false);
         let lambda_ce_schedule = |t: usize| -> f32 {
             let total = num_timesteps.max(1) as f32;
             let center = 0.5 * total;
             let sigma = (0.15 * total).max(1.0);
             let capped_t = t.min(num_timesteps.saturating_sub(1)) as f32;
             let x = (center - capped_t) / sigma;
-            let s = crate::richards::RichardsCurve::sigmoid(false).forward_scalar_f32(x);
+            let s = richards_sigmoid.forward_scalar_f32(x);
             s.clamp(0.5, 1.0)
         };
         let log_dir = std::path::Path::new("training_logs");
