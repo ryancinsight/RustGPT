@@ -2128,11 +2128,12 @@ impl LLM {
             let mut similarity_ctx: Option<Array2<f32>> = None;
 
             for layer in &mut self.network {
-                layer_inputs.push(input.clone());
+                layer_inputs.push(input);
+                let input_ref = layer_inputs.last().unwrap();
                 input = match layer {
                     LayerEnum::TransformerBlock(block) => {
                         block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(&input);
+                        let out = block.forward(input_ref);
                         if let Some(existing) = similarity_ctx.as_mut() {
                             existing.assign(block.activation_similarity_matrix());
                         } else {
@@ -2142,7 +2143,7 @@ impl LLM {
                     }
                     _ => {
                         similarity_ctx = None;
-                        layer.forward(&input)
+                        layer.forward(input_ref)
                     }
                 };
 
