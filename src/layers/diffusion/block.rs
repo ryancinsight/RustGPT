@@ -530,15 +530,13 @@ impl NoiseScheduler {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct TimeEmbedding {
-    pub w: Array2<f32>,
     pub b: Array1<f32>,
 }
 
 impl TimeEmbedding {
     pub fn new(embed_dim: usize) -> Self {
-        let w = Array2::zeros((embed_dim, embed_dim)); // Placeholder
         let b = Array1::zeros(embed_dim);
-        Self { w, b }
+        Self { b }
     }
 
     pub fn forward(&self, t: usize, max_t: usize) -> Array1<f32> {
@@ -760,6 +758,26 @@ pub struct DiffusionParamPartitions {
     pub adaptive_residual_positional_weights: usize,
 }
 
+impl DiffusionParamPartitions {
+    fn total(&self) -> usize {
+        self.temporal_mixing
+            + self.feedforward
+            + self.pre_ffn_norm
+            + self.pre_attention_norm
+            + self.time_conditioner
+            + self.time_embedding
+            + self.adaptive_residual_similarity
+            + self.adaptive_residual_affinity
+            + self.adaptive_residual_attention
+            + self.adaptive_residual_channel
+            + self.adaptive_residual_scales_attention
+            + self.adaptive_residual_scales_ffn
+            + self.adaptive_residual_positional_qkv
+            + self.adaptive_residual_positional_cope
+            + self.adaptive_residual_positional_weights
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DiffusionBlock {
     pub config: DiffusionBlockConfig,
@@ -794,6 +812,8 @@ pub struct DiffusionBlock {
     pub param_partitions: RwLock<Option<DiffusionParamPartitions>>,
     #[serde(skip)]
     pub adaptive_residuals: Option<AdaptiveResiduals>,
+    #[serde(skip)]
+    film_gamma_beta_tanh_scratch: Vec<f32>,
     #[serde(skip)]
     titan_memory_workspace: TitanMemoryWorkspace,
 }
@@ -870,6 +890,7 @@ impl DiffusionBlock {
             } else {
                 None
             },
+            film_gamma_beta_tanh_scratch: Vec::new(),
             titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
@@ -1074,16 +1095,34 @@ impl DiffusionBlock {
         let mut beta_attn_vec = Array2::<f32>::zeros((1, embed));
         let mut gamma_ffn_vec = Array2::<f32>::zeros((1, embed));
         let mut beta_ffn_vec = Array2::<f32>::zeros((1, embed));
-        for j in 0..embed {
-            let g_attn = tanh.forward_scalar_f32(gamma_beta[[0, j]]);
-            let b_attn = tanh.forward_scalar_f32(gamma_beta[[0, embed + j]]);
-            let g_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 2 * embed + j]]);
-            let b_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 3 * embed + j]]);
+        if let (Some(gb), Some(ga), Some(ba), Some(gf), Some(bf)) = (
+            gamma_beta.as_slice(),
+            gamma_attn_vec.as_slice_mut(),
+            beta_attn_vec.as_slice_mut(),
+            gamma_ffn_vec.as_slice_mut(),
+            beta_ffn_vec.as_slice_mut(),
+        ) {
+            self.film_gamma_beta_tanh_scratch.resize(gb.len(), 0.0);
+            tanh.forward_into_f32(gb, &mut self.film_gamma_beta_tanh_scratch);
+            for j in 0..embed {
+                ga[j] = 1.0 + self.film_scale_gamma * self.film_gamma_beta_tanh_scratch[j];
+                ba[j] = self.film_scale_beta * self.film_gamma_beta_tanh_scratch[embed + j];
+                gf[j] =
+                    1.0 + self.film_scale_gamma * self.film_gamma_beta_tanh_scratch[2 * embed + j];
+                bf[j] = self.film_scale_beta * self.film_gamma_beta_tanh_scratch[3 * embed + j];
+            }
+        } else {
+            for j in 0..embed {
+                let g_attn = tanh.forward_scalar_f32(gamma_beta[[0, j]]);
+                let b_attn = tanh.forward_scalar_f32(gamma_beta[[0, embed + j]]);
+                let g_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 2 * embed + j]]);
+                let b_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 3 * embed + j]]);
 
-            gamma_attn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_attn;
-            beta_attn_vec[[0, j]] = self.film_scale_beta * b_attn;
-            gamma_ffn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_ffn;
-            beta_ffn_vec[[0, j]] = self.film_scale_beta * b_ffn;
+                gamma_attn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_attn;
+                beta_attn_vec[[0, j]] = self.film_scale_beta * b_attn;
+                gamma_ffn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_ffn;
+                beta_ffn_vec[[0, j]] = self.film_scale_beta * b_ffn;
+            }
         }
 
         let (x_model_in, c_skip, c_out, edm_on) =
@@ -1637,14 +1676,25 @@ impl Layer for DiffusionBlock {
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
             + 4
+            + self
+                .adaptive_residuals
+                .as_ref()
+                .map(|r| r.parameter_count())
+                .unwrap_or(0)
     }
 
     fn weight_norm(&self) -> f32 {
+        let residual_norm = self
+            .adaptive_residuals
+            .as_ref()
+            .map(|r| r.weight_norm())
+            .unwrap_or(0.0);
         (self.pre_attention_norm.weight_norm().powi(2)
             + self.temporal_mixing.weight_norm().powi(2)
             + self.pre_ffn_norm.weight_norm().powi(2)
             + self.feedforward.weight_norm().powi(2)
-            + self.time_conditioner.weight_norm().powi(2))
+            + self.time_conditioner.weight_norm().powi(2)
+            + residual_norm.powi(2))
         .sqrt()
     }
 
@@ -1669,6 +1719,8 @@ impl Layer for DiffusionBlock {
             let residual1: &Array2<f32> = cache.residual1.as_ref();
             let norm2_out: &Array2<f32> = cache.norm2_out.as_ref();
             let norm2_mod: &Array2<f32> = cache.norm2_mod.as_ref();
+            let attn_out: &Array2<f32> = cache.attn_out.as_ref();
+            let ffn_out: &Array2<f32> = cache.ffn_out.as_ref();
             let h_vec: &Array1<f32> = cache.h_vec.as_ref();
             let gamma_attn_vec: &Array2<f32> = cache.gamma_attn.as_ref();
             let beta_attn_vec: &Array2<f32> = cache.beta_attn.as_ref();
@@ -1836,6 +1888,20 @@ impl Layer for DiffusionBlock {
                     .backward(&grad_gamma_beta, &h_mat, time_embed);
             all_param_grads.extend(time_grads);
 
+            let adaptive_param_grads = if let Some(residuals) = self.adaptive_residuals.as_ref() {
+                residuals.compute_gradients(
+                    input_cache,
+                    attn_out,
+                    &residual1_total_grads,
+                    ffn_out,
+                    &safe_scaled_grads,
+                )
+            } else {
+                Vec::new()
+            };
+            let adaptive_grad_count = adaptive_param_grads.len();
+            all_param_grads.extend(adaptive_param_grads);
+
             let partitions = DiffusionParamPartitions {
                 temporal_mixing: attn_grad_count,
                 feedforward: ffn_grad_count,
@@ -1843,13 +1909,12 @@ impl Layer for DiffusionBlock {
                 pre_attention_norm: pre_attn_grad_count,
                 time_conditioner: 4,
                 time_embedding: 0,
-                // Adaptive residual partitions (placeholder - will be implemented in Phase 2)
                 adaptive_residual_similarity: 0,
                 adaptive_residual_affinity: 0,
                 adaptive_residual_attention: 0,
                 adaptive_residual_channel: 0,
-                adaptive_residual_scales_attention: 0,
-                adaptive_residual_scales_ffn: 0,
+                adaptive_residual_scales_attention: adaptive_grad_count.min(1),
+                adaptive_residual_scales_ffn: adaptive_grad_count.saturating_sub(1).min(1),
                 // Theorem 4 extension partitions
                 adaptive_residual_positional_qkv: 0,
                 adaptive_residual_positional_cope: 0,
@@ -1884,33 +1949,10 @@ impl Layer for DiffusionBlock {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or(None);
-        let partitions = cached_partitions.unwrap_or_else(|| {
-            if !sanitized.is_empty() {
-                tracing::warn!(
-                    arrays = sanitized.len(),
-                    "DiffusionBlock::apply_gradients missing partition metadata; routing all gradients to attention as a safe fallback"
-                );
-                DiffusionParamPartitions {
-                    temporal_mixing: sanitized.len(),
-                    feedforward: 0,
-                    pre_ffn_norm: 0,
-                    pre_attention_norm: 0,
-                    time_conditioner: 0,
-                    time_embedding: 0,
-                    adaptive_residual_similarity: 0,
-                    adaptive_residual_affinity: 0,
-                    adaptive_residual_attention: 0,
-                    adaptive_residual_channel: 0,
-                    adaptive_residual_scales_attention: 0,
-                    adaptive_residual_scales_ffn: 0,
-                    adaptive_residual_positional_qkv: 0,
-                    adaptive_residual_positional_cope: 0,
-                    adaptive_residual_positional_weights: 0,
-                }
-            } else {
-                DiffusionParamPartitions::default()
-            }
-        });
+        let partitions =
+            cached_partitions.ok_or_else(|| crate::errors::ModelError::GradientError {
+                message: "DiffusionBlock::apply_gradients missing partition metadata".to_string(),
+            })?;
 
         let mut idx0 = 0usize;
         let mut next_range = |count: usize| {
@@ -1921,14 +1963,15 @@ impl Layer for DiffusionBlock {
             start..idx0
         };
 
-        if partitions.temporal_mixing
-            + partitions.feedforward
-            + partitions.pre_ffn_norm
-            + partitions.pre_attention_norm
-            + partitions.time_conditioner
-            != sanitized.len()
-        {
-            // Just a warning, proceed with best effort
+        let expected = partitions.total();
+        if expected != sanitized.len() {
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "DiffusionBlock::apply_gradients gradient count mismatch: expected {}, got {}",
+                    expected,
+                    sanitized.len()
+                ),
+            });
         }
 
         // Temporal-mixing gradients
@@ -1976,6 +2019,15 @@ impl Layer for DiffusionBlock {
             let time_grads = &sanitized[time_range];
             self.time_conditioner
                 .apply_gradients(time_grads, lr, self.ema_decay);
+        }
+
+        let adaptive_range = next_range(
+            partitions.adaptive_residual_scales_attention + partitions.adaptive_residual_scales_ffn,
+        );
+        if adaptive_range.len() == 2
+            && let Some(ref mut residuals) = self.adaptive_residuals
+        {
+            residuals.apply_gradients(&sanitized[adaptive_range], lr)?;
         }
 
         if let Ok(mut guard) = self.param_partitions.write() {

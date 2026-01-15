@@ -336,11 +336,7 @@ impl MultiScaleUpdater {
 
 /// Create trace updater for a specific scale
 fn create_scale_updater(alpha: f32, neuron_config: NeuronConfig) -> TraceUpdater {
-    let mut scale_config = neuron_config.clone();
-    // Modify alpha for this specific scale if needed
-    // For now, use the original config as the base updater
-    
-    TraceUpdater::from_alpha(alpha, scale_config)
+    TraceUpdater::from_alpha(alpha, neuron_config)
 }
 
 #[cfg(test)]

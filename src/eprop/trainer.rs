@@ -153,12 +153,17 @@ impl EPropTrainer {
 
         // Initialize adaptive softmax if output layer matches vocab size
         let softmax = if config.output_dim > 2 {
-            use super::adaptive_softmax::{SoftmaxStrategy, SoftmaxConfig};
+            use super::adaptive_softmax::SoftmaxConfig;
 
-            let softmax_config = SoftmaxConfig::auto_select(
-                config.output_dim,
-                None, // No frequencies for now
-            );
+            let mut softmax_config =
+                SoftmaxConfig::auto_select(config.output_dim, config.vocab_frequencies.clone());
+            if let Some(strategy) = config.softmax_strategy {
+                softmax_config.strategy = Some(strategy);
+            }
+            if matches!(softmax_config.strategy, Some(super::adaptive_softmax::SoftmaxStrategy::Sampled))
+            {
+                softmax_config.num_samples = config.num_negative_samples;
+            }
 
             // Always create softmax for large classification tasks (>= 100 vocab)
             // This provides consistent API regardless of auto-selected strategy

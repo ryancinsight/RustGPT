@@ -100,7 +100,10 @@ impl HRM {
             max_pos: config.max_seq_len,
             window_size: config.window_size,
             use_moe: config.moe_router.is_some(),
-            moe_config: None, // Simplified for now
+            moe_config: config
+                .moe_router
+                .as_ref()
+                .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
             temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,

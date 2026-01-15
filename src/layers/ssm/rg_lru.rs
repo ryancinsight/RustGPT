@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use ndarray::{Array1, Array2, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Axis, Data, Ix2, Zip, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -27,6 +27,23 @@ fn array2_bitwise_eq_f32(a: &Array2<f32>, b: &Array2<f32>) -> bool {
     }
     if std::ptr::eq(a, b) {
         return true;
+    }
+    match (a.as_slice_memory_order(), b.as_slice_memory_order()) {
+        (Some(sa), Some(sb)) => sa
+            .iter()
+            .zip(sb.iter())
+            .all(|(&x, &y)| x.to_bits() == y.to_bits()),
+        _ => a
+            .iter()
+            .zip(b.iter())
+            .all(|(&x, &y)| x.to_bits() == y.to_bits()),
+    }
+}
+
+#[inline]
+fn array2_bitwise_eq_base_f32<D: Data<Elem = f32>>(a: &Array2<f32>, b: &ArrayBase<D, Ix2>) -> bool {
+    if a.dim() != b.dim() {
+        return false;
     }
     match (a.as_slice_memory_order(), b.as_slice_memory_order()) {
         (Some(sa), Some(sb)) => sa
@@ -124,9 +141,6 @@ pub struct MoHRgLru {
     pub last_head_activity_vec: Option<Vec<f32>>,
     #[serde(skip_serializing, skip_deserializing)]
     pub last_token_head_activity_vec: Option<Vec<f32>>,
-
-    #[serde(skip_serializing, skip_deserializing)]
-    head_input_scratch: Vec<Array2<f32>>,
 }
 
 impl MoHRgLru {
@@ -174,27 +188,6 @@ impl MoHRgLru {
             last_avg_active_heads: None,
             last_head_activity_vec: None,
             last_token_head_activity_vec: None,
-            head_input_scratch: Vec::new(),
-        }
-    }
-
-    fn ensure_head_input_scratch(&mut self, t: usize) {
-        if self.num_heads == 0 || self.head_dim == 0 {
-            self.head_input_scratch.clear();
-            return;
-        }
-
-        if self.head_input_scratch.len() != self.num_heads {
-            self.head_input_scratch = (0..self.num_heads)
-                .map(|_| Array2::<f32>::zeros((t, self.head_dim)))
-                .collect();
-            return;
-        }
-
-        for buf in &mut self.head_input_scratch {
-            if buf.dim() != (t, self.head_dim) {
-                *buf = Array2::<f32>::zeros((t, self.head_dim));
-            }
         }
     }
 
@@ -296,6 +289,7 @@ impl RgLru {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn compute_gates(&self, input: &Array2<f32>) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
         let t = input.nrows();
@@ -322,7 +316,7 @@ impl RgLru {
 
     #[inline]
     fn compute_gates_into_parts(
-        input: &Array2<f32>,
+        input: &ArrayBase<impl Data<Elem = f32>, Ix2>,
         p: GatesParams<'_>,
         r: &mut Array2<f32>,
         i: &mut Array2<f32>,
@@ -376,6 +370,7 @@ impl RgLru {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn compute_state(
         &self,
@@ -393,7 +388,7 @@ impl RgLru {
 
     #[inline]
     fn compute_state_into(
-        input: &Array2<f32>,
+        input: &ArrayBase<impl Data<Elem = f32>, Ix2>,
         i: &Array2<f32>,
         a: &Array2<f32>,
         hprev: &mut Array2<f32>,
@@ -470,9 +465,60 @@ impl RgLru {
     }
 
     #[inline]
+    fn compute_forward_cached_view(&mut self, input: &ArrayView2<f32>) -> Array2<f32> {
+        let t = input.nrows();
+        let d = input.ncols();
+        if t == 0 || d == 0 {
+            self.cached_input = Some(input.to_owned());
+            self.cached_r = Some(Array2::<f32>::zeros((t, d)));
+            self.cached_i = Some(Array2::<f32>::zeros((t, d)));
+            self.cached_a = Some(Array2::<f32>::zeros((t, d)));
+            self.cached_hprev = Some(Array2::<f32>::zeros((t, d)));
+            return Array2::<f32>::zeros((t, d));
+        }
+
+        if self.cached_r.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_r = Some(Array2::<f32>::zeros((t, d)));
+        }
+        if self.cached_i.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_i = Some(Array2::<f32>::zeros((t, d)));
+        }
+        if self.cached_a.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_a = Some(Array2::<f32>::zeros((t, d)));
+        }
+        if self.cached_hprev.as_ref().is_none_or(|x| x.dim() != (t, d)) {
+            self.cached_hprev = Some(Array2::<f32>::zeros((t, d)));
+        }
+
+        let r = self.cached_r.as_mut().expect("cached_r must exist");
+        let i = self.cached_i.as_mut().expect("cached_i must exist");
+        let a = self.cached_a.as_mut().expect("cached_a must exist");
+        let hprev = self.cached_hprev.as_mut().expect("cached_hprev must exist");
+
+        let p = GatesParams {
+            w_a: &self.w_a,
+            b_a: &self.b_a,
+            w_x: &self.w_x,
+            b_x: &self.b_x,
+            lambda: &self.lambda,
+        };
+        Self::compute_gates_into_parts(input, p, r, i, a);
+        let mut h = Array2::<f32>::zeros((t, d));
+        Self::compute_state_into(input, i, a, hprev, &mut h);
+
+        self.cached_input = Some(input.to_owned());
+        h
+    }
+
+    #[inline]
+    fn forward_view(&mut self, input: &ArrayView2<f32>) -> Array2<f32> {
+        self.compute_forward_cached_view(input)
+    }
+
+    #[inline]
     fn compute_gates_and_state_from_cache_or_recompute<'a>(
         &'a self,
-        input: &Array2<f32>,
+        input: &ArrayBase<impl Data<Elem = f32>, Ix2>,
     ) -> GatesAndState<'a> {
         let can_use = self
             .cached_input
@@ -482,7 +528,7 @@ impl RgLru {
             && self
                 .cached_input
                 .as_ref()
-                .is_some_and(|x| std::ptr::eq(x, input) || array2_bitwise_eq_f32(x, input));
+                .is_some_and(|x| array2_bitwise_eq_base_f32(x, input));
         if same_input
             && let (Some(r), Some(i), Some(a), Some(hp)) = (
                 self.cached_r.as_ref(),
@@ -499,15 +545,139 @@ impl RgLru {
             );
         }
 
-        // Recompute forward pieces (without mutating self).
-        let (r, i, a) = self.compute_gates(input);
-        let (hprev, _h) = self.compute_state(input, &i, &a);
+        let t = input.nrows();
+        let d = input.ncols();
+
+        let mut r = Array2::<f32>::zeros((t, d));
+        let mut i = Array2::<f32>::zeros((t, d));
+        let mut a = Array2::<f32>::zeros((t, d));
+        Self::compute_gates_into_parts(
+            input,
+            GatesParams {
+                w_a: &self.w_a,
+                b_a: &self.b_a,
+                w_x: &self.w_x,
+                b_x: &self.b_x,
+                lambda: &self.lambda,
+            },
+            &mut r,
+            &mut i,
+            &mut a,
+        );
+        let mut hprev = Array2::<f32>::zeros((t, d));
+        let mut h = Array2::<f32>::zeros((t, d));
+        Self::compute_state_into(input, &i, &a, &mut hprev, &mut h);
+        let _ = h;
+
         (
             Cow::Owned(r),
             Cow::Owned(i),
             Cow::Owned(a),
             Cow::Owned(hprev),
         )
+    }
+
+    fn compute_gradients_impl<Din: Data<Elem = f32>, Dout: Data<Elem = f32>>(
+        &self,
+        input: &ArrayBase<Din, Ix2>,
+        output_grads: &ArrayBase<Dout, Ix2>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        let (r, i, a, hprev) = self.compute_gates_and_state_from_cache_or_recompute(input);
+        let r = r.as_ref();
+        let i = i.as_ref();
+        let a = a.as_ref();
+        let hprev = hprev.as_ref();
+
+        let t = input.nrows();
+        let d = input.ncols();
+        if t == 0 || d == 0 {
+            return (Array2::zeros(input.raw_dim()), vec![]);
+        }
+
+        let c: f32 = 8.0;
+        let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
+        let dlogsig_dlambda: Array1<f32> = {
+            let sigmoid = RichardsCurve::sigmoid(false);
+            self.lambda
+                .row(0)
+                .to_owned()
+                .mapv(|x| sigmoid.forward_scalar_f32(-x))
+        };
+
+        let mut dh_next = Array1::<f32>::zeros(d);
+
+        let mut dlogits_r = Array2::<f32>::zeros((t, d));
+        let mut dlogits_i = Array2::<f32>::zeros((t, d));
+
+        let mut dlog_base_a = Array1::<f32>::zeros(d);
+
+        let mut d_x_from_u = Array2::<f32>::zeros((t, d));
+
+        for ti in (0..t).rev() {
+            for j in 0..d {
+                let g = output_grads[[ti, j]];
+
+                let dh = g + dh_next[j];
+
+                let at = a[[ti, j]];
+                let it = i[[ti, j]];
+                let rt = r[[ti, j]];
+                let xt = input[[ti, j]];
+                let prev = hprev[[ti, j]];
+
+                let u = it * xt;
+                let one_minus_a = 1.0 - at;
+
+                let du = dh * one_minus_a;
+                d_x_from_u[[ti, j]] = du * it;
+                let di = du * xt;
+
+                let da = dh * (prev - u);
+
+                dh_next[j] = dh * at;
+
+                let k = c * rt * log_base_a[j];
+                let active = (-80.0..=0.0).contains(&k);
+                let dk = if active { da * at } else { 0.0 };
+
+                let dr = dk * c * log_base_a[j];
+                dlog_base_a[j] += dk * c * rt;
+
+                let zr_grad = dr * rt * (1.0 - rt);
+                dlogits_r[[ti, j]] = zr_grad;
+
+                let zi_grad = di * it * (1.0 - it);
+                dlogits_i[[ti, j]] = zi_grad;
+            }
+        }
+
+        let mut d_lambda = Array2::<f32>::zeros((1, d));
+        for j in 0..d {
+            let dl = dlog_base_a[j] * dlogsig_dlambda[j];
+            d_lambda[[0, j]] = dl;
+        }
+
+        let grad_w_a = input.t().dot(&dlogits_r);
+        let grad_b_a = dlogits_r.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_w_x = input.t().dot(&dlogits_i);
+        let grad_b_x = dlogits_i.sum_axis(Axis(0)).insert_axis(Axis(0));
+
+        let dx_gate = dlogits_r.dot(&self.w_a.t()) + dlogits_i.dot(&self.w_x.t());
+        let grad_input = dx_gate + d_x_from_u;
+
+        (
+            grad_input,
+            vec![grad_w_a, grad_b_a, grad_w_x, grad_b_x, d_lambda],
+        )
+    }
+
+    #[inline]
+    fn compute_gradients_view(
+        &self,
+        input: &ArrayView2<f32>,
+        output_grads: &ArrayView2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        self.compute_gradients_impl(input, output_grads)
     }
 
     fn opt_init_if_needed(&mut self) {
@@ -568,112 +738,7 @@ impl Layer for RgLru {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let (r, i, a, hprev) = self.compute_gates_and_state_from_cache_or_recompute(input);
-        let r = r.as_ref();
-        let i = i.as_ref();
-        let a = a.as_ref();
-        let hprev = hprev.as_ref();
-
-        let t = input.nrows();
-        let d = input.ncols();
-        if t == 0 || d == 0 {
-            return (Array2::zeros(input.raw_dim()), vec![]);
-        }
-
-        let c: f32 = 8.0;
-        // log(sigmoid(lambda)) = -softplus(-lambda)
-        let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
-        // d/dlambda log(sigmoid(lambda)) = sigmoid(-lambda) = 1 - sigmoid(lambda)
-        let dlogsig_dlambda: Array1<f32> = {
-            let sigmoid = RichardsCurve::sigmoid(false);
-            self.lambda
-                .row(0)
-                .to_owned()
-                .mapv(|x| sigmoid.forward_scalar_f32(-x))
-        };
-
-        // Full BPTT through diagonal recurrence: dh_next carries gradients to h_{t-1}.
-        let mut dh_next = Array1::<f32>::zeros(d);
-
-        // Accumulate gate preactivation gradients per time step.
-        let mut dlogits_r = Array2::<f32>::zeros((t, d));
-        let mut dlogits_i = Array2::<f32>::zeros((t, d));
-
-        // Accumulate dL/d(log_base_a) per channel across time.
-        let mut dlog_base_a = Array1::<f32>::zeros(d);
-
-        // Direct input gradient path via u = i ⊙ x.
-        let mut d_x_from_u = Array2::<f32>::zeros((t, d));
-
-        for ti in (0..t).rev() {
-            for j in 0..d {
-                let g = output_grads[[ti, j]];
-
-                // Add gradient arriving through time from h_{t} -> h_{t-1}.
-                let dh = g + dh_next[j];
-
-                let at = a[[ti, j]];
-                let it = i[[ti, j]];
-                let rt = r[[ti, j]];
-                let xt = input[[ti, j]];
-                let prev = hprev[[ti, j]];
-
-                let u = it * xt;
-                let one_minus_a = 1.0 - at;
-
-                // dh/du
-                let du = dh * one_minus_a;
-                // direct dL/dx via u = i ⊙ x
-                d_x_from_u[[ti, j]] = du * it;
-                // dL/di
-                let di = du * xt;
-
-                // h_t = a_t * prev + (1-a_t) * u  => dL/da = dh * (prev - u)
-                let da = dh * (prev - u);
-
-                // Propagate to previous hidden state: h_t = a_t ⊙ h_{t-1} + ...
-                dh_next[j] = dh * at;
-
-                // a_t = exp(clamp(k_t, -80, 0)), k_t = c * r_t * log_base_a
-                let k = c * rt * log_base_a[j];
-                let active = (-80.0..=0.0).contains(&k);
-                let dk = if active { da * at } else { 0.0 };
-
-                // k depends on r_t and log_base_a
-                let dr = dk * c * log_base_a[j];
-                dlog_base_a[j] += dk * c * rt;
-
-                // r = sigmoid(z_r)
-                let zr_grad = dr * rt * (1.0 - rt);
-                dlogits_r[[ti, j]] = zr_grad;
-
-                // i = sigmoid(z_i)
-                let zi_grad = di * it * (1.0 - it);
-                dlogits_i[[ti, j]] = zi_grad;
-            }
-        }
-
-        // dL/dlambda = dL/dlog_base_a * d/dlambda log(sigmoid(lambda))
-        let mut d_lambda = Array2::<f32>::zeros((1, d));
-        for j in 0..d {
-            let dl = dlog_base_a[j] * dlogsig_dlambda[j];
-            d_lambda[[0, j]] = dl;
-        }
-
-        // Weight/bias grads: X^T dot dlogits
-        let grad_w_a = input.t().dot(&dlogits_r);
-        let grad_b_a = dlogits_r.sum_axis(Axis(0)).insert_axis(Axis(0));
-        let grad_w_x = input.t().dot(&dlogits_i);
-        let grad_b_x = dlogits_i.sum_axis(Axis(0)).insert_axis(Axis(0));
-
-        // Input grads through gate preactivations
-        let dx_gate = dlogits_r.dot(&self.w_a.t()) + dlogits_i.dot(&self.w_x.t());
-        let grad_input = dx_gate + d_x_from_u;
-
-        (
-            grad_input,
-            vec![grad_w_a, grad_b_a, grad_w_x, grad_b_x, d_lambda],
-        )
+        self.compute_gradients_impl(input, output_grads)
     }
 
     fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> Result<()> {
@@ -726,25 +791,23 @@ impl Layer for MoHRgLru {
         self.cached_input = Some(input.clone());
 
         let gd = self.moh.w_g.nrows().min(d);
-        let gate_input = input.slice(s![.., 0..gd]).to_owned();
-        let eff = self.moh.forward_weights(&gate_input, None, None);
+        let gate_input = input.slice(s![.., 0..gd]);
+        let eff = self.moh.forward_weights_view(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 
         let mut out = Array2::<f32>::zeros((t, d));
-        self.ensure_head_input_scratch(t);
-        for (h, buf) in self.head_input_scratch.iter_mut().enumerate() {
-            let c0 = h * self.head_dim;
-            let c1 = c0 + self.head_dim;
-            let x_view = input.slice(s![.., c0..c1]);
-            buf.assign(&x_view);
-        }
 
         use rayon::prelude::*;
         let head_outs: Vec<Array2<f32>> = self
             .heads
             .par_iter_mut()
-            .zip(self.head_input_scratch.par_iter())
-            .map(|(head, x_h)| head.forward(x_h))
+            .enumerate()
+            .map(|(h, head)| {
+                let c0 = h * self.head_dim;
+                let c1 = c0 + self.head_dim;
+                let x_view = input.slice(s![.., c0..c1]);
+                head.forward_view(&x_view)
+            })
             .collect();
 
         // Compute per-head outputs and apply per-token scaling.
@@ -883,8 +946,8 @@ impl Layer for MoHRgLru {
             // Recompute eff weights without mutating gating caches.
             let mut moh_tmp = self.moh.clone();
             let gd = moh_tmp.w_g.nrows().min(d);
-            let gate_input = input.slice(s![.., 0..gd]).to_owned();
-            eff_local = moh_tmp.forward_weights(&gate_input, None, None);
+            let gate_input = input.slice(s![.., 0..gd]);
+            eff_local = moh_tmp.forward_weights_view(&gate_input, None, None);
             &eff_local
         };
 
@@ -900,9 +963,9 @@ impl Layer for MoHRgLru {
                         .map(|h| {
                             let c0 = h * self.head_dim;
                             let c1 = c0 + self.head_dim;
-                            let x_h = input.slice(s![.., c0..c1]).to_owned();
+                            let x_view = input.slice(s![.., c0..c1]);
                             let mut head = self.heads[h].clone();
-                            head.forward(&x_h)
+                            head.forward_view(&x_view)
                         })
                         .collect();
                     &head_outputs_local
@@ -912,9 +975,9 @@ impl Layer for MoHRgLru {
                     .map(|h| {
                         let c0 = h * self.head_dim;
                         let c1 = c0 + self.head_dim;
-                        let x_h = input.slice(s![.., c0..c1]).to_owned();
+                        let x_view = input.slice(s![.., c0..c1]);
                         let mut head = self.heads[h].clone();
-                        head.forward(&x_h)
+                        head.forward_view(&x_view)
                     })
                     .collect();
                 &head_outputs_local
@@ -940,18 +1003,7 @@ impl Layer for MoHRgLru {
         for h in 0..self.num_heads {
             let c0 = h * self.head_dim;
             let c1 = c0 + self.head_dim;
-            let x_h_owned: Array2<f32>;
-            let x_h: &Array2<f32> = if can_use_cache
-                && let Some(x) = self.heads[h]
-                    .cached_input
-                    .as_ref()
-                    .filter(|x| x.dim() == (t, self.head_dim))
-            {
-                x
-            } else {
-                x_h_owned = input.slice(s![.., c0..c1]).to_owned();
-                &x_h_owned
-            };
+            let x_view = input.slice(s![.., c0..c1]);
             let mut scaled_grads = Array2::<f32>::zeros((t, self.head_dim));
             let eff_col = eff.column(h);
             let eff_col = eff_col.insert_axis(Axis(1));
@@ -966,7 +1018,17 @@ impl Layer for MoHRgLru {
                     *sg = og * w;
                 });
 
-            let (dx_h, pgrads_h) = self.heads[h].compute_gradients(x_h, &scaled_grads);
+            let scaled_grads_view = scaled_grads.view();
+            let (dx_h, pgrads_h) = if can_use_cache
+                && let Some(x) = self.heads[h]
+                    .cached_input
+                    .as_ref()
+                    .filter(|x| x.dim() == (t, self.head_dim))
+            {
+                self.heads[h].compute_gradients(x, &scaled_grads)
+            } else {
+                self.heads[h].compute_gradients_view(&x_view, &scaled_grads_view)
+            };
             let mut gi_block = grad_input.slice_mut(s![.., c0..c1]);
             gi_block += &dx_h;
             grads.extend(pgrads_h);
@@ -976,8 +1038,8 @@ impl Layer for MoHRgLru {
         let (dx_moh, moh_grads) = {
             let mut moh_local = self.moh.clone();
             let gd = moh_local.w_g.nrows().min(d);
-            let gate_input = input.slice(s![.., 0..gd]).to_owned();
-            moh_local.compute_gradients_from_eff(&gate_input, &eff_grads)
+            let gate_input = input.slice(s![.., 0..gd]);
+            moh_local.compute_gradients_from_eff_view(&gate_input, &eff_grads)
         };
         {
             let gd = self.moh.w_g.nrows().min(d);

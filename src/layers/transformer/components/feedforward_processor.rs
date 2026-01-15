@@ -42,11 +42,11 @@ impl FeedforwardProcessor {
     }
 
     pub fn backward(
-        &mut self,
+        &self,
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match &mut self.feedforward {
+        match &self.feedforward {
             FeedForwardVariant::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
             FeedForwardVariant::MixtureOfExperts(layer) => {
                 layer.compute_gradients(input, output_grads)

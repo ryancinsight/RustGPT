@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use ndarray::{Array1, Array2, Axis, Zip, s};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Axis, Data, Ix2, Zip, s};
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1202,13 +1202,16 @@ impl Mamba {
         (state, z, y_pre)
     }
 
-    pub fn forward_mamba2(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward_mamba2_impl<D: Data<Elem = f32>>(
+        &mut self,
+        input: &ArrayBase<D, Ix2>,
+    ) -> Array2<f32> {
         self.cached_kind = MambaCachedKind::Mamba2;
 
         let t = input.nrows();
         let d = input.ncols();
         if t == 0 || d == 0 {
-            self.cached_input = Some(input.clone());
+            self.cached_input = Some(input.to_owned());
             return Array2::zeros((t, d));
         }
 
@@ -1346,7 +1349,7 @@ impl Mamba {
         let out_pre = y_pre.dot(&self.w_dt) + self.b_dt.broadcast((t, d)).unwrap();
 
         // caches
-        self.cached_input = Some(input.clone());
+        self.cached_input = Some(input.to_owned());
         self.cached_u_pre = Some(u_pre);
         self.cached_u_act = Some(u_act);
         self.cached_gate = Some(gate);
@@ -1374,10 +1377,18 @@ impl Mamba {
         out_pre
     }
 
-    fn compute_gradients_mamba2(
+    pub fn forward_mamba2(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.forward_mamba2_impl(input)
+    }
+
+    pub(crate) fn forward_mamba2_view(&mut self, input: &ArrayView2<f32>) -> Array2<f32> {
+        self.forward_mamba2_impl(input)
+    }
+
+    fn compute_gradients_mamba2_impl<Din: Data<Elem = f32>, Dout: Data<Elem = f32>>(
         &self,
-        input: &Array2<f32>,
-        output_grads: &Array2<f32>,
+        input: &ArrayBase<Din, Ix2>,
+        output_grads: &ArrayBase<Dout, Ix2>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let u_pre = self.cached_u_pre.as_ref().expect("cache u_pre");
         let u_act = self.cached_u_act.as_ref().expect("cache u_act");
@@ -1651,6 +1662,22 @@ impl Mamba {
                 grad_b_out,
             ],
         )
+    }
+
+    fn compute_gradients_mamba2(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        self.compute_gradients_mamba2_impl(input, output_grads)
+    }
+
+    pub(crate) fn compute_gradients_mamba2_view(
+        &self,
+        input: &ArrayView2<f32>,
+        output_grads: &ArrayView2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        self.compute_gradients_mamba2_impl(input, output_grads)
     }
 }
 
@@ -2241,8 +2268,8 @@ impl Layer for MoHMamba {
         self.cached_input = Some(input.clone());
 
         let gd = self.gating_embed_dim.min(d);
-        let gate_input = input.slice(s![.., 0..gd]).to_owned();
-        let eff = self.moh.forward_weights(&gate_input, None, None);
+        let gate_input = input.slice(s![.., 0..gd]);
+        let eff = self.moh.forward_weights_view(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 
         let y_inner = self.inner.forward(input);
@@ -2373,8 +2400,8 @@ impl Layer for MoHMamba {
         } else {
             let mut moh_tmp = self.moh.clone();
             let gd = self.gating_embed_dim.min(d);
-            let gate_input = input.slice(s![.., 0..gd]).to_owned();
-            eff_local = moh_tmp.forward_weights(&gate_input, None, None);
+            let gate_input = input.slice(s![.., 0..gd]);
+            eff_local = moh_tmp.forward_weights_view(&gate_input, None, None);
             &eff_local
         };
 
@@ -2431,8 +2458,8 @@ impl Layer for MoHMamba {
         let (dx_moh, moh_grads) = {
             let mut moh_local = self.moh.clone();
             let gd = self.gating_embed_dim.min(d);
-            let gate_input = input.slice(s![.., 0..gd]).to_owned();
-            moh_local.compute_gradients_from_eff(&gate_input, &eff_grads)
+            let gate_input = input.slice(s![.., 0..gd]);
+            moh_local.compute_gradients_from_eff_view(&gate_input, &eff_grads)
         };
         {
             let gd = self.gating_embed_dim.min(d);

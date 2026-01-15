@@ -1132,13 +1132,6 @@ impl Layer for RichardsExpert {
     }
 }
 
-/// Parameter information for the MoE layer
-#[derive(Debug, Clone)]
-struct MoeParamInfo {
-    /// Total parameter count across all components
-    total_params: usize,
-}
-
 /// Mixture of Experts layer combining routing and expert execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixtureOfExperts {
@@ -1150,9 +1143,6 @@ pub struct MixtureOfExperts {
     pub config: ExpertRouterConfig,
     /// Router hidden dimension
     pub router_hidden_dim: usize,
-    /// Cached parameter information
-    #[serde(skip)]
-    param_info: Option<MoeParamInfo>,
     /// Cached routing probabilities for gradient computation
     #[serde(skip)]
     cached_routing_probs: Option<ndarray::Array2<f32>>,
@@ -1216,7 +1206,6 @@ impl MixtureOfExperts {
             experts,
             config,
             router_hidden_dim,
-            param_info: None,
             cached_routing_probs: None,
             cached_input: None,
             cached_router_input: None,
@@ -1692,42 +1681,9 @@ impl MixtureOfExperts {
         output
     }
 
-    /// Get parameter information for the MoE layer
-    fn get_param_info(&mut self) -> &MoeParamInfo {
-        if self.param_info.is_none() {
-            // Get router parameter info (avoid clone by taking ownership)
-            let router_info = (*self.router.get_param_info()).clone();
-
-            // Get expert parameter info using iterator chains
-            let expert_infos = self
-                .experts
-                .iter_mut()
-                .map(|expert| (*expert.get_param_info()).clone())
-                .collect::<Vec<_>>();
-
-            // Calculate total parameters using iterator chains
-            let total_params = router_info.total_params
-                + expert_infos
-                    .iter()
-                    .map(|info| info.total_params)
-                    .sum::<usize>();
-
-            let total_params = total_params
-                + self
-                    .k_adapter
-                    .as_ref()
-                    .map(|a| a.w.len() + a.b.len())
-                    .unwrap_or(0);
-
-            self.param_info = Some(MoeParamInfo { total_params });
-        }
-
-        self.param_info.as_ref().unwrap()
-    }
-
     /// Get total parameters in the MoE layer
-    pub fn total_parameters(&mut self) -> usize {
-        self.get_param_info().total_params
+    pub fn total_parameters(&self) -> usize {
+        self.parameters()
     }
 }
 
@@ -1846,33 +1802,29 @@ impl Layer for MixtureOfExperts {
     }
 
     fn parameters(&self) -> usize {
-        // We need to use a mutable reference, so we can't implement this directly
-        // This is a limitation - we'll need to compute parameters differently
-        // For now, return a cached value or compute without mutation
-        if let Some(ref info) = self.param_info {
-            info.total_params
-        } else {
-            // Fallback: compute without caching
-            let mut total = 0;
-            total += self.router.weights1.len() + self.router.weights2.len();
-            total += self.router.bias1.len() + self.router.bias2.len();
-            total += self.router.norm.parameters();
-            total += self.router.activation.parameters();
-
-            total += self
-                .experts
-                .iter()
-                .map(|expert| expert.glu.parameters())
-                .sum::<usize>();
-
-            total += self
-                .k_adapter
-                .as_ref()
-                .map(|a| a.w.len() + a.b.len())
-                .unwrap_or(0);
-
-            total
+        let mut total = 0;
+        total += self.router.weights1.len() + self.router.weights2.len();
+        total += self.router.bias1.len() + self.router.bias2.len();
+        total += self.router.norm.parameters();
+        total += self.router.activation.parameters();
+        total += self.router.sigmoid.weights().len();
+        if let Some(w) = self.router.head_to_expert.as_ref() {
+            total += w.len();
         }
+
+        total += self
+            .experts
+            .iter()
+            .map(|expert| expert.glu.parameters())
+            .sum::<usize>();
+
+        total += self
+            .k_adapter
+            .as_ref()
+            .map(|a| a.w.len() + a.b.len())
+            .unwrap_or(0);
+
+        total
     }
 
     fn compute_gradients(

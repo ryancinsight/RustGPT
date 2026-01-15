@@ -114,25 +114,29 @@ impl CompressedTraceCheckpoint {
                 scale: dynamic_range / 127.0, // Map to int8 range
                 offset: trace.iter().cloned().fold(f32::INFINITY, f32::min),
             }
-        } else if let Some(prev) = previous_base {
-            // Delta compression possible
+        } else if previous_base.is_some() {
             CompressionType::DeltaSparse
         } else {
             // Fallback to no compression for critical precision
             CompressionType::None
         };
 
-        let compressed_data = match compression_type {
-            CompressionType::Sparse => Self::compress_sparse(trace),
-            CompressionType::Quantized { scale, offset } => Self::compress_quantized(trace, scale, offset),
+        let (compression_type, compressed_data) = match compression_type {
+            CompressionType::Sparse => (CompressionType::Sparse, Self::compress_sparse(trace)),
+            CompressionType::Quantized { scale, offset } => (
+                CompressionType::Quantized { scale, offset },
+                Self::compress_quantized(trace, scale, offset),
+            ),
             CompressionType::DeltaSparse => {
-                if let Some(prev) = previous_base {
-                    Self::compress_delta_sparse(trace, prev, timestep)
+                if let Some(prev) = previous_base
+                    && let Some(data) = Self::compress_delta_sparse(trace, prev)
+                {
+                    (CompressionType::DeltaSparse, data)
                 } else {
-                    Self::compress_sparse(trace) // Fallback
+                    (CompressionType::Sparse, Self::compress_sparse(trace))
                 }
             }
-            CompressionType::None => Self::compress_none(trace),
+            CompressionType::None => (CompressionType::None, Self::compress_none(trace)),
         };
 
         Self {
@@ -150,8 +154,38 @@ impl CompressedTraceCheckpoint {
             CompressionType::None => self.decompress_none(),
             CompressionType::Sparse => self.decompress_sparse(),
             CompressionType::Quantized { scale, offset } => self.decompress_quantized(scale, offset),
-            CompressionType::DeltaSparse => self.decompress_delta_sparse(),
+            CompressionType::DeltaSparse => Err("DeltaSparse decompression requires a previous checkpoint".into()),
         }
+    }
+
+    pub fn decompress_with_previous(
+        &self,
+        previous: &CompressedTraceCheckpoint,
+    ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+        if !matches!(self.compression_type, CompressionType::DeltaSparse) {
+            return self.decompress();
+        }
+        if matches!(previous.compression_type, CompressionType::DeltaSparse) {
+            return Err("DeltaSparse base checkpoint cannot itself be DeltaSparse".into());
+        }
+        if self.original_shape != previous.original_shape {
+            return Err("DeltaSparse shape mismatch with previous checkpoint".into());
+        }
+
+        if self.compressed_data.len() < 8 {
+            return Err("DeltaSparse compressed data too short".into());
+        }
+        let mut prev_timestep_bytes = [0u8; 8];
+        prev_timestep_bytes.copy_from_slice(&self.compressed_data[..8]);
+        let expected_prev_timestep = u64::from_le_bytes(prev_timestep_bytes) as usize;
+        if expected_prev_timestep != previous.base_timestep {
+            return Err("DeltaSparse previous timestep mismatch".into());
+        }
+        let delta_data = &self.compressed_data[8..];
+        let delta = Self::decompress_sparse_data(delta_data, self.original_shape)?;
+
+        let base = previous.decompress()?;
+        Ok(base + delta)
     }
 
     /// Estimate memory savings vs uncompressed f32 array
@@ -208,9 +242,25 @@ impl CompressedTraceCheckpoint {
         quantized.iter().map(|&x| x as u8).collect()
     }
 
-    fn compress_delta_sparse(trace: &Array2<f32>, previous: &CompressedTraceCheckpoint, current_timestep: usize) -> Vec<u8> {
-        // Not implemented in this foundation - would need full delta logic
-        Self::compress_sparse(trace)
+    fn compress_delta_sparse(
+        trace: &Array2<f32>,
+        previous: &CompressedTraceCheckpoint,
+    ) -> Option<Vec<u8>> {
+        if trace.dim() != previous.original_shape {
+            return None;
+        }
+        if matches!(previous.compression_type, CompressionType::DeltaSparse) {
+            return None;
+        }
+
+        let base = previous.decompress().ok()?;
+        let delta = trace - &base;
+        let delta_encoded = Self::compress_sparse(&delta);
+
+        let mut data = Vec::with_capacity(8 + delta_encoded.len());
+        data.extend_from_slice(&(previous.base_timestep as u64).to_le_bytes());
+        data.extend_from_slice(&delta_encoded);
+        Some(data)
     }
 
     // Private decompression methods
@@ -233,49 +283,7 @@ impl CompressedTraceCheckpoint {
     }
 
     fn decompress_sparse(&self) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-        if self.compressed_data.len() < 4 {
-            return Err("Compressed data too short".into());
-        }
-
-        let num_elements = u32::from_le_bytes([self.compressed_data[0], self.compressed_data[1],
-                                               self.compressed_data[2], self.compressed_data[3]]) as usize;
-
-        let indices_start = 4;
-        let indices_end = indices_start + num_elements * 4;
-        let values_start = indices_end;
-
-        if indices_end > self.compressed_data.len() || values_start + num_elements * 4 != self.compressed_data.len() {
-            return Err("Invalid sparse compressed data format".into());
-        }
-
-        // Read indices
-        let mut indices = Vec::with_capacity(num_elements);
-        for i in (indices_start..indices_end).step_by(4) {
-            let bytes = [self.compressed_data[i], self.compressed_data[i+1],
-                        self.compressed_data[i+2], self.compressed_data[i+3]];
-            indices.push(u32::from_le_bytes(bytes) as usize);
-        }
-
-        // Read values
-        let mut values = Vec::with_capacity(num_elements);
-        for i in (values_start..self.compressed_data.len()).step_by(4) {
-            let bytes = [self.compressed_data[i], self.compressed_data[i+1],
-                        self.compressed_data[i+2], self.compressed_data[i+3]];
-            values.push(f32::from_le_bytes(bytes));
-        }
-
-        // Reconstruct sparse array
-        let total_elements = self.original_shape.0 * self.original_shape.1;
-        let mut trace_data = vec![0.0f32; total_elements];
-
-        for (&idx, &val) in indices.iter().zip(values.iter()) {
-            if idx < total_elements {
-                trace_data[idx] = val;
-            }
-        }
-
-        Array2::from_shape_vec(self.original_shape, trace_data)
-            .map_err(|e| e.into())
+        Self::decompress_sparse_data(&self.compressed_data, self.original_shape)
     }
 
     fn decompress_quantized(&self, scale: f32, offset: f32) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
@@ -296,9 +304,63 @@ impl CompressedTraceCheckpoint {
             .map_err(|e| e.into())
     }
 
-    fn decompress_delta_sparse(&self) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
-        // Not implemented - fallback to sparse
-        self.decompress_sparse()
+    fn decompress_sparse_data(
+        compressed_data: &[u8],
+        original_shape: (usize, usize),
+    ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+        if compressed_data.len() < 4 {
+            return Err("Compressed data too short".into());
+        }
+
+        let num_elements = u32::from_le_bytes([
+            compressed_data[0],
+            compressed_data[1],
+            compressed_data[2],
+            compressed_data[3],
+        ]) as usize;
+
+        let indices_start = 4;
+        let indices_end = indices_start + num_elements * 4;
+        let values_start = indices_end;
+
+        if indices_end > compressed_data.len()
+            || values_start + num_elements * 4 != compressed_data.len()
+        {
+            return Err("Invalid sparse compressed data format".into());
+        }
+
+        let mut indices = Vec::with_capacity(num_elements);
+        for i in (indices_start..indices_end).step_by(4) {
+            let bytes = [
+                compressed_data[i],
+                compressed_data[i + 1],
+                compressed_data[i + 2],
+                compressed_data[i + 3],
+            ];
+            indices.push(u32::from_le_bytes(bytes) as usize);
+        }
+
+        let mut values = Vec::with_capacity(num_elements);
+        for i in (values_start..compressed_data.len()).step_by(4) {
+            let bytes = [
+                compressed_data[i],
+                compressed_data[i + 1],
+                compressed_data[i + 2],
+                compressed_data[i + 3],
+            ];
+            values.push(f32::from_le_bytes(bytes));
+        }
+
+        let total_elements = original_shape.0 * original_shape.1;
+        let mut trace_data = vec![0.0f32; total_elements];
+        for (&idx, &val) in indices.iter().zip(values.iter()) {
+            if idx >= total_elements {
+                return Err("Sparse index out of bounds".into());
+            }
+            trace_data[idx] = val;
+        }
+
+        Array2::from_shape_vec(original_shape, trace_data).map_err(|e| e.into())
     }
 
     // Utility functions
@@ -565,6 +627,40 @@ mod tests {
         assert_eq!(restored.timestep, 42);
         assert!(arrays_equal(&ε_x, &ε_x_restored, 1e-6));
         assert!(arrays_equal(&ε_f, &ε_f_restored, 1e-6));
+    }
+
+    #[test]
+    fn test_compressed_trace_delta_sparse_roundtrip() {
+        let base_trace =
+            Array2::from_shape_fn((16, 16), |(i, j)| (i as f32).sin() + (j as f32).cos());
+        let base = CompressedTraceCheckpoint::compress_adaptive(0, &base_trace, None, 0.0);
+        assert!(!matches!(base.compression_type, CompressionType::DeltaSparse));
+
+        let next_trace = &base_trace + 0.001;
+        let delta =
+            CompressedTraceCheckpoint::compress_adaptive(10, &next_trace, Some(&base), 0.0);
+        assert!(matches!(delta.compression_type, CompressionType::DeltaSparse));
+
+        assert!(delta.decompress().is_err());
+
+        let restored = delta.decompress_with_previous(&base).unwrap();
+        assert!(arrays_equal(&next_trace, &restored, 1e-6));
+    }
+
+    #[test]
+    fn test_delta_sparse_previous_mismatch_errors() {
+        let base_trace = Array2::from_elem((4, 4), 1.0);
+        let base = CompressedTraceCheckpoint::compress_adaptive(0, &base_trace, None, 0.0);
+
+        let next_trace = &base_trace + 1.0;
+        let mut delta =
+            CompressedTraceCheckpoint::compress_adaptive(10, &next_trace, Some(&base), 0.0);
+        assert!(matches!(delta.compression_type, CompressionType::DeltaSparse));
+
+        if delta.compressed_data.len() >= 8 {
+            delta.compressed_data[0] ^= 0xFF;
+        }
+        assert!(delta.decompress_with_previous(&base).is_err());
     }
 
     #[test]

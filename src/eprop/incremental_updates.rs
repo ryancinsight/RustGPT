@@ -22,7 +22,7 @@ Implementation Strategy:
 - Maintain accuracy with automatic fallback
 */
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 /// Incremental computation state for tracking changes
@@ -168,16 +168,54 @@ impl IncrementalGradientUpdater {
     /// Returns whether incremental computation was beneficial
     pub fn compute_incremental_gradient(
         &mut self,
-        previous_grad_in: &ndarray::Array2<f32>,
-        previous_grad_rec: &ndarray::Array2<f32>,
-        current_input: &Array1<f32>,
+        grad_in: &mut Array2<f32>,
+        grad_rec: &mut Array2<f32>,
+        current_voltage: &Array1<f32>,
         current_spikes: &Array1<f32>,
         current_filtered_spikes: &Array1<f32>,
         current_eps_x: &Array1<f32>,
         current_eps_f: &Array1<f32>,
         learning_signal: &Array1<f32>,
     ) -> IncrementalGradientResult {
-        if !self.enable_incremental {
+        assert_eq!(learning_signal.len(), current_eps_f.len(), "Dim mismatch: learning_signal vs eps_f");
+        assert_eq!(
+            learning_signal.len(),
+            current_filtered_spikes.len(),
+            "Dim mismatch: learning_signal vs filtered_spikes"
+        );
+
+        let num_neurons = learning_signal.len();
+        let input_dim = current_eps_x.len();
+
+        assert_eq!(
+            grad_in.raw_dim(),
+            (num_neurons, input_dim).into(),
+            "grad_in shape mismatch"
+        );
+        assert_eq!(
+            grad_rec.raw_dim(),
+            (num_neurons, num_neurons).into(),
+            "grad_rec shape mismatch"
+        );
+        assert_eq!(
+            current_voltage.len(),
+            num_neurons,
+            "Dim mismatch: voltage vs learning_signal"
+        );
+
+        let modulated_eps_f = learning_signal * current_eps_f;
+
+        if !self.enable_incremental || !self.state.cache_status() {
+            Self::outer_assign(grad_in, &modulated_eps_f, current_eps_x);
+            Self::outer_assign(grad_rec, &modulated_eps_f, current_filtered_spikes);
+            self.state.update_cache(
+                current_voltage,
+                current_spikes,
+                current_filtered_spikes,
+                current_eps_x,
+                current_eps_f,
+                learning_signal,
+            );
             return IncrementalGradientResult {
                 used_incremental: false,
                 speedup_factor: 1.0,
@@ -185,45 +223,98 @@ impl IncrementalGradientUpdater {
                 time_ratio: 1.0,
             };
         }
-        
-        // Check if incremental update is beneficial
-        let input_changed = self.state.input_changed_significantly(current_input);
-        let state_changed = self.state.state_changed_significantly(current_spikes);
-        
-        let should_use_incremental = !input_changed && !state_changed && 
-                                    self.state.cached_learning_signal.is_some();
-        
-        if should_use_incremental {
-            // Use incremental update
-            self.compute_delta_update(previous_grad_in, previous_grad_rec, learning_signal);
 
-            let previous_voltage = self.state.cached_voltage.as_ref().unwrap().clone();
+        let (cached_eps_x, cached_eps_f, cached_filtered_spikes, cached_learning_signal) = match (
+            self.state.cached_eps_x.as_ref(),
+            self.state.cached_eps_f.as_ref(),
+            self.state.cached_filtered_spikes.as_ref(),
+            self.state.cached_learning_signal.as_ref(),
+        ) {
+            (Some(x), Some(f), Some(zf), Some(ls)) => (x, f, zf, ls),
+            _ => {
+                Self::outer_assign(grad_in, &modulated_eps_f, current_eps_x);
+                Self::outer_assign(grad_rec, &modulated_eps_f, current_filtered_spikes);
+                self.state.update_cache(
+                    current_voltage,
+                    current_spikes,
+                    current_filtered_spikes,
+                    current_eps_x,
+                    current_eps_f,
+                    learning_signal,
+                );
+                return IncrementalGradientResult {
+                    used_incremental: false,
+                    speedup_factor: 1.0,
+                    accuracy_factor: 1.0,
+                    time_ratio: 1.0,
+                };
+            }
+        };
+
+        // Check if incremental update is beneficial
+        let input_changed = self.state.input_changed_significantly(current_eps_x);
+        let state_changed = self.state.state_changed_significantly(current_spikes);
+
+        let cached_modulated_eps_f = cached_learning_signal * cached_eps_f;
+        let delta_modulated_eps_f = &modulated_eps_f - &cached_modulated_eps_f;
+        let delta_eps_x = current_eps_x - cached_eps_x;
+        let delta_filtered_spikes = current_filtered_spikes - cached_filtered_spikes;
+
+        let nz_delta_mod = delta_modulated_eps_f.iter().filter(|&&v| v != 0.0).count();
+        let nz_delta_x = delta_eps_x.iter().filter(|&&v| v != 0.0).count();
+        let nz_delta_filtered = delta_filtered_spikes.iter().filter(|&&v| v != 0.0).count();
+
+        let full_ops = (num_neurons * input_dim + num_neurons * num_neurons).max(1);
+        let incremental_ops = (nz_delta_mod * input_dim
+            + num_neurons * nz_delta_x
+            + nz_delta_mod * num_neurons
+            + num_neurons * nz_delta_filtered)
+            .max(1);
+        let estimated_speedup = (full_ops as f32) / (incremental_ops as f32);
+
+        let should_use_incremental =
+            !input_changed && !state_changed && estimated_speedup >= self.min_speedup_threshold;
+
+        if should_use_incremental {
+            self.apply_delta_update_inplace(
+                grad_in,
+                grad_rec,
+                current_eps_x,
+                current_filtered_spikes,
+                &cached_modulated_eps_f,
+                &delta_modulated_eps_f,
+                &delta_eps_x,
+                &delta_filtered_spikes,
+            );
+
             self.state.update_cache(
-                &previous_voltage, // Previous voltage
+                current_voltage,
                 current_spikes,
                 current_filtered_spikes,
                 current_eps_x,
                 current_eps_f,
                 learning_signal,
             );
-            
+
             IncrementalGradientResult {
                 used_incremental: true,
-                speedup_factor: 3.0, // Estimated 3× speedup
-                accuracy_factor: 0.98, // 98% accuracy with incremental
-                time_ratio: 0.33, // 1/3 the computation time
+                speedup_factor: estimated_speedup,
+                accuracy_factor: 1.0,
+                time_ratio: 1.0 / estimated_speedup,
             }
         } else {
-            // Fallback to full computation
+            Self::outer_assign(grad_in, &modulated_eps_f, current_eps_x);
+            Self::outer_assign(grad_rec, &modulated_eps_f, current_filtered_spikes);
+
             self.state.update_cache(
-                &Array1::zeros(current_spikes.len()), // New voltage (placeholder)
+                current_voltage,
                 current_spikes,
                 current_filtered_spikes,
                 current_eps_x,
                 current_eps_f,
                 learning_signal,
             );
-            
+
             IncrementalGradientResult {
                 used_incremental: false,
                 speedup_factor: 1.0,
@@ -232,28 +323,82 @@ impl IncrementalGradientUpdater {
             }
         }
     }
-    
-    /// Compute delta-based gradient update
-    fn compute_delta_update(
+
+    fn outer_assign(out: &mut Array2<f32>, left: &Array1<f32>, right: &Array1<f32>) {
+        assert_eq!(out.nrows(), left.len(), "outer_assign: out.nrows != left.len");
+        assert_eq!(out.ncols(), right.len(), "outer_assign: out.ncols != right.len");
+        for i in 0..left.len() {
+            let li = left[i];
+            for j in 0..right.len() {
+                out[(i, j)] = li * right[j];
+            }
+        }
+    }
+
+    fn apply_delta_update_inplace(
         &self,
-        grad_in: &ndarray::Array2<f32>,
-        grad_rec: &ndarray::Array2<f32>,
-        learning_signal: &Array1<f32>,
+        grad_in: &mut Array2<f32>,
+        grad_rec: &mut Array2<f32>,
+        eps_x: &Array1<f32>,
+        filtered_spikes: &Array1<f32>,
+        cached_modulated_eps_f: &Array1<f32>,
+        delta_modulated_eps_f: &Array1<f32>,
+        delta_eps_x: &Array1<f32>,
+        delta_filtered_spikes: &Array1<f32>,
     ) {
-        // Simplified incremental update logic
-        // In practice, this would compute gradient deltas based on
-        // changes in the learning signal or other factors
-        
-        // For now, this is a placeholder that shows the concept
-        // The actual implementation would track finer-grained changes
-        let _ = grad_in;
-        let _ = grad_rec;
-        let _ = learning_signal;
-        
-        // Delta computation would happen here:
-        // - Compute change in learning signal
-        // - Update only affected gradient components
-        // - Apply local updates instead of full recomputation
+        let num_neurons = cached_modulated_eps_f.len();
+        let input_dim = eps_x.len();
+
+        assert_eq!(delta_modulated_eps_f.len(), num_neurons, "delta_mod len mismatch");
+        assert_eq!(delta_eps_x.len(), input_dim, "delta_eps_x len mismatch");
+        assert_eq!(
+            filtered_spikes.len(),
+            num_neurons,
+            "filtered_spikes len mismatch"
+        );
+        assert_eq!(
+            delta_filtered_spikes.len(),
+            num_neurons,
+            "delta_filtered_spikes len mismatch"
+        );
+
+        for i in 0..num_neurons {
+            let dm = delta_modulated_eps_f[i];
+            if dm == 0.0 {
+                continue;
+            }
+            for j in 0..input_dim {
+                grad_in[(i, j)] += dm * eps_x[j];
+            }
+        }
+        for j in 0..input_dim {
+            let dx = delta_eps_x[j];
+            if dx == 0.0 {
+                continue;
+            }
+            for i in 0..num_neurons {
+                grad_in[(i, j)] += cached_modulated_eps_f[i] * dx;
+            }
+        }
+
+        for i in 0..num_neurons {
+            let dm = delta_modulated_eps_f[i];
+            if dm == 0.0 {
+                continue;
+            }
+            for j in 0..num_neurons {
+                grad_rec[(i, j)] += dm * filtered_spikes[j];
+            }
+        }
+        for j in 0..num_neurons {
+            let dz = delta_filtered_spikes[j];
+            if dz == 0.0 {
+                continue;
+            }
+            for i in 0..num_neurons {
+                grad_rec[(i, j)] += cached_modulated_eps_f[i] * dz;
+            }
+        }
     }
     
     /// Enable/disable incremental updates
@@ -332,9 +477,9 @@ mod tests {
         
         assert!(!updater.cache_status());
         
-        let grad_in = ndarray::Array2::zeros((3, 4));
-        let grad_rec = ndarray::Array2::zeros((3, 3));
-        let input = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+        let mut grad_in = ndarray::Array2::zeros((3, 4));
+        let mut grad_rec = ndarray::Array2::zeros((3, 3));
+        let voltage = Array1::from_vec(vec![0.1, 0.2, 0.3]);
         let spikes = Array1::from_vec(vec![0.0, 1.0, 0.0]);
         let filtered = Array1::from_vec(vec![0.1, 0.9, 0.1]);
         let eps_x = Array1::from_vec(vec![0.5, 0.6, 0.7, 0.8]);
@@ -342,21 +487,54 @@ mod tests {
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
         
         let result = updater.compute_incremental_gradient(
-            &grad_in, &grad_rec, &input, &spikes, &filtered, &eps_x, &eps_f, &learning
+            &mut grad_in,
+            &mut grad_rec,
+            &voltage,
+            &spikes,
+            &filtered,
+            &eps_x,
+            &eps_f,
+            &learning,
         );
         
         // First call should use full computation (no cache)
         assert!(!result.used_incremental);
         assert!(updater.cache_status());
+
+        let modulated = &learning * &eps_f;
+        for i in 0..3 {
+            for j in 0..4 {
+                let expected = modulated[i] * eps_x[j];
+                assert_eq!(grad_in[(i, j)], expected);
+            }
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = modulated[i] * filtered[j];
+                assert_eq!(grad_rec[(i, j)], expected);
+            }
+        }
+
+        let result2 = updater.compute_incremental_gradient(
+            &mut grad_in,
+            &mut grad_rec,
+            &voltage,
+            &spikes,
+            &filtered,
+            &eps_x,
+            &eps_f,
+            &learning,
+        );
+        assert!(result2.used_incremental);
     }
     
     #[test]
     fn test_incremental_disabled() {
         let mut updater = IncrementalGradientUpdater::new(false);
         
-        let grad_in = ndarray::Array2::zeros((3, 4));
-        let grad_rec = ndarray::Array2::zeros((3, 3));
-        let input = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+        let mut grad_in = ndarray::Array2::zeros((3, 4));
+        let mut grad_rec = ndarray::Array2::zeros((3, 3));
+        let voltage = Array1::from_vec(vec![0.1, 0.2, 0.3]);
         let spikes = Array1::from_vec(vec![0.0, 1.0, 0.0]);
         let filtered = Array1::from_vec(vec![0.1, 0.9, 0.1]);
         let eps_x = Array1::from_vec(vec![0.5, 0.6, 0.7, 0.8]);
@@ -364,7 +542,14 @@ mod tests {
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
         
         let result = updater.compute_incremental_gradient(
-            &grad_in, &grad_rec, &input, &spikes, &filtered, &eps_x, &eps_f, &learning
+            &mut grad_in,
+            &mut grad_rec,
+            &voltage,
+            &spikes,
+            &filtered,
+            &eps_x,
+            &eps_f,
+            &learning,
         );
         
         // Should never use incremental when disabled

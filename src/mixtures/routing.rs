@@ -286,15 +286,23 @@ fn apply_softmax_selection(
         1.0
     };
 
-    // Scale gates by temperature
-    let scaled_gates = gates.mapv(|x| {
-        let x = if x.is_finite() { x } else { 0.0 };
-        x / temperature
-    });
+    if (temperature - 1.0).abs() <= 1e-6 {
+        return softmax.forward_immutable(gates);
+    }
 
-    // Apply softmax using the existing implementation
-    // This is a pure forward-only call site; avoid Softmax::forward() which caches outputs
-    // and would otherwise clone the full output tensor.
+    let mut scaled_gates = gates.to_owned();
+    if let Some(slice) = scaled_gates.as_slice_mut() {
+        let inv_t = 1.0 / temperature;
+        for v in slice {
+            *v *= inv_t;
+        }
+    } else {
+        let inv_t = 1.0 / temperature;
+        for v in scaled_gates.iter_mut() {
+            *v *= inv_t;
+        }
+    }
+
     softmax.forward_immutable(&scaled_gates.view())
 }
 

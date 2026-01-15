@@ -453,12 +453,10 @@ impl LLM {
             return Array1::zeros(self.vocab.size());
         }
 
-        // Convert tokens to embeddings (convert to f32)
-        let token_ids = Array2::from_shape_vec(
-            (1, tokens.len()),
-            tokens.iter().map(|&x| x as f32).collect(),
-        )
-        .expect("Failed to create token array");
+        let mut token_ids = Array2::<f32>::zeros((1, tokens.len()));
+        for (i, &token) in tokens.iter().enumerate() {
+            token_ids[[0, i]] = token as f32;
+        }
 
         // Forward through embeddings
         let mut hidden = self.network[0].forward(&token_ids);

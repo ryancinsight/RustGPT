@@ -118,11 +118,11 @@ impl TemporalMixingWrapper {
 
     /// Backward pass through the temporal mixing layer
     pub fn backward(
-        &mut self,
+        &self,
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match &mut self.temporal_mixing {
+        match &self.temporal_mixing {
             TemporalMixingLayer::Attention(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::RgLru(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::Mamba(layer) => layer.compute_gradients(input, output_grads),

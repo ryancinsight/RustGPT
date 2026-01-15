@@ -367,27 +367,67 @@ impl LRM {
     }
 
     pub fn from_model_config(config: &ModelConfig) -> Self {
-        // Default to Transformer for now if not specified, or infer from config
-        // Assuming Transformer base for standard LRM usage unless specified otherwise
-        let block_config = BlockTypeConfig::Transformer(TransformerBlockConfig {
-            embed_dim: config.embedding_dim,
-            hidden_dim: config.hidden_dim,
-            num_heads: config.get_num_heads(),
-            poly_degree: config.get_poly_degree_p(),
-            max_pos: config.max_seq_len,
-            window_size: config.window_size,
-            use_moe: config.moe_router.is_some(),
-            moe_config: None,
-            head_selection: config.head_selection.clone(),
-            temporal_mixing: config.temporal_mixing,
-            use_adaptive_window: config.use_adaptive_window,
-            min_window_size: config.min_window_size,
-            max_window_size: config.max_window_size,
-            window_adaptation_strategy: config.window_adaptation_strategy,
-            entropy_ema_alpha: config.entropy_ema_alpha,
-            use_advanced_adaptive_residuals: true,
-            titan_memory: config.titan_memory.clone(),
-        });
+        let block_config = if config.trm_use_diffusion {
+            BlockTypeConfig::Diffusion(DiffusionBlockConfig {
+                embed_dim: config.embedding_dim,
+                hidden_dim: config.hidden_dim,
+                num_heads: config.get_num_heads(),
+                num_timesteps: 1000,
+                noise_schedule: config.diffusion_noise_schedule.clone(),
+                prediction_target: config.diffusion_prediction_target.clone(),
+                timestep_strategy: config.diffusion_timestep_strategy,
+                causal_attention: false,
+                window_size: config.window_size,
+                use_adaptive_window: config.use_adaptive_window,
+                discrete_masked: false,
+                poly_degree: config.get_poly_degree_p(),
+                max_pos: config.max_seq_len,
+                use_moe: config.moe_router.is_some(),
+                moe_config: config
+                    .moe_router
+                    .as_ref()
+                    .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
+                head_selection: config.head_selection.clone(),
+                titan_memory: config.titan_memory.clone(),
+                time_embed_dim: config.embedding_dim,
+                mask_token_id: None,
+                temporal_mixing: config.temporal_mixing,
+                use_advanced_adaptive_residuals: true,
+                edm_sigma_data: crate::layers::diffusion::EDM_SIGMA_DATA_DEFAULT,
+                sampler: Default::default(),
+                guidance: None,
+                loss_weighting: Default::default(),
+                use_p2_weighting: false,
+                use_snr_weighting: false,
+                adaptive_guidance: false,
+                min_guidance_scale: 1.0,
+                max_guidance_scale: 10.0,
+                ddim_steps_policy: Default::default(),
+            })
+        } else {
+            BlockTypeConfig::Transformer(TransformerBlockConfig {
+                embed_dim: config.embedding_dim,
+                hidden_dim: config.hidden_dim,
+                num_heads: config.get_num_heads(),
+                poly_degree: config.get_poly_degree_p(),
+                max_pos: config.max_seq_len,
+                window_size: config.window_size,
+                use_moe: config.moe_router.is_some(),
+                moe_config: config
+                    .moe_router
+                    .as_ref()
+                    .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
+                head_selection: config.head_selection.clone(),
+                temporal_mixing: config.temporal_mixing,
+                use_adaptive_window: config.use_adaptive_window,
+                min_window_size: config.min_window_size,
+                max_window_size: config.max_window_size,
+                window_adaptation_strategy: config.window_adaptation_strategy,
+                entropy_ema_alpha: config.entropy_ema_alpha,
+                use_advanced_adaptive_residuals: true,
+                titan_memory: config.titan_memory.clone(),
+            })
+        };
 
         let c = LRMConfig {
             block_config,
@@ -535,12 +575,6 @@ impl LRM {
         let halt_eps = self.config.halting.epsilon.clamp(1e-6, 0.5);
 
         for t in 0..max_steps {
-            // Move the previous y instead of cloning it; this is reused for:
-            // - recursion input
-            // - step-cache (training)
-            // - convergence check
-            // Replace y with a tiny placeholder to avoid allocating a full-sized buffer.
-            let prev_y = std::mem::replace(&mut y, Array2::<f32>::zeros((0, 0)));
             let initial_z = if self.is_training {
                 Some(z.clone())
             } else {
@@ -548,6 +582,7 @@ impl LRM {
             };
 
             if sparse_inference {
+                let prev_y = y.clone();
                 // Determine which tokens are still active.
                 let mut active_rows: Vec<usize> = Vec::new();
                 for r in 0..bsz {
@@ -558,7 +593,6 @@ impl LRM {
 
                 // If nothing is active, the model has fully halted.
                 if active_rows.is_empty() {
-                    y = prev_y;
                     break;
                 }
 
@@ -670,16 +704,23 @@ impl LRM {
                 continue;
             }
 
+            let prev_y_owned = if self.is_training {
+                Some(y.clone())
+            } else {
+                None
+            };
+            let prev_y_ref = prev_y_owned.as_ref().unwrap_or(&y);
+
             // Run recursions (don't capture caches during forward pass to save memory).
             let _ = self.run_recursions_with_guard(
                 &mut block_guard,
-                &prev_y,
+                prev_y_ref,
                 &mut z,
                 &mut ans_in,
                 false,
             );
 
-            ans_in.assign(&prev_y);
+            ans_in.assign(prev_y_ref);
             ans_in += &z;
             Self::sanitize(&mut ans_in);
 
@@ -705,7 +746,7 @@ impl LRM {
                     let mut ny_r = 0.0f32;
                     for c in 0..embed_dim {
                         let a = new_y[[r, c]];
-                        let b = prev_y[[r, c]];
+                        let b = prev_y_ref[[r, c]];
                         diff_r += (a - b).abs();
                         ny_r += a.abs();
                     }
@@ -760,7 +801,7 @@ impl LRM {
             // Compute a scalar convergence metric (used as a backstop when halting is disabled).
             let mut diff = 0.0f32;
             let mut ny = 0.0f32;
-            for (a, b) in new_y.iter().zip(prev_y.iter()) {
+            for (a, b) in new_y.iter().zip(prev_y_ref.iter()) {
                 diff += (*a - *b).abs();
                 ny += a.abs();
             }
@@ -770,6 +811,7 @@ impl LRM {
                 // Store initial_z and prev_y instead of full recursion caches (Gradient
                 // Checkpointing)
                 if let (Some(cache), Some(initial_z)) = (answer_cache, initial_z) {
+                    let prev_y = prev_y_owned.unwrap_or_else(|| y.clone());
                     self.cached_step_states.push(SupervisionStepCache::new(
                         cache,
                         initial_z,

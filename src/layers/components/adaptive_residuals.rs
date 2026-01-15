@@ -589,42 +589,74 @@ impl AdaptiveResiduals {
         self.parameter_count() * 8
     }
 
-    /// Invalidate similarity cache (no-op for this implementation)
     pub fn invalidate_similarity_cache(&mut self) {
-        // This implementation doesn't have a separate cache, so this is a no-op
+        self.activation_similarity_diag.fill(0.0);
+        self.activation_similarity_off_abs_mean.fill(0.0);
+        self.reset_statistics();
     }
 
-    /// Compute batch similarity matrix (placeholder implementation)
     pub fn compute_batch_similarity_matrix(
         &mut self,
-        _attention_weights: &Array2<f32>,
-        _ffn_weights: &Array2<f32>,
+        attention_weights: &Array2<f32>,
+        ffn_weights: &Array2<f32>,
     ) -> Array2<f32> {
-        // Return a lightweight sketch matrix: diag on diagonal, -off_abs_mean on off-diagonals.
-        let embed_dim = self.config.embed_dim;
-        let mut m = Array2::zeros((embed_dim, embed_dim));
-        for i in 0..embed_dim {
-            let d = self.activation_similarity_diag[[i, 0]];
-            m[[i, i]] = if d.is_finite() {
-                d.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
+        let d = self.config.embed_dim;
+        let mut m = Array2::zeros((d, d));
+
+        let seq_len = attention_weights.nrows().min(ffn_weights.nrows());
+        let embed_dim = attention_weights
+            .ncols()
+            .min(ffn_weights.ncols())
+            .min(self.config.embed_dim);
+
+        if seq_len == 0 || embed_dim == 0 {
+            return m;
         }
-        for i in 0..embed_dim {
-            let off = self.activation_similarity_off_abs_mean[[i, 0]];
-            let off = if off.is_finite() {
-                off.clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+
+        let sample = seq_len.min(32);
+        let step = (seq_len / sample).max(1);
+
+        self.scratch_nx.resize(embed_dim, 0.0f64);
+        self.scratch_nx.fill(0.0f64);
+        let mut dot = vec![0.0f64; embed_dim * embed_dim];
+        let mut z = vec![0.0f64; embed_dim];
+
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
             for j in 0..embed_dim {
-                if i == j {
-                    continue;
+                let a = attention_weights[[seq_idx, j]];
+                let f = ffn_weights[[seq_idx, j]];
+                let a = if a.is_finite() { a as f64 } else { 0.0 };
+                let f = if f.is_finite() { f as f64 } else { 0.0 };
+                let v = a + f;
+                z[j] = v;
+                self.scratch_nx[j] += v * v;
+            }
+
+            for i in 0..embed_dim {
+                let zi = z[i];
+                for j in i..embed_dim {
+                    dot[i * embed_dim + j] += zi * z[j];
                 }
-                m[[i, j]] = -off;
             }
         }
+
+        let eps = 1e-12f64;
+        for i in 0..embed_dim {
+            let ni = self.scratch_nx[i].max(0.0);
+            for j in i..embed_dim {
+                let nj = self.scratch_nx[j].max(0.0);
+                let denom = (ni * nj).sqrt() + eps;
+                let v = if denom > eps {
+                    (dot[i * embed_dim + j] / denom).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let vf = if v.is_finite() { v as f32 } else { 0.0 };
+                m[[i, j]] = vf;
+                m[[j, i]] = vf;
+            }
+        }
+
         m
     }
 
@@ -633,8 +665,9 @@ impl AdaptiveResiduals {
         &self,
         input: &Array2<f32>,
         attn_out: &Array2<f32>,
+        attn_residual_grads: &Array2<f32>,
         ffn_out: &Array2<f32>,
-        residual_grads: &Array2<f32>,
+        ffn_residual_grads: &Array2<f32>,
     ) -> Vec<Array2<f32>> {
         let seq_len = input.nrows();
         let embed_dim = input.ncols();
@@ -656,7 +689,7 @@ impl AdaptiveResiduals {
             for seq in 0..seq_len {
                 let attn_val = attn_out[[seq, channel]];
                 let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
-                let res_grad = residual_grads[[seq, channel]];
+                let res_grad = attn_residual_grads[[seq, channel]];
                 let res_grad = if res_grad.is_finite() { res_grad } else { 0.0 };
                 // dL/dscale = attn_out * dL/doutput (chain rule through scaling)
                 output_grad_sum += attn_val * res_grad;
@@ -675,14 +708,14 @@ impl AdaptiveResiduals {
 
         // Compute gradients for FFN residual scales (same chain rule: dL/dscale = ffn_out *
         // dL/doutput)
-        let ffn_rows = ffn_out.nrows().min(residual_grads.nrows());
-        let ffn_cols = ffn_out.ncols().min(residual_grads.ncols());
+        let ffn_rows = ffn_out.nrows().min(ffn_residual_grads.nrows());
+        let ffn_cols = ffn_out.ncols().min(ffn_residual_grads.ncols());
         for channel in 0..embed_dim.min(ffn_cols) {
             let mut output_grad_sum = 0.0f32;
             for seq in 0..ffn_rows {
                 let ffn_val = ffn_out[[seq, channel]];
                 let ffn_val = if ffn_val.is_finite() { ffn_val } else { 0.0 };
-                let res_grad = residual_grads[[seq, channel]];
+                let res_grad = ffn_residual_grads[[seq, channel]];
                 let res_grad = if res_grad.is_finite() { res_grad } else { 0.0 };
                 output_grad_sum += ffn_val * res_grad;
             }
