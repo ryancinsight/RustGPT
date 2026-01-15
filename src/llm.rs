@@ -749,14 +749,10 @@ impl LLM {
             let mut input = token_input;
 
             // Forward pass through all layers except output projection to get hidden states
-            let network_len = self.network.len();
-            let mut hidden_states = input.clone();
-            let mut logits = Array2::zeros((1, self.vocab.size()));
-
             // Similarity context threaded across successive TransformerBlock layers.
             let mut similarity_ctx: Option<Array2<f32>> = None;
 
-            for (i, layer) in self.network.iter_mut().enumerate() {
+            for layer in self.network.iter_mut() {
                 input = match layer {
                     LayerEnum::TransformerBlock(block) => {
                         block.set_incoming_similarity_context(similarity_ctx.as_ref());
@@ -773,17 +769,9 @@ impl LLM {
                         layer.forward(&input)
                     }
                 };
-
-                // Capture hidden states before output projection (second-to-last layer)
-                if i == network_len - 2 {
-                    hidden_states = input.clone();
-                }
-
-                // Get logits from output projection (last layer)
-                if i == network_len - 1 {
-                    logits = input.clone();
-                }
             }
+
+            let logits = input;
 
             // Safety check: ensure we have at least one token
             if logits.shape()[0] == 0 {
@@ -791,9 +779,6 @@ impl LLM {
             }
 
             let last_logit_row = logits.row(logits.shape()[0] - 1);
-
-            // Get hidden states for the last position
-            let _last_hidden = hidden_states.row(hidden_states.shape()[0] - 1).to_owned();
 
             let next_token = if let (Some(cfg), SpeculativeMode::Transformer) =
                 (self.speculative_config, self.speculative_mode)
