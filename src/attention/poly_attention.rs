@@ -850,26 +850,33 @@ impl PolyAttention {
                     let z_i = a_h * xw_col[[i, 0]] + b_h;
                     let dphi_dz_i = self.moh.gate.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
-                    // Parameter grads for Richards curve
-                    let gws = self.moh.gate.grad_weights_scalar_f32(z_i, d_g_i);
-                    for (wi, &gw) in gws.iter().enumerate() {
-                        grad_gate_poly_vec[wi] += gw;
-                    }
-                    // dW_g_col increment (outer product)
+
+                    // Apply gradients to gating parameters only if coupled
+                    if self.moh.head_selection_config.gating.training_mode
+                        == crate::mixtures::gating::GatingTrainingMode::Coupled
                     {
-                        let mut grad_wg_slice = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
-                        for d in 0..self.embed_dim {
-                            grad_wg_slice[[d, 0]] += a_h * input[[i, d]] * grad_g_i;
+                        // Parameter grads for Richards curve
+                        let gws = self.moh.gate.grad_weights_scalar_f32(z_i, d_g_i);
+                        for (wi, &gw) in gws.iter().enumerate() {
+                            grad_gate_poly_vec[wi] += gw;
                         }
-                    }
-                    grad_alpha_g[[0, h_idx]] += grad_g_i * xw_col[[i, 0]];
-                    grad_beta_g[[0, h_idx]] += grad_g_i;
-                    // dX from gating path
-                    {
-                        let wg_col_owned = self.moh.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
-                        let wg_scaled_t = wg_col_owned.t();
-                        for d in 0..self.embed_dim {
-                            grad_input_total[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i;
+                        // dW_g_col increment (outer product)
+                        {
+                            let mut grad_wg_slice = grad_w_g.slice_mut(s![.., h_idx..h_idx + 1]);
+                            for d in 0..self.embed_dim {
+                                grad_wg_slice[[d, 0]] += a_h * input[[i, d]] * grad_g_i;
+                            }
+                        }
+                        grad_alpha_g[[0, h_idx]] += grad_g_i * xw_col[[i, 0]];
+                        grad_beta_g[[0, h_idx]] += grad_g_i;
+                        // dX from gating path
+                        {
+                            let wg_col_owned =
+                                self.moh.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
+                            let wg_scaled_t = wg_col_owned.t();
+                            for d in 0..self.embed_dim {
+                                grad_input_total[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i;
+                            }
                         }
                     }
 
@@ -991,13 +998,17 @@ impl PolyAttention {
                     // Compute gradient w.r.t. threshold predictor output m_col[[i, 0]]
                     // Since g_yh_pre_row[h] = g_yh_gated_row[h] * g_col[i] * m_col[i]
                     // ∂L/∂m_i = sum_h g_yh_gated_row[h] * g_col[i] * ∂L/∂g_yh_pre_row[h]
-                    if let Some(threshold_grad_accum) = threshold_grad_accum.as_mut() {
-                        // Compute ∂L/∂g_yh_pre_row for this position i
-                        // This comes from all the gradient computations that used g_yh_pre_row
-                        let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                    // Only done if training mode is Coupled
+                    if self.moh.head_selection_config.gating.training_mode
+                        == crate::mixtures::gating::GatingTrainingMode::Coupled
+                    {
+                        if let Some(threshold_grad_accum) = threshold_grad_accum.as_mut() {
+                            // Compute ∂L/∂g_yh_pre_row for this position i
+                            // This comes from all the gradient computations that used g_yh_pre_row
+                            let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
 
-                        // Contribution from grad_v: each j contributes phi * coefficient
-                        for j in j_start..=j_end {
+                            // Contribution from grad_v: each j contributes phi * coefficient
+                            for j in j_start..=j_end {
                             let base = q.row(i).dot(&k.row(j)) * dk_scale;
                             let mut s = base;
                             let pos = i.saturating_sub(j);
@@ -1102,12 +1113,13 @@ impl PolyAttention {
                             }
                         }
 
-                        // Now compute gradient w.r.t. m_col[[i, 0]]
-                        let g_i = g_col[[i, 0]];
-                        for h in 0..self.head_dim {
-                            let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                            threshold_grad_accum[[i, h]] +=
-                                g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                            // Now compute gradient w.r.t. m_col[[i, 0]]
+                            let g_i = g_col[[i, 0]];
+                            for h in 0..self.head_dim {
+                                let g_yh_gated_h = g_yh_gated_row[[0, h]];
+                                threshold_grad_accum[[i, h]] +=
+                                    g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                            }
                         }
                     }
                 }
@@ -1606,19 +1618,24 @@ impl PolyAttention {
                     let z_i = a_h * xw_col[[i, 0]] + b_h;
                     let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
-                    let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
-                    for (wi, &gw) in gws.iter().enumerate() {
-                        grad_gate_poly_vec[wi] += gw;
-                    }
-                    for d in 0..self.embed_dim {
-                        grad_w_g_col[[d, 0]] += a_h * input[[i, d]] * grad_g_i;
-                    }
-                    grad_alpha_val += grad_g_i * xw_col[[i, 0]];
-                    grad_beta_val += grad_g_i;
-                    let wg_col_owned = self.moh.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
-                    let wg_scaled_t = wg_col_owned.t();
-                    for d in 0..self.embed_dim {
-                        grad_input_contrib[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i;
+
+                    if self.moh.head_selection_config.gating.training_mode
+                        == crate::mixtures::gating::GatingTrainingMode::Coupled
+                    {
+                        let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
+                        for (wi, &gw) in gws.iter().enumerate() {
+                            grad_gate_poly_vec[wi] += gw;
+                        }
+                        for d in 0..self.embed_dim {
+                            grad_w_g_col[[d, 0]] += a_h * input[[i, d]] * grad_g_i;
+                        }
+                        grad_alpha_val += grad_g_i * xw_col[[i, 0]];
+                        grad_beta_val += grad_g_i;
+                        let wg_col_owned = self.moh.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
+                        let wg_scaled_t = wg_col_owned.t();
+                        for d in 0..self.embed_dim {
+                            grad_input_contrib[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i;
+                        }
                     }
 
                     let mut g_yh_pre_row = g_yh_gated_row.clone();
@@ -1702,9 +1719,12 @@ impl PolyAttention {
                         }
                     }
 
-                    if let Some(threshold_grad_accum) = threshold_accum_local.as_mut() {
-                        let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
-                        for j in j_start..=j_end {
+                    if self.moh.head_selection_config.gating.training_mode
+                        == crate::mixtures::gating::GatingTrainingMode::Coupled
+                    {
+                        if let Some(threshold_grad_accum) = threshold_accum_local.as_mut() {
+                            let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                            for j in j_start..=j_end {
                             let base = q.row(i).dot(&k.row(j)) * dk_scale;
                             let mut s = base;
                             let pos = i.saturating_sub(j);
@@ -1731,17 +1751,18 @@ impl PolyAttention {
                                 }
                                 result
                             };
-                            let v_j = v.row(j);
-                            let dphi_contrib = (a * sp + b) * scale;
-                            for h in 0..self.head_dim {
-                                d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
+                                let v_j = v.row(j);
+                                let dphi_contrib = (a * sp + b) * scale;
+                                for h in 0..self.head_dim {
+                                    d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
+                                }
                             }
-                        }
-                        let g_i = g_col[[i, 0]];
-                        for h in 0..self.head_dim {
-                            let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                            threshold_grad_accum[[i, h_idx]] +=
-                                g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                            let g_i = g_col[[i, 0]];
+                            for h in 0..self.head_dim {
+                                let g_yh_gated_h = g_yh_gated_row[[0, h]];
+                                threshold_grad_accum[[i, h_idx]] +=
+                                    g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                            }
                         }
                     }
                 }
@@ -2519,6 +2540,7 @@ mod tests {
             sparsity_weight: 0.01,
             importance_loss_weight: 0.0,
             switch_balance_weight: 0.0,
+            training_mode: crate::mixtures::gating::GatingTrainingMode::Coupled,
         };
         pa.set_head_selection_config(&strategy);
         let n = 6;
@@ -2545,5 +2567,92 @@ mod tests {
         let non_finite = gi.iter().any(|x| !x.is_finite())
             || pg.iter().any(|g| g.iter().any(|x| !x.is_finite()));
         assert!(!non_finite);
+    }
+
+    #[test]
+    fn test_moh_independent_training_decoupling() {
+        use crate::mixtures::gating::GatingTrainingMode;
+
+        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+
+        // Setup Independent training strategy
+        let strategy = crate::mixtures::moh::HeadSelectionStrategy::Learned {
+            num_active: 4,
+            load_balance_weight: 0.0, // Zero aux weights to verify ONLY attention gradients are blocked
+            complexity_loss_weight: 0.0,
+            sparsity_weight: 0.0,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
+            training_mode: GatingTrainingMode::Independent,
+        };
+        pa.set_head_selection_config(&strategy);
+
+        let n = 4;
+        let d = 32;
+        let mut input = Array2::<f32>::zeros((n, d));
+        // Simple input
+        for i in 0..n {
+            for j in 0..d {
+                input[[i, j]] = 0.1;
+            }
+        }
+
+        // Forward pass
+        let _ = pa.forward_impl(&input, true);
+
+        // Backward pass with non-zero output gradients
+        let output_grads = Array2::<f32>::ones((n, d));
+
+        let (_grad_input, param_grads) = pa.compute_gradients_parallel(&input, &output_grads);
+
+        // Check gating parameters gradients.
+        // Indices:
+        // Heads (3*4 = 12) + W_out (1) + a,b,scale (3) = 16
+        // Next are: w_g, alpha_g, beta_g, gate_poly
+        let idx_w_g = 16;
+        let idx_alpha_g = 17;
+        let idx_beta_g = 18;
+        let idx_gate_poly = 19;
+
+        let grad_w_g = &param_grads[idx_w_g];
+        let grad_alpha_g = &param_grads[idx_alpha_g];
+        let grad_beta_g = &param_grads[idx_beta_g];
+        let grad_gate_poly = &param_grads[idx_gate_poly];
+
+        // Since aux weights are 0 and mode is Independent, gradients from attention should not flow to gating
+        // So gating gradients should be exactly zero.
+        assert!(grad_w_g.iter().all(|&x| x == 0.0), "w_g grad should be 0 in independent mode without aux loss");
+        assert!(grad_alpha_g.iter().all(|&x| x == 0.0), "alpha_g grad should be 0");
+        assert!(grad_beta_g.iter().all(|&x| x == 0.0), "beta_g grad should be 0");
+        assert!(grad_gate_poly.iter().all(|&x| x == 0.0), "gate_poly grad should be 0");
+
+        // Now switch to Coupled and verify we GET gradients
+        let strategy_coupled = crate::mixtures::moh::HeadSelectionStrategy::Learned {
+            num_active: 4,
+            load_balance_weight: 0.0,
+            complexity_loss_weight: 0.0,
+            sparsity_weight: 0.0,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
+            training_mode: GatingTrainingMode::Coupled,
+        };
+        pa.set_head_selection_config(&strategy_coupled);
+
+        let (_grad_input_c, param_grads_c) = pa.compute_gradients_parallel(&input, &output_grads);
+
+        let grad_w_g_c = &param_grads_c[idx_w_g];
+
+        // In coupled mode, we expect some gradients flowing back from attention
+        // (assuming the gate values are not saturated and weights allow flow)
+        // With constant input 0.1, values should be non-zero unless something is degenerate.
+        // We can just check that they are NOT all zero, or at least different from Independent.
+
+        // Note: if gate is saturated, grad might be small.
+        // Let's assert that AT LEAST one gating parameter has non-zero gradient in coupled mode.
+        let has_grad = grad_w_g_c.iter().any(|&x| x.abs() > 1e-10) ||
+                       param_grads_c[idx_alpha_g].iter().any(|&x| x.abs() > 1e-10) ||
+                       param_grads_c[idx_beta_g].iter().any(|&x| x.abs() > 1e-10);
+
+        assert!(has_grad, "Should have gradients in Coupled mode");
     }
 }
