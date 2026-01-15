@@ -7,4 +7,4 @@ pub mod speculative;
 #[cfg(test)]
 mod speculative_tests;
 
-pub use block::{ModularTransformerBlock, TransformerBlock, TransformerBlockConfig};
+pub use block::{TransformerBlock, TransformerBlockConfig};

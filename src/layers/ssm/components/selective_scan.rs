@@ -4,6 +4,83 @@
 //! with support for different scanning strategies and parallelization.
 
 use ndarray::Array2;
+use rayon::prelude::*;
+
+use crate::errors::{ModelError, Result};
+
+#[inline]
+fn affine_compose(lhs: (f32, f32), rhs: (f32, f32)) -> (f32, f32) {
+    (lhs.0 * rhs.0, lhs.1 * rhs.0 + rhs.1)
+}
+
+fn affine_prefix_outputs(mult: f32, c: &[f32]) -> Vec<f32> {
+    let n = c.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let n2 = n.next_power_of_two();
+    let mut tree = vec![(1.0f32, 0.0f32); n2];
+    for i in 0..n {
+        tree[i] = (mult, c[i]);
+    }
+
+    let mut step = 1usize;
+    while step < n2 {
+        for base in (0..n2).step_by(2 * step) {
+            let left = base + step - 1;
+            let right = base + 2 * step - 1;
+            tree[right] = affine_compose(tree[left], tree[right]);
+        }
+        step *= 2;
+    }
+
+    tree[n2 - 1] = (1.0f32, 0.0f32);
+
+    let mut step = n2 / 2;
+    while step >= 1 {
+        for base in (0..n2).step_by(2 * step) {
+            let left = base + step - 1;
+            let right = base + 2 * step - 1;
+            let t = tree[left];
+            tree[left] = tree[right];
+            tree[right] = affine_compose(t, tree[right]);
+        }
+        if step == 1 {
+            break;
+        }
+        step /= 2;
+    }
+
+    let mut out = vec![0.0f32; n];
+    for i in 0..n {
+        let incl = affine_compose(tree[i], (mult, c[i]));
+        out[i] = incl.1;
+    }
+    out
+}
+
+fn is_exact_diagonal(a: &Array2<f32>) -> bool {
+    if a.nrows() != a.ncols() {
+        return false;
+    }
+    let n = a.nrows();
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let v = a[[i, j]];
+            if v.is_finite() && v == 0.0 {
+                continue;
+            }
+            if !v.is_finite() || v != 0.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// Selective scan configuration
 #[derive(Debug, Clone, Copy)]
@@ -88,30 +165,75 @@ impl SelectiveScanner {
 
     /// Enhanced parallel selective scan with better load balancing and memory efficiency
     fn parallel_scan(&self, a: &Array2<f32>, b: &Array2<f32>, u: &Array2<f32>) -> Array2<f32> {
-        // NOTE: This recurrence is inherently sequential in time because x_t depends on x_{t-1}.
-        // A correct parallel implementation would require a different formulation (e.g., scan
-        // with associativity). For now, keep correctness by falling back to the sequential scan.
-        let _ = (a, b, u);
-        self.sequential_scan(a, b, u)
-    }
+        let seq_len = u.nrows();
+        let state_dim = a.ncols();
 
-    /// Optimized selective scan with numerical stability checks
-    pub fn stable_scan(&self, a: &Array2<f32>, b: &Array2<f32>, u: &Array2<f32>) -> Array2<f32> {
-        let result = self.scan(a, b, u);
+        if seq_len == 0 || state_dim == 0 {
+            return Array2::zeros((seq_len, state_dim));
+        }
 
-        // Apply numerical stability checks
-        let mut stable_result = result.clone();
-        for mut row in stable_result.rows_mut() {
-            for val in row.iter_mut() {
-                if !val.is_finite() {
-                    *val = 0.0;
-                } else if val.abs() > 1.0 / self.config.stability_threshold {
-                    *val = val.signum() * (1.0 / self.config.stability_threshold);
+        if !is_exact_diagonal(a) {
+            return self.sequential_scan(a, b, u);
+        }
+
+        let b_u = u.dot(b);
+        let diag: Vec<f32> = (0..state_dim).map(|j| a[[j, j]]).collect();
+
+        let per_dim: Vec<Vec<f32>> = (0..state_dim)
+            .into_par_iter()
+            .map(|j| {
+                let mut c = Vec::with_capacity(seq_len);
+                for t in 0..seq_len {
+                    c.push(b_u[[t, j]]);
                 }
+                affine_prefix_outputs(diag[j], &c)
+            })
+            .collect();
+
+        let mut y = Array2::zeros((seq_len, state_dim));
+        for t in 0..seq_len {
+            for j in 0..state_dim {
+                y[[t, j]] = per_dim[j][t];
             }
         }
 
-        stable_result
+        y
+    }
+
+    /// Optimized selective scan with numerical stability checks
+    pub fn stable_scan(
+        &self,
+        a: &Array2<f32>,
+        b: &Array2<f32>,
+        u: &Array2<f32>,
+    ) -> Result<Array2<f32>> {
+        let threshold = self.config.stability_threshold;
+        if !threshold.is_finite() || threshold <= 0.0 {
+            return Err(ModelError::InvalidInput {
+                message: format!("stability_threshold must be positive, got {threshold}"),
+            });
+        }
+
+        let max_abs = 1.0 / threshold;
+        if !max_abs.is_finite() {
+            return Err(ModelError::InvalidInput {
+                message: format!("stability_threshold too small, got {threshold}"),
+            });
+        }
+
+        let mut result = self.scan(a, b, u);
+        for ((t, j), val) in result.indexed_iter_mut() {
+            if !val.is_finite() {
+                return Err(ModelError::Inference {
+                    message: format!("non-finite scan output at ({t}, {j})"),
+                });
+            }
+            if val.abs() > max_abs {
+                *val = val.signum() * max_abs;
+            }
+        }
+
+        Ok(result)
     }
 
     /// Memory-efficient selective scan with adaptive chunking

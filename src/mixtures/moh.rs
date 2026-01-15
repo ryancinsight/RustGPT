@@ -258,22 +258,17 @@ impl Router for HeadRouter {
                 ndarray::Array2::ones((input.nrows(), self.num_heads)) / self.num_heads as f32
             }
         } else {
-            // Fixed selection: uniform gating for top-k heads using iterator chains
             let n_tokens = input.nrows();
             let active_heads = self.config.num_active.min(self.num_heads);
-
-            let gate_data: Vec<f32> = (0..n_tokens)
-                .flat_map(|_token_idx| {
-                    (0..self.num_heads).map(
-                        move |head_idx| {
-                            if head_idx < active_heads { 1.0 } else { 0.0 }
-                        },
-                    )
-                })
-                .collect();
-
-            ndarray::Array2::from_shape_vec((n_tokens, self.num_heads), gate_data)
-                .unwrap_or_else(|_| ndarray::Array2::<f32>::zeros((n_tokens, self.num_heads)))
+            let mut gates = ndarray::Array2::<f32>::zeros((n_tokens, self.num_heads));
+            if active_heads > 0 {
+                for mut row in gates.outer_iter_mut() {
+                    for h in 0..active_heads {
+                        row[h] = 1.0;
+                    }
+                }
+            }
+            gates
         };
 
         // Apply selection algorithm

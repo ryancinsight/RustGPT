@@ -27,12 +27,12 @@ use crate::{
 #[serde(tag = "type", content = "data")]
 pub enum TemporalMixingLayer {
     Attention(Box<PolyAttention>),
-    RgLruMoH(MoHRgLru),
-    RgLru(RgLru),
-    MambaMoH(MoHMamba),
-    Mamba(Mamba),
-    Mamba2MoH(MoHMamba2),
-    Mamba2(Mamba2),
+    RgLruMoH(Box<MoHRgLru>),
+    RgLru(Box<RgLru>),
+    MambaMoH(Box<MoHMamba>),
+    Mamba(Box<Mamba>),
+    Mamba2MoH(Box<MoHMamba2>),
+    Mamba2(Box<Mamba2>),
 }
 
 #[derive(Default, Debug)]
@@ -549,35 +549,30 @@ impl CommonLayers {
     pub fn new(config: &CommonLayerConfig) -> Self {
         let pre_attention_norm = RichardsNorm::new(config.embed_dim);
 
-        let temporal_mixing = match config.temporal_mixing {
-            TemporalMixingType::Attention => {
-                let mut attention = PolyAttention::new(
-                    config.embed_dim,
-                    config.num_heads,
-                    config.poly_degree,
-                    config.max_pos,
-                    config.window_size,
-                );
-                attention.set_titan_memory_config(config.titan_memory.clone());
-                attention.set_head_selection_config(&config.head_selection);
-                TemporalMixingLayer::Attention(Box::new(attention))
-            }
-            TemporalMixingType::RgLru => TemporalMixingLayer::RgLruMoH(MoHRgLru::new(
-                config.embed_dim,
-                config.num_heads,
-                &config.head_selection,
-            )),
-            TemporalMixingType::Mamba => TemporalMixingLayer::MambaMoH(MoHMamba::new(
-                config.embed_dim,
-                config.num_heads,
-                &config.head_selection,
-            )),
-            TemporalMixingType::Mamba2 => TemporalMixingLayer::Mamba2MoH(MoHMamba2::new(
-                config.embed_dim,
-                config.num_heads,
-                &config.head_selection,
-            )),
-        };
+        let temporal_mixing =
+            match config.temporal_mixing {
+                TemporalMixingType::Attention => {
+                    let mut attention = PolyAttention::new(
+                        config.embed_dim,
+                        config.num_heads,
+                        config.poly_degree,
+                        config.max_pos,
+                        config.window_size,
+                    );
+                    attention.set_titan_memory_config(config.titan_memory.clone());
+                    attention.set_head_selection_config(&config.head_selection);
+                    TemporalMixingLayer::Attention(Box::new(attention))
+                }
+                TemporalMixingType::RgLru => TemporalMixingLayer::RgLruMoH(Box::new(
+                    MoHRgLru::new(config.embed_dim, config.num_heads, &config.head_selection),
+                )),
+                TemporalMixingType::Mamba => TemporalMixingLayer::MambaMoH(Box::new(
+                    MoHMamba::new(config.embed_dim, config.num_heads, &config.head_selection),
+                )),
+                TemporalMixingType::Mamba2 => TemporalMixingLayer::Mamba2MoH(Box::new(
+                    MoHMamba2::new(config.embed_dim, config.num_heads, &config.head_selection),
+                )),
+            };
 
         let pre_ffn_norm = RichardsNorm::new(config.embed_dim);
 

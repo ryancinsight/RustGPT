@@ -51,6 +51,19 @@ thread_local! {
 pub struct EpropContext;
 
 impl EpropContext {
+    pub fn init_for_layers_with_adaptation(layer_dims: Vec<(usize, usize, bool)>) {
+        let traces: Vec<EligibilityTraces> = layer_dims
+            .into_iter()
+            .map(|(output_dim, input_dim, use_adaptation)| {
+                EligibilityTraces::new(input_dim, output_dim, use_adaptation)
+            })
+            .collect();
+
+        EPROP_TRACES.with(|cell| {
+            *cell.borrow_mut() = Some(traces);
+        });
+    }
+
     /// Initialize context with traces for multiple layers
     ///
     /// Creates one `EligibilityTraces` per layer, dimensioned according to
@@ -66,18 +79,12 @@ impl EpropContext {
     /// EpropContext::init_for_layers(dims);
     /// ```
     pub fn init_for_layers(layer_dims: Vec<(usize, usize)>) {
-        let traces: Vec<EligibilityTraces> = layer_dims
-            .into_iter()
-            .map(|(output_dim, input_dim)| {
-                // Use existing EligibilityTraces constructor
-                // For now, use LIF mode (no adaptation traces)
-                EligibilityTraces::new(input_dim, output_dim, false)
-            })
-            .collect();
-
-        EPROP_TRACES.with(|cell| {
-            *cell.borrow_mut() = Some(traces);
-        });
+        Self::init_for_layers_with_adaptation(
+            layer_dims
+                .into_iter()
+                .map(|(output_dim, input_dim)| (output_dim, input_dim, false))
+                .collect(),
+        );
     }
 
     /// Access traces with a closure (read-write)

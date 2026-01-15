@@ -325,19 +325,36 @@ impl AdaptiveSurrogate {
             return false; // Need minimum history
         }
         
-        // Check recent performance trend
-        let recent_avg = self.performance_history
+        let window = 10usize.min(self.performance_history.len() / 2).max(1);
+
+        let recent_scores = self
+            .performance_history
             .iter()
             .rev()
-            .take(10)
-            .map(|m| m.overall_score)
-            .sum::<f32>() / 10.0;
-            
-        let older_avg = self.performance_history
-            .iter()
-            .take(10)
-            .map(|m| m.overall_score)
-            .sum::<f32>() / 10.0;
+            .take(window)
+            .map(|m| m.overall_score);
+        let mut recent_sum = 0.0f32;
+        let mut recent_n = 0usize;
+        for s in recent_scores {
+            recent_sum += s;
+            recent_n += 1;
+        }
+        if recent_n == 0 {
+            return false;
+        }
+        let recent_avg = recent_sum / recent_n as f32;
+
+        let older_scores = self.performance_history.iter().take(window).map(|m| m.overall_score);
+        let mut older_sum = 0.0f32;
+        let mut older_n = 0usize;
+        for s in older_scores {
+            older_sum += s;
+            older_n += 1;
+        }
+        if older_n == 0 {
+            return false;
+        }
+        let older_avg = older_sum / older_n as f32;
             
         recent_avg < older_avg * 0.95 // 5% performance drop triggers adaptation
     }
@@ -378,45 +395,67 @@ impl AdaptiveSurrogate {
     /// Get current performance score
     fn get_current_performance_score(&self) -> f32 {
         if self.performance_history.is_empty() {
-            return 0.5; // Neutral score
+            return 0.5;
         }
-        
-        self.performance_history
+
+        let window = 10usize.min(self.performance_history.len()).max(1);
+        let mut sum = 0.0f32;
+        let mut n = 0usize;
+        for s in self
+            .performance_history
             .iter()
             .rev()
-            .take(10)
+            .take(window)
             .map(|m| m.overall_score)
-            .sum::<f32>() / 10.0
+        {
+            sum += s;
+            n += 1;
+        }
+        if n == 0 { 0.5 } else { sum / n as f32 }
     }
     
     /// Estimate performance of a candidate function (simulation-based)
     fn estimate_function_performance(&self, function: SurrogateFunction) -> f32 {
-        // Simplified performance estimation based on current activity stats
-        let base_scores = [
-            (SurrogateFunction::PiecewiseLinear, 0.85),
-            (SurrogateFunction::Sigmoid, 0.80),
-            (SurrogateFunction::FastSigmoid, 0.90),
-            (SurrogateFunction::Gaussian, 0.75),
-            (SurrogateFunction::AdaptivePiecewise, 0.88),
-            (SurrogateFunction::Hybrid, 0.92),
-        ];
-        
-        let mut base_score = 0.5;
-        for (func, score) in base_scores {
-            if func == function {
-                base_score = score;
-                break;
-            }
+        let mut candidate = self.clone();
+        candidate.current_function = function;
+        candidate.adapt_function_parameters();
+
+        let var = candidate.activity_stats.voltage_variance;
+        let mut sigma = if var.is_finite() && var >= 0.0 { var.sqrt() } else { 1.0 };
+        if !sigma.is_finite() || sigma <= 0.0 {
+            sigma = 1.0;
         }
-        
-        // Adjust based on current activity
-        let activity_factor = match self.activity_stats.avg_firing_rate {
-            rate if rate < 0.1 => 0.9,  // Low activity - prefer fast functions
-            rate if rate > 0.5 => 1.1,  // High activity - prefer stable functions
-            _ => 1.0,                   // Normal activity
-        };
-        
-        base_score * activity_factor
+
+        let grid = 33usize;
+        let mut weights_sum = 0.0f64;
+        let mut mean = 0.0f64;
+        let mut m2 = 0.0f64;
+        let mut mean_abs = 0.0f64;
+
+        for i in 0..grid {
+            let z = -3.0f64 + (6.0f64 * (i as f64) / ((grid - 1) as f64));
+            let w = (-0.5 * z * z).exp();
+            let d = candidate.derivative((z as f32) * sigma) as f64;
+            let v = if d.is_finite() { d } else { 0.0 };
+            weights_sum += w;
+            mean += w * v;
+            mean_abs += w * v.abs();
+            m2 += w * v * v;
+        }
+
+        if weights_sum <= 0.0 {
+            return 0.5;
+        }
+
+        mean /= weights_sum;
+        mean_abs /= weights_sum;
+        m2 /= weights_sum;
+        let var = (m2 - mean * mean).max(0.0);
+
+        let stability = 1.0 / (1.0 + var);
+        let responsiveness = mean_abs / (1.0 + mean_abs);
+        let score = 0.6 * stability + 0.4 * responsiveness;
+        (score as f32).clamp(0.0, 1.0)
     }
 
     /// Adapt function-specific parameters

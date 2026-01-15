@@ -22,13 +22,8 @@ impl SharedFeedforward {
     }
 
     /// Forward pass through the feedforward network
-    /// Note: This is a simplified implementation for demonstration purposes
-    /// In a full implementation, this would properly delegate to the underlying
-    /// feedforward variant with proper trait objects or enum matching
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // For now, implement a simple identity transformation
-        // This demonstrates the modular structure while keeping the example simple
-        input.clone()
+        self.feedforward.forward(input)
     }
 
     /// Backward pass through the feedforward network

@@ -1129,10 +1129,6 @@ impl PolyAttention {
         }
 
         // ===== Head-selection regularizers (auxiliary losses) =====
-        // TODO: Consider decoupling MoH training like RichardsCurve
-        // Option 1: Keep coupled (current) - MoH learns from attention gradients + auxiliary losses
-        // Option 2: Independent training - MoH learns from separate head-selection objectives
-        // Option 3: Hierarchical training - MoH learns first, then attention layer learns
         if self.moh.head_selection_config.gating.use_learned_predictor
             && (self.moh.head_selection_config.gating.complexity_loss_weight > 0.0
                 || self.moh.head_selection_config.gating.load_balance_weight > 0.0
@@ -1383,10 +1379,6 @@ impl PolyAttention {
             .opt_beta_g
             .step(&mut self.moh.beta_g, &param_grads[idx + 2], lr);
         idx += 3;
-        // TODO: Consider decoupling Richards curve training
-        // Option 1: Keep coupled (current) - Richards learns from attention gradients
-        // Option 2: Independent training - Richards learns from separate objectives
-        // Option 3: Meta-learning - Richards learns across multiple attention layers
         {
             let grad_gate_poly = &param_grads[idx];
             let _ = self

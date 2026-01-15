@@ -26,7 +26,7 @@ impl NormalizationLayer {
 
     /// Backward pass through the normalization layer
     pub fn backward(
-        &mut self,
+        &self,
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {

@@ -1,4 +1,4 @@
-use ndarray::{Array2, s};
+use ndarray::{Array2, ArrayView2, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -309,6 +309,15 @@ impl MoHGating {
         token_threshold_scale: Option<&Array2<f32>>,
         token_latent_features: Option<&Array2<f32>>,
     ) -> Array2<f32> {
+        self.forward_weights_view(&input.view(), token_threshold_scale, token_latent_features)
+    }
+
+    pub fn forward_weights_view(
+        &mut self,
+        input: &ArrayView2<f32>,
+        token_threshold_scale: Option<&Array2<f32>>,
+        token_latent_features: Option<&Array2<f32>>,
+    ) -> Array2<f32> {
         let n = input.nrows();
         let num_heads = self.w_g.ncols();
         if n == 0 || num_heads == 0 {
@@ -607,6 +616,14 @@ impl MoHGating {
     pub fn compute_gradients_from_eff(
         &mut self,
         input: &Array2<f32>,
+        eff_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        self.compute_gradients_from_eff_view(&input.view(), eff_grads)
+    }
+
+    pub fn compute_gradients_from_eff_view(
+        &mut self,
+        input: &ArrayView2<f32>,
         eff_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let n = input.nrows();

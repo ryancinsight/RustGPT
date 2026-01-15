@@ -5,6 +5,7 @@
 //! sparse spike optimizations (Theorem 3.1).
 
 use ndarray::{Array1, Array2};
+use rayon::prelude::*;
 
 /// Enhanced sparse computation with block-wise operations and dynamic thresholds
 ///
@@ -452,21 +453,45 @@ pub fn parallel_sparse_matvec(
     min_rows_for_parallel: usize,
 ) -> Array1<f32> {
     let n_rows = weights.nrows();
+    let n_cols = weights.ncols();
+    assert_eq!(input.len(), n_cols);
     
     // Fallback to sequential for small matrices
     if n_rows < min_rows_for_parallel || active_indices.len() < 10 {
         return enhanced_sparse_matvec(weights, input, active_indices, 0);
     }
-    
-    // Fallback to enhanced sparse for now (rayon parallel iterator limitations)
-    // This can be improved once ndarray parallel support is more stable
-    enhanced_sparse_matvec(weights, input, active_indices, 0)
+
+    for &idx in active_indices {
+        assert!(idx < n_cols);
+    }
+
+    let out: Vec<f32> = (0..n_rows)
+        .into_par_iter()
+        .map(|r| {
+            let w_row = weights.row(r);
+            let mut acc = 0.0f32;
+            for &c in active_indices {
+                let x = input[c];
+                if x != 0.0 && x.is_finite() {
+                    let w = w_row[c];
+                    let w = if w.is_finite() { w } else { 0.0 };
+                    acc += w * x;
+                }
+            }
+            if acc.is_finite() { acc } else { 0.0 }
+        })
+        .collect();
+
+    Array1::from_vec(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use ndarray::{Array1, Array2};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand_distr::StandardNormal;
     
     #[test]
     fn test_outer_product() {
@@ -551,7 +576,37 @@ mod tests {
         let expected = (12.0_f32).sqrt();
         assert_relative_eq!(frobenius_norm(&m), expected, epsilon = 1e-5);
     }
-    
+
+    #[test]
+    fn test_parallel_sparse_matvec_matches_dense() {
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let n_rows = 64usize;
+        let n_cols = 96usize;
+
+        let weights = Array2::from_shape_fn((n_rows, n_cols), |_| {
+            let v: f32 = rng.sample(StandardNormal);
+            if v.is_finite() { v } else { 0.0 }
+        });
+
+        let mut input = Array1::<f32>::zeros(n_cols);
+        let mut active_indices: Vec<usize> = Vec::new();
+        for c in 0..n_cols {
+            if rng.gen::<f32>() < 0.15 {
+                input[c] = rng.sample(StandardNormal);
+                active_indices.push(c);
+            }
+        }
+
+        let dense = weights.dot(&input);
+        let sparse = parallel_sparse_matvec(&weights, &input, &active_indices, 1);
+
+        assert_eq!(dense.len(), sparse.len());
+        for (a, b) in dense.iter().zip(sparse.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-5);
+        }
+    }
+
     #[test]
     fn test_normalize() {
         let v = Array1::from_vec(vec![3.0, 4.0]);

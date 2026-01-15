@@ -68,12 +68,11 @@ pub enum SoftmaxStrategy {
 
 impl SoftmaxStrategy {
     /// Automatically select best strategy based on vocabulary size
-    pub fn auto_select(vocab_size: usize, has_frequencies: bool) -> Self {
-        match vocab_size {
-            v if v < 10_000 => Self::Full,
-            v if v < 100_000 => Self::Sampled,
-            v if v >= 100_000 && has_frequencies => Self::Hierarchical,
-            _ => Self::Sampled, // Fallback to sampled without frequencies
+    pub fn auto_select(vocab_size: usize, _has_frequencies: bool) -> Self {
+        if vocab_size < 10_000 {
+            Self::Full
+        } else {
+            Self::Sampled
         }
     }
 }
@@ -127,7 +126,7 @@ impl SoftmaxConfig {
         let num_samples = if strategy == SoftmaxStrategy::Sampled {
             ((vocab_size as f32).sqrt() as usize).min(5_000).max(100)
         } else {
-            vocab_size // Full or hierarchical don't use sampling
+            vocab_size
         };
         
         Self {
@@ -163,9 +162,11 @@ impl SoftmaxConfig {
     
     /// Create config for massive vocabulary (force hierarchical softmax)
     pub fn massive_vocab(vocab_size: usize, frequencies: Vec<f32>) -> Self {
+        let num_samples = ((vocab_size as f32).sqrt() as usize).min(5_000).max(100);
         Self {
             vocab_size,
-            strategy: Some(SoftmaxStrategy::Hierarchical),
+            strategy: Some(SoftmaxStrategy::Sampled),
+            num_samples,
             frequencies: Some(frequencies),
             ..Default::default()
         }
@@ -204,6 +205,16 @@ impl AdaptiveSoftmax {
         let strategy = config.strategy.unwrap_or_else(|| {
             SoftmaxStrategy::auto_select(config.vocab_size, config.frequencies.is_some())
         });
+
+        match strategy {
+            SoftmaxStrategy::Full | SoftmaxStrategy::Sampled => {}
+            SoftmaxStrategy::Hierarchical | SoftmaxStrategy::Adaptive => {
+                panic!(
+                    "SoftmaxStrategy::{:?} is unsupported by AdaptiveSoftmax(logits: [vocab_size]).",
+                    strategy
+                );
+            }
+        }
         
         let sampled = match strategy {
             SoftmaxStrategy::Sampled => {
@@ -215,7 +226,7 @@ impl AdaptiveSoftmax {
                 full_config.num_samples = config.vocab_size;
                 Some(SampledSoftmaxImpl::new(&full_config))
             }
-            _ => None,
+            SoftmaxStrategy::Hierarchical | SoftmaxStrategy::Adaptive => unreachable!(),
         };
         
         Self {
@@ -254,14 +265,7 @@ impl AdaptiveSoftmax {
             SoftmaxStrategy::Full | SoftmaxStrategy::Sampled => {
                 self.full_softmax_forward(logits)
             }
-            SoftmaxStrategy::Hierarchical => {
-                // TODO: Implement hierarchical forward
-                self.full_softmax_forward(logits)
-            }
-            SoftmaxStrategy::Adaptive => {
-                // TODO: Implement adaptive forward
-                self.full_softmax_forward(logits)
-            }
+            SoftmaxStrategy::Hierarchical | SoftmaxStrategy::Adaptive => unreachable!(),
         }
     }
     
@@ -534,7 +538,7 @@ mod tests {
     #[test]
     fn test_strategy_auto_select_large() {
         let strategy = SoftmaxStrategy::auto_select(200_000, true);
-        assert_eq!(strategy, SoftmaxStrategy::Hierarchical);
+        assert_eq!(strategy, SoftmaxStrategy::Sampled);
     }
 
     #[test]

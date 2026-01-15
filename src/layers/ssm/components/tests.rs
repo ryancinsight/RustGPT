@@ -124,7 +124,9 @@ fn test_selective_scanner_stability() {
     let b = Array2::ones((3, 3)) * 2.0;
     let u = Array2::ones((10, 3));
 
-    let result = scanner.stable_scan(&a, &b, &u);
+    let result = scanner
+        .stable_scan(&a, &b, &u)
+        .expect("stable_scan should succeed for finite inputs");
 
     // All values should be stable (finite and within reasonable bounds)
     for val in result.iter() {
@@ -241,7 +243,9 @@ fn test_numerical_stability() {
     let b = Array2::ones((3, 3)) * 100.0;
     let u = Array2::ones((5, 3)) * 1000.0;
 
-    let result = scanner.stable_scan(&a, &b, &u);
+    let result = scanner
+        .stable_scan(&a, &b, &u)
+        .expect("stable_scan should succeed for finite inputs");
 
     // Should handle extreme values gracefully
     for val in result.iter() {

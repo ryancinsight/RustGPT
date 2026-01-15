@@ -39,21 +39,18 @@ impl ResidualConnection {
             return input.clone();
         }
 
-        let mut result = input.clone();
-        let scale = strength / embed_dim as f32;
-
-        // Apply context mixing: X' = X + (strength / embed_dim) * X·S
-        for i in 0..input.nrows() {
-            for j in 0..embed_dim {
-                let mut sum = 0.0;
-                for k in 0..embed_dim {
-                    sum += input[[i, k]] * context[[k, j]];
-                }
-                result[[i, j]] += scale * sum;
-            }
+        if input.ncols() != context.nrows() || context.nrows() != context.ncols() {
+            return input.clone();
         }
 
-        result
+        let scale = strength / embed_dim as f32;
+        let mut out = input.dot(context);
+        out.zip_mut_with(input, |o, &x| {
+            let ms = if o.is_finite() { *o } else { 0.0 };
+            let xs = if x.is_finite() { x } else { 0.0 };
+            *o = xs + scale * ms;
+        });
+        out
     }
 
     /// Update activation similarity matrix
