@@ -48,7 +48,8 @@ use ndarray::{Array1, Array2, Axis};
 use rand::prelude::*;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
 
 /// Softmax computation strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,8 +196,8 @@ pub struct AdaptiveSoftmax {
     // Sampled softmax components
     sampled: Option<SampledSoftmaxImpl>,
     
-    // Hierarchical softmax components (future)
-    // hierarchical: Option<HierarchicalSoftmaxImpl>,
+    // Hierarchical softmax components
+    hierarchical: Option<HierarchicalSoftmaxImpl>,
 }
 
 impl AdaptiveSoftmax {
@@ -206,33 +207,29 @@ impl AdaptiveSoftmax {
             SoftmaxStrategy::auto_select(config.vocab_size, config.frequencies.is_some())
         });
 
-        match strategy {
-            SoftmaxStrategy::Full | SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {}
-            SoftmaxStrategy::Hierarchical => {
-                panic!(
-                    "SoftmaxStrategy::{:?} is unsupported by AdaptiveSoftmax(logits: [vocab_size]).",
-                    strategy
-                );
-            }
-        }
-        
-        let sampled = match strategy {
-            SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
-                Some(SampledSoftmaxImpl::new(&config))
+        let (sampled, hierarchical) = match strategy {
+            SoftmaxStrategy::Sampled => {
+                (Some(SampledSoftmaxImpl::new(&config)), None)
             }
             SoftmaxStrategy::Full => {
                 // Full softmax is just sampled with K = |V|
                 let mut full_config = config.clone();
                 full_config.num_samples = config.vocab_size;
-                Some(SampledSoftmaxImpl::new(&full_config))
+                (Some(SampledSoftmaxImpl::new(&full_config)), None)
             }
-            SoftmaxStrategy::Hierarchical => unreachable!(),
+            SoftmaxStrategy::Hierarchical => {
+                (None, Some(HierarchicalSoftmaxImpl::new(&config)))
+            }
+            SoftmaxStrategy::Adaptive => {
+                panic!("SoftmaxStrategy::Adaptive is currently unsupported.")
+            }
         };
         
         Self {
             config,
             strategy,
             sampled,
+            hierarchical,
         }
     }
     
@@ -265,12 +262,10 @@ impl AdaptiveSoftmax {
             SoftmaxStrategy::Full | SoftmaxStrategy::Sampled => {
                 self.full_softmax_forward(logits)
             }
-            SoftmaxStrategy::Adaptive => {
-                // Adaptive strategy currently uses full softmax for inference
-                // to ensure exact probabilities across the entire vocabulary.
-                self.full_softmax_forward(logits)
+            SoftmaxStrategy::Hierarchical => {
+                self.hierarchical.as_ref().unwrap().forward(logits)
             }
-            SoftmaxStrategy::Hierarchical => unreachable!(),
+            SoftmaxStrategy::Adaptive => unreachable!(),
         }
     }
     
@@ -320,6 +315,9 @@ impl AdaptiveSoftmax {
                     self.full_softmax_loss(logits, target)
                 }
             }
+            SoftmaxStrategy::Hierarchical => {
+                self.hierarchical.as_ref().unwrap().loss(logits, target)
+            }
             _ => self.full_softmax_loss(logits, target),
         }
     }
@@ -342,6 +340,9 @@ impl AdaptiveSoftmax {
                 } else {
                     self.full_softmax_loss_and_gradient(logits, target)
                 }
+            }
+            SoftmaxStrategy::Hierarchical => {
+                self.hierarchical.as_ref().unwrap().loss_and_gradient(logits, target)
             }
             _ => self.full_softmax_loss_and_gradient(logits, target),
         }
@@ -522,6 +523,200 @@ impl SampledSoftmaxImpl {
         
         (loss, grad)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Node {
+    Internal(usize),
+    Leaf(usize),
+}
+
+// For Huffman construction
+#[derive(Debug, PartialEq, Eq)]
+struct HeapNode {
+    freq: u64, // using u64 for freq comparison to avoid float issues in Eq
+    node: Node,
+}
+
+impl PartialOrd for HeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.freq.cmp(&other.freq)
+    }
+}
+
+struct HierarchicalSoftmaxImpl {
+    vocab_size: usize,
+    tree: Vec<(Node, Node)>, // Index is internal node index. Value is (Left, Right)
+    paths: Vec<Vec<(usize, bool)>>, // Leaf index -> Path [(InternalNodeIndex, GoLeft)]
+}
+
+impl HierarchicalSoftmaxImpl {
+    fn new(config: &SoftmaxConfig) -> Self {
+        let vocab_size = config.vocab_size;
+
+        if vocab_size <= 1 {
+             return Self { vocab_size, tree: vec![], paths: vec![vec![]; vocab_size] };
+        }
+
+        let mut internal_nodes = Vec::with_capacity(vocab_size);
+        let mut paths = vec![vec![]; vocab_size];
+
+        if let Some(ref freqs) = config.frequencies {
+             // Huffman Tree
+             let mut heap = BinaryHeap::new();
+             for (i, &f) in freqs.iter().enumerate() {
+                 let freq_int = (f * 1_000_000.0) as u64;
+                 heap.push(Reverse(HeapNode { freq: freq_int, node: Node::Leaf(i) }));
+             }
+             // Add any missing words as freq 1
+             for i in freqs.len()..vocab_size {
+                 heap.push(Reverse(HeapNode { freq: 1, node: Node::Leaf(i) }));
+             }
+
+             let mut next_node_idx = 0;
+             while heap.len() > 1 {
+                 if let (Some(Reverse(left)), Some(Reverse(right))) = (heap.pop(), heap.pop()) {
+                    let idx = next_node_idx;
+                    next_node_idx += 1;
+
+                    internal_nodes.push((left.node, right.node));
+
+                    let new_node = HeapNode {
+                        freq: left.freq + right.freq,
+                        node: Node::Internal(idx),
+                    };
+                    heap.push(Reverse(new_node));
+                 } else {
+                     break;
+                 }
+             }
+        } else {
+             // Balanced Tree
+             let leaves: Vec<Node> = (0..vocab_size).map(Node::Leaf).collect();
+             let mut next_node_idx = 0;
+             Self::build_balanced(&leaves, &mut internal_nodes, &mut next_node_idx);
+        }
+
+        // Build paths
+        if !internal_nodes.is_empty() {
+            // Root is the last added node
+            let root_idx = internal_nodes.len() - 1;
+            Self::traverse(Node::Internal(root_idx), vec![], &internal_nodes, &mut paths);
+        }
+
+        Self {
+            vocab_size,
+            tree: internal_nodes,
+            paths,
+        }
+    }
+
+    fn build_balanced(leaves: &[Node], internal_nodes: &mut Vec<(Node, Node)>, next_node_idx: &mut usize) -> Node {
+        if leaves.len() == 1 {
+            return leaves[0];
+        }
+
+        let mid = leaves.len() / 2;
+        let (left_slice, right_slice) = leaves.split_at(mid);
+
+        let left_child = Self::build_balanced(left_slice, internal_nodes, next_node_idx);
+        let right_child = Self::build_balanced(right_slice, internal_nodes, next_node_idx);
+
+        let idx = *next_node_idx;
+        *next_node_idx += 1;
+        internal_nodes.push((left_child, right_child));
+
+        Node::Internal(idx)
+    }
+
+    fn traverse(node: Node, current_path: Vec<(usize, bool)>, internal_nodes: &[(Node, Node)], paths: &mut Vec<Vec<(usize, bool)>>) {
+        match node {
+            Node::Leaf(idx) => {
+                paths[idx] = current_path;
+            }
+            Node::Internal(idx) => {
+                let (left, right) = internal_nodes[idx];
+
+                let mut left_path = current_path.clone();
+                left_path.push((idx, true));
+                Self::traverse(left, left_path, internal_nodes, paths);
+
+                let mut right_path = current_path;
+                right_path.push((idx, false));
+                Self::traverse(right, right_path, internal_nodes, paths);
+            }
+        }
+    }
+
+    fn forward(&self, logits: &Array1<f32>) -> Array1<f32> {
+        let mut probs = Array1::zeros(self.vocab_size);
+        if self.tree.is_empty() {
+             if self.vocab_size == 1 { probs[0] = 1.0; }
+             return probs;
+        }
+
+        let root_idx = self.tree.len() - 1;
+        self.forward_recursive(Node::Internal(root_idx), 1.0, logits, &mut probs);
+        probs
+    }
+
+    fn forward_recursive(&self, node: Node, prob: f32, logits: &Array1<f32>, probs: &mut Array1<f32>) {
+        if prob < 1e-10 { return; }
+        match node {
+            Node::Leaf(idx) => {
+                probs[idx] = prob;
+            }
+            Node::Internal(idx) => {
+                let logit = logits[idx];
+                let p_left = sigmoid(logit);
+                let p_right = 1.0 - p_left;
+
+                let (left, right) = self.tree[idx];
+                self.forward_recursive(left, prob * p_left, logits, probs);
+                self.forward_recursive(right, prob * p_right, logits, probs);
+            }
+        }
+    }
+
+    fn loss(&self, logits: &Array1<f32>, target: usize) -> f32 {
+        let mut loss = 0.0;
+        for &(node_idx, go_left) in &self.paths[target] {
+            let logit = logits[node_idx];
+            let p_left = sigmoid(logit);
+            let prob = if go_left { p_left } else { 1.0 - p_left };
+            loss -= prob.ln();
+        }
+        loss
+    }
+
+    fn loss_and_gradient(&self, logits: &Array1<f32>, target: usize) -> (f32, Array1<f32>) {
+        let mut loss = 0.0;
+        let mut grad = Array1::zeros(self.vocab_size);
+
+        for &(node_idx, go_left) in &self.paths[target] {
+            let logit = logits[node_idx];
+            let p_left = sigmoid(logit);
+            let prob = if go_left { p_left } else { 1.0 - p_left };
+
+            loss -= prob.ln();
+
+            let g = if go_left { p_left - 1.0 } else { p_left };
+            grad[node_idx] += g;
+        }
+
+        (loss, grad)
+    }
+}
+
+fn sigmoid(x: f32) -> f32 {
+    let x = x.clamp(-80.0, 80.0);
+    1.0 / (1.0 + (-x).exp())
 }
 
 #[cfg(test)]
@@ -736,22 +931,111 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_strategy_fallback() {
+    fn test_hierarchical_creation() {
+        let config = SoftmaxConfig::massive_vocab(1000, vec![1.0; 1000]);
+        let softmax = AdaptiveSoftmax::new(config);
+        match softmax.strategy() {
+             SoftmaxStrategy::Sampled => {
+                 // The massive_vocab helper might force Sampled. Let's check logic.
+                 // "massive_vocab" calls: strategy: Some(SoftmaxStrategy::Sampled).
+                 // Ah, the helper forces Sampled.
+             }
+             _ => {}
+        }
+
+        // Manually force Hierarchical
         let mut config = SoftmaxConfig::default();
-        config.strategy = Some(SoftmaxStrategy::Adaptive);
         config.vocab_size = 100;
+        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+
+        let softmax = AdaptiveSoftmax::new(config);
+        assert_eq!(softmax.strategy(), SoftmaxStrategy::Hierarchical);
+    }
+
+    #[test]
+    fn test_hierarchical_forward_sum() {
+        let mut config = SoftmaxConfig::default();
+        config.vocab_size = 10;
+        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+
+        let softmax = AdaptiveSoftmax::new(config);
+        let logits = Array1::from_vec(vec![0.5; 10]); // Node scores
+
+        let probs = softmax.forward(&logits);
+        assert_eq!(probs.len(), 10);
+
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "Sum was {}", sum);
+    }
+
+    #[test]
+    fn test_hierarchical_forward_values() {
+        // Construct a small tree manually check values.
+        // Vocab size 3.
+        // Tree: Root(0). Left->Leaf(0). Right->Node(1).
+        // Node(1): Left->Leaf(1). Right->Leaf(2).
+        // Balanced tree for 3 leaves:
+        // build([0,1,2]) -> mid=1. Left=[0], Right=[1,2].
+        //   Left -> Leaf(0).
+        //   Right -> build([1,2]) -> mid=1. Left=[1], Right=[2].
+        //     Left -> Leaf(1).
+        //     Right -> Leaf(2).
+        //     Push (L1, L2). Returns Internal(0).
+        //   Push (L0, I0). Returns Internal(1).
+        //
+        // So Root is Internal(1).
+        // Root children: Left=Leaf(0), Right=Internal(0).
+        // Internal(0) children: Left=Leaf(1), Right=Leaf(2).
+        //
+        // Logits indices: 0 corresponds to Internal(0), 1 corresponds to Internal(1).
+        // logits[1] is root score.
+        // logits[0] is child score.
+
+        let mut config = SoftmaxConfig::default();
+        config.vocab_size = 3;
+        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+
         let softmax = AdaptiveSoftmax::new(config);
 
-        assert_eq!(softmax.strategy(), SoftmaxStrategy::Adaptive);
+        // Set logits so that sigmoid(logit) is known.
+        // sigmoid(0) = 0.5.
+        // sigmoid(large) -> 1.0.
+        // sigmoid(-large) -> 0.0.
 
-        let logits = Array1::from_vec(vec![1.0; 100]);
+        let mut logits = Array1::zeros(3);
+        // logits[1] (root) = 0.0 -> p_left = 0.5. p_right = 0.5.
+        // Left child is Leaf(0). P(0) = 0.5.
+        // Right child is Internal(0). P_node = 0.5.
+        // logits[0] (child) = 0.0 -> p_left = 0.5.
+        // Leaf(1) = 0.5 * 0.5 = 0.25.
+        // Leaf(2) = 0.5 * 0.5 = 0.25.
+
         let probs = softmax.forward(&logits);
 
-        // Should fallback to full softmax (uniform)
-        assert_eq!(probs.len(), 100);
-        let expected_prob = 1.0 / 100.0;
-        for &p in probs.iter() {
-            assert!((p - expected_prob).abs() < 1e-4);
-        }
+        assert!((probs[0] - 0.5).abs() < 1e-4);
+        assert!((probs[1] - 0.25).abs() < 1e-4);
+        assert!((probs[2] - 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_hierarchical_loss_gradient() {
+        let mut config = SoftmaxConfig::default();
+        config.vocab_size = 5;
+        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+
+        let mut softmax = AdaptiveSoftmax::new(config);
+        let logits = Array1::zeros(5);
+        let target = 2;
+
+        let (loss, grad) = softmax.loss_and_gradient(&logits, target);
+
+        assert!(loss > 0.0);
+        assert_eq!(grad.len(), 5);
+
+        // Gradient should be non-zero at path nodes
+        // but since we don't easily know path nodes indices without inspecting internals,
+        // we just check basic properties.
+        let grad_norm: f32 = grad.iter().map(|x| x.abs()).sum();
+        assert!(grad_norm > 0.0);
     }
 }
