@@ -118,6 +118,7 @@ impl HeadSelectionConfig {
                 sparsity_weight: _sparsity_weight,
                 importance_loss_weight: _importance_loss_weight,
                 switch_balance_weight: _switch_balance_weight,
+                training_mode: _,
             } => Self {
                 gating: GatingConfig::from_strategy(strategy, num_heads),
                 min_heads: 1, // Default min, could be parameterized
@@ -309,6 +310,7 @@ mod tests {
             sparsity_weight: 0.01,
             importance_loss_weight: 0.0,
             switch_balance_weight: 0.0,
+            training_mode: crate::mixtures::gating::GatingTrainingMode::Coupled,
         };
 
         let config = HeadSelectionConfig::from_strategy(&strategy, 8);
