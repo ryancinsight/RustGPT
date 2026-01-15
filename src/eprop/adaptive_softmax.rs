@@ -207,8 +207,8 @@ impl AdaptiveSoftmax {
         });
 
         match strategy {
-            SoftmaxStrategy::Full | SoftmaxStrategy::Sampled => {}
-            SoftmaxStrategy::Hierarchical | SoftmaxStrategy::Adaptive => {
+            SoftmaxStrategy::Full | SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {}
+            SoftmaxStrategy::Hierarchical => {
                 panic!(
                     "SoftmaxStrategy::{:?} is unsupported by AdaptiveSoftmax(logits: [vocab_size]).",
                     strategy
@@ -217,7 +217,7 @@ impl AdaptiveSoftmax {
         }
         
         let sampled = match strategy {
-            SoftmaxStrategy::Sampled => {
+            SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
                 Some(SampledSoftmaxImpl::new(&config))
             }
             SoftmaxStrategy::Full => {
@@ -226,7 +226,7 @@ impl AdaptiveSoftmax {
                 full_config.num_samples = config.vocab_size;
                 Some(SampledSoftmaxImpl::new(&full_config))
             }
-            SoftmaxStrategy::Hierarchical | SoftmaxStrategy::Adaptive => unreachable!(),
+            SoftmaxStrategy::Hierarchical => unreachable!(),
         };
         
         Self {
@@ -265,7 +265,12 @@ impl AdaptiveSoftmax {
             SoftmaxStrategy::Full | SoftmaxStrategy::Sampled => {
                 self.full_softmax_forward(logits)
             }
-            SoftmaxStrategy::Hierarchical | SoftmaxStrategy::Adaptive => unreachable!(),
+            SoftmaxStrategy::Adaptive => {
+                // Adaptive strategy currently uses full softmax for inference
+                // to ensure exact probabilities across the entire vocabulary.
+                self.full_softmax_forward(logits)
+            }
+            SoftmaxStrategy::Hierarchical => unreachable!(),
         }
     }
     
@@ -308,7 +313,7 @@ impl AdaptiveSoftmax {
         assert!(target < self.config.vocab_size, "Target index out of bounds");
         
         match self.strategy {
-            SoftmaxStrategy::Sampled => {
+            SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
                 if let Some(ref mut sampled) = self.sampled {
                     sampled.loss(logits, target)
                 } else {
@@ -331,7 +336,7 @@ impl AdaptiveSoftmax {
         assert!(target < self.config.vocab_size, "Target index out of bounds");
         
         match self.strategy {
-            SoftmaxStrategy::Sampled => {
+            SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
                 if let Some(ref mut sampled) = self.sampled {
                     sampled.loss_and_gradient(logits, target)
                 } else {
@@ -601,7 +606,7 @@ mod tests {
         
         let logits = Array1::from_vec(vec![0.0; 100]);
         let target = 42;
-        let (loss, grad) = softmax.loss_and_gradient(&logits, target);
+        let (_loss, grad) = softmax.loss_and_gradient(&logits, target);
         
         // Check gradient properties
         assert_eq!(grad.len(), 100);
@@ -728,5 +733,25 @@ mod tests {
         // Gradient must sum to 0 (conservation law)
         let grad_sum: f32 = grad.iter().sum();
         assert!(grad_sum.abs() < 1e-4, "Gradient sum: {}", grad_sum);
+    }
+
+    #[test]
+    fn test_adaptive_strategy_fallback() {
+        let mut config = SoftmaxConfig::default();
+        config.strategy = Some(SoftmaxStrategy::Adaptive);
+        config.vocab_size = 100;
+        let softmax = AdaptiveSoftmax::new(config);
+
+        assert_eq!(softmax.strategy(), SoftmaxStrategy::Adaptive);
+
+        let logits = Array1::from_vec(vec![1.0; 100]);
+        let probs = softmax.forward(&logits);
+
+        // Should fallback to full softmax (uniform)
+        assert_eq!(probs.len(), 100);
+        let expected_prob = 1.0 / 100.0;
+        for &p in probs.iter() {
+            assert!((p - expected_prob).abs() < 1e-4);
+        }
     }
 }
