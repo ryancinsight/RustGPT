@@ -2132,10 +2132,6 @@ impl LLM {
                 input[[0, i]] = token_id as f32;
             }
 
-            // Track forward pass variance for signal propagation analysis
-            // Reference: "Deep Information Propagation" (Schoenholz et al., 2017)
-            // Ideal: Var(x_l) ≈ Var(x_0) for all layers (isometry condition)
-            let mut layer_variances: Vec<f32> = Vec::new();
             let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
 
             let mut similarity_ctx: Option<Array2<f32>> = None;
@@ -2158,15 +2154,6 @@ impl LLM {
                         layer.forward(&input)
                     }
                 };
-
-                // Compute variance of layer output in single pass
-                let (sum, sum_sq) = input
-                    .iter()
-                    .fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
-                let n = input.len() as f32;
-                let mean = sum / n;
-                let variance = (sum_sq / n) - mean * mean;
-                layer_variances.push(variance);
             }
 
             let logits = input;

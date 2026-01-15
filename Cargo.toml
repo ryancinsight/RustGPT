@@ -93,3 +93,7 @@ path = "test_learning_bug_demo.rs"
 [[bin]]
 name = "debug_counts"
 path = "src/bin/debug_counts.rs"
+
+[[bench]]
+name = "llm_training_bench"
+harness = false
