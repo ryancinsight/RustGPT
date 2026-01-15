@@ -3079,13 +3079,14 @@ impl LLM {
         let mse_weight_ema_decay: f32 = 0.995;
         let mse_weight_min: f32 = 0.1;
         let mse_weight_max: f32 = 10.0;
+        let richards_sigmoid = crate::richards::RichardsCurve::sigmoid(false);
         let lambda_ce_schedule = |t: usize| -> f32 {
             let total = num_timesteps.max(1) as f32;
             let center = 0.5 * total;
             let sigma = (0.15 * total).max(1.0);
             let capped_t = t.min(num_timesteps.saturating_sub(1)) as f32;
             let x = (center - capped_t) / sigma;
-            let s = crate::richards::RichardsCurve::sigmoid(false).forward_scalar_f32(x);
+            let s = richards_sigmoid.forward_scalar_f32(x);
             s.clamp(0.5, 1.0)
         };
         let log_dir = std::path::Path::new("training_logs");
