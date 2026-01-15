@@ -308,7 +308,7 @@ impl AdaptiveSoftmax {
         assert!(target < self.config.vocab_size, "Target index out of bounds");
         
         match self.strategy {
-            SoftmaxStrategy::Sampled => {
+            SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
                 if let Some(ref mut sampled) = self.sampled {
                     sampled.loss(logits, target)
                 } else {
@@ -334,7 +334,7 @@ impl AdaptiveSoftmax {
         assert!(target < self.config.vocab_size, "Target index out of bounds");
         
         match self.strategy {
-            SoftmaxStrategy::Sampled => {
+            SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
                 if let Some(ref mut sampled) = self.sampled {
                     sampled.loss_and_gradient(logits, target)
                 } else {
@@ -801,7 +801,7 @@ mod tests {
         
         let logits = Array1::from_vec(vec![0.0; 100]);
         let target = 42;
-        let (loss, grad) = softmax.loss_and_gradient(&logits, target);
+        let (_loss, grad) = softmax.loss_and_gradient(&logits, target);
         
         // Check gradient properties
         assert_eq!(grad.len(), 100);
