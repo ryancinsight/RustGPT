@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, Seek};
 
 use csv::ReaderBuilder;
 
@@ -56,12 +57,15 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
     }
 
     // convert json file to Vec<String>
-    let data_json_raw = fs::read_to_string(path).map_err(ModelError::from)?;
+    let file = fs::File::open(path).map_err(ModelError::from)?;
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
 
-    match serde_json::from_str::<Vec<String>>(&data_json_raw) {
+    match serde_json::from_reader::<_, Vec<String>>(&mut reader) {
         Ok(strict) => Ok(strict),
         Err(_) => {
-            let parsed = serde_json::from_str::<Vec<serde_json::Value>>(&data_json_raw);
+            reader.seek(std::io::SeekFrom::Start(0))?;
+
+            let parsed = serde_json::from_reader::<_, Vec<serde_json::Value>>(&mut reader);
             if let Ok(vals) = parsed {
                 let mut out: Vec<String> = Vec::new();
                 for v in vals {
@@ -79,8 +83,12 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
                     return Ok(out);
                 }
             }
+
+            reader.seek(std::io::SeekFrom::Start(0))?;
+
             let mut items = Vec::new();
-            for line in data_json_raw.lines() {
+            for line in (&mut reader).lines() {
+                let line = line.map_err(ModelError::from)?;
                 let t = line.trim();
                 if t.is_empty() || t == "," || t == "[" || t == "]" {
                     continue;
@@ -94,7 +102,8 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
                 }
             }
             if items.is_empty() {
-                serde_json::from_str::<Vec<String>>(&data_json_raw).map_err(|e| {
+                reader.seek(std::io::SeekFrom::Start(0))?;
+                serde_json::from_reader::<_, Vec<String>>(&mut reader).map_err(|e| {
                     ModelError::Serialization {
                         source: Box::new(e),
                     }
