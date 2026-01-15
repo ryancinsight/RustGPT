@@ -19,6 +19,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::mixtures::metrics::MixtureMetrics;
 
+/// Training mode for the gating mechanism
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GatingTrainingMode {
+    /// Coupled training: Gating parameters learn from both the main task gradients
+    /// (backpropagated through the selected components) and auxiliary losses.
+    #[default]
+    Coupled,
+    /// Independent training: Gating parameters learn ONLY from auxiliary losses
+    /// (complexity, load balance, sparsity). The main task gradients are blocked
+    /// from flowing into the gating mechanism.
+    Independent,
+    /// Hierarchical training: Similar to Independent training, typically used in a
+    /// phased training curriculum where gating learns structure first.
+    Hierarchical,
+}
+
 /// Strategy for gating component activation (heads or experts)
 ///
 /// Provides unified configuration for both MoH and MoE gating approaches.
@@ -50,6 +66,10 @@ pub enum GatingStrategy {
         /// This is often a robust default for MoE routers.
         #[serde(default)]
         switch_balance_weight: f32,
+
+        /// Training mode for the gating mechanism
+        #[serde(default)]
+        training_mode: GatingTrainingMode,
     },
     /// Soft top-p gating: Differentiable top-p selection using AutoDeco-inspired soft sampling
     ///
@@ -100,6 +120,11 @@ pub struct GatingConfig {
     /// Weight for Switch/GShard-style combined balance loss
     #[serde(default)]
     pub switch_balance_weight: f32,
+
+    /// Training mode for the gating mechanism
+    #[serde(default)]
+    pub training_mode: GatingTrainingMode,
+
     /// Shared metrics for tracking activation patterns
     pub metrics: MixtureMetrics,
 }
@@ -117,6 +142,7 @@ impl Default for GatingConfig {
             complexity_loss_weight: 0.0,
             importance_loss_weight: 0.0,
             switch_balance_weight: 0.0,
+            training_mode: GatingTrainingMode::default(),
             metrics: MixtureMetrics::default(),
         }
     }
@@ -133,6 +159,7 @@ impl GatingConfig {
                 complexity_loss_weight,
                 importance_loss_weight,
                 switch_balance_weight,
+                training_mode,
             } => Self {
                 use_learned_predictor: true,
                 use_soft_top_p: false,
@@ -144,6 +171,7 @@ impl GatingConfig {
                 complexity_loss_weight: *complexity_loss_weight,
                 importance_loss_weight: *importance_loss_weight,
                 switch_balance_weight: *switch_balance_weight,
+                training_mode: *training_mode,
                 metrics: MixtureMetrics::new(num_components),
             },
             GatingStrategy::SoftTopP {
@@ -160,6 +188,7 @@ impl GatingConfig {
                 complexity_loss_weight: 0.0,
                 importance_loss_weight: 0.0,
                 switch_balance_weight: 0.0,
+                training_mode: GatingTrainingMode::default(),
                 metrics: MixtureMetrics::new(num_components),
             },
             GatingStrategy::Fixed { num_active } => Self {
@@ -173,6 +202,7 @@ impl GatingConfig {
                 complexity_loss_weight: 0.0,
                 importance_loss_weight: 0.0,
                 switch_balance_weight: 0.0,
+                training_mode: GatingTrainingMode::default(),
                 metrics: MixtureMetrics::new(num_components),
             },
         }
@@ -296,6 +326,7 @@ mod tests {
         assert_eq!(config.load_balance_weight, 0.0);
         assert_eq!(config.importance_loss_weight, 0.0);
         assert_eq!(config.switch_balance_weight, 0.0);
+        assert_eq!(config.training_mode, GatingTrainingMode::Coupled);
     }
 
     #[test]
@@ -307,6 +338,7 @@ mod tests {
             complexity_loss_weight: 0.05,
             importance_loss_weight: 0.0,
             switch_balance_weight: 0.0,
+            training_mode: GatingTrainingMode::Independent,
         };
 
         let config = GatingConfig::from_strategy(&strategy, 8);
@@ -315,6 +347,7 @@ mod tests {
         assert_eq!(config.load_balance_weight, 0.1);
         assert_eq!(config.sparsity_weight, 0.01);
         assert_eq!(config.complexity_loss_weight, 0.05);
+        assert_eq!(config.training_mode, GatingTrainingMode::Independent);
         assert_eq!(config.metrics.active_sum_per_component.len(), 8);
     }
 

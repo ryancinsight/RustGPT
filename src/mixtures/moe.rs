@@ -255,6 +255,7 @@ impl ExpertRouterConfig {
                         complexity_loss_weight: 0.005, // Default
                         importance_loss_weight: 0.0,
                         switch_balance_weight: 0.0,
+                        training_mode: crate::mixtures::gating::GatingTrainingMode::Coupled,
                     },
                     *num_experts,
                 ),
