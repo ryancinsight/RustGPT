@@ -2116,6 +2116,8 @@ impl LLM {
             }
         }
 
+        let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
+
         // Process each sequence in the batch
         for training_row in batch {
             if training_row.len() < 2 {
@@ -2136,7 +2138,7 @@ impl LLM {
             // Reference: "Deep Information Propagation" (Schoenholz et al., 2017)
             // Ideal: Var(x_l) ≈ Var(x_0) for all layers (isometry condition)
             let mut layer_variances: Vec<f32> = Vec::new();
-            let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
+            layer_inputs.clear();
 
             let mut similarity_ctx: Option<Array2<f32>> = None;
 
