@@ -1138,7 +1138,10 @@ impl DiffusionBlock {
         let mut attn_out = self
             .temporal_mixing
             .forward_with_causal(&norm1_mod, self.config.causal_attention);
-        if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+        if !matches!(
+            self.temporal_mixing,
+            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
+        ) {
             self.config.titan_memory.apply_into_out_with_workspace(
                 &mut attn_out,
                 &norm1_mod,
@@ -1802,7 +1805,10 @@ impl Layer for DiffusionBlock {
             let (mut attn_input_grad_mod, attn_param_grads) = self
                 .temporal_mixing
                 .compute_gradients(norm1_mod, attn_out_grads);
-            if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+            if !matches!(
+                self.temporal_mixing,
+                TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
+            ) {
                 self.config
                     .titan_memory
                     .add_input_grads_from_output_grads_into(

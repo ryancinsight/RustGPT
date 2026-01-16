@@ -15,6 +15,12 @@ pub struct TitanMemoryConfig {
     pub eta: f32,
     #[serde(default = "titan_memory_decay_default")]
     pub decay: f32,
+    #[serde(default = "titan_memory_segment_len_default")]
+    pub segment_len: usize,
+    #[serde(default = "titan_memory_persistent_len_default")]
+    pub persistent_len: usize,
+    #[serde(default = "titan_memory_hidden_dim_default")]
+    pub hidden_dim: usize,
 }
 
 impl Default for TitanMemoryConfig {
@@ -24,6 +30,9 @@ impl Default for TitanMemoryConfig {
             scale: titan_memory_scale_default(),
             eta: titan_memory_eta_default(),
             decay: titan_memory_decay_default(),
+            segment_len: titan_memory_segment_len_default(),
+            persistent_len: titan_memory_persistent_len_default(),
+            hidden_dim: titan_memory_hidden_dim_default(),
         }
     }
 }
@@ -88,6 +97,9 @@ pub enum TemporalMixingType {
 
     /// Mamba-2 style selective SSM (reference implementation)
     Mamba2,
+
+    /// Titans MAC (Memory As Context)
+    Titans,
 }
 
 /// Strategy for sampling diffusion timesteps during training
@@ -395,6 +407,18 @@ fn titan_memory_eta_default() -> f32 {
 
 fn titan_memory_decay_default() -> f32 {
     0.001
+}
+
+fn titan_memory_segment_len_default() -> usize {
+    128
+}
+
+fn titan_memory_persistent_len_default() -> usize {
+    32
+}
+
+fn titan_memory_hidden_dim_default() -> usize {
+    64
 }
 
 fn residual_decorrelation_weight_default() -> f32 {

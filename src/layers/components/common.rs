@@ -14,6 +14,7 @@ use crate::{
     model_config::{TemporalMixingType, TitanMemoryConfig},
     network::Layer,
     richards::{RichardsGlu, RichardsNorm},
+    models::titans::{mac::TitansMAC, memory::NeuralMemory},
 };
 
 /// Temporal-mixing layer variants shared between TransformerBlock and DiffusionBlock.
@@ -33,6 +34,7 @@ pub enum TemporalMixingLayer {
     Mamba(Box<Mamba>),
     Mamba2MoH(Box<MoHMamba2>),
     Mamba2(Box<Mamba2>),
+    Titans(Box<TitansMAC>),
 }
 
 #[derive(Default, Debug)]
@@ -150,6 +152,7 @@ impl TemporalMixingLayer {
             TemporalMixingLayer::Mamba(layer) => layer.forward(input),
             TemporalMixingLayer::Mamba2MoH(layer) => layer.forward(input),
             TemporalMixingLayer::Mamba2(layer) => layer.forward(input),
+            TemporalMixingLayer::Titans(layer) => layer.forward(input),
         }
     }
 
@@ -175,6 +178,10 @@ impl TemporalMixingLayer {
                 let _ = causal;
                 layer.forward(input)
             }
+            TemporalMixingLayer::Titans(layer) => {
+                let _ = causal; // TitansMAC implies causal
+                layer.forward(input)
+            }
         }
     }
 
@@ -192,6 +199,7 @@ impl TemporalMixingLayer {
             TemporalMixingLayer::Mamba(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::Mamba2MoH(layer) => layer.compute_gradients(input, output_grads),
             TemporalMixingLayer::Mamba2(layer) => layer.compute_gradients(input, output_grads),
+            TemporalMixingLayer::Titans(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -205,6 +213,7 @@ impl TemporalMixingLayer {
             TemporalMixingLayer::Mamba(layer) => layer.apply_gradients(grads, lr),
             TemporalMixingLayer::Mamba2MoH(layer) => layer.apply_gradients(grads, lr),
             TemporalMixingLayer::Mamba2(layer) => layer.apply_gradients(grads, lr),
+            TemporalMixingLayer::Titans(layer) => layer.apply_gradients(grads, lr),
         }
     }
 
@@ -218,6 +227,7 @@ impl TemporalMixingLayer {
             TemporalMixingLayer::Mamba(layer) => layer.parameters(),
             TemporalMixingLayer::Mamba2MoH(layer) => layer.parameters(),
             TemporalMixingLayer::Mamba2(layer) => layer.parameters(),
+            TemporalMixingLayer::Titans(layer) => layer.parameters(),
         }
     }
 
@@ -231,6 +241,7 @@ impl TemporalMixingLayer {
             TemporalMixingLayer::Mamba(layer) => layer.weight_norm(),
             TemporalMixingLayer::Mamba2MoH(layer) => layer.weight_norm(),
             TemporalMixingLayer::Mamba2(layer) => layer.weight_norm(),
+            TemporalMixingLayer::Titans(layer) => layer.weight_norm(),
         }
     }
 }
@@ -250,6 +261,9 @@ mod tests {
             scale: 0.3,
             eta: 0.7,
             decay: 0.2,
+            segment_len: 128,
+            persistent_len: 32,
+            hidden_dim: 64,
         };
 
         let x = Array2::from_shape_fn((7, 5), |(i, j)| (i as f32 * 0.01) - (j as f32 * 0.02));
@@ -282,6 +296,9 @@ mod tests {
             scale: rng_cfg.random_range(-1.0..1.0),
             eta: rng_cfg.random_range(0.0..1.0),
             decay: rng_cfg.random_range(0.0..1.0),
+            segment_len: 128,
+            persistent_len: 32,
+            hidden_dim: 64,
         };
 
         let mut rng_x = get_rng_with_subseed(2);
@@ -315,6 +332,9 @@ mod tests {
             scale: 0.3,
             eta: 0.7,
             decay: 0.2,
+            segment_len: 128,
+            persistent_len: 32,
+            hidden_dim: 64,
         };
 
         let x = Array2::from_shape_fn((3, 4), |(i, j)| (i as f32) + (j as f32));
@@ -380,6 +400,9 @@ mod tests {
             scale: 0.11,
             eta: 0.9,
             decay: 0.05,
+            segment_len: 128,
+            persistent_len: 32,
+            hidden_dim: 64,
         };
 
         let g = Array2::from_shape_fn((9, 4), |(i, j)| (i as f32 * 0.02) - (j as f32 * 0.03));
@@ -401,6 +424,9 @@ mod tests {
             scale: 0.17,
             eta: 0.23,
             decay: 0.11,
+            segment_len: 128,
+            persistent_len: 32,
+            hidden_dim: 64,
         };
 
         let x = Array2::from_shape_fn((11, 7), |(i, j)| (i as f32 * 0.007) - (j as f32 * 0.013));
@@ -437,7 +463,7 @@ mod tests {
             prop_assume!(x_flat.len() >= len);
             prop_assume!(g_flat.len() >= len);
 
-            let cfg = TitanMemoryConfig { enabled: true, scale, eta, decay };
+            let cfg = TitanMemoryConfig { enabled: true, scale, eta, decay, segment_len: 128, persistent_len: 32, hidden_dim: 64 };
             let x = Array2::from_shape_vec((n, d), x_flat[..len].to_vec()).unwrap();
             let g = Array2::from_shape_vec((n, d), g_flat[..len].to_vec()).unwrap();
 
@@ -572,6 +598,33 @@ impl CommonLayers {
                 TemporalMixingType::Mamba2 => TemporalMixingLayer::Mamba2MoH(Box::new(
                     MoHMamba2::new(config.embed_dim, config.num_heads, &config.head_selection),
                 )),
+                TemporalMixingType::Titans => {
+                    let mut attention = PolyAttention::new(
+                        config.embed_dim,
+                        config.num_heads,
+                        config.poly_degree,
+                        config.max_pos,
+                        config.window_size,
+                    );
+                    attention.set_titan_memory_config(config.titan_memory.clone());
+                    attention.set_head_selection_config(&config.head_selection);
+
+                    let memory = NeuralMemory::new(
+                        config.embed_dim,
+                        config.embed_dim,
+                        config.embed_dim,
+                        config.titan_memory.hidden_dim
+                    );
+
+                    let mac = TitansMAC::new(
+                        attention,
+                        memory,
+                        config.titan_memory.persistent_len,
+                        config.titan_memory.segment_len
+                    );
+
+                    TemporalMixingLayer::Titans(Box::new(mac))
+                }
             };
 
         let pre_ffn_norm = RichardsNorm::new(config.embed_dim);
