@@ -475,8 +475,9 @@ impl Layer for NeuralMemory {
 
             // d_S_t = dL/dM_t + (dL/dS_{t+1} * eta)
             let mut d_St = d_M_curr.clone();
-            d_S_next.scale(eta_t);
-            d_St.add(&d_S_next);
+            let mut scaled_s_next = d_S_next.clone();
+            scaled_s_next.scale(eta_t);
+            d_St.add(&scaled_s_next);
 
             // Partial dL/dM_{t-1} from update
             // dL/dM_{t-1} += dL/dM_t * (1 - alpha)
