@@ -49,21 +49,21 @@ pub struct AdaptiveSurrogate {
 
 /// Performance metrics for surrogate function evaluation
 #[derive(Debug, Clone)]
-struct PerformanceMetrics {
+pub struct PerformanceMetrics {
     /// Gradient correlation with true gradient
-    gradient_correlation: f32,
+    pub gradient_correlation: f32,
     
     /// Learning stability (inverse of gradient variance)
-    stability_score: f32,
+    pub stability_score: f32,
     
     /// Training loss improvement rate
-    loss_improvement_rate: f32,
+    pub loss_improvement_rate: f32,
     
     /// Spike generation efficiency
-    spike_efficiency: f32,
+    pub spike_efficiency: f32,
     
     /// Overall performance score
-    overall_score: f32,
+    pub overall_score: f32,
 }
 
 /// Function-specific parameters
@@ -215,8 +215,7 @@ impl AdaptiveSurrogate {
     /// Gaussian surrogate gradient
     fn gaussian_surrogate(&self, delta: f32) -> f32 {
         let width = self.function_params.gaussian_width;
-        let gaussian = (-0.5 * (delta / width).powi(2)).exp();
-        gaussian * (-delta / (width * width))
+        (-0.5 * (delta / width).powi(2)).exp()
     }
     
     /// Adaptive piecewise linear surrogate

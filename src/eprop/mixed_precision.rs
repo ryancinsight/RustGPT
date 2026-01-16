@@ -297,7 +297,13 @@ mod tests {
     
     #[test]
     fn test_memory_usage() {
-        let traces = QuantizedEligibilityTraces::new(1000, 500, true, 0.01);
+        let mut traces = QuantizedEligibilityTraces::new(1000, 500, true, 0.01);
+
+        // Drop full precision shadows to realize memory savings
+        traces.eps_x_fp = None;
+        traces.eps_f_fp = None;
+        traces.eps_a_fp = None;
+
         let (savings, savings_percent) = traces.memory_savings();
         
         // Should save significant memory

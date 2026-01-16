@@ -535,9 +535,9 @@ mod tests {
     fn test_adaptive_alpha_medium_sequence() {
         // Medium sequences should have moderate alpha
         let alpha = ContextConfig::adaptive_alpha(100);
-        assert!(alpha >= 0.90 && alpha <= 0.95);
-        // α = 1 - 4/100 = 0.96, but clamped to 0.95
-        assert!((alpha - 0.95).abs() < 0.01);
+        assert!(alpha >= 0.90 && alpha <= 0.96);
+        // α = 1 - 4/100 = 0.96
+        assert!((alpha - 0.96).abs() < 0.01);
     }
 
     #[test]

@@ -592,7 +592,7 @@ mod tests {
         let mut input = Array1::<f32>::zeros(n_cols);
         let mut active_indices: Vec<usize> = Vec::new();
         for c in 0..n_cols {
-            if rng.gen::<f32>() < 0.15 {
+            if rng.random::<f32>() < 0.15 {
                 input[c] = rng.sample(StandardNormal);
                 active_indices.push(c);
             }

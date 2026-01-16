@@ -189,12 +189,12 @@ impl IncrementalGradientUpdater {
 
         assert_eq!(
             grad_in.raw_dim(),
-            (num_neurons, input_dim).into(),
+            ndarray::Dim((num_neurons, input_dim)),
             "grad_in shape mismatch"
         );
         assert_eq!(
             grad_rec.raw_dim(),
-            (num_neurons, num_neurons).into(),
+            ndarray::Dim((num_neurons, num_neurons)),
             "grad_rec shape mismatch"
         );
         assert_eq!(
