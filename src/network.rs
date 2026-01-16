@@ -6,6 +6,7 @@ use crate::{
     layers::{recurrence::LRM, transformer::TransformerBlock},
     output_projection::OutputProjection,
     richards::{RichardsGlu, RichardsNorm},
+    models::titans::memory::NeuralMemory,
 };
 
 /// Layer trait for neural network components
@@ -49,6 +50,7 @@ pub enum LayerEnum {
     TransformerBlock(Box<TransformerBlock>),
     DiffusionBlock(Box<crate::layers::diffusion::DiffusionBlock>),
     LRM(Box<LRM>),
+    TitansMemory(Box<NeuralMemory>),
 }
 
 impl Layer for LayerEnum {
@@ -68,6 +70,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.layer_type(),
             LayerEnum::DiffusionBlock(layer) => layer.layer_type(),
             LayerEnum::LRM(layer) => layer.layer_type(),
+            LayerEnum::TitansMemory(layer) => layer.layer_type(),
         }
     }
 
@@ -87,6 +90,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.parameters(),
             LayerEnum::DiffusionBlock(layer) => layer.parameters(),
             LayerEnum::LRM(layer) => layer.parameters(),
+            LayerEnum::TitansMemory(layer) => layer.parameters(),
         }
     }
 
@@ -106,6 +110,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.forward(input),
             LayerEnum::DiffusionBlock(layer) => layer.forward(input),
             LayerEnum::LRM(layer) => layer.forward(input),
+            LayerEnum::TitansMemory(layer) => layer.forward(input),
         }
     }
 
@@ -120,6 +125,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.backward(grads, lr),
             LayerEnum::DiffusionBlock(layer) => layer.backward(grads, lr),
             LayerEnum::LRM(layer) => layer.backward(grads, lr),
+            LayerEnum::TitansMemory(layer) => layer.backward(grads, lr),
         }
     }
 
@@ -134,6 +140,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.weight_norm(),
             LayerEnum::DiffusionBlock(layer) => layer.weight_norm(),
             LayerEnum::LRM(layer) => layer.weight_norm(),
+            LayerEnum::TitansMemory(layer) => layer.weight_norm(),
         }
     }
 
@@ -157,6 +164,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::DiffusionBlock(layer) => layer.compute_gradients(input, output_grads),
             LayerEnum::LRM(layer) => layer.compute_gradients(input, output_grads),
+            LayerEnum::TitansMemory(layer) => layer.compute_gradients(input, output_grads),
         }
     }
 
@@ -180,6 +188,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.apply_gradients(gradients, learning_rate),
             LayerEnum::DiffusionBlock(layer) => layer.apply_gradients(gradients, learning_rate),
             LayerEnum::LRM(layer) => layer.apply_gradients(gradients, learning_rate),
+            LayerEnum::TitansMemory(layer) => layer.apply_gradients(gradients, learning_rate),
         }
     }
 
@@ -199,6 +208,7 @@ impl Layer for LayerEnum {
             LayerEnum::TransformerBlock(layer) => layer.zero_gradients(),
             LayerEnum::DiffusionBlock(layer) => layer.zero_gradients(),
             LayerEnum::LRM(layer) => layer.zero_gradients(),
+            LayerEnum::TitansMemory(layer) => layer.zero_gradients(),
         }
     }
 }
