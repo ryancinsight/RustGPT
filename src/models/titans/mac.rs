@@ -24,6 +24,9 @@ pub struct TitansMAC {
 
     pub segment_len: usize,
     pub persistent_len: usize,
+
+    #[serde(skip)]
+    cached_input: Option<Array2<f32>>,
 }
 
 impl TitansMAC {
@@ -46,6 +49,7 @@ impl TitansMAC {
             persistent_memory,
             segment_len,
             persistent_len,
+            cached_input: None,
         }
     }
 
@@ -85,6 +89,7 @@ impl Layer for TitansMAC {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.cached_input = Some(input.clone());
         let seq_len = input.nrows();
         let input_dim = input.ncols();
 
@@ -119,7 +124,8 @@ impl Layer for TitansMAC {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        let input = self.cached_input.as_ref().expect("forward must be called before backward");
+        let (input_grads, param_grads) = self.compute_gradients(input, grads);
         self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
     }
