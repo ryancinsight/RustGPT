@@ -139,7 +139,10 @@ impl Layer for TitansMAC {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let input = self.cached_input.as_ref().expect("forward must be called before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before backward");
         let (input_grads, param_grads) = self.compute_gradients(input, grads);
         self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
@@ -173,12 +176,25 @@ impl Layer for TitansMAC {
             seg_out: Array2<f32>,
             memory_before: MemoryWeights,
             momentum_before: MemoryWeights,
-            memory_trace: Vec<(Array1<f32>, Array1<f32>, Array1<f32>, f32, f32, f32, MemoryWeights, MemoryWeights)>, // Trace for update loop
+            memory_trace: Vec<(
+                Array1<f32>,
+                Array1<f32>,
+                Array1<f32>,
+                f32,
+                f32,
+                f32,
+                MemoryWeights,
+                MemoryWeights,
+            )>, // Trace for update loop
         }
 
         let mut forward_data = Vec::new();
         let mut curr_memory = self.memory.init_memory.clone();
-        let mut momentum = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+        let mut momentum = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
 
         let mut processed = 0;
         while processed < seq_len {
@@ -202,23 +218,28 @@ impl Layer for TitansMAC {
             let s_len = segment.nrows();
             let total_len = p_len + s_len + s_len;
             let mut context = Array2::<f32>::zeros((total_len, input_dim));
-            context.slice_mut(s![0..p_len, ..]).assign(&self.persistent_memory);
-            context.slice_mut(s![p_len..p_len+s_len, ..]).assign(&h_t);
-            context.slice_mut(s![p_len+s_len..total_len, ..]).assign(&segment);
+            context
+                .slice_mut(s![0..p_len, ..])
+                .assign(&self.persistent_memory);
+            context.slice_mut(s![p_len..p_len + s_len, ..]).assign(&h_t);
+            context
+                .slice_mut(s![p_len + s_len..total_len, ..])
+                .assign(&segment);
 
             // Note: We use forward_impl_baseline to set cache on core (PolyAttention).
             // We assume core doesn't change state other than cache.
-            // Using interior mutability on self.core (via &self -> &mut self requires ref cell or similar, but compute_gradients is &self).
+            // Using interior mutability on self.core (via &self -> &mut self requires ref cell or
+            // similar, but compute_gradients is &self).
             // Wait, PolyAttention::forward_impl requires &mut self.
             // TitansMAC::compute_gradients is &self.
             // We cannot call core.forward_impl here!
-            // But PolyAttention::compute_gradients usually works on cached data from previous forward.
-            // If we are re-running logic, we can't populate cache on `self.core`.
-            // But PolyAttention::compute_gradients needs `cached_input`.
+            // But PolyAttention::compute_gradients usually works on cached data from previous
+            // forward. If we are re-running logic, we can't populate cache on
+            // `self.core`. But PolyAttention::compute_gradients needs `cached_input`.
 
-            // FIXME: PolyAttention design assumes `forward` was called just before `backward/compute_gradients`.
-            // Here we are chunking. The last chunk's cache is likely in `self.core`.
-            // But previous chunks are lost.
+            // FIXME: PolyAttention design assumes `forward` was called just before
+            // `backward/compute_gradients`. Here we are chunking. The last chunk's
+            // cache is likely in `self.core`. But previous chunks are lost.
             // We MUST instantiate a temporary core or bypass the cache check if possible.
             // Actually, we can use `self.core` as a template but we can't mutate it.
             // We need to call `core.compute_gradients_parallel` passing `input` explicitly?
@@ -241,7 +262,7 @@ impl Layer for TitansMAC {
 
             let mut core_clone = self.core.clone();
             let attn_out = core_clone.forward_impl_baseline(&context, true);
-            let seg_out = attn_out.slice(s![p_len+s_len..total_len, ..]).to_owned();
+            let seg_out = attn_out.slice(s![p_len + s_len..total_len, ..]).to_owned();
 
             // Update Memory Logic
             let memory_before = curr_memory.clone();
@@ -261,11 +282,17 @@ impl Layer for TitansMAC {
                 let v_pred = curr_memory.w2.dot(&h) + &curr_memory.b2;
                 let grad_output = &v_pred - &v;
 
-                let grad_w2 = grad_output.clone().insert_axis(Axis(1)).dot(&h.clone().insert_axis(Axis(0)));
+                let grad_w2 = grad_output
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&h.clone().insert_axis(Axis(0)));
                 let grad_b2 = grad_output.clone();
                 let grad_h = curr_memory.w2.t().dot(&grad_output);
                 let grad_z = grad_h * z.mapv(|val| if val > 0.0 { 1.0 } else { 0.0 });
-                let grad_w1 = grad_z.clone().insert_axis(Axis(1)).dot(&k.clone().insert_axis(Axis(0)));
+                let grad_w1 = grad_z
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&k.clone().insert_axis(Axis(0)));
                 let grad_b1 = grad_z;
 
                 momentum.scale(eta);
@@ -312,10 +339,22 @@ impl Layer for TitansMAC {
         let mut d_w_alpha = Array1::<f32>::zeros(self.memory.w_alpha.raw_dim());
         let mut d_w_eta = Array1::<f32>::zeros(self.memory.w_eta.raw_dim());
         let mut d_w_theta = Array1::<f32>::zeros(self.memory.w_theta.raw_dim());
-        let mut d_init_memory = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+        let mut d_init_memory = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
 
-        let mut d_M_next = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
-        let mut d_S_next = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+        let mut d_M_next = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
+        let mut d_S_next = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
 
         let mut input_grads = Array2::<f32>::zeros(input.raw_dim());
 
@@ -362,7 +401,11 @@ impl Layer for TitansMAC {
 
                 let mut val_eta = 0.0;
                 // S_{t-1} is needed. If t=0, it's momentum_before. Else trace[t-1].
-                let s_prev = if t == 0 { &data.momentum_before } else { &data.memory_trace[t-1].7 };
+                let s_prev = if t == 0 {
+                    &data.momentum_before
+                } else {
+                    &data.memory_trace[t - 1].7
+                };
 
                 val_eta += (d_St.w1.clone() * &s_prev.w1).sum();
                 val_eta += (d_St.b1.clone() * &s_prev.b1).sum();
@@ -379,11 +422,17 @@ impl Layer for TitansMAC {
                 let v_pred = m_prev.w2.dot(&h_k) + &m_prev.b2;
                 let delta = &v_pred - v;
 
-                let g_w2 = delta.clone().insert_axis(Axis(1)).dot(&h_k.clone().insert_axis(Axis(0)));
+                let g_w2 = delta
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&h_k.clone().insert_axis(Axis(0)));
                 let g_b2 = delta.clone();
                 let grad_h_k = m_prev.w2.t().dot(&delta);
                 let grad_z_k = &grad_h_k * z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-                let g_w1 = grad_z_k.clone().insert_axis(Axis(1)).dot(&k.clone().insert_axis(Axis(0)));
+                let g_w1 = grad_z_k
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&k.clone().insert_axis(Axis(0)));
                 let g_b1 = grad_z_k.clone();
 
                 let mut val_theta = 0.0;
@@ -411,7 +460,11 @@ impl Layer for TitansMAC {
                 let term2 = u_w1.t().dot(&epsilon);
                 let d_kt = term1 + term2;
 
-                d_wk = d_wk + d_kt.clone().insert_axis(Axis(1)).dot(&u_in.clone().insert_axis(Axis(0)));
+                d_wk = d_wk
+                    + d_kt
+                        .clone()
+                        .insert_axis(Axis(1))
+                        .dot(&u_in.clone().insert_axis(Axis(0)));
                 d_uin = d_uin + self.memory.w_k.t().dot(&d_kt);
 
                 let u_w1_k_ub1 = u_w1.dot(k) + &u_b1;
@@ -419,7 +472,11 @@ impl Layer for TitansMAC {
                 let term_v_1 = u_w2.dot(&h_k) + &u_b2;
                 let d_vt = -(term_v_1 + term_v_2);
 
-                d_wv = d_wv + d_vt.clone().insert_axis(Axis(1)).dot(&u_in.clone().insert_axis(Axis(0)));
+                d_wv = d_wv
+                    + d_vt
+                        .clone()
+                        .insert_axis(Axis(1))
+                        .dot(&u_in.clone().insert_axis(Axis(0)));
                 d_uin = d_uin + self.memory.w_v.t().dot(&d_vt);
 
                 d_update_inputs.row_mut(t).assign(&d_uin);
@@ -431,12 +488,15 @@ impl Layer for TitansMAC {
             let d_seg_out_total = &d_seg_out_loss + &d_update_inputs;
 
             // 3. Backprop Core
-            // Construct d_context_out (zeros for persistent/memory part, d_seg_out_total for segment)
+            // Construct d_context_out (zeros for persistent/memory part, d_seg_out_total for
+            // segment)
             let p_len = self.persistent_len;
             let s_len = seg_len;
             let total_len = p_len + s_len + s_len;
             let mut d_context_out = Array2::<f32>::zeros((total_len, input_dim));
-            d_context_out.slice_mut(s![p_len+s_len..total_len, ..]).assign(&d_seg_out_total);
+            d_context_out
+                .slice_mut(s![p_len + s_len..total_len, ..])
+                .assign(&d_seg_out_total);
 
             // We need a Core instance with correct cache.
             // We can clone `self.core`, run forward baseline to populate cache, then backward.
@@ -455,11 +515,13 @@ impl Layer for TitansMAC {
 
             // Extract gradients from d_context
             let d_persistent_seg = d_context.slice(s![0..p_len, ..]);
-            let d_ht_seg = d_context.slice(s![p_len..p_len+s_len, ..]);
-            let d_segment_seg = d_context.slice(s![p_len+s_len..total_len, ..]);
+            let d_ht_seg = d_context.slice(s![p_len..p_len + s_len, ..]);
+            let d_segment_seg = d_context.slice(s![p_len + s_len..total_len, ..]);
 
             persistent_grad += &d_persistent_seg;
-            input_grads.slice_mut(s![global_t_start..global_t_end, ..]).assign(&d_segment_seg);
+            input_grads
+                .slice_mut(s![global_t_start..global_t_end, ..])
+                .assign(&d_segment_seg);
 
             // 4. Memory Retrieval Backward
             // Accumulate dL/dM_start from all retrieval steps in this segment
@@ -478,7 +540,11 @@ impl Layer for TitansMAC {
                 let grad_z_q = &grad_h_q * z_q.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
                 let d_qt = m_start.w1.t().dot(&grad_z_q);
 
-                d_wq = d_wq + d_qt.clone().insert_axis(Axis(1)).dot(&q_in.insert_axis(Axis(0)));
+                d_wq = d_wq
+                    + d_qt
+                        .clone()
+                        .insert_axis(Axis(1))
+                        .dot(&q_in.insert_axis(Axis(0)));
                 let d_qin = self.memory.w_q.t().dot(&d_qt);
 
                 // Add to input gradients (segment part)
@@ -488,9 +554,17 @@ impl Layer for TitansMAC {
                 current_grad += &d_qin;
 
                 // Accumulate to d_M_next (which flows to M_start, i.e. M_{k-1})
-                d_M_next.w2 = d_M_next.w2 + dy_t.clone().insert_axis(Axis(1)).dot(&h_q.insert_axis(Axis(0)));
+                d_M_next.w2 = d_M_next.w2
+                    + dy_t
+                        .clone()
+                        .insert_axis(Axis(1))
+                        .dot(&h_q.insert_axis(Axis(0)));
                 d_M_next.b2 = d_M_next.b2 + &dy_t;
-                d_M_next.w1 = d_M_next.w1 + grad_z_q.clone().insert_axis(Axis(1)).dot(&q_t.clone().insert_axis(Axis(0)));
+                d_M_next.w1 = d_M_next.w1
+                    + grad_z_q
+                        .clone()
+                        .insert_axis(Axis(1))
+                        .dot(&q_t.clone().insert_axis(Axis(0)));
                 d_M_next.b1 = d_M_next.b1 + &grad_z_q;
             }
 
@@ -522,11 +596,7 @@ impl Layer for TitansMAC {
         (input_grads, all_grads)
     }
 
-    fn apply_gradients(
-        &mut self,
-        gradients: &[Array2<f32>],
-        lr: f32,
-    ) -> crate::errors::Result<()> {
+    fn apply_gradients(&mut self, gradients: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
         let core_params = self.core.parameters();
         let memory_params = 10;
         let persistent_params = 1;

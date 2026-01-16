@@ -12,9 +12,9 @@ use crate::{
         moe::{ExpertRouterConfig, MixtureOfExperts},
     },
     model_config::{TemporalMixingType, TitanMemoryConfig},
+    models::titans::{mac::TitansMAC, memory::NeuralMemory},
     network::Layer,
     richards::{RichardsGlu, RichardsNorm},
-    models::titans::{mac::TitansMAC, memory::NeuralMemory},
 };
 
 /// Temporal-mixing layer variants shared between TransformerBlock and DiffusionBlock.
@@ -613,14 +613,14 @@ impl CommonLayers {
                         config.embed_dim,
                         config.embed_dim,
                         config.embed_dim,
-                        config.titan_memory.hidden_dim
+                        config.titan_memory.hidden_dim,
                     );
 
                     let mac = TitansMAC::new(
                         attention,
                         memory,
                         config.titan_memory.persistent_len,
-                        config.titan_memory.segment_len
+                        config.titan_memory.segment_len,
                     );
 
                     TemporalMixingLayer::Titans(Box::new(mac))
