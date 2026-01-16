@@ -113,7 +113,6 @@ impl EPropTrainer {
     pub fn new(config: EPropConfig) -> Result<Self> {
         config.validate()?;
         
-        use rand::Rng;
         use rand_distr::{Distribution, Normal};
         
         let mut rng = get_rng();
