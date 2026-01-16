@@ -1,26 +1,24 @@
-/*!
-Incremental Gradient Updates for E-Prop
-
-This module implements incremental gradient computation to avoid full
-recomputation when inputs change only slightly between steps.
-
-Key Benefits:
-- 2-5× speedup for repeated forward passes
-- Memory efficient delta tracking
-- Seamless fallback to full computation when needed
-- Ideal for curriculum learning and multi-step processing
-
-Mathematical Foundation:
-Instead of: ∇W_new = f(x_new)  [full recomputation]
-We compute: ∇W_new = ∇W_old + Δ∇W  [incremental update]
-where Δ∇W depends only on changed inputs/outputs.
-
-Implementation Strategy:
-- Cache previous computation state
-- Detect changes in inputs/outputs
-- Compute gradient deltas efficiently
-- Maintain accuracy with automatic fallback
-*/
+//! Incremental Gradient Updates for E-Prop
+//!
+//! This module implements incremental gradient computation to avoid full
+//! recomputation when inputs change only slightly between steps.
+//!
+//! Key Benefits:
+//! - 2-5× speedup for repeated forward passes
+//! - Memory efficient delta tracking
+//! - Seamless fallback to full computation when needed
+//! - Ideal for curriculum learning and multi-step processing
+//!
+//! Mathematical Foundation:
+//! Instead of: ∇W_new = f(x_new)  [full recomputation]
+//! We compute: ∇W_new = ∇W_old + Δ∇W  [incremental update]
+//! where Δ∇W depends only on changed inputs/outputs.
+//!
+//! Implementation Strategy:
+//! - Cache previous computation state
+//! - Detect changes in inputs/outputs
+//! - Compute gradient deltas efficiently
+//! - Maintain accuracy with automatic fallback
 
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -32,14 +30,14 @@ pub struct IncrementalState {
     pub cached_voltage: Option<Array1<f32>>,
     pub cached_spikes: Option<Array1<f32>>,
     pub cached_filtered_spikes: Option<Array1<f32>>,
-    
+
     /// Cached eligibility traces
     pub cached_eps_x: Option<Array1<f32>>,
     pub cached_eps_f: Option<Array1<f32>>,
-    
+
     /// Previous learning signal
     pub cached_learning_signal: Option<Array1<f32>>,
-    
+
     /// Change detection thresholds
     pub input_change_threshold: f32,
     pub state_change_threshold: f32,
@@ -55,11 +53,11 @@ impl IncrementalState {
             cached_eps_x: None,
             cached_eps_f: None,
             cached_learning_signal: None,
-            input_change_threshold: 0.01,  // 1% change threshold
-            state_change_threshold: 0.05,  // 5% state change threshold
+            input_change_threshold: 0.01, // 1% change threshold
+            state_change_threshold: 0.05, // 5% state change threshold
         }
     }
-    
+
     /// Check if current input differs significantly from cached
     pub fn input_changed_significantly(&self, current_input: &Array1<f32>) -> bool {
         if let Some(ref cached_input) = self.cached_eps_x {
@@ -69,11 +67,9 @@ impl IncrementalState {
                     .zip(cached_input.iter())
                     .map(|(curr, cached)| (curr - cached).abs())
                     .fold(0.0, f32::max);
-                
-                let max_cached = cached_input.iter()
-                    .map(|x| x.abs())
-                    .fold(0.001, f32::max); // Avoid division by zero
-                
+
+                let max_cached = cached_input.iter().map(|x| x.abs()).fold(0.001, f32::max); // Avoid division by zero
+
                 max_change / max_cached > self.input_change_threshold
             } else {
                 true // Different dimensions
@@ -82,7 +78,7 @@ impl IncrementalState {
             true // No cache available
         }
     }
-    
+
     /// Check if neuron state changed significantly
     pub fn state_changed_significantly(&self, current_spikes: &Array1<f32>) -> bool {
         if let Some(ref cached_spikes) = self.cached_spikes {
@@ -91,8 +87,9 @@ impl IncrementalState {
                     .iter()
                     .zip(cached_spikes.iter())
                     .map(|(curr, cached)| (curr - cached).abs())
-                    .sum::<f32>() / current_spikes.len() as f32;
-                
+                    .sum::<f32>()
+                    / current_spikes.len() as f32;
+
                 change_ratio > self.state_change_threshold
             } else {
                 true
@@ -101,11 +98,17 @@ impl IncrementalState {
             true
         }
     }
-    
+
     /// Update cached states with current values
-    pub fn update_cache(&mut self, voltage: &Array1<f32>, spikes: &Array1<f32>, 
-                       filtered_spikes: &Array1<f32>, eps_x: &Array1<f32>, 
-                       eps_f: &Array1<f32>, learning_signal: &Array1<f32>) {
+    pub fn update_cache(
+        &mut self,
+        voltage: &Array1<f32>,
+        spikes: &Array1<f32>,
+        filtered_spikes: &Array1<f32>,
+        eps_x: &Array1<f32>,
+        eps_f: &Array1<f32>,
+        learning_signal: &Array1<f32>,
+    ) {
         self.cached_voltage = Some(voltage.clone());
         self.cached_spikes = Some(spikes.clone());
         self.cached_filtered_spikes = Some(filtered_spikes.clone());
@@ -113,7 +116,7 @@ impl IncrementalState {
         self.cached_eps_f = Some(eps_f.clone());
         self.cached_learning_signal = Some(learning_signal.clone());
     }
-    
+
     /// Clear all cached state
     pub fn clear_cache(&mut self) {
         self.cached_voltage = None;
@@ -135,13 +138,13 @@ impl IncrementalState {
 pub struct IncrementalGradientResult {
     /// Whether incremental computation was used
     pub used_incremental: bool,
-    
+
     /// Speedup factor achieved
     pub speedup_factor: f32,
-    
+
     /// Estimated gradient accuracy (1.0 = full accuracy)
     pub accuracy_factor: f32,
-    
+
     /// Computation time ratio (incremental / full)
     pub time_ratio: f32,
 }
@@ -162,9 +165,9 @@ impl IncrementalGradientUpdater {
             min_speedup_threshold: 1.5, // Use incremental if ≥1.5× speedup
         }
     }
-    
+
     /// Compute incremental gradient update
-    /// 
+    ///
     /// Returns whether incremental computation was beneficial
     pub fn compute_incremental_gradient(
         &mut self,
@@ -177,7 +180,11 @@ impl IncrementalGradientUpdater {
         current_eps_f: &Array1<f32>,
         learning_signal: &Array1<f32>,
     ) -> IncrementalGradientResult {
-        assert_eq!(learning_signal.len(), current_eps_f.len(), "Dim mismatch: learning_signal vs eps_f");
+        assert_eq!(
+            learning_signal.len(),
+            current_eps_f.len(),
+            "Dim mismatch: learning_signal vs eps_f"
+        );
         assert_eq!(
             learning_signal.len(),
             current_filtered_spikes.len(),
@@ -325,8 +332,16 @@ impl IncrementalGradientUpdater {
     }
 
     fn outer_assign(out: &mut Array2<f32>, left: &Array1<f32>, right: &Array1<f32>) {
-        assert_eq!(out.nrows(), left.len(), "outer_assign: out.nrows != left.len");
-        assert_eq!(out.ncols(), right.len(), "outer_assign: out.ncols != right.len");
+        assert_eq!(
+            out.nrows(),
+            left.len(),
+            "outer_assign: out.nrows != left.len"
+        );
+        assert_eq!(
+            out.ncols(),
+            right.len(),
+            "outer_assign: out.ncols != right.len"
+        );
         for i in 0..left.len() {
             let li = left[i];
             for j in 0..right.len() {
@@ -349,7 +364,11 @@ impl IncrementalGradientUpdater {
         let num_neurons = cached_modulated_eps_f.len();
         let input_dim = eps_x.len();
 
-        assert_eq!(delta_modulated_eps_f.len(), num_neurons, "delta_mod len mismatch");
+        assert_eq!(
+            delta_modulated_eps_f.len(),
+            num_neurons,
+            "delta_mod len mismatch"
+        );
         assert_eq!(delta_eps_x.len(), input_dim, "delta_eps_x len mismatch");
         assert_eq!(
             filtered_spikes.len(),
@@ -400,7 +419,7 @@ impl IncrementalGradientUpdater {
             }
         }
     }
-    
+
     /// Enable/disable incremental updates
     pub fn set_incremental_enabled(&mut self, enabled: bool) {
         self.enable_incremental = enabled;
@@ -408,12 +427,12 @@ impl IncrementalGradientUpdater {
             self.state.clear_cache();
         }
     }
-    
+
     /// Clear cached state
     pub fn clear_cache(&mut self) {
         self.state.clear_cache();
     }
-    
+
     /// Get current cache status
     pub fn cache_status(&self) -> bool {
         self.state.cached_learning_signal.is_some()
@@ -422,61 +441,62 @@ impl IncrementalGradientUpdater {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array1;
-    
+
+    use super::*;
+
     #[test]
     fn test_incremental_state_creation() {
         let state = IncrementalState::new();
-        
+
         assert!(!state.cache_status());
         assert!(state.input_changed_significantly(&Array1::zeros(5)));
     }
-    
+
     #[test]
     fn test_input_change_detection() {
         let mut state = IncrementalState::new();
-        
+
         let input1 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         let input2 = Array1::from_vec(vec![1.01, 2.0, 3.0, 4.0, 5.0]); // 1% change
-        
+
         // No cache initially
         assert!(state.input_changed_significantly(&input1));
-        
+
         // Set cache
         state.cached_eps_x = Some(input1.clone());
-        
+
         // Small change should not trigger significant change
         assert!(!state.input_changed_significantly(&input2));
-        
+
         let input3 = Array1::from_vec(vec![2.0, 2.0, 3.0, 4.0, 5.0]); // Large change
         assert!(state.input_changed_significantly(&input3));
     }
-    
+
     #[test]
     fn test_cache_update() {
         let mut state = IncrementalState::new();
-        
+
         let voltage = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let spikes = Array1::from_vec(vec![0.0, 1.0, 0.0]);
         let filtered = Array1::from_vec(vec![0.1, 0.9, 0.1]);
         let eps_x = Array1::from_vec(vec![0.5, 0.6, 0.7]);
         let eps_f = Array1::from_vec(vec![0.8, 0.9, 1.0]);
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
-        
+
         state.update_cache(&voltage, &spikes, &filtered, &eps_x, &eps_f, &learning);
-        
+
         assert!(state.cache_status());
         assert!(state.cached_spikes.is_some());
         assert_eq!(state.cached_spikes.as_ref().unwrap(), &spikes);
     }
-    
+
     #[test]
     fn test_incremental_updater() {
         let mut updater = IncrementalGradientUpdater::new(true);
-        
+
         assert!(!updater.cache_status());
-        
+
         let mut grad_in = ndarray::Array2::zeros((3, 4));
         let mut grad_rec = ndarray::Array2::zeros((3, 3));
         let voltage = Array1::from_vec(vec![0.1, 0.2, 0.3]);
@@ -485,7 +505,7 @@ mod tests {
         let eps_x = Array1::from_vec(vec![0.5, 0.6, 0.7, 0.8]);
         let eps_f = Array1::from_vec(vec![0.8, 0.9, 1.0]);
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
-        
+
         let result = updater.compute_incremental_gradient(
             &mut grad_in,
             &mut grad_rec,
@@ -496,7 +516,7 @@ mod tests {
             &eps_f,
             &learning,
         );
-        
+
         // First call should use full computation (no cache)
         assert!(!result.used_incremental);
         assert!(updater.cache_status());
@@ -527,11 +547,11 @@ mod tests {
         );
         assert!(result2.used_incremental);
     }
-    
+
     #[test]
     fn test_incremental_disabled() {
         let mut updater = IncrementalGradientUpdater::new(false);
-        
+
         let mut grad_in = ndarray::Array2::zeros((3, 4));
         let mut grad_rec = ndarray::Array2::zeros((3, 3));
         let voltage = Array1::from_vec(vec![0.1, 0.2, 0.3]);
@@ -540,7 +560,7 @@ mod tests {
         let eps_x = Array1::from_vec(vec![0.5, 0.6, 0.7, 0.8]);
         let eps_f = Array1::from_vec(vec![0.8, 0.9, 1.0]);
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
-        
+
         let result = updater.compute_incremental_gradient(
             &mut grad_in,
             &mut grad_rec,
@@ -551,7 +571,7 @@ mod tests {
             &eps_f,
             &learning,
         );
-        
+
         // Should never use incremental when disabled
         assert!(!result.used_incremental);
         assert_eq!(result.speedup_factor, 1.0);

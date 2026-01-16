@@ -1,10 +1,11 @@
-use serde::{Deserialize, Serialize};
 use ndarray::{Array2, s};
-use crate::network::Layer;
-use crate::attention::poly_attention::PolyAttention;
-use crate::models::titans::memory::NeuralMemory;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    attention::poly_attention::PolyAttention, models::titans::memory::NeuralMemory, network::Layer,
+};
 
 /// Memory As Context (MAC) Architecture
 ///
@@ -38,7 +39,9 @@ impl TitansMAC {
         let mut rng = rand::rng();
         let normal = Normal::new(0.0, 0.02).unwrap();
 
-        let p_vec: Vec<f32> = (0..persistent_len * input_dim).map(|_| normal.sample(&mut rng)).collect();
+        let p_vec: Vec<f32> = (0..persistent_len * input_dim)
+            .map(|_| normal.sample(&mut rng))
+            .collect();
         let persistent_memory = Array2::from_shape_vec((persistent_len, input_dim), p_vec).unwrap();
 
         Self {
@@ -68,9 +71,15 @@ impl TitansMAC {
 
         let mut context_input = Array2::<f32>::zeros((total_len, d));
 
-        context_input.slice_mut(s![0..p_len, ..]).assign(&self.persistent_memory);
-        context_input.slice_mut(s![p_len..p_len+s_len, ..]).assign(&h_t);
-        context_input.slice_mut(s![p_len+s_len..total_len, ..]).assign(segment);
+        context_input
+            .slice_mut(s![0..p_len, ..])
+            .assign(&self.persistent_memory);
+        context_input
+            .slice_mut(s![p_len..p_len + s_len, ..])
+            .assign(&h_t);
+        context_input
+            .slice_mut(s![p_len + s_len..total_len, ..])
+            .assign(segment);
 
         // 3. Pass to Attention
         let attention_output = self.core.forward(&context_input);
@@ -79,7 +88,9 @@ impl TitansMAC {
         // We typically care about the output corresponding to the *Segment*.
         // We extract the last S rows.
 
-        let segment_output = attention_output.slice(s![p_len+s_len..total_len, ..]).to_owned();
+        let segment_output = attention_output
+            .slice(s![p_len + s_len..total_len, ..])
+            .to_owned();
 
         // 4. Update Memory using Attention output (segment part)
         self.memory.update(&segment_output);
@@ -123,7 +134,7 @@ impl Layer for TitansMAC {
         let mut cursor = 0;
         for out in outputs {
             let rows = out.nrows();
-            result.slice_mut(s![cursor..cursor+rows, ..]).assign(&out);
+            result.slice_mut(s![cursor..cursor + rows, ..]).assign(&out);
             cursor += rows;
         }
 
@@ -140,19 +151,27 @@ impl Layer for TitansMAC {
     }
 
     fn weight_norm(&self) -> f32 {
-         let mut sum_sq = 0.0;
-         sum_sq += self.core.weight_norm().powi(2);
-         sum_sq += self.memory.weight_norm().powi(2);
-         sum_sq += self.persistent_memory.mapv(|x| x*x).sum();
-         sum_sq.sqrt()
+        let mut sum_sq = 0.0;
+        sum_sq += self.core.weight_norm().powi(2);
+        sum_sq += self.memory.weight_norm().powi(2);
+        sum_sq += self.persistent_memory.mapv(|x| x * x).sum();
+        sum_sq.sqrt()
     }
 
-    fn compute_gradients(&self, input: &Array2<f32>, _output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         // TODO: Implement
         (Array2::zeros(input.raw_dim()), Vec::new())
     }
 
-    fn apply_gradients(&mut self, _gradients: &[Array2<f32>], _learning_rate: f32) -> crate::errors::Result<()> {
+    fn apply_gradients(
+        &mut self,
+        _gradients: &[Array2<f32>],
+        _learning_rate: f32,
+    ) -> crate::errors::Result<()> {
         // TODO: Implement
         Ok(())
     }
@@ -165,10 +184,10 @@ impl Layer for TitansMAC {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
-    use crate::attention::poly_attention::PolyAttention;
-    use crate::models::titans::memory::NeuralMemory;
+
+    use super::*;
+    use crate::{attention::poly_attention::PolyAttention, models::titans::memory::NeuralMemory};
 
     #[test]
     fn test_titans_mac_forward() {

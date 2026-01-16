@@ -1,6 +1,5 @@
+use llm::{models::titans::memory::NeuralMemory, network::Layer};
 use ndarray::Array2;
-use llm::models::titans::memory::NeuralMemory;
-use llm::network::Layer;
 use rand::Rng;
 
 #[test]
@@ -39,7 +38,8 @@ fn test_neural_memory_learning() {
 
     let output = memory.forward(&input);
 
-    // Check if the output varies across the sequence (implies state change / distinct inputs processed)
+    // Check if the output varies across the sequence (implies state change / distinct inputs
+    // processed)
     let first = output.row(0);
     let last = output.row(seq_len - 1);
 

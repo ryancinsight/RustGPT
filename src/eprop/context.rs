@@ -13,26 +13,23 @@
 //! # Usage
 //!
 //! ```rust
-//! use eprop::context::EpropContext;
+//! use llm::eprop::context::EpropContext;
 //!
-//! // Initialize at epoch start
 //! let layer_dims = vec![(128, 64), (64, 10)];
 //! EpropContext::init_for_layers(layer_dims);
 //!
-//! // Training loop (traces persist across sequences)
-//! for sequence in epoch {
-//!     EpropContext::with_traces(|traces| {
-//!         // Update traces with current sequence
-//!         // Gradients benefit from accumulated temporal information
-//!     });
+//! let epoch: Vec<()> = vec![(); 3];
+//! for _sequence in epoch {
+//!     let result = EpropContext::with_traces(|traces| traces.len());
+//!     assert!(result.is_ok());
 //! }
 //!
-//! // Reset between epochs
 //! EpropContext::reset();
 //! ```
 
 use std::cell::RefCell;
-use super::{EligibilityTraces, EPropError, Result};
+
+use super::{EPropError, EligibilityTraces, Result};
 
 /// Thread-local storage for eligibility traces
 ///
@@ -75,6 +72,7 @@ impl EpropContext {
     /// # Example
     /// ```
     /// // Two layers: 128→64 and 64→10
+    /// use llm::eprop::context::EpropContext;
     /// let dims = vec![(128, 64), (64, 10)];
     /// EpropContext::init_for_layers(dims);
     /// ```
@@ -100,11 +98,14 @@ impl EpropContext {
     ///
     /// # Example
     /// ```
-    /// EpropContext::with_traces(|traces| {
+    /// use llm::eprop::context::EpropContext;
+    /// EpropContext::init_for_layers(vec![(10, 5)]);
+    /// let result = EpropContext::with_traces(|traces| {
     ///     for (layer_idx, trace) in traces.iter_mut().enumerate() {
     ///         // Update traces for each layer
     ///     }
     /// });
+    /// assert!(result.is_ok());
     /// ```
     pub fn with_traces<F, R>(f: F) -> Result<R>
     where
@@ -115,7 +116,7 @@ impl EpropContext {
             match traces_opt.as_mut() {
                 Some(traces) => Ok(f(traces)),
                 None => Err(EPropError::InvalidConfig(
-                    "EpropContext not initialized. Call init_for_layers() first.".to_string()
+                    "EpropContext not initialized. Call init_for_layers() first.".to_string(),
                 )),
             }
         })
@@ -132,9 +133,9 @@ impl EpropContext {
             cell.borrow()
                 .as_ref()
                 .map(|traces| traces.len())
-                .ok_or_else(|| EPropError::InvalidConfig(
-                    "EpropContext not initialized".to_string()
-                ))
+                .ok_or_else(|| {
+                    EPropError::InvalidConfig("EpropContext not initialized".to_string())
+                })
         })
     }
 
@@ -147,6 +148,7 @@ impl EpropContext {
     /// # Example
     /// ```
     /// // End of epoch
+    /// use llm::eprop::context::EpropContext;
     /// EpropContext::reset();
     /// // Start new epoch (traces exist but are zeroed)
     /// ```
@@ -264,7 +266,6 @@ impl ContextPreset {
         alpha: 0.9,
         description: "Default: balanced memory (α=0.9, ~10 step horizon)",
     };
-
     /// Long-term memory: α=0.95 (~20 timestep horizon)
     ///
     /// Extended temporal credit assignment. Good for:
@@ -275,7 +276,6 @@ impl ContextPreset {
         alpha: 0.95,
         description: "Long memory: extended horizon (α=0.95, ~20 step horizon)",
     };
-
     /// Short-term memory: α=0.85 (~6.7 timestep horizon)
     ///
     /// Faster decay, more reactive. Good for:
@@ -352,13 +352,13 @@ impl ContextConfig {
         // T_eff = 1/(1-α) = 0.25·T
         // α = 1 - 4/T  (derived by algebra)
         let alpha = 1.0 - 4.0 / sequence_length.max(20) as f32;
-        alpha.clamp(0.85, 0.98)  // Safe operating range from literature
+        alpha.clamp(0.85, 0.98) // Safe operating range from literature
     }
 
     /// Create configuration with adaptive alpha for sequence length
     pub fn with_adaptive_alpha(sequence_length: usize) -> Self {
         Self {
-            enabled: true,  // Enable when using adaptive alpha
+            enabled: true, // Enable when using adaptive alpha
             alpha: Self::adaptive_alpha(sequence_length),
         }
     }
@@ -409,7 +409,8 @@ mod tests {
         EpropContext::with_traces(|traces| {
             traces[0].eps_x.fill(1.0);
             traces[0].eps_f.fill(2.0);
-        }).unwrap();
+        })
+        .unwrap();
 
         // Reset
         EpropContext::reset();
@@ -418,7 +419,8 @@ mod tests {
         EpropContext::with_traces(|traces| {
             assert!(traces[0].eps_x.iter().all(|&x| x == 0.0));
             assert!(traces[0].eps_f.iter().all(|&x| x == 0.0));
-        }).unwrap();
+        })
+        .unwrap();
 
         // Still initialized
         assert!(EpropContext::is_initialized());
@@ -450,7 +452,8 @@ mod tests {
         EpropContext::with_traces(|traces| {
             assert!(traces[0].eps_x.iter().all(|&x| x == 1.0));
             assert!(traces[1].eps_x.iter().all(|&x| x == 0.0)); // Unchanged
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -473,7 +476,8 @@ mod tests {
         EpropContext::with_traces(|traces| {
             traces[0].eps_x.fill(0.5);
             traces[0].eps_f.fill(0.2);
-        }).unwrap();
+        })
+        .unwrap();
 
         let learning_signal = Array1::from_elem(10, 1.0);
         let result = EpropContext::compute_layer_gradients(0, &learning_signal);

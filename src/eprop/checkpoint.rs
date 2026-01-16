@@ -16,25 +16,27 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use eprop::checkpoint::CheckpointManager;
+//! ```rust,no_run
+//! use llm::eprop::checkpoint::CheckpointManager;
 //! use ndarray::Array2;
 //!
-//! // For sequence length T=10,000
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let seq_len = 10_000;
-//! let interval = (seq_len as f32).sqrt() as usize; // 100
+//! let interval = (seq_len as f32).sqrt() as usize;
 //! let mut manager = CheckpointManager::new(interval, seq_len);
 //!
-//! // During forward pass: checkpoint every 100 timesteps
+//! let eligibility_x = Array2::<f32>::zeros((5, 10));
+//! let eligibility_f = Array2::<f32>::zeros((5, 10));
+//!
 //! for t in 0..seq_len {
-//!     // Compute traces...
 //!     if manager.should_checkpoint(t) {
 //!         manager.save_checkpoint(t, &eligibility_x, &eligibility_f)?;
 //!     }
 //! }
 //!
-//! // During backward pass: load from nearest checkpoint
-//! let (restored_x, restored_f) = manager.load_checkpoint(5000)?;
+//! let (_restored_x, _restored_f) = manager.load_checkpoint(0)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Performance
@@ -50,9 +52,10 @@
 //! - Chen et al. (2016): "Training Deep Nets with Sublinear Memory Cost"
 //! - Griewank & Walther (2000): "Algorithm 799: Revolve"
 
+use std::collections::HashMap;
+
 use ndarray::Array2;
 use rkyv::{Archive, Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Compressed trace checkpoint for memory-efficient indefinite learning
 ///
@@ -153,8 +156,12 @@ impl CompressedTraceCheckpoint {
         match self.compression_type {
             CompressionType::None => self.decompress_none(),
             CompressionType::Sparse => self.decompress_sparse(),
-            CompressionType::Quantized { scale, offset } => self.decompress_quantized(scale, offset),
-            CompressionType::DeltaSparse => Err("DeltaSparse decompression requires a previous checkpoint".into()),
+            CompressionType::Quantized { scale, offset } => {
+                self.decompress_quantized(scale, offset)
+            }
+            CompressionType::DeltaSparse => {
+                Err("DeltaSparse decompression requires a previous checkpoint".into())
+            }
         }
     }
 
@@ -198,9 +205,7 @@ impl CompressedTraceCheckpoint {
     // Private compression methods
     fn compress_none(trace: &Array2<f32>) -> Vec<u8> {
         // Store as raw f32 bytes
-        trace.iter()
-            .flat_map(|&x| x.to_le_bytes())
-            .collect()
+        trace.iter().flat_map(|&x| x.to_le_bytes()).collect()
     }
 
     fn compress_sparse(trace: &Array2<f32>) -> Vec<u8> {
@@ -209,7 +214,8 @@ impl CompressedTraceCheckpoint {
         let mut values = Vec::new();
 
         for (idx, &val) in trace.iter().enumerate() {
-            if val.abs() > 1e-6 { // Non-zero threshold
+            if val.abs() > 1e-6 {
+                // Non-zero threshold
                 indices.push(idx as u32);
                 values.push(val);
             }
@@ -232,7 +238,8 @@ impl CompressedTraceCheckpoint {
 
     fn compress_quantized(trace: &Array2<f32>, scale: f32, offset: f32) -> Vec<u8> {
         // Quantize to int8
-        let quantized: Vec<i8> = trace.iter()
+        let quantized: Vec<i8> = trace
+            .iter()
             .map(|&x| {
                 let normalized = (x - offset) / scale;
                 (normalized.clamp(-127.0, 127.0) as i8)
@@ -278,15 +285,18 @@ impl CompressedTraceCheckpoint {
             values.push(f32::from_le_bytes(bytes));
         }
 
-        Array2::from_shape_vec(self.original_shape, values)
-            .map_err(|e| e.into())
+        Array2::from_shape_vec(self.original_shape, values).map_err(|e| e.into())
     }
 
     fn decompress_sparse(&self) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
         Self::decompress_sparse_data(&self.compressed_data, self.original_shape)
     }
 
-    fn decompress_quantized(&self, scale: f32, offset: f32) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    fn decompress_quantized(
+        &self,
+        scale: f32,
+        offset: f32,
+    ) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
         let expected_len = self.original_shape.0 * self.original_shape.1;
 
         if self.compressed_data.len() != expected_len {
@@ -300,8 +310,7 @@ impl CompressedTraceCheckpoint {
             values.push(dequantized);
         }
 
-        Array2::from_shape_vec(self.original_shape, values)
-            .map_err(|e| e.into())
+        Array2::from_shape_vec(self.original_shape, values).map_err(|e| e.into())
     }
 
     fn decompress_sparse_data(
@@ -390,17 +399,17 @@ impl CompressedTraceCheckpoint {
 pub struct TraceCheckpoint {
     /// Timestep at which checkpoint was created
     pub timestep: usize,
-    
+
     /// Flattened eligibility trace for input (ε^x)
     /// Stored as Vec<f32> for rkyv compatibility
     pub eligibility_x_data: Vec<f32>,
-    
+
     /// Shape of eligibility_x array [rows, cols]
     pub eligibility_x_shape: [usize; 2],
-    
+
     /// Flattened eligibility trace for feedback (ε^f)
     pub eligibility_f_data: Vec<f32>,
-    
+
     /// Shape of eligibility_f array [rows, cols]
     pub eligibility_f_shape: [usize; 2],
 }
@@ -412,11 +421,7 @@ impl TraceCheckpoint {
     /// * `timestep` - Current timestep
     /// * `ε_x` - Input eligibility trace
     /// * `ε_f` - Feedback eligibility trace
-    pub fn from_arrays(
-        timestep: usize,
-        ε_x: &Array2<f32>,
-        ε_f: &Array2<f32>,
-    ) -> Self {
+    pub fn from_arrays(timestep: usize, ε_x: &Array2<f32>, ε_f: &Array2<f32>) -> Self {
         Self {
             timestep,
             eligibility_x_data: ε_x.iter().copied().collect(),
@@ -435,12 +440,12 @@ impl TraceCheckpoint {
             (self.eligibility_x_shape[0], self.eligibility_x_shape[1]),
             self.eligibility_x_data.clone(),
         )?;
-        
+
         let ε_f = Array2::from_shape_vec(
             (self.eligibility_f_shape[0], self.eligibility_f_shape[1]),
             self.eligibility_f_data.clone(),
         )?;
-        
+
         Ok((ε_x, ε_f))
     }
 }
@@ -452,10 +457,10 @@ impl TraceCheckpoint {
 pub struct CheckpointManager {
     /// Stored checkpoints: timestep → rkyv-serialized bytes
     checkpoints: HashMap<usize, Vec<u8>>,
-    
+
     /// Checkpoint interval (distance between checkpoints)
     interval: usize,
-    
+
     /// Maximum number of checkpoints to store
     max_checkpoints: usize,
 }
@@ -470,6 +475,7 @@ impl CheckpointManager {
     /// # Example
     /// ```rust
     /// // For T=1000, use √T = 32 checkpoints
+    /// use llm::eprop::checkpoint::CheckpointManager;
     /// let manager = CheckpointManager::new(32, 1000);
     /// ```
     pub fn new(interval: usize, seq_len: usize) -> Self {
@@ -509,12 +515,12 @@ impl CheckpointManager {
         ε_f: &Array2<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let checkpoint = TraceCheckpoint::from_arrays(t, ε_x, ε_f);
-        
+
         // Serialize with rkyv (zero-copy)
         // Buffer size: 256 bytes for small traces, grows automatically
         let bytes = rkyv::to_bytes::<_, 256>(&checkpoint)?;
         self.checkpoints.insert(t, bytes.to_vec());
-        
+
         Ok(())
     }
 
@@ -533,13 +539,15 @@ impl CheckpointManager {
         &self,
         t: usize,
     ) -> Result<(Array2<f32>, Array2<f32>), Box<dyn std::error::Error>> {
-        let bytes = self.checkpoints.get(&t)
+        let bytes = self
+            .checkpoints
+            .get(&t)
             .ok_or_else(|| format!("Checkpoint not found at timestep {}", t))?;
-        
+
         // Deserialize with rkyv (zero-copy view)
         let archived = rkyv::check_archived_root::<TraceCheckpoint>(bytes)?;
         let checkpoint: TraceCheckpoint = archived.deserialize(&mut rkyv::Infallible)?;
-        
+
         checkpoint.to_arrays()
     }
 
@@ -556,10 +564,7 @@ impl CheckpointManager {
             Some(checkpoint_t)
         } else {
             // Find the largest checkpoint <= t
-            self.checkpoints.keys()
-                .filter(|&&k| k <= t)
-                .max()
-                .copied()
+            self.checkpoints.keys().filter(|&&k| k <= t).max().copied()
         }
     }
 
@@ -602,10 +607,10 @@ mod tests {
     fn test_trace_checkpoint_roundtrip() {
         let ε_x = Array2::from_shape_vec((10, 20), (0..200).map(|i| i as f32).collect()).unwrap();
         let ε_f = Array2::from_shape_vec((10, 20), (200..400).map(|i| i as f32).collect()).unwrap();
-        
+
         let checkpoint = TraceCheckpoint::from_arrays(42, &ε_x, &ε_f);
         let (ε_x_restored, ε_f_restored) = checkpoint.to_arrays().unwrap();
-        
+
         assert_eq!(checkpoint.timestep, 42);
         assert!(arrays_equal(&ε_x, &ε_x_restored, 1e-6));
         assert!(arrays_equal(&ε_f, &ε_f_restored, 1e-6));
@@ -615,15 +620,15 @@ mod tests {
     fn test_rkyv_serialization_roundtrip() {
         let ε_x = Array2::from_shape_vec((10, 20), (0..200).map(|i| i as f32).collect()).unwrap();
         let ε_f = Array2::from_shape_vec((10, 20), (200..400).map(|i| i as f32).collect()).unwrap();
-        
+
         let checkpoint = TraceCheckpoint::from_arrays(42, &ε_x, &ε_f);
         let bytes = rkyv::to_bytes::<_, 256>(&checkpoint).unwrap();
-        
+
         let archived = rkyv::check_archived_root::<TraceCheckpoint>(&bytes).unwrap();
         let restored: TraceCheckpoint = archived.deserialize(&mut rkyv::Infallible).unwrap();
-        
+
         let (ε_x_restored, ε_f_restored) = restored.to_arrays().unwrap();
-        
+
         assert_eq!(restored.timestep, 42);
         assert!(arrays_equal(&ε_x, &ε_x_restored, 1e-6));
         assert!(arrays_equal(&ε_f, &ε_f_restored, 1e-6));
@@ -634,12 +639,17 @@ mod tests {
         let base_trace =
             Array2::from_shape_fn((16, 16), |(i, j)| (i as f32).sin() + (j as f32).cos());
         let base = CompressedTraceCheckpoint::compress_adaptive(0, &base_trace, None, 0.0);
-        assert!(!matches!(base.compression_type, CompressionType::DeltaSparse));
+        assert!(!matches!(
+            base.compression_type,
+            CompressionType::DeltaSparse
+        ));
 
         let next_trace = &base_trace + 0.001;
-        let delta =
-            CompressedTraceCheckpoint::compress_adaptive(10, &next_trace, Some(&base), 0.0);
-        assert!(matches!(delta.compression_type, CompressionType::DeltaSparse));
+        let delta = CompressedTraceCheckpoint::compress_adaptive(10, &next_trace, Some(&base), 0.0);
+        assert!(matches!(
+            delta.compression_type,
+            CompressionType::DeltaSparse
+        ));
 
         assert!(delta.decompress().is_err());
 
@@ -655,7 +665,10 @@ mod tests {
         let next_trace = &base_trace + 1.0;
         let mut delta =
             CompressedTraceCheckpoint::compress_adaptive(10, &next_trace, Some(&base), 0.0);
-        assert!(matches!(delta.compression_type, CompressionType::DeltaSparse));
+        assert!(matches!(
+            delta.compression_type,
+            CompressionType::DeltaSparse
+        ));
 
         if delta.compressed_data.len() >= 8 {
             delta.compressed_data[0] ^= 0xFF;
@@ -685,12 +698,12 @@ mod tests {
         let mut manager = CheckpointManager::new(10, 100);
         let ε_x = Array2::zeros((5, 10));
         let ε_f = Array2::ones((5, 10));
-        
+
         manager.save_checkpoint(20, &ε_x, &ε_f).unwrap();
         assert_eq!(manager.checkpoint_count(), 1);
-        
+
         let (restored_x, restored_f) = manager.load_checkpoint(20).unwrap();
-        
+
         assert!(arrays_equal(&ε_x, &restored_x, 1e-6));
         assert!(arrays_equal(&ε_f, &restored_f, 1e-6));
     }
@@ -707,11 +720,11 @@ mod tests {
         let mut manager = CheckpointManager::new(10, 100);
         let ε_x = Array2::zeros((5, 10));
         let ε_f = Array2::ones((5, 10));
-        
+
         manager.save_checkpoint(0, &ε_x, &ε_f).unwrap();
         manager.save_checkpoint(10, &ε_x, &ε_f).unwrap();
         manager.save_checkpoint(20, &ε_x, &ε_f).unwrap();
-        
+
         assert_eq!(manager.find_nearest_checkpoint(5), Some(0));
         assert_eq!(manager.find_nearest_checkpoint(10), Some(10));
         assert_eq!(manager.find_nearest_checkpoint(15), Some(10));
@@ -723,13 +736,13 @@ mod tests {
         let mut manager = CheckpointManager::new(10, 100);
         let ε_x = Array2::zeros((100, 100));
         let ε_f = Array2::ones((100, 100));
-        
+
         let initial_memory = manager.memory_usage();
         assert_eq!(initial_memory, 0);
-        
+
         manager.save_checkpoint(10, &ε_x, &ε_f).unwrap();
         let final_memory = manager.memory_usage();
-        
+
         // Expect ~80KB for two 100×100 float arrays (40KB each)
         assert!(final_memory > 80_000, "Memory usage: {}", final_memory);
         assert!(final_memory < 100_000, "Memory usage: {}", final_memory);
@@ -740,11 +753,11 @@ mod tests {
         let mut manager = CheckpointManager::new(10, 100);
         let ε_x = Array2::zeros((5, 10));
         let ε_f = Array2::ones((5, 10));
-        
+
         manager.save_checkpoint(10, &ε_x, &ε_f).unwrap();
         manager.save_checkpoint(20, &ε_x, &ε_f).unwrap();
         assert_eq!(manager.checkpoint_count(), 2);
-        
+
         manager.clear();
         assert_eq!(manager.checkpoint_count(), 0);
         assert_eq!(manager.memory_usage(), 0);
@@ -753,7 +766,7 @@ mod tests {
     #[test]
     fn test_multiple_checkpoints() {
         let mut manager = CheckpointManager::new(10, 100);
-        
+
         // Create 10 checkpoints with different values
         for i in 0..10 {
             let t = i * 10;
@@ -761,17 +774,17 @@ mod tests {
             let ε_f = Array2::from_elem((5, 10), (t * 2) as f32);
             manager.save_checkpoint(t, &ε_x, &ε_f).unwrap();
         }
-        
+
         assert_eq!(manager.checkpoint_count(), 10);
-        
+
         // Verify we can load each checkpoint correctly
         for i in 0..10 {
             let t = i * 10;
             let (restored_x, restored_f) = manager.load_checkpoint(t).unwrap();
-            
+
             let expected_x = Array2::from_elem((5, 10), t as f32);
             let expected_f = Array2::from_elem((5, 10), (t * 2) as f32);
-            
+
             assert!(arrays_equal(&restored_x, &expected_x, 1e-6));
             assert!(arrays_equal(&restored_f, &expected_f, 1e-6));
         }
@@ -783,7 +796,7 @@ mod tests {
         let seq_len = 10_000;
         let optimal_interval = (seq_len as f32).sqrt().ceil() as usize;
         assert_eq!(optimal_interval, 100);
-        
+
         // Verify memory reduction
         let num_checkpoints = seq_len / optimal_interval;
         let reduction_factor = seq_len / num_checkpoints;

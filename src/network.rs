@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     embeddings::TokenEmbeddings,
     layers::{recurrence::LRM, transformer::TransformerBlock},
+    models::titans::memory::NeuralMemory,
     output_projection::OutputProjection,
     richards::{RichardsGlu, RichardsNorm},
-    models::titans::memory::NeuralMemory,
 };
 
 /// Layer trait for neural network components

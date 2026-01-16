@@ -1,5 +1,7 @@
-use std::fs;
-use std::io::{BufRead, Seek};
+use std::{
+    fs,
+    io::{BufRead, Seek},
+};
 
 use csv::ReaderBuilder;
 
@@ -143,7 +145,8 @@ fn get_data_from_csv(path: &str) -> Result<Vec<String>> {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         })?;
         // Each record is a row, join all columns into a single string
-        let capacity = record.iter().map(|s| s.len()).sum::<usize>() + record.len().saturating_sub(1);
+        let capacity =
+            record.iter().map(|s| s.len()).sum::<usize>() + record.len().saturating_sub(1);
         let mut line = String::with_capacity(capacity);
         for (i, field) in record.iter().enumerate() {
             if i > 0 {

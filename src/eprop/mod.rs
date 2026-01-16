@@ -24,48 +24,57 @@
 //! # Quick Start
 //!
 //! ```rust
-//! use eprop::{EPropTrainer, EPropConfig, NeuronModel};
+//! use llm::eprop::{EPropConfig, EPropTrainer, NeuronConfig};
+//! use ndarray::Array1;
 //!
-//! let config = EPropConfig {
-//!     num_neurons: 128,
-//!     input_dim: 64,
-//!     output_dim: 10,
-//!     ..Default::default()
-//! };
+//! fn main() -> llm::eprop::Result<()> {
+//!     let config = EPropConfig {
+//!         num_neurons: 128,
+//!         input_dim: 64,
+//!         output_dim: 10,
+//!         neuron_config: NeuronConfig::default(),
+//!         ..Default::default()
+//!     };
 //!
-//! let mut trainer = EPropTrainer::new(config);
+//!     let mut trainer = EPropTrainer::new(config)?;
 //!
-//! // Training loop
-//! for (input, target) in dataset {
-//!     let loss = trainer.train_step(&input.view(), &target.view())?;
+//!     let dataset: Vec<(Array1<f32>, usize)> = vec![(Array1::zeros(64), 0)];
+//!     for (input, target_class) in dataset {
+//!         let _loss = trainer.train_step_classification(&input, target_class)?;
+//!     }
+//!
+//!     Ok(())
 //! }
 //! ```
 
+pub mod adaptive_softmax;
+pub mod adaptive_surrogate;
+pub mod checkpoint;
 pub mod config;
 pub mod context;
+pub mod incremental_updates;
+pub mod mixed_precision;
 pub mod neuron;
-pub mod adaptive_softmax;
-pub mod checkpoint;
 pub mod traces;
 pub mod trainer;
 pub mod utils;
-pub mod incremental_updates;
-pub mod adaptive_surrogate;
-pub mod mixed_precision;
 
 // Re-export main types for convenience
-pub use config::{EPropConfig, NeuronConfig, NeuronModel};
-pub use context::{EpropContext, ContextPreset, ContextConfig};
-pub use neuron::{NeuronState, NeuronDynamics};
 pub use adaptive_softmax::{AdaptiveSoftmax, SoftmaxConfig, SoftmaxStrategy};
-pub use checkpoint::{CheckpointManager, TraceCheckpoint, CompressedTraceCheckpoint};
+pub use checkpoint::{CheckpointManager, CompressedTraceCheckpoint, TraceCheckpoint};
+pub use config::{EPropConfig, NeuronConfig, NeuronModel};
+pub use context::{ContextConfig, ContextPreset, EpropContext};
+pub use incremental_updates::{
+    IncrementalGradientResult, IncrementalGradientUpdater, IncrementalState,
+};
+pub use mixed_precision::QuantizedEligibilityTraces;
+pub use neuron::{NeuronDynamics, NeuronState};
 pub use traces::{EligibilityTraces, TraceUpdater};
 pub use trainer::{EPropTrainer, TrainingStats};
-pub use utils::{cosine_similarity, outer_product,
-    should_use_sparse_computation, compute_sparsity_ratio,
-    enhanced_sparse_matvec, parallel_sparse_matvec};
-pub use mixed_precision::QuantizedEligibilityTraces;
-pub use incremental_updates::{IncrementalGradientUpdater, IncrementalState, IncrementalGradientResult};
+pub use utils::{
+    compute_sparsity_ratio, cosine_similarity, enhanced_sparse_matvec, outer_product,
+    parallel_sparse_matvec, should_use_sparse_computation,
+};
 
 /// Errors specific to e-prop training
 #[derive(thiserror::Error, Debug)]

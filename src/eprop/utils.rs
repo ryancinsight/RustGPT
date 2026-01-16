@@ -34,25 +34,25 @@ const AUTO_SPARSITY_THRESHOLD: f32 = 0.1;
 ///
 /// # Examples
 /// ```
+/// use llm::eprop::utils::outer_product;
 /// use ndarray::Array1;
-/// use eprop::utils::outer_product;
 ///
 /// let a = Array1::from_vec(vec![1.0, 2.0]);
 /// let b = Array1::from_vec(vec![3.0, 4.0]);
 /// let result = outer_product(&a, &b);
 ///
-/// assert_eq!(result[[0, 0]], 3.0);  // 1 * 3
-/// assert_eq!(result[[1, 1]], 8.0);  // 2 * 4
+/// assert_eq!(result[[0, 0]], 3.0); // 1 * 3
+/// assert_eq!(result[[1, 1]], 8.0); // 2 * 4
 /// ```
 pub fn outer_product(a: &Array1<f32>, b: &Array1<f32>) -> Array2<f32> {
     let mut result = Array2::zeros((a.len(), b.len()));
-    
+
     for i in 0..a.len() {
         for j in 0..b.len() {
             result[[i, j]] = a[i] * b[j];
         }
     }
-    
+
     result
 }
 
@@ -72,8 +72,8 @@ pub fn outer_product(a: &Array1<f32>, b: &Array1<f32>) -> Array2<f32> {
 ///
 /// # Examples
 /// ```
+/// use llm::eprop::utils::clip_gradient;
 /// use ndarray::Array2;
-/// use eprop::utils::clip_gradient;
 ///
 /// let grad = Array2::from_elem((10, 10), 10.0);
 /// let clipped = clip_gradient(grad, 5.0);
@@ -83,12 +83,12 @@ pub fn outer_product(a: &Array1<f32>, b: &Array1<f32>) -> Array2<f32> {
 /// ```
 pub fn clip_gradient(mut grad: Array2<f32>, max_norm: f32) -> Array2<f32> {
     let norm = grad.mapv(|x| x * x).sum().sqrt();
-    
+
     if norm > max_norm {
         let scale = max_norm / norm;
         grad.mapv_inplace(|x| x * scale);
     }
-    
+
     grad
 }
 
@@ -110,8 +110,8 @@ pub fn clip_gradient(mut grad: Array2<f32>, max_norm: f32) -> Array2<f32> {
 ///
 /// # Examples
 /// ```
+/// use llm::eprop::utils::cosine_similarity;
 /// use ndarray::Array1;
-/// use eprop::utils::cosine_similarity;
 ///
 /// let a = Array1::from_vec(vec![1.0, 0.0, 0.0]);
 /// let b = Array1::from_vec(vec![1.0, 0.0, 0.0]);
@@ -120,11 +120,11 @@ pub fn clip_gradient(mut grad: Array2<f32>, max_norm: f32) -> Array2<f32> {
 /// ```
 pub fn cosine_similarity(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "Vectors must have same length");
-    
+
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a = a.mapv(|x| x * x).sum().sqrt();
     let norm_b = b.mapv(|x| x * x).sum().sqrt();
-    
+
     if norm_a == 0.0 || norm_b == 0.0 {
         0.0
     } else {
@@ -169,7 +169,7 @@ pub fn frobenius_norm(matrix: &Array2<f32>) -> f32 {
 /// Normalized vector with ‖v‖₂ = 1, or zero vector if input is zero
 pub fn normalize(v: &Array1<f32>) -> Array1<f32> {
     let norm = l2_norm(v);
-    
+
     if norm == 0.0 {
         Array1::zeros(v.len())
     } else {
@@ -205,7 +205,7 @@ pub fn softmax(x: &Array1<f32>) -> Array1<f32> {
     let max_val = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp_x = x.mapv(|v| (v - max_val).exp());
     let sum_exp = exp_x.sum();
-    
+
     exp_x / sum_exp
 }
 
@@ -220,9 +220,16 @@ pub fn softmax(x: &Array1<f32>) -> Array1<f32> {
 /// # Returns
 /// Mean squared error (non-negative scalar)
 pub fn mse(predictions: &Array1<f32>, targets: &Array1<f32>) -> f32 {
-    debug_assert_eq!(predictions.len(), targets.len(), "Arrays must have same length");
-    
-    (predictions - targets).mapv(|x| x * x).mean().unwrap_or(0.0)
+    debug_assert_eq!(
+        predictions.len(),
+        targets.len(),
+        "Arrays must have same length"
+    );
+
+    (predictions - targets)
+        .mapv(|x| x * x)
+        .mean()
+        .unwrap_or(0.0)
 }
 
 /// Compute cross-entropy loss between predictions and targets
@@ -239,10 +246,14 @@ pub fn mse(predictions: &Array1<f32>, targets: &Array1<f32>) -> f32 {
 /// # Returns
 /// Cross-entropy loss (non-negative scalar)
 pub fn cross_entropy(predictions: &Array1<f32>, targets: &Array1<f32>) -> f32 {
-    debug_assert_eq!(predictions.len(), targets.len(), "Arrays must have same length");
-    
+    debug_assert_eq!(
+        predictions.len(),
+        targets.len(),
+        "Arrays must have same length"
+    );
+
     const EPSILON: f32 = 1e-7;
-    
+
     -targets
         .iter()
         .zip(predictions.iter())
@@ -266,8 +277,8 @@ pub fn cross_entropy(predictions: &Array1<f32>, targets: &Array1<f32>) -> f32 {
 ///
 /// # Examples
 /// ```
+/// use llm::eprop::utils::get_active_spike_indices;
 /// use ndarray::Array1;
-/// use eprop::utils::get_active_spike_indices;
 ///
 /// let spikes = Array1::from_vec(vec![0.0, 1.0, 0.0, 0.8, 0.001]);
 /// let active = get_active_spike_indices(&spikes, 0.01);
@@ -301,8 +312,8 @@ pub fn get_active_spike_indices(spikes: &Array1<f32>, threshold: f32) -> Vec<usi
 ///
 /// # Examples
 /// ```
+/// use llm::eprop::utils::sparse_outer_product;
 /// use ndarray::{Array1, Array2};
-/// use eprop::utils::sparse_outer_product;
 ///
 /// let post = Array1::from_vec(vec![1.0, 2.0, 0.0, 3.0]);
 /// let pre = Array1::from_vec(vec![4.0, 5.0]);
@@ -317,14 +328,14 @@ pub fn sparse_outer_product(
     active_post_indices: &[usize],
 ) -> Array2<f32> {
     let mut result = Array2::zeros((postsynaptic.len(), presynaptic.len()));
-    
+
     // Only compute outer product for active neurons
     for &i in active_post_indices {
         for j in 0..presynaptic.len() {
             result[[i, j]] = postsynaptic[i] * presynaptic[j];
         }
     }
-    
+
     result
 }
 
@@ -348,17 +359,17 @@ pub fn sparse_matvec(
 ) -> Array1<f32> {
     let n_rows = weights.nrows();
     let mut result = Array1::zeros(n_rows);
-    
+
     // Only accumulate columns corresponding to active inputs
     for &col_idx in active_indices {
         let weight_col = weights.column(col_idx);
         let input_val = input[col_idx];
-        
+
         for row_idx in 0..n_rows {
             result[row_idx] += weight_col[row_idx] * input_val;
         }
     }
-    
+
     result
 }
 
@@ -410,27 +421,27 @@ pub fn enhanced_sparse_matvec(
 ) -> Array1<f32> {
     let n_rows = weights.nrows();
     let mut result = Array1::zeros(n_rows);
-    
+
     // Auto-select block size if not specified
     let block_size = if block_size == 0 {
         std::cmp::min(ENHANCED_BLOCK_SIZE, active_indices.len())
     } else {
         block_size
     };
-    
+
     // Process in blocks for better cache utilization
     for chunk in active_indices.chunks(block_size) {
         for &col_idx in chunk {
             let weight_col = weights.column(col_idx);
             let input_val = input[col_idx];
-            
+
             // Vectorized accumulation
             for row_idx in 0..n_rows {
                 result[row_idx] += weight_col[row_idx] * input_val;
             }
         }
     }
-    
+
     result
 }
 
@@ -455,7 +466,7 @@ pub fn parallel_sparse_matvec(
     let n_rows = weights.nrows();
     let n_cols = weights.ncols();
     assert_eq!(input.len(), n_cols);
-    
+
     // Fallback to sequential for small matrices
     if n_rows < min_rows_for_parallel || active_indices.len() < 10 {
         return enhanced_sparse_matvec(weights, input, active_indices, 0);
@@ -487,89 +498,90 @@ pub fn parallel_sparse_matvec(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use approx::assert_relative_eq;
     use ndarray::{Array1, Array2};
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     use rand_distr::StandardNormal;
-    
+
+    use super::*;
+
     #[test]
     fn test_outer_product() {
         let a = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let b = Array1::from_vec(vec![4.0, 5.0]);
         let result = outer_product(&a, &b);
-        
+
         assert_eq!(result.shape(), &[3, 2]);
         assert_relative_eq!(result[[0, 0]], 4.0);
         assert_relative_eq!(result[[0, 1]], 5.0);
         assert_relative_eq!(result[[1, 0]], 8.0);
         assert_relative_eq!(result[[2, 1]], 15.0);
     }
-    
+
     #[test]
     fn test_outer_product_zero() {
         let a = Array1::zeros(3);
         let b = Array1::from_elem(2, 1.0);
         let result = outer_product(&a, &b);
-        
+
         assert!(result.iter().all(|&x| x == 0.0));
     }
-    
+
     #[test]
     fn test_clip_gradient_no_clip() {
         let grad = Array2::from_elem((10, 10), 0.1);
         let clipped = clip_gradient(grad.clone(), 100.0);
-        
+
         assert_eq!(grad, clipped);
     }
-    
+
     #[test]
     fn test_clip_gradient_with_clip() {
         let grad = Array2::from_elem((10, 10), 10.0);
         let clipped = clip_gradient(grad, 5.0);
-        
+
         let norm = clipped.mapv(|x| x * x).sum().sqrt();
         assert_relative_eq!(norm, 5.0, epsilon = 1e-4);
     }
-    
+
     #[test]
     fn test_cosine_similarity_identical() {
         let a = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let b = a.clone();
-        
+
         assert_relative_eq!(cosine_similarity(&a, &b), 1.0, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_cosine_similarity_orthogonal() {
         let a = Array1::from_vec(vec![1.0, 0.0, 0.0]);
         let b = Array1::from_vec(vec![0.0, 1.0, 0.0]);
-        
+
         assert_relative_eq!(cosine_similarity(&a, &b), 0.0, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_cosine_similarity_opposite() {
         let a = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let b = -&a;
-        
+
         assert_relative_eq!(cosine_similarity(&a, &b), -1.0, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_cosine_similarity_zero_vector() {
         let a = Array1::zeros(3);
         let b = Array1::from_elem(3, 1.0);
-        
+
         assert_relative_eq!(cosine_similarity(&a, &b), 0.0, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_l2_norm() {
         let v = Array1::from_vec(vec![3.0, 4.0]);
         assert_relative_eq!(l2_norm(&v), 5.0, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_frobenius_norm() {
         let m = Array2::from_elem((3, 4), 1.0);
@@ -611,181 +623,180 @@ mod tests {
     fn test_normalize() {
         let v = Array1::from_vec(vec![3.0, 4.0]);
         let normalized = normalize(&v);
-        
+
         assert_relative_eq!(l2_norm(&normalized), 1.0, epsilon = 1e-5);
         assert_relative_eq!(normalized[0], 0.6, epsilon = 1e-5);
         assert_relative_eq!(normalized[1], 0.8, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_normalize_zero() {
         let v = Array1::zeros(3);
         let normalized = normalize(&v);
-        
+
         assert!(normalized.iter().all(|&x| x == 0.0));
     }
-    
+
     #[test]
     fn test_relu() {
         let x = Array1::from_vec(vec![-1.0, 0.0, 1.0, 2.0]);
         let result = relu(&x);
-        
+
         assert_eq!(result[0], 0.0);
         assert_eq!(result[1], 0.0);
         assert_eq!(result[2], 1.0);
         assert_eq!(result[3], 2.0);
     }
-    
+
     #[test]
     fn test_softmax() {
         let x = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let result = softmax(&x);
-        
+
         // Should sum to 1
         assert_relative_eq!(result.sum(), 1.0, epsilon = 1e-5);
-        
+
         // Larger inputs should have larger probabilities
         assert!(result[2] > result[1]);
         assert!(result[1] > result[0]);
     }
-    
+
     #[test]
     fn test_softmax_uniform() {
         let x = Array1::from_elem(4, 1.0);
         let result = softmax(&x);
-        
+
         // Should be uniform distribution
         for &prob in result.iter() {
             assert_relative_eq!(prob, 0.25, epsilon = 1e-5);
         }
     }
-    
+
     #[test]
     fn test_mse() {
         let predictions = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let targets = Array1::from_vec(vec![1.0, 2.0, 3.0]);
-        
+
         assert_relative_eq!(mse(&predictions, &targets), 0.0, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_mse_nonzero() {
         let predictions = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let targets = Array1::from_vec(vec![0.0, 0.0, 0.0]);
-        
+
         let expected = (1.0 + 4.0 + 9.0) / 3.0; // (1² + 2² + 3²) / 3
         assert_relative_eq!(mse(&predictions, &targets), expected, epsilon = 1e-5);
     }
-    
+
     #[test]
     fn test_cross_entropy() {
         // Perfect prediction
         let predictions = Array1::from_vec(vec![1.0, 0.0, 0.0]);
         let targets = Array1::from_vec(vec![1.0, 0.0, 0.0]);
-        
+
         let loss = cross_entropy(&predictions, &targets);
         assert!(loss < 0.01); // Should be near zero
     }
-    
+
     #[test]
     fn test_cross_entropy_uniform() {
         let predictions = Array1::from_elem(4, 0.25);
         let targets = Array1::from_elem(4, 0.25);
-        
+
         let loss = cross_entropy(&predictions, &targets);
         assert!(loss > 0.0); // Should be positive
     }
-    
+
     #[test]
     fn test_get_active_spike_indices_dense() {
         let spikes = Array1::from_elem(10, 1.0);
         let active = get_active_spike_indices(&spikes, 0.5);
-        
+
         assert_eq!(active.len(), 10); // All active
         assert_eq!(active, (0..10).collect::<Vec<_>>());
     }
-    
+
     #[test]
     fn test_get_active_spike_indices_sparse() {
         let spikes = Array1::from_vec(vec![0.0, 1.0, 0.001, 0.8, 0.0, 0.9]);
         let active = get_active_spike_indices(&spikes, 0.01);
-        
+
         assert_eq!(active.len(), 3); // Indices 1, 3, 5
         assert_eq!(active, vec![1, 3, 5]);
     }
-    
+
     #[test]
     fn test_get_active_spike_indices_empty() {
         let spikes = Array1::zeros(10);
         let active = get_active_spike_indices(&spikes, 0.001);
-        
+
         assert_eq!(active.len(), 0); // No active spikes
     }
-    
+
     #[test]
     fn test_sparse_outer_product() {
         let post = Array1::from_vec(vec![1.0, 2.0, 0.0, 3.0]);
         let pre = Array1::from_vec(vec![4.0, 5.0]);
         let active = vec![0, 1, 3]; // Skip index 2
-        
+
         let result = sparse_outer_product(&post, &pre, &active);
-        
+
         // Check active rows
         assert_relative_eq!(result[[0, 0]], 4.0);
         assert_relative_eq!(result[[0, 1]], 5.0);
         assert_relative_eq!(result[[1, 0]], 8.0);
         assert_relative_eq!(result[[3, 0]], 12.0);
-        
+
         // Check inactive row (should be zero)
         assert_eq!(result[[2, 0]], 0.0);
         assert_eq!(result[[2, 1]], 0.0);
     }
-    
+
     #[test]
     fn test_sparse_outer_product_full() {
         let post = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let pre = Array1::from_vec(vec![4.0, 5.0]);
         let active = vec![0, 1, 2]; // All active
-        
+
         let sparse_result = sparse_outer_product(&post, &pre, &active);
         let dense_result = outer_product(&post, &pre);
-        
+
         // Should match dense computation
         assert_eq!(sparse_result, dense_result);
     }
-    
+
     #[test]
     fn test_sparse_matvec() {
-        let weights = Array2::from_shape_vec((3, 4), vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-        ]).unwrap();
-        
+        let weights = Array2::from_shape_vec(
+            (3, 4),
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+        )
+        .unwrap();
+
         let input = Array1::from_vec(vec![1.0, 0.0, 1.0, 0.0]);
         let active = vec![0, 2]; // Only columns 0 and 2 are active
-        
+
         let result = sparse_matvec(&weights, &input, &active);
-        
+
         // Should compute: W[:, [0,2]] @ [1.0, 1.0]
         assert_relative_eq!(result[0], 1.0 + 3.0); // 4.0
         assert_relative_eq!(result[1], 5.0 + 7.0); // 12.0
         assert_relative_eq!(result[2], 9.0 + 11.0); // 20.0
     }
-    
+
     #[test]
     fn test_sparse_matvec_dense_equivalence() {
-        let weights = Array2::from_shape_vec((2, 3), vec![
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-        ]).unwrap();
-        
+        let weights = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+
         let input = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let active = vec![0, 1, 2]; // All active
-        
+
         let sparse_result = sparse_matvec(&weights, &input, &active);
         let dense_result = weights.dot(&input);
-        
+
         // Should match dense computation
         for i in 0..sparse_result.len() {
             assert_relative_eq!(sparse_result[i], dense_result[i], epsilon = 1e-5);
