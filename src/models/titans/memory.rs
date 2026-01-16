@@ -459,14 +459,20 @@ impl NeuralMemory {
             let grad_output = &v_pred - &v_t;
 
             // Gradients w.r.t weights
-            let grad_w2 = grad_output.clone().insert_axis(Axis(1)).dot(&h.clone().insert_axis(Axis(0)));
+            let grad_w2 = grad_output
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&h.clone().insert_axis(Axis(0)));
             let grad_b2 = grad_output.clone();
 
             let grad_h = curr_memory.w2.t().dot(&grad_output);
             let z = curr_memory.w1.dot(&k_t) + &curr_memory.b1;
             let grad_z = grad_h * z.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
 
-            let grad_w1 = grad_z.clone().insert_axis(Axis(1)).dot(&k_t.clone().insert_axis(Axis(0)));
+            let grad_w1 = grad_z
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&k_t.clone().insert_axis(Axis(0)));
             let grad_b1 = grad_z.clone();
 
             // S_t = eta * S_{t-1} - theta * grad
@@ -486,7 +492,15 @@ impl NeuralMemory {
         }
 
         MacForwardTrace {
-            qs, ks, vs, alphas, etas, thetas, retrieval_memories, update_memories, momentums
+            qs,
+            ks,
+            vs,
+            alphas,
+            etas,
+            thetas,
+            retrieval_memories,
+            update_memories,
+            momentums,
         }
     }
 }
@@ -894,7 +908,8 @@ impl NeuralMemory {
         let mut d_w_eta = Array1::<f32>::zeros(self.w_eta.raw_dim());
         let mut d_w_theta = Array1::<f32>::zeros(self.w_theta.raw_dim());
 
-        let mut d_init_memory = MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
+        let mut d_init_memory =
+            MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
 
         // State Gradients
         // d_M_next: gradient w.r.t M_t (at end of step t)
@@ -906,7 +921,8 @@ impl NeuralMemory {
 
         // Accumulator for dL/dM_{chunk_start}
         // This collects gradients from retrieval steps in the chunk
-        let mut d_M_chunk_start = MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
+        let mut d_M_chunk_start =
+            MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
 
         for t in (0..seq_len).rev() {
             let dy_t = d_retrieved.row(t); // dL/dh_t (retrieved)
@@ -922,12 +938,16 @@ impl NeuralMemory {
             let eta_t = trace.etas[t];
             let theta_t = trace.thetas[t];
 
-            let m_prev = if t == 0 { &self.init_memory } else { &trace.update_memories[t-1] };
+            let m_prev = if t == 0 {
+                &self.init_memory
+            } else {
+                &trace.update_memories[t - 1]
+            };
             let m_retrieval = &trace.retrieval_memories[t];
             let s_prev = if t == 0 {
                 MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim)
             } else {
-                trace.momentums[t-1].clone()
+                trace.momentums[t - 1].clone()
             };
 
             // 1. Gradients from Retrieval (y_t = MLP(M_retrieval, q_t))
@@ -941,14 +961,26 @@ impl NeuralMemory {
             let grad_z_q = &grad_h_q * z_q.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
             let d_qt = m_retrieval.w1.t().dot(&grad_z_q);
 
-            d_wq = d_wq + d_qt.clone().insert_axis(Axis(1)).dot(&q_in.insert_axis(Axis(0)));
+            d_wq = d_wq
+                + d_qt
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&q_in.insert_axis(Axis(0)));
             let d_qin = self.w_q.t().dot(&d_qt);
             d_queries.row_mut(t).assign(&d_qin);
 
             // Accumulate to d_M_chunk_start
-            d_M_chunk_start.w2 = d_M_chunk_start.w2 + dy_t.clone().insert_axis(Axis(1)).dot(&h_q.insert_axis(Axis(0)));
+            d_M_chunk_start.w2 = d_M_chunk_start.w2
+                + dy_t
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&h_q.insert_axis(Axis(0)));
             d_M_chunk_start.b2 = d_M_chunk_start.b2 + &dy_t;
-            d_M_chunk_start.w1 = d_M_chunk_start.w1 + grad_z_q.clone().insert_axis(Axis(1)).dot(&q_t.clone().insert_axis(Axis(0)));
+            d_M_chunk_start.w1 = d_M_chunk_start.w1
+                + grad_z_q
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&q_t.clone().insert_axis(Axis(0)));
             d_M_chunk_start.b1 = d_M_chunk_start.b1 + &grad_z_q;
 
             // 2. Gradients from Update Rule
@@ -958,8 +990,9 @@ impl NeuralMemory {
             // If we are at end of chunk (t+1 is start of next chunk, or t is end of seq),
             // d_M_next should receive d_M_chunk_start from next chunk?
             // Actually, M_t becomes M_{t+1}_prev.
-            // If t+1 is start of new chunk, M_{t+1}_prev is also M_{chunk_start} for that new chunk.
-            // So d_M_next should accumulate d_M_chunk_start IF t is end of previous chunk.
+            // If t+1 is start of new chunk, M_{t+1}_prev is also M_{chunk_start} for that new
+            // chunk. So d_M_next should accumulate d_M_chunk_start IF t is end of
+            // previous chunk.
 
             // Wait, d_M_next flows backwards.
             // When we move from t+1 to t:
@@ -973,23 +1006,25 @@ impl NeuralMemory {
             // So M_t was the M_{chunk_start} for the *next* chunk.
             // So we add d_M_chunk_start (accumulated for next chunk) to d_M_next.
             if (t + 1) % segment_len == 0 && t + 1 < seq_len {
-                 // We just finished processing the next chunk (in reverse), so d_M_chunk_start contains its gradients.
-                 // Add to d_M_next.
-                 d_M_next.add(&d_M_chunk_start);
-                 // Reset accumulator for current chunk
-                 d_M_chunk_start = MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
+                // We just finished processing the next chunk (in reverse), so d_M_chunk_start
+                // contains its gradients. Add to d_M_next.
+                d_M_next.add(&d_M_chunk_start);
+                // Reset accumulator for current chunk
+                d_M_chunk_start =
+                    MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
             }
-            // Special case: if we are at the very end of sequence, d_M_chunk_start might contain gradients
-            // if we assume future usage? No, output gradients are zero for future.
-            // But within this loop, we accumulate into d_M_chunk_start for the *current* chunk.
-            // When we hit the *start* of the current chunk (t % segment_len == 0),
-            // the d_M_chunk_start accumulated so far is for *this* chunk.
-            // But we need to pass it to M_{t-1}.
+            // Special case: if we are at the very end of sequence, d_M_chunk_start might contain
+            // gradients if we assume future usage? No, output gradients are zero for
+            // future. But within this loop, we accumulate into d_M_chunk_start for the
+            // *current* chunk. When we hit the *start* of the current chunk (t %
+            // segment_len == 0), the d_M_chunk_start accumulated so far is for *this*
+            // chunk. But we need to pass it to M_{t-1}.
             // Wait, M_{chunk_start} is M_{t-1} when t is start of chunk.
             // So at t (start of chunk), we process update.
             // dL/dM_t flows to M_{t-1}.
             // AND d_M_chunk_start flows to M_{t-1}.
-            // So at t where t % segment_len == 0, we add d_M_chunk_start to the gradient flowing to M_{t-1}.
+            // So at t where t % segment_len == 0, we add d_M_chunk_start to the gradient flowing to
+            // M_{t-1}.
 
             // Update logic:
             let d_M_curr = d_M_next.clone();
@@ -1015,11 +1050,12 @@ impl NeuralMemory {
             if t % segment_len == 0 {
                 d_M_next.add(&d_M_chunk_start);
                 // Reset for safety, though it will be reset at next boundary check (t-1)
-                // Actually, d_M_chunk_start accumulates for the *current* chunk being processed in reverse.
-                // At t=start, we dump it into M_{t-1}.
+                // Actually, d_M_chunk_start accumulates for the *current* chunk being processed in
+                // reverse. At t=start, we dump it into M_{t-1}.
                 // Then we should zero it out so it doesn't double count?
                 // Yes. Because we are moving to t-1 which is in previous chunk.
-                d_M_chunk_start = MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
+                d_M_chunk_start =
+                    MemoryWeights::zeros(self.key_dim, self.memory_hidden_dim, self.val_dim);
             }
 
             // Gradients w.r.t update inputs (u_in)
@@ -1050,11 +1086,17 @@ impl NeuralMemory {
             let v_pred = m_prev.w2.dot(&h_k) + &m_prev.b2;
             let delta = &v_pred - &trace.vs[t];
 
-            let g_w2 = delta.clone().insert_axis(Axis(1)).dot(&h_k.clone().insert_axis(Axis(0)));
+            let g_w2 = delta
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&h_k.clone().insert_axis(Axis(0)));
             let g_b2 = delta.clone();
             let grad_h_k = m_prev.w2.t().dot(&delta);
             let grad_z_k = &grad_h_k * z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-            let g_w1 = grad_z_k.clone().insert_axis(Axis(1)).dot(&k_t.clone().insert_axis(Axis(0)));
+            let g_w1 = grad_z_k
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&k_t.clone().insert_axis(Axis(0)));
             let g_b1 = grad_z_k.clone();
 
             let mut val_theta = 0.0;
@@ -1083,7 +1125,11 @@ impl NeuralMemory {
             let term2 = u_w1.t().dot(&epsilon);
             let d_kt = term1 + term2;
 
-            d_wk = d_wk + d_kt.clone().insert_axis(Axis(1)).dot(&u_in.insert_axis(Axis(0)));
+            d_wk = d_wk
+                + d_kt
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&u_in.insert_axis(Axis(0)));
             d_uin = d_uin + self.w_k.t().dot(&d_kt);
 
             let u_w1_k_ub1 = u_w1.dot(k_t) + &u_b1;
@@ -1091,7 +1137,11 @@ impl NeuralMemory {
             let term_v_1 = u_w2.dot(&h_k) + &u_b2;
             let d_vt = -(term_v_1 + term_v_2);
 
-            d_wv = d_wv + d_vt.clone().insert_axis(Axis(1)).dot(&u_in.insert_axis(Axis(0)));
+            d_wv = d_wv
+                + d_vt
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&u_in.insert_axis(Axis(0)));
             d_uin = d_uin + self.w_v.t().dot(&d_vt);
 
             d_update_inputs.row_mut(t).assign(&d_uin);
