@@ -35,6 +35,8 @@ pub mod models;
 pub mod training;
 pub mod inference;
 
+pub mod eprop;
+
 // Define crate-level constants used across modules
 pub const EMBEDDING_DIM: usize = 128;
 pub const HIDDEN_DIM: usize = 256;
