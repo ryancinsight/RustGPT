@@ -1,12 +1,14 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use llm::{Dataset, DatasetType};
 use std::io::Write;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use llm::{Dataset, DatasetType};
 use tempfile::NamedTempFile;
 
 fn create_csv_file(rows: usize) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("failed to create temp file");
     for i in 0..rows {
-        writeln!(file, "{},{},{},{},{}", i, i+1, i+2, i+3, i+4).expect("failed to write to file");
+        writeln!(file, "{},{},{},{},{}", i, i + 1, i + 2, i + 3, i + 4)
+            .expect("failed to write to file");
     }
     file
 }
@@ -18,13 +20,7 @@ fn bench_csv_loading(c: &mut Criterion) {
     let path = csv_file.path().to_str().unwrap().to_string();
 
     group.bench_function("csv_loading_10k_rows", |b| {
-        b.iter(|| {
-            Dataset::new(
-                path.clone(),
-                path.clone(),
-                DatasetType::CSV,
-            ).unwrap()
-        })
+        b.iter(|| Dataset::new(path.clone(), path.clone(), DatasetType::CSV).unwrap())
     });
 
     group.finish();

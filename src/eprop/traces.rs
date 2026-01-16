@@ -6,8 +6,11 @@
 
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
-use crate::eprop::config::{EPropConfig, NeuronConfig};
-use crate::eprop::neuron::NeuronState;
+
+use crate::eprop::{
+    config::{EPropConfig, NeuronConfig},
+    neuron::NeuronState,
+};
 
 /// Multi-scale eligibility traces for enhanced sequential task performance
 ///
@@ -22,13 +25,13 @@ use crate::eprop::neuron::NeuronState;
 pub struct MultiScaleTraces {
     /// Fast temporal scale traces (recent dependencies)
     pub fast_scale: SingleScaleTraces,
-    
+
     /// Medium temporal scale traces (intermediate dependencies)
     pub medium_scale: SingleScaleTraces,
-    
+
     /// Slow temporal scale traces (long-range dependencies)
     pub slow_scale: SingleScaleTraces,
-    
+
     /// Gradient magnitude weights for automatic scale balancing
     /// Updated online based on current gradient magnitudes
     pub gradient_weights: [f32; 3],
@@ -52,7 +55,7 @@ impl MultiScaleTraces {
             gradient_weights: [1.0, 1.0, 1.0], // Equal initial weights
         }
     }
-    
+
     /// Update all scales with current input and state
     pub fn update_all_scales(
         &mut self,
@@ -64,7 +67,7 @@ impl MultiScaleTraces {
         self.slow_scale.update(state, input)?;
         Ok(())
     }
-    
+
     /// Update gradient magnitude weights based on current gradients
     pub fn update_gradient_weights(&mut self, gradient_magnitudes: [f32; 3]) {
         // Normalize weights based on gradient magnitudes
@@ -74,15 +77,15 @@ impl MultiScaleTraces {
                 self.gradient_weights[i] = mag / total_magnitude;
             }
         }
-        
+
         // Apply smoothing to prevent rapid weight oscillations
         let smoothing = 0.1;
         for i in 0..3 {
-            self.gradient_weights[i] = (1.0 - smoothing) * self.gradient_weights[i] 
-                + smoothing * (1.0 / 3.0); // Move toward equal weights
+            self.gradient_weights[i] =
+                (1.0 - smoothing) * self.gradient_weights[i] + smoothing * (1.0 / 3.0); // Move toward equal weights
         }
     }
-    
+
     /// Compute weighted combination of traces for gradient computation
     pub fn compute_weighted_traces(&self) -> (Array1<f32>, Array1<f32>) {
         // Combine presynaptic traces
@@ -94,10 +97,10 @@ impl MultiScaleTraces {
         let weighted_eps_f = self.gradient_weights[0] * &self.fast_scale.eps_f
             + self.gradient_weights[1] * &self.medium_scale.eps_f
             + self.gradient_weights[2] * &self.slow_scale.eps_f;
-            
+
         (weighted_eps_x, weighted_eps_f)
     }
-    
+
     /// Reset all traces to zero
     pub fn reset(&mut self) {
         self.fast_scale.reset();
@@ -115,20 +118,19 @@ impl SingleScaleTraces {
             alpha,
         }
     }
-    
+
     fn update(&mut self, state: &NeuronState, input: &Array1<f32>) -> super::Result<()> {
         // Update presynaptic trace: ε^x_t = α·ε^x_{t-1} + x_t
         self.eps_x = &self.eps_x * self.alpha + input;
-        
+
         // Update postsynaptic trace: ε^f_t = α·(D_t ∘ ε^f_{t-1}) + (1-α)·D^f_t
         let leak_diag = &state.voltage * self.alpha;
         let sens_diag = &state.surrogate_deriv;
-        self.eps_f = &(&leak_diag * &self.eps_f) * self.alpha
-            + &(sens_diag * (1.0 - self.alpha));
-            
+        self.eps_f = &(&leak_diag * &self.eps_f) * self.alpha + &(sens_diag * (1.0 - self.alpha));
+
         Ok(())
     }
-    
+
     fn reset(&mut self) {
         self.eps_x.fill(0.0);
         self.eps_f.fill(0.0);
@@ -143,7 +145,7 @@ impl SingleScaleTraces {
 ///
 /// The full eligibility matrix is approximated as: ε ≈ ε^f ⊗ ε^x
 /// This reduces storage from O(N²) to O(N) and computation from O(N²) to O(N).
-/// 
+///
 /// Optional features:
 /// - Windowed traces for adaptive truncation (2-3× speedup)
 /// - Gradient variance tracking for window adaptation
@@ -160,18 +162,18 @@ pub struct EligibilityTraces {
     /// Adaptation eligibility (ALIF only)
     /// Shape: (num_neurons,)
     pub eps_a: Option<Array1<f32>>,
-    
+
     /// Current position in sequence (for windowing)
     #[serde(skip)]
     pub position: usize,
-    
+
     /// Gradient variance EMA (for adaptive windowing)
     #[serde(skip)]
     pub gradient_variance_ema: f32,
-    
+
     /// Exponential smoothing factor (customizable per trace set)
     pub alpha_smooth: f32,
-    
+
     /// Multi-scale traces for enhanced temporal processing
     /// Each scale has different temporal horizons for sequential dependencies
     #[serde(skip)]
@@ -216,27 +218,28 @@ impl EligibilityTraces {
     pub fn dimensions(&self) -> (usize, usize) {
         (self.eps_f.len(), self.eps_x.len())
     }
-    
+
     /// Update gradient variance estimate (for adaptive windowing)
     pub fn update_variance_estimate(&mut self, gradient_norm_sq: f32, ema_alpha: f32) {
         let variance = gradient_norm_sq / (self.eps_f.len() + self.eps_x.len()) as f32;
-        self.gradient_variance_ema = ema_alpha * variance + (1.0 - ema_alpha) * self.gradient_variance_ema;
+        self.gradient_variance_ema =
+            ema_alpha * variance + (1.0 - ema_alpha) * self.gradient_variance_ema;
     }
-    
+
     /// Check if traces should be truncated based on window settings
     pub fn should_truncate(&self, min_window: usize, max_window: usize) -> bool {
         if self.position < min_window {
             return false; // Keep minimum history
         }
-        
+
         if self.position >= max_window {
             return true; // Exceeded maximum, must truncate
         }
-        
+
         // Adaptive: truncate if gradient variance is low (task is easy)
         self.gradient_variance_ema < 0.3 && self.position > min_window
     }
-    
+
     /// Increment position counter
     pub fn step(&mut self) {
         self.position += 1;
@@ -277,7 +280,7 @@ impl TraceUpdater {
             neuron_config,
             // Stability parameters: prevent trace explosion by capping magnitude
             max_trace_magnitude: 10.0, // Max trace norm before stabilization
-            stability_decay: 0.5, // Decay factor when stability threshold exceeded
+            stability_decay: 0.5,      // Decay factor when stability threshold exceeded
         }
     }
 
@@ -374,8 +377,8 @@ impl TraceUpdater {
         let sens_diag = &state.surrogate_deriv;
 
         // Combined update: ε^f_t = α·(D_t ∘ ε^f_{t-1}) + (1-α)·D^f_t
-        traces.eps_f = &(&leak_diag * &traces.eps_f) * self.alpha
-            + &(sens_diag * (1.0 - self.alpha));
+        traces.eps_f =
+            &(&leak_diag * &traces.eps_f) * self.alpha + &(sens_diag * (1.0 - self.alpha));
 
         Ok(())
     }
@@ -402,7 +405,7 @@ impl TraceUpdater {
             *eps_a = &(&decay * &*eps_a) + &psi_z;
         } else {
             return Err(super::EPropError::InvalidDynamics(
-                "Adaptation trace requested but not initialized".to_string()
+                "Adaptation trace requested but not initialized".to_string(),
             ));
         }
 
@@ -491,8 +494,12 @@ impl TraceUpdater {
 
         // Hard clamp for extreme outliers (numerical safety)
         const MAX_TRACE_VALUE: f32 = 100.0;
-        traces.eps_x.mapv_inplace(|x| x.clamp(-MAX_TRACE_VALUE, MAX_TRACE_VALUE));
-        traces.eps_f.mapv_inplace(|x| x.clamp(-MAX_TRACE_VALUE, MAX_TRACE_VALUE));
+        traces
+            .eps_x
+            .mapv_inplace(|x| x.clamp(-MAX_TRACE_VALUE, MAX_TRACE_VALUE));
+        traces
+            .eps_f
+            .mapv_inplace(|x| x.clamp(-MAX_TRACE_VALUE, MAX_TRACE_VALUE));
 
         if let Some(ref mut eps_a) = traces.eps_a {
             let norm_a = eps_a.mapv(|x| x * x).sum().sqrt();
@@ -506,9 +513,10 @@ impl TraceUpdater {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_relative_eq;
+
     use super::*;
     use crate::eprop::config::NeuronConfig;
-    use approx::assert_relative_eq;
 
     #[test]
     fn test_traces_initialization() {

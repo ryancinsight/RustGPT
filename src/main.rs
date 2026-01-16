@@ -9,7 +9,10 @@ use llm::{
     llm::LLM,
     model_builder::{build_network, print_architecture_summary},
     rng::set_seed,
-    training::{configure_speculative_sampling_from_args, run_training_pipeline},
+    training::{
+        configure_speculative_sampling_from_args, run_eprop_training_pipeline,
+        run_training_pipeline,
+    },
 };
 
 fn main() -> crate::Result<()> {
@@ -48,6 +51,11 @@ fn main() -> crate::Result<()> {
 
     // Build model configuration
     let config = build_model_config(&args);
+
+    if args.eprop {
+        run_eprop_training_pipeline(&args, &dataset, &vocab, &config)?;
+        return Ok(());
+    }
 
     // Build network based on configuration
     let network = build_network(&config, &vocab);

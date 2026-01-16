@@ -8,6 +8,7 @@
 
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
+
 use crate::eprop::EPropError;
 
 /// Types of surrogate gradient functions
@@ -32,17 +33,17 @@ pub enum SurrogateFunction {
 pub struct AdaptiveSurrogate {
     /// Current active function type
     current_function: SurrogateFunction,
-    
+
     /// Performance metrics for adaptation
     performance_history: Vec<PerformanceMetrics>,
-    
+
     /// Adaptation parameters
     adaptation_rate: f32,
     performance_window: usize,
-    
+
     /// Function parameters (may vary by function type)
     function_params: FunctionParams,
-    
+
     /// Neural activity tracking
     activity_stats: ActivityStats,
 }
@@ -52,16 +53,16 @@ pub struct AdaptiveSurrogate {
 pub struct PerformanceMetrics {
     /// Gradient correlation with true gradient
     pub gradient_correlation: f32,
-    
+
     /// Learning stability (inverse of gradient variance)
     pub stability_score: f32,
-    
+
     /// Training loss improvement rate
     pub loss_improvement_rate: f32,
-    
+
     /// Spike generation efficiency
     pub spike_efficiency: f32,
-    
+
     /// Overall performance score
     pub overall_score: f32,
 }
@@ -71,13 +72,13 @@ pub struct PerformanceMetrics {
 struct FunctionParams {
     /// Sigmoid steepness parameter
     sigmoid_steepness: f32,
-    
+
     /// Gaussian width parameter
     gaussian_width: f32,
-    
+
     /// Adaptive window size
     adaptive_window: f32,
-    
+
     /// Hybrid function weights
     hybrid_weights: [f32; 3],
 }
@@ -87,13 +88,13 @@ struct FunctionParams {
 pub struct ActivityStats {
     /// Average firing rate
     avg_firing_rate: f32,
-    
+
     /// Membrane potential variance
     voltage_variance: f32,
-    
+
     /// Spike timing precision
     spike_precision: f32,
-    
+
     /// Adaptation strength
     adaptation_strength: f32,
 }
@@ -110,7 +111,7 @@ impl AdaptiveSurrogate {
             activity_stats: ActivityStats::default(),
         }
     }
-    
+
     /// Create with optimized parameters for specific use case
     pub fn optimized_for_task(task_type: TaskType) -> Self {
         match task_type {
@@ -120,7 +121,7 @@ impl AdaptiveSurrogate {
             TaskType::Memory => Self::new(SurrogateFunction::Hybrid),
         }
     }
-    
+
     /// Compute surrogate gradient for voltage relative to threshold
     pub fn compute_surrogate_gradient(
         &mut self,
@@ -131,23 +132,23 @@ impl AdaptiveSurrogate {
     ) -> Array1<f32> {
         // Update activity statistics
         self.update_activity_stats(neuron_state);
-        
+
         // Compute gradient using current function
         let gradient = self.compute_gradient_with_current_function(voltage, threshold);
-        
+
         // Update performance metrics if loss gradient is available
         if let Some(loss_grad) = loss_gradient {
             self.update_performance_metrics(&gradient, loss_grad);
         }
-        
+
         // Check if adaptation is needed
         if self.should_adapt() {
             self.adapt_function();
         }
-        
+
         gradient
     }
-    
+
     /// Compute gradient using the current surrogate function
     fn compute_gradient_with_current_function(
         &self,
@@ -156,34 +157,26 @@ impl AdaptiveSurrogate {
     ) -> Array1<f32> {
         let n = voltage.len();
         let mut gradient = Array1::zeros(n);
-        
+
         for i in 0..n {
             let delta = voltage[i] - threshold[i];
             gradient[i] = match self.current_function {
                 SurrogateFunction::PiecewiseLinear => {
                     self.piecewise_linear_surrogate(delta, threshold[i])
                 }
-                SurrogateFunction::Sigmoid => {
-                    self.sigmoid_surrogate(delta)
-                }
-                SurrogateFunction::FastSigmoid => {
-                    self.fast_sigmoid_surrogate(delta)
-                }
-                SurrogateFunction::Gaussian => {
-                    self.gaussian_surrogate(delta)
-                }
+                SurrogateFunction::Sigmoid => self.sigmoid_surrogate(delta),
+                SurrogateFunction::FastSigmoid => self.fast_sigmoid_surrogate(delta),
+                SurrogateFunction::Gaussian => self.gaussian_surrogate(delta),
                 SurrogateFunction::AdaptivePiecewise => {
                     self.adaptive_piecewise_surrogate(delta, threshold[i])
                 }
-                SurrogateFunction::Hybrid => {
-                    self.hybrid_surrogate(delta, threshold[i])
-                }
+                SurrogateFunction::Hybrid => self.hybrid_surrogate(delta, threshold[i]),
             };
         }
-        
+
         gradient
     }
-    
+
     /// Piecewise linear surrogate gradient (original)
     fn piecewise_linear_surrogate(&self, delta: f32, threshold: f32) -> f32 {
         let abs_delta = delta.abs() / threshold;
@@ -193,14 +186,14 @@ impl AdaptiveSurrogate {
             0.0
         }
     }
-    
+
     /// Sigmoid surrogate gradient
     fn sigmoid_surrogate(&self, delta: f32) -> f32 {
         let steepness = self.function_params.sigmoid_steepness;
         let sigmoid = 1.0 / (1.0 + (-steepness * delta).exp());
         sigmoid * (1.0 - sigmoid) * steepness
     }
-    
+
     /// Fast sigmoid surrogate gradient (optimized approximation)
     fn fast_sigmoid_surrogate(&self, delta: f32) -> f32 {
         // Fast approximation: f(x) = x / (1 + |x|)
@@ -211,22 +204,22 @@ impl AdaptiveSurrogate {
             0.1 / abs_delta // Small gradient for far from threshold
         }
     }
-    
+
     /// Gaussian surrogate gradient
     fn gaussian_surrogate(&self, delta: f32) -> f32 {
         let width = self.function_params.gaussian_width;
         (-0.5 * (delta / width).powi(2)).exp()
     }
-    
+
     /// Adaptive piecewise linear surrogate
     fn adaptive_piecewise_surrogate(&self, delta: f32, threshold: f32) -> f32 {
         let window = self.function_params.adaptive_window;
         let normalized_delta = delta / threshold;
-        
+
         // Adaptive window based on recent neuron activity
         let activity_factor = 1.0 + self.activity_stats.avg_firing_rate * 0.5;
         let adaptive_window = window * activity_factor;
-        
+
         let abs_normalized = normalized_delta.abs();
         if abs_normalized < adaptive_window {
             (adaptive_window - abs_normalized) / (adaptive_window * threshold)
@@ -234,30 +227,30 @@ impl AdaptiveSurrogate {
             0.0
         }
     }
-    
+
     /// Hybrid surrogate gradient (combination of multiple functions)
     fn hybrid_surrogate(&self, delta: f32, threshold: f32) -> f32 {
         let weights = self.function_params.hybrid_weights;
-        
+
         let piecewise = self.piecewise_linear_surrogate(delta, threshold);
         let sigmoid = self.sigmoid_surrogate(delta);
         let gaussian = self.gaussian_surrogate(delta);
-        
+
         weights[0] * piecewise + weights[1] * sigmoid + weights[2] * gaussian
     }
-    
+
     /// Update activity statistics
     fn update_activity_stats(&mut self, neuron_state: &super::neuron::NeuronState) {
         let firing_rate = neuron_state.spikes.mean().unwrap_or(0.0);
         let voltage_var = neuron_state.voltage.var(0.0);
-        
+
         // Update EMA
         let alpha = 0.1;
-        self.activity_stats.avg_firing_rate = 
+        self.activity_stats.avg_firing_rate =
             alpha * firing_rate + (1.0 - alpha) * self.activity_stats.avg_firing_rate;
-        self.activity_stats.voltage_variance = 
+        self.activity_stats.voltage_variance =
             alpha * voltage_var + (1.0 - alpha) * self.activity_stats.voltage_variance;
-        
+
         // Update spike precision (coefficient of variation)
         if firing_rate > 0.0 {
             let spike_count = neuron_state.spikes.len() as f32 * firing_rate;
@@ -266,31 +259,35 @@ impl AdaptiveSurrogate {
             } else {
                 1.0
             };
-            self.activity_stats.spike_precision = 
+            self.activity_stats.spike_precision =
                 alpha * precision + (1.0 - alpha) * self.activity_stats.spike_precision;
         }
-        
+
         // Update adaptation strength if available
         if let Some(adaptation) = &neuron_state.adaptation {
             let adapt_strength = adaptation.mean().unwrap_or(0.0);
-            self.activity_stats.adaptation_strength = 
+            self.activity_stats.adaptation_strength =
                 alpha * adapt_strength + (1.0 - alpha) * self.activity_stats.adaptation_strength;
         }
     }
-    
+
     /// Update performance metrics
-    fn update_performance_metrics(&mut self, surrogate_grad: &Array1<f32>, true_grad: &Array1<f32>) {
+    fn update_performance_metrics(
+        &mut self,
+        surrogate_grad: &Array1<f32>,
+        true_grad: &Array1<f32>,
+    ) {
         if surrogate_grad.len() != true_grad.len() {
             return; // Skip if dimensions don't match
         }
-        
+
         // Compute gradient correlation
         let correlation = compute_correlation(surrogate_grad, true_grad);
-        
+
         // Compute stability score (inverse of gradient variance)
         let surrogate_var = surrogate_grad.var(1.0);
         let stability = 1.0 / (1.0 + surrogate_var);
-        
+
         // Compute spike efficiency
         let avg_surrogate = surrogate_grad.mean().unwrap_or(0.0);
         let spike_efficiency = if avg_surrogate > 0.0 {
@@ -298,10 +295,10 @@ impl AdaptiveSurrogate {
         } else {
             0.0
         };
-        
+
         // Compute overall score
         let overall_score = 0.4 * correlation + 0.3 * stability + 0.3 * spike_efficiency;
-        
+
         let metrics = PerformanceMetrics {
             gradient_correlation: correlation,
             stability_score: stability,
@@ -309,21 +306,21 @@ impl AdaptiveSurrogate {
             spike_efficiency,
             overall_score,
         };
-        
+
         self.performance_history.push(metrics);
-        
+
         // Keep history within window size
         if self.performance_history.len() > self.performance_window {
             self.performance_history.remove(0);
         }
     }
-    
+
     /// Determine if function adaptation is needed
     fn should_adapt(&self) -> bool {
         if self.performance_history.len() < 10 {
             return false; // Need minimum history
         }
-        
+
         let window = 10usize.min(self.performance_history.len() / 2).max(1);
 
         let recent_scores = self
@@ -343,7 +340,11 @@ impl AdaptiveSurrogate {
         }
         let recent_avg = recent_sum / recent_n as f32;
 
-        let older_scores = self.performance_history.iter().take(window).map(|m| m.overall_score);
+        let older_scores = self
+            .performance_history
+            .iter()
+            .take(window)
+            .map(|m| m.overall_score);
         let mut older_sum = 0.0f32;
         let mut older_n = 0usize;
         for s in older_scores {
@@ -354,20 +355,20 @@ impl AdaptiveSurrogate {
             return false;
         }
         let older_avg = older_sum / older_n as f32;
-            
+
         recent_avg < older_avg * 0.95 // 5% performance drop triggers adaptation
     }
-    
+
     /// Adapt to better performing surrogate function
     fn adapt_function(&mut self) {
         if self.performance_history.len() < 5 {
             return;
         }
-        
+
         // Evaluate all functions and select the best
         let mut best_function = self.current_function;
         let mut best_score = self.get_current_performance_score();
-        
+
         for function in [
             SurrogateFunction::PiecewiseLinear,
             SurrogateFunction::Sigmoid,
@@ -384,13 +385,13 @@ impl AdaptiveSurrogate {
                 }
             }
         }
-        
+
         if best_function != self.current_function {
             self.current_function = best_function;
             self.adapt_function_parameters();
         }
     }
-    
+
     /// Get current performance score
     fn get_current_performance_score(&self) -> f32 {
         if self.performance_history.is_empty() {
@@ -412,7 +413,7 @@ impl AdaptiveSurrogate {
         }
         if n == 0 { 0.5 } else { sum / n as f32 }
     }
-    
+
     /// Estimate performance of a candidate function (simulation-based)
     fn estimate_function_performance(&self, function: SurrogateFunction) -> f32 {
         let mut candidate = self.clone();
@@ -420,7 +421,11 @@ impl AdaptiveSurrogate {
         candidate.adapt_function_parameters();
 
         let var = candidate.activity_stats.voltage_variance;
-        let mut sigma = if var.is_finite() && var >= 0.0 { var.sqrt() } else { 1.0 };
+        let mut sigma = if var.is_finite() && var >= 0.0 {
+            var.sqrt()
+        } else {
+            1.0
+        };
         if !sigma.is_finite() || sigma <= 0.0 {
             sigma = 1.0;
         }
@@ -463,9 +468,9 @@ impl AdaptiveSurrogate {
             SurrogateFunction::Sigmoid => {
                 // Adapt steepness based on firing rate
                 let target_steepness = match self.activity_stats.avg_firing_rate {
-                    rate if rate < 0.1 => 2.0,  // Lower steepness for sparse activity
-                    rate if rate > 0.5 => 8.0,  // Higher steepness for dense activity
-                    _ => 4.0,                   // Default
+                    rate if rate < 0.1 => 2.0, // Lower steepness for sparse activity
+                    rate if rate > 0.5 => 8.0, // Higher steepness for dense activity
+                    _ => 4.0,                  // Default
                 };
                 self.function_params.sigmoid_steepness =
                     0.9 * self.function_params.sigmoid_steepness + 0.1 * target_steepness;
@@ -487,8 +492,8 @@ impl AdaptiveSurrogate {
 
             SurrogateFunction::Hybrid => {
                 // Adapt weights based on overall activity
-                let total_activity = self.activity_stats.avg_firing_rate +
-                                    self.activity_stats.adaptation_strength;
+                let total_activity =
+                    self.activity_stats.avg_firing_rate + self.activity_stats.adaptation_strength;
 
                 if total_activity < 0.3 {
                     // Low activity - emphasize fast sigmoid
@@ -680,10 +685,10 @@ impl SurrogatePerformance {
         let spike_efficiency = compute_correlation(surrogate_gradient, loss_gradient).abs();
 
         // Compute overall performance score
-        let overall_score = 0.3 * gradient_correlation +
-                           0.2 * stability_score +
-                           0.25 * loss_improvement_rate.clamp(0.0, 1.0) +
-                           0.25 * spike_efficiency;
+        let overall_score = 0.3 * gradient_correlation
+            + 0.2 * stability_score
+            + 0.25 * loss_improvement_rate.clamp(0.0, 1.0)
+            + 0.25 * spike_efficiency;
 
         // Create and store performance metrics
         let metrics = PerformanceMetrics {
@@ -716,7 +721,9 @@ impl SurrogatePerformance {
         if self.adaptive_surrogate.performance_history.is_empty() {
             0.5
         } else {
-            let recent_scores: Vec<f32> = self.adaptive_surrogate.performance_history
+            let recent_scores: Vec<f32> = self
+                .adaptive_surrogate
+                .performance_history
                 .iter()
                 .rev()
                 .take(10.min(self.adaptive_surrogate.performance_history.len()))
@@ -757,23 +764,23 @@ fn compute_correlation(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
     if n == 0 {
         return 0.0;
     }
-    
+
     let mean_a = a.iter().take(n).sum::<f32>() / n as f32;
     let mean_b = b.iter().take(n).sum::<f32>() / n as f32;
-    
+
     let mut numerator = 0.0;
     let mut denom_a = 0.0;
     let mut denom_b = 0.0;
-    
+
     for i in 0..n {
         let diff_a = a[i] - mean_a;
         let diff_b = b[i] - mean_b;
-        
+
         numerator += diff_a * diff_b;
         denom_a += diff_a * diff_a;
         denom_b += diff_b * diff_b;
     }
-    
+
     let denominator = (denom_a * denom_b).sqrt();
     if denominator > 1e-8 {
         numerator / denominator
@@ -806,73 +813,76 @@ impl Default for ActivityStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::eprop::neuron::NeuronState;
-    use crate::eprop::config::NeuronConfig;
     use approx::assert_relative_eq;
-    
+
+    use super::*;
+    use crate::eprop::{config::NeuronConfig, neuron::NeuronState};
+
     #[test]
     fn test_adaptive_surrogate_creation() {
         let adaptive = AdaptiveSurrogate::new(SurrogateFunction::PiecewiseLinear);
-        assert_eq!(adaptive.current_function(), SurrogateFunction::PiecewiseLinear);
+        assert_eq!(
+            adaptive.current_function(),
+            SurrogateFunction::PiecewiseLinear
+        );
     }
-    
+
     #[test]
     fn test_surrogate_functions() {
         let adaptive = AdaptiveSurrogate::new(SurrogateFunction::PiecewiseLinear);
-        
+
         // Test at threshold
         let grad_linear = adaptive.piecewise_linear_surrogate(0.0, 1.0);
         let grad_sigmoid = adaptive.sigmoid_surrogate(0.0);
         let grad_gaussian = adaptive.gaussian_surrogate(0.0);
-        
+
         // Should be positive at threshold
         assert!(grad_linear > 0.0);
         assert!(grad_sigmoid > 0.0);
         assert!(grad_gaussian > 0.0);
     }
-    
+
     #[test]
     fn test_fast_sigmoid_properties() {
         let adaptive = AdaptiveSurrogate::new(SurrogateFunction::FastSigmoid);
-        
+
         // At threshold
         let grad = adaptive.fast_sigmoid_surrogate(0.0);
         assert_relative_eq!(grad, 1.0, epsilon = 1e-6);
-        
+
         // Far from threshold should approach 0
         let grad_far = adaptive.fast_sigmoid_surrogate(10.0);
         assert!(grad_far < 0.1);
     }
-    
+
     #[test]
     fn test_activity_stats_update() {
         let mut adaptive = AdaptiveSurrogate::new(SurrogateFunction::PiecewiseLinear);
-        
+
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, false, &config);
         state.spikes.fill(0.5);
         state.voltage.fill(1.0);
-        
+
         adaptive.update_activity_stats(&state);
-        
+
         assert!(adaptive.activity_stats.avg_firing_rate > 0.0);
         assert!(adaptive.activity_stats.voltage_variance > 0.0);
     }
-    
+
     #[test]
     fn test_function_switching() {
         let mut adaptive = AdaptiveSurrogate::new(SurrogateFunction::PiecewiseLinear);
-        
+
         adaptive.set_function(SurrogateFunction::Sigmoid);
         assert_eq!(adaptive.current_function(), SurrogateFunction::Sigmoid);
     }
-    
+
     #[test]
     fn test_correlation_computation() {
         let a = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
         let b = Array1::from_vec(vec![2.0, 4.0, 6.0, 8.0]); // Perfect correlation
-        
+
         let corr = compute_correlation(&a, &b);
         assert!(corr > 0.99); // Should be nearly 1.0
     }

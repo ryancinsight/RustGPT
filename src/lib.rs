@@ -31,9 +31,9 @@ pub mod decoding;
 pub mod encoding;
 
 // New Architecture Structure
+pub mod inference;
 pub mod models;
 pub mod training;
-pub mod inference;
 
 pub mod eprop;
 
@@ -55,18 +55,16 @@ pub use encoding::{SimpleTokenizer, Vocab};
 pub use errors::{ModelError, Result};
 pub use evaluator::Evaluator;
 pub use inference::engine::InferenceEngine; // adjusted path
-pub use models::llm::LLM; // adjusted path
 pub use mixtures::{
     ExpertRouter, ExpertRouterConfig, HeadSelectionConfig, HeadSelectionStrategy, MixtureOfExperts,
     ThresholdPredictor,
 };
 pub use model_builder::{build_network, print_architecture_summary};
 pub use model_config::{ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy};
-pub use network::{Layer, LayerEnum};
-pub use richards::RichardsGlu;
-pub use richards::RichardsNorm as DynamicTanhNorm;
-pub use rng::{get_rng, get_seed, is_seeded, set_seed};
-pub use training::trainer::Trainer; // adjusted path
-
 // Keep module aliases if necessary
 pub use models::llm;
+pub use models::llm::LLM; // adjusted path
+pub use network::{Layer, LayerEnum};
+pub use richards::{RichardsGlu, RichardsNorm as DynamicTanhNorm};
+pub use rng::{get_rng, get_seed, is_seeded, set_seed};
+pub use training::trainer::Trainer; // adjusted path
