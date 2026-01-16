@@ -1222,6 +1222,12 @@ impl PolyAttention {
                     let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
 
+                    // Parameter grads for Richards curve from auxiliary loss
+                    let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
+                    for (wi, &gw) in gws.iter().enumerate() {
+                        grad_gate_poly_vec[wi] += gw;
+                    }
+
                     // update gating parameter grads
                     for d in 0..self.embed_dim {
                         grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i;
@@ -1392,11 +1398,17 @@ impl PolyAttention {
             .step(&mut self.moh.beta_g, &param_grads[idx + 2], lr);
         idx += 3;
         {
-            let grad_gate_poly = &param_grads[idx];
-            let _ = self
-                .moh
+            let grad_gate_poly_packed = &param_grads[idx];
+            // Unpack gradients for RichardsGate: packed (1, 4) -> [ (1,1), (1,1), (1,1), (1,1) ]
+            let n_params = self.moh.gate.parameters();
+            let mut unpacked_grads = Vec::with_capacity(n_params);
+            for i in 0..n_params {
+                unpacked_grads.push(Array2::from_elem((1, 1), grad_gate_poly_packed[[0, i]]));
+            }
+            self.moh
                 .gate
-                .apply_gradients(std::slice::from_ref(grad_gate_poly), lr);
+                .apply_gradients(&unpacked_grads, lr)
+                .unwrap();
         }
         idx += 1;
 
@@ -1910,6 +1922,10 @@ impl PolyAttention {
                     let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
                     let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
+                    let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
+                    for (wi, &gw) in gws.iter().enumerate() {
+                        grad_gate_poly_vec_acc[wi] += gw;
+                    }
                     for d in 0..self.embed_dim {
                         grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i;
                     }
@@ -2654,5 +2670,75 @@ mod tests {
                        param_grads_c[idx_beta_g].iter().any(|&x| x.abs() > 1e-10);
 
         assert!(has_grad, "Should have gradients in Coupled mode");
+    }
+
+    #[test]
+    fn test_moh_independent_training_with_aux_loss_grads() {
+        use crate::mixtures::gating::GatingTrainingMode;
+        // This test verifies that in Independent mode with auxiliary losses,
+        // RichardsCurve parameters SHOULD receive gradients.
+
+        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+
+        // Setup Independent training strategy WITH auxiliary loss
+        let strategy = crate::mixtures::moh::HeadSelectionStrategy::Learned {
+            num_active: 4,
+            load_balance_weight: 1.0, // High weight to ensure gradients
+            complexity_loss_weight: 0.0,
+            sparsity_weight: 0.0,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
+            training_mode: GatingTrainingMode::Independent,
+        };
+        pa.set_head_selection_config(&strategy);
+
+        let n = 4;
+        let d = 32;
+        let mut input = Array2::<f32>::zeros((n, d));
+        // Simple input
+        for i in 0..n {
+            for j in 0..d {
+                input[[i, j]] = ((i * d + j) as f32 * 0.1).sin();
+            }
+        }
+
+        // Forward pass
+        let _ = pa.forward_impl(&input, true);
+
+        // Backward pass with non-zero output gradients
+        let output_grads = Array2::<f32>::ones((n, d));
+
+        let (_grad_input, param_grads) = pa.compute_gradients_parallel(&input, &output_grads);
+
+        // Indices:
+        // Heads (3*4 = 12) + W_out (1) + a,b,scale (3) = 16
+        // Next are: w_g, alpha_g, beta_g, gate_poly
+        let idx_gate_poly = 19;
+
+        let grad_gate_poly = &param_grads[idx_gate_poly];
+
+        // We expect gradients to be present because of load_balance_weight
+        let has_grad = grad_gate_poly.iter().any(|&x| x.abs() > 1e-10);
+
+        // Assert that we HAVE gradients.
+        assert!(has_grad, "gate_poly grad should be NON-zero in independent mode with aux loss");
+    }
+
+    #[test]
+    fn test_apply_gradients_works() {
+        // This test ensures that apply_gradients doesn't panic due to gradient unpacking mismatch
+        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let n = 2;
+        let d = 32;
+        let input = Array2::<f32>::zeros((n, d));
+        let output_grads = Array2::<f32>::ones((n, d));
+
+        // Need forward pass to cache input
+        let _ = pa.forward_impl(&input, true);
+
+        let (_gi, param_grads) = pa.compute_gradients_parallel(&input, &output_grads);
+
+        // This should NOT panic now
+        pa.apply_gradients(&param_grads, 0.01).unwrap();
     }
 }
