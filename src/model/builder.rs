@@ -290,6 +290,9 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                         "Mamba2MoH"
                     }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
+                    crate::layers::components::common::TemporalMixingLayer::Titans(_) => {
+                        "TitansMAC"
+                    }
                 };
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
             }
@@ -310,6 +313,9 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                         "Mamba2MoH"
                     }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
+                    crate::layers::components::common::TemporalMixingLayer::Titans(_) => {
+                        "TitansMAC"
+                    }
                 };
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
             }
