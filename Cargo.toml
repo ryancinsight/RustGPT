@@ -20,11 +20,7 @@ thiserror = "1.0"
 tracing = "0.1"
 clap = { version = "4.0", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rkyv = { version = "0.7", features = ["validation"], optional = true }
-
-[features]
-default = []
-eprop = ["dep:rkyv"]
+rkyv = { version = "0.7", features = ["validation"] }
 
 [dev-dependencies]
 proptest = "1.5"

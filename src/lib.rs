@@ -35,7 +35,6 @@ pub mod models;
 pub mod training;
 pub mod inference;
 
-#[cfg(feature = "eprop")]
 pub mod eprop;
 
 // Define crate-level constants used across modules
