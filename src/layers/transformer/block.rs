@@ -676,7 +676,10 @@ impl Layer for TransformerBlock {
 
         // Temporal mixing forward
         let mut mix_out = self.temporal_mixing.forward(&norm1_out);
-        if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+        if !matches!(
+            self.temporal_mixing,
+            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
+        ) {
             self.config.titan_memory.apply_into_out_with_workspace(
                 &mut mix_out,
                 &norm1_out,
@@ -868,7 +871,10 @@ impl Layer for TransformerBlock {
             let (mut mix_input_grad, mix_param_grads) = self
                 .temporal_mixing
                 .compute_gradients(norm1_out, &residual1_total_grads);
-            if !matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+            if !matches!(
+                self.temporal_mixing,
+                TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
+            ) {
                 self.config
                     .titan_memory
                     .add_input_grads_from_output_grads_into(

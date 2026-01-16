@@ -335,6 +335,7 @@ impl LLM {
             Mamba,
             Mamba2MoH,
             Mamba2,
+            Titans,
         }
 
         let mut tm_seen: Option<TM> = None;
@@ -364,6 +365,9 @@ impl LLM {
                     crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
                         Some(TM::Mamba2MoH)
                     }
+                    crate::layers::components::common::TemporalMixingLayer::Titans(_) => {
+                        Some(TM::Titans)
+                    }
                 },
                 crate::LayerEnum::DiffusionBlock(db) => match &db.temporal_mixing {
                     crate::layers::components::common::TemporalMixingLayer::Attention(_) => {
@@ -386,6 +390,9 @@ impl LLM {
                     }
                     crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
                         Some(TM::Mamba2MoH)
+                    }
+                    crate::layers::components::common::TemporalMixingLayer::Titans(_) => {
+                        Some(TM::Titans)
                     }
                 },
                 _ => None,
@@ -413,6 +420,7 @@ impl LLM {
                 Some(TM::Mamba) => Some("Mamba"),
                 Some(TM::Mamba2MoH) => Some("Mamba2MoH"),
                 Some(TM::Mamba2) => Some("Mamba2"),
+                Some(TM::Titans) => Some("TitansMAC"),
                 None => None,
             }
         };
