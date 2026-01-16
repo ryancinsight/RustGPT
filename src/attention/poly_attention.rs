@@ -1397,10 +1397,19 @@ impl PolyAttention {
             .opt_beta_g
             .step(&mut self.moh.beta_g, &param_grads[idx + 2], lr);
         idx += 3;
-        self.moh
-            .gate
-            .apply_gradients(std::slice::from_ref(&param_grads[idx]), lr)
-            .unwrap();
+        {
+            let grad_gate_poly_packed = &param_grads[idx];
+            // Unpack gradients for RichardsGate: packed (1, 4) -> [ (1,1), (1,1), (1,1), (1,1) ]
+            let n_params = self.moh.gate.parameters();
+            let mut unpacked_grads = Vec::with_capacity(n_params);
+            for i in 0..n_params {
+                unpacked_grads.push(Array2::from_elem((1, 1), grad_gate_poly_packed[[0, i]]));
+            }
+            self.moh
+                .gate
+                .apply_gradients(&unpacked_grads, lr)
+                .unwrap();
+        }
         idx += 1;
 
         if self.moh.head_selection_config.gating.use_learned_predictor {
@@ -2668,7 +2677,6 @@ mod tests {
         use crate::mixtures::gating::GatingTrainingMode;
         // This test verifies that in Independent mode with auxiliary losses,
         // RichardsCurve parameters SHOULD receive gradients.
-        // Before the fix, they likely won't.
 
         let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
 
@@ -2713,7 +2721,24 @@ mod tests {
         let has_grad = grad_gate_poly.iter().any(|&x| x.abs() > 1e-10);
 
         // Assert that we HAVE gradients.
-        // If the bug exists (RichardsCurve not learning from aux loss), this assertion will fail (it will be false).
         assert!(has_grad, "gate_poly grad should be NON-zero in independent mode with aux loss");
+    }
+
+    #[test]
+    fn test_apply_gradients_works() {
+        // This test ensures that apply_gradients doesn't panic due to gradient unpacking mismatch
+        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let n = 2;
+        let d = 32;
+        let input = Array2::<f32>::zeros((n, d));
+        let output_grads = Array2::<f32>::ones((n, d));
+
+        // Need forward pass to cache input
+        let _ = pa.forward_impl(&input, true);
+
+        let (_gi, param_grads) = pa.compute_gradients_parallel(&input, &output_grads);
+
+        // This should NOT panic now
+        pa.apply_gradients(&param_grads, 0.01).unwrap();
     }
 }
