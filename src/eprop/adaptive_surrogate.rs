@@ -215,7 +215,8 @@ impl AdaptiveSurrogate {
     /// Gaussian surrogate gradient
     fn gaussian_surrogate(&self, delta: f32) -> f32 {
         let width = self.function_params.gaussian_width;
-        (-0.5 * (delta / width).powi(2)).exp()
+        let norm = 1.0 / (width * (2.0 * std::f32::consts::PI).sqrt());
+        norm * (-0.5 * (delta / width).powi(2)).exp()
     }
     
     /// Adaptive piecewise linear surrogate
