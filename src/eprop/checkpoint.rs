@@ -242,7 +242,7 @@ impl CompressedTraceCheckpoint {
             .iter()
             .map(|&x| {
                 let normalized = (x - offset) / scale;
-                (normalized.clamp(-127.0, 127.0) as i8)
+                normalized.clamp(-127.0, 127.0) as i8
             })
             .collect();
 
@@ -419,34 +419,34 @@ impl TraceCheckpoint {
     ///
     /// # Arguments
     /// * `timestep` - Current timestep
-    /// * `ε_x` - Input eligibility trace
-    /// * `ε_f` - Feedback eligibility trace
-    pub fn from_arrays(timestep: usize, ε_x: &Array2<f32>, ε_f: &Array2<f32>) -> Self {
+    /// * `eps_x` - Input eligibility trace
+    /// * `eps_f` - Feedback eligibility trace
+    pub fn from_arrays(timestep: usize, eps_x: &Array2<f32>, eps_f: &Array2<f32>) -> Self {
         Self {
             timestep,
-            eligibility_x_data: ε_x.iter().copied().collect(),
-            eligibility_x_shape: [ε_x.nrows(), ε_x.ncols()],
-            eligibility_f_data: ε_f.iter().copied().collect(),
-            eligibility_f_shape: [ε_f.nrows(), ε_f.ncols()],
+            eligibility_x_data: eps_x.iter().copied().collect(),
+            eligibility_x_shape: [eps_x.nrows(), eps_x.ncols()],
+            eligibility_f_data: eps_f.iter().copied().collect(),
+            eligibility_f_shape: [eps_f.nrows(), eps_f.ncols()],
         }
     }
 
     /// Restore ndarray traces from checkpoint
     ///
     /// # Returns
-    /// Tuple of (ε_x, ε_f) as Array2<f32>
+    /// Tuple of (eps_x, eps_f) as Array2<f32>
     pub fn to_arrays(&self) -> Result<(Array2<f32>, Array2<f32>), Box<dyn std::error::Error>> {
-        let ε_x = Array2::from_shape_vec(
+        let eps_x = Array2::from_shape_vec(
             (self.eligibility_x_shape[0], self.eligibility_x_shape[1]),
             self.eligibility_x_data.clone(),
         )?;
 
-        let ε_f = Array2::from_shape_vec(
+        let eps_f = Array2::from_shape_vec(
             (self.eligibility_f_shape[0], self.eligibility_f_shape[1]),
             self.eligibility_f_data.clone(),
         )?;
 
-        Ok((ε_x, ε_f))
+        Ok((eps_x, eps_f))
     }
 }
 
@@ -479,7 +479,7 @@ impl CheckpointManager {
     /// let manager = CheckpointManager::new(32, 1000);
     /// ```
     pub fn new(interval: usize, seq_len: usize) -> Self {
-        let max_checkpoints = (seq_len + interval - 1) / interval;
+        let max_checkpoints = seq_len.div_ceil(interval);
         Self {
             checkpoints: HashMap::with_capacity(max_checkpoints),
             interval,
@@ -495,15 +495,15 @@ impl CheckpointManager {
     /// # Returns
     /// `true` if this timestep is a checkpoint boundary
     pub fn should_checkpoint(&self, t: usize) -> bool {
-        t % self.interval == 0
+        t.is_multiple_of(self.interval)
     }
 
     /// Save checkpoint using rkyv zero-copy serialization
     ///
     /// # Arguments
     /// * `t` - Timestep
-    /// * `ε_x` - Input eligibility trace
-    /// * `ε_f` - Feedback eligibility trace
+    /// * `eps_x` - Input eligibility trace
+    /// * `eps_f` - Feedback eligibility trace
     ///
     /// # Performance
     /// - Serialization: O(N) time, zero copies
@@ -511,15 +511,22 @@ impl CheckpointManager {
     pub fn save_checkpoint(
         &mut self,
         t: usize,
-        ε_x: &Array2<f32>,
-        ε_f: &Array2<f32>,
+        eps_x: &Array2<f32>,
+        eps_f: &Array2<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let checkpoint = TraceCheckpoint::from_arrays(t, ε_x, ε_f);
+        let checkpoint = TraceCheckpoint::from_arrays(t, eps_x, eps_f);
 
         // Serialize with rkyv (zero-copy)
         // Buffer size: 256 bytes for small traces, grows automatically
         let bytes = rkyv::to_bytes::<_, 256>(&checkpoint)?;
         self.checkpoints.insert(t, bytes.to_vec());
+
+        if self.checkpoints.len() > self.max_checkpoints {
+            let Some(oldest_t) = self.checkpoints.keys().copied().min() else {
+                return Ok(());
+            };
+            self.checkpoints.remove(&oldest_t);
+        }
 
         Ok(())
     }
@@ -605,33 +612,35 @@ mod tests {
 
     #[test]
     fn test_trace_checkpoint_roundtrip() {
-        let ε_x = Array2::from_shape_vec((10, 20), (0..200).map(|i| i as f32).collect()).unwrap();
-        let ε_f = Array2::from_shape_vec((10, 20), (200..400).map(|i| i as f32).collect()).unwrap();
+        let eps_x = Array2::from_shape_vec((10, 20), (0..200).map(|i| i as f32).collect()).unwrap();
+        let eps_f =
+            Array2::from_shape_vec((10, 20), (200..400).map(|i| i as f32).collect()).unwrap();
 
-        let checkpoint = TraceCheckpoint::from_arrays(42, &ε_x, &ε_f);
-        let (ε_x_restored, ε_f_restored) = checkpoint.to_arrays().unwrap();
+        let checkpoint = TraceCheckpoint::from_arrays(42, &eps_x, &eps_f);
+        let (eps_x_restored, eps_f_restored) = checkpoint.to_arrays().unwrap();
 
         assert_eq!(checkpoint.timestep, 42);
-        assert!(arrays_equal(&ε_x, &ε_x_restored, 1e-6));
-        assert!(arrays_equal(&ε_f, &ε_f_restored, 1e-6));
+        assert!(arrays_equal(&eps_x, &eps_x_restored, 1e-6));
+        assert!(arrays_equal(&eps_f, &eps_f_restored, 1e-6));
     }
 
     #[test]
     fn test_rkyv_serialization_roundtrip() {
-        let ε_x = Array2::from_shape_vec((10, 20), (0..200).map(|i| i as f32).collect()).unwrap();
-        let ε_f = Array2::from_shape_vec((10, 20), (200..400).map(|i| i as f32).collect()).unwrap();
+        let eps_x = Array2::from_shape_vec((10, 20), (0..200).map(|i| i as f32).collect()).unwrap();
+        let eps_f =
+            Array2::from_shape_vec((10, 20), (200..400).map(|i| i as f32).collect()).unwrap();
 
-        let checkpoint = TraceCheckpoint::from_arrays(42, &ε_x, &ε_f);
+        let checkpoint = TraceCheckpoint::from_arrays(42, &eps_x, &eps_f);
         let bytes = rkyv::to_bytes::<_, 256>(&checkpoint).unwrap();
 
         let archived = rkyv::check_archived_root::<TraceCheckpoint>(&bytes).unwrap();
         let restored: TraceCheckpoint = archived.deserialize(&mut rkyv::Infallible).unwrap();
 
-        let (ε_x_restored, ε_f_restored) = restored.to_arrays().unwrap();
+        let (eps_x_restored, eps_f_restored) = restored.to_arrays().unwrap();
 
         assert_eq!(restored.timestep, 42);
-        assert!(arrays_equal(&ε_x, &ε_x_restored, 1e-6));
-        assert!(arrays_equal(&ε_f, &ε_f_restored, 1e-6));
+        assert!(arrays_equal(&eps_x, &eps_x_restored, 1e-6));
+        assert!(arrays_equal(&eps_f, &eps_f_restored, 1e-6));
     }
 
     #[test]
@@ -696,16 +705,16 @@ mod tests {
     #[test]
     fn test_save_and_load_checkpoint() {
         let mut manager = CheckpointManager::new(10, 100);
-        let ε_x = Array2::zeros((5, 10));
-        let ε_f = Array2::ones((5, 10));
+        let eps_x = Array2::zeros((5, 10));
+        let eps_f = Array2::ones((5, 10));
 
-        manager.save_checkpoint(20, &ε_x, &ε_f).unwrap();
+        manager.save_checkpoint(20, &eps_x, &eps_f).unwrap();
         assert_eq!(manager.checkpoint_count(), 1);
 
         let (restored_x, restored_f) = manager.load_checkpoint(20).unwrap();
 
-        assert!(arrays_equal(&ε_x, &restored_x, 1e-6));
-        assert!(arrays_equal(&ε_f, &restored_f, 1e-6));
+        assert!(arrays_equal(&eps_x, &restored_x, 1e-6));
+        assert!(arrays_equal(&eps_f, &restored_f, 1e-6));
     }
 
     #[test]
@@ -718,12 +727,12 @@ mod tests {
     #[test]
     fn test_find_nearest_checkpoint() {
         let mut manager = CheckpointManager::new(10, 100);
-        let ε_x = Array2::zeros((5, 10));
-        let ε_f = Array2::ones((5, 10));
+        let eps_x = Array2::zeros((5, 10));
+        let eps_f = Array2::ones((5, 10));
 
-        manager.save_checkpoint(0, &ε_x, &ε_f).unwrap();
-        manager.save_checkpoint(10, &ε_x, &ε_f).unwrap();
-        manager.save_checkpoint(20, &ε_x, &ε_f).unwrap();
+        manager.save_checkpoint(0, &eps_x, &eps_f).unwrap();
+        manager.save_checkpoint(10, &eps_x, &eps_f).unwrap();
+        manager.save_checkpoint(20, &eps_x, &eps_f).unwrap();
 
         assert_eq!(manager.find_nearest_checkpoint(5), Some(0));
         assert_eq!(manager.find_nearest_checkpoint(10), Some(10));
@@ -734,13 +743,13 @@ mod tests {
     #[test]
     fn test_memory_usage() {
         let mut manager = CheckpointManager::new(10, 100);
-        let ε_x = Array2::zeros((100, 100));
-        let ε_f = Array2::ones((100, 100));
+        let eps_x = Array2::zeros((100, 100));
+        let eps_f = Array2::ones((100, 100));
 
         let initial_memory = manager.memory_usage();
         assert_eq!(initial_memory, 0);
 
-        manager.save_checkpoint(10, &ε_x, &ε_f).unwrap();
+        manager.save_checkpoint(10, &eps_x, &eps_f).unwrap();
         let final_memory = manager.memory_usage();
 
         // Expect ~80KB for two 100×100 float arrays (40KB each)
@@ -751,11 +760,11 @@ mod tests {
     #[test]
     fn test_clear_checkpoints() {
         let mut manager = CheckpointManager::new(10, 100);
-        let ε_x = Array2::zeros((5, 10));
-        let ε_f = Array2::ones((5, 10));
+        let eps_x = Array2::zeros((5, 10));
+        let eps_f = Array2::ones((5, 10));
 
-        manager.save_checkpoint(10, &ε_x, &ε_f).unwrap();
-        manager.save_checkpoint(20, &ε_x, &ε_f).unwrap();
+        manager.save_checkpoint(10, &eps_x, &eps_f).unwrap();
+        manager.save_checkpoint(20, &eps_x, &eps_f).unwrap();
         assert_eq!(manager.checkpoint_count(), 2);
 
         manager.clear();
@@ -770,9 +779,9 @@ mod tests {
         // Create 10 checkpoints with different values
         for i in 0..10 {
             let t = i * 10;
-            let ε_x = Array2::from_elem((5, 10), t as f32);
-            let ε_f = Array2::from_elem((5, 10), (t * 2) as f32);
-            manager.save_checkpoint(t, &ε_x, &ε_f).unwrap();
+            let eps_x = Array2::from_elem((5, 10), t as f32);
+            let eps_f = Array2::from_elem((5, 10), (t * 2) as f32);
+            manager.save_checkpoint(t, &eps_x, &eps_f).unwrap();
         }
 
         assert_eq!(manager.checkpoint_count(), 10);

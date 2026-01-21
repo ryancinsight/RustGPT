@@ -169,23 +169,23 @@ impl Layer for TitansMAC {
         let input_dim = input.ncols();
 
         // 1. Re-run forward pass to capture state
+        type MemoryTraceEntry = (
+            Array1<f32>,
+            Array1<f32>,
+            Array1<f32>,
+            f32,
+            f32,
+            f32,
+            MemoryWeights,
+            MemoryWeights,
+        );
         struct SegmentData {
             segment: Array2<f32>,
-            h_t: Array2<f32>,
             context: Array2<f32>,
             seg_out: Array2<f32>,
             memory_before: MemoryWeights,
             momentum_before: MemoryWeights,
-            memory_trace: Vec<(
-                Array1<f32>,
-                Array1<f32>,
-                Array1<f32>,
-                f32,
-                f32,
-                f32,
-                MemoryWeights,
-                MemoryWeights,
-            )>, // Trace for update loop
+            memory_trace: Vec<MemoryTraceEntry>, // Trace for update loop
         }
 
         let mut forward_data = Vec::new();
@@ -312,7 +312,6 @@ impl Layer for TitansMAC {
 
             forward_data.push(SegmentData {
                 segment,
-                h_t,
                 context,
                 seg_out,
                 memory_before,
@@ -345,12 +344,12 @@ impl Layer for TitansMAC {
             self.memory.val_dim,
         );
 
-        let mut d_M_next = MemoryWeights::zeros(
+        let mut d_m_next = MemoryWeights::zeros(
             self.memory.key_dim,
             self.memory.memory_hidden_dim,
             self.memory.val_dim,
         );
-        let mut d_S_next = MemoryWeights::zeros(
+        let mut d_s_next = MemoryWeights::zeros(
             self.memory.key_dim,
             self.memory.memory_hidden_dim,
             self.memory.val_dim,
@@ -375,23 +374,23 @@ impl Layer for TitansMAC {
                 let (k, v, u_in, alpha, eta, theta, m_prev, _s_curr) = &data.memory_trace[t];
                 // Note: m_prev is M_{t-1} relative to this step. s_curr is S_t.
 
-                // d_M_next is dL/dM_t
-                let d_M_curr = d_M_next.clone();
+                // d_m_next is dL/dM_t
+                let d_m_curr = d_m_next.clone();
 
                 // d_alpha
                 let mut val_alpha = 0.0;
-                val_alpha += (d_M_curr.w1.clone() * &m_prev.w1).sum();
-                val_alpha += (d_M_curr.b1.clone() * &m_prev.b1).sum();
-                val_alpha += (d_M_curr.w2.clone() * &m_prev.w2).sum();
-                val_alpha += (d_M_curr.b2.clone() * &m_prev.b2).sum();
+                val_alpha += (d_m_curr.w1.clone() * &m_prev.w1).sum();
+                val_alpha += (d_m_curr.b1.clone() * &m_prev.b1).sum();
+                val_alpha += (d_m_curr.w2.clone() * &m_prev.w2).sum();
+                val_alpha += (d_m_curr.b2.clone() * &m_prev.b2).sum();
                 let d_alpha = -val_alpha;
 
-                let mut d_St = d_M_curr.clone();
-                let mut scaled_s_next = d_S_next.clone();
+                let mut d_s_t = d_m_curr.clone();
+                let mut scaled_s_next = d_s_next.clone();
                 scaled_s_next.scale(*eta);
-                d_St.add(&scaled_s_next);
+                d_s_t.add(&scaled_s_next);
 
-                d_M_next.scale(1.0 - alpha); // Now d_M_next is dL/dM_{t-1} from update
+                d_m_next.scale(1.0 - alpha); // Now d_m_next is dL/dM_{t-1} from update
 
                 let mut d_uin = Array1::<f32>::zeros(u_in.len());
 
@@ -407,10 +406,10 @@ impl Layer for TitansMAC {
                     &data.memory_trace[t - 1].7
                 };
 
-                val_eta += (d_St.w1.clone() * &s_prev.w1).sum();
-                val_eta += (d_St.b1.clone() * &s_prev.b1).sum();
-                val_eta += (d_St.w2.clone() * &s_prev.w2).sum();
-                val_eta += (d_St.b2.clone() * &s_prev.b2).sum();
+                val_eta += (d_s_t.w1.clone() * &s_prev.w1).sum();
+                val_eta += (d_s_t.b1.clone() * &s_prev.b1).sum();
+                val_eta += (d_s_t.w2.clone() * &s_prev.w2).sum();
+                val_eta += (d_s_t.b2.clone() * &s_prev.b2).sum();
                 let d_eta = val_eta;
                 let d_z_eta = d_eta * eta * (1.0 - eta);
                 d_w_eta = d_w_eta + (u_in * d_z_eta);
@@ -436,20 +435,20 @@ impl Layer for TitansMAC {
                 let g_b1 = grad_z_k.clone();
 
                 let mut val_theta = 0.0;
-                val_theta += (d_St.w1.clone() * &g_w1).sum();
-                val_theta += (d_St.b1.clone() * &g_b1).sum();
-                val_theta += (d_St.w2.clone() * &g_w2).sum();
-                val_theta += (d_St.b2.clone() * &g_b2).sum();
+                val_theta += (d_s_t.w1.clone() * &g_w1).sum();
+                val_theta += (d_s_t.b1.clone() * &g_b1).sum();
+                val_theta += (d_s_t.w2.clone() * &g_w2).sum();
+                val_theta += (d_s_t.b2.clone() * &g_b2).sum();
                 let d_theta = -val_theta;
                 let d_z_theta = d_theta * theta * (1.0 - theta);
                 d_w_theta = d_w_theta + (u_in * d_z_theta);
                 d_uin = d_uin + (&self.memory.w_theta * d_z_theta);
 
                 // d_G_t
-                let u_w1 = d_St.w1.mapv(|x| -theta * x);
-                let u_b1 = d_St.b1.mapv(|x| -theta * x);
-                let u_w2 = d_St.w2.mapv(|x| -theta * x);
-                let u_b2 = d_St.b2.mapv(|x| -theta * x);
+                let u_w1 = d_s_t.w1.mapv(|x| -theta * x);
+                let u_b1 = d_s_t.b1.mapv(|x| -theta * x);
+                let u_w2 = d_s_t.w2.mapv(|x| -theta * x);
+                let u_b2 = d_s_t.b2.mapv(|x| -theta * x);
 
                 let sigma_prime = z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
                 let u_w2_t_delta = u_w2.t().dot(&delta);
@@ -480,7 +479,7 @@ impl Layer for TitansMAC {
                 d_uin = d_uin + self.memory.w_v.t().dot(&d_vt);
 
                 d_update_inputs.row_mut(t).assign(&d_uin);
-                d_S_next = d_St;
+                d_s_next = d_s_t;
             }
 
             // 2. Combine gradients for seg_out
@@ -553,25 +552,22 @@ impl Layer for TitansMAC {
                 let mut current_grad = input_grads.row_mut(global_t_start + t);
                 current_grad += &d_qin;
 
-                // Accumulate to d_M_next (which flows to M_start, i.e. M_{k-1})
-                d_M_next.w2 = d_M_next.w2
-                    + dy_t
-                        .clone()
-                        .insert_axis(Axis(1))
-                        .dot(&h_q.insert_axis(Axis(0)));
-                d_M_next.b2 = d_M_next.b2 + &dy_t;
-                d_M_next.w1 = d_M_next.w1
+                // Accumulate to d_m_next (which flows to M_start, i.e. M_{k-1})
+                d_m_next.w2 =
+                    d_m_next.w2 + dy_t.insert_axis(Axis(1)).dot(&h_q.insert_axis(Axis(0)));
+                d_m_next.b2.zip_mut_with(&dy_t, |a, &b| *a += b);
+                d_m_next.w1 = d_m_next.w1
                     + grad_z_q
                         .clone()
                         .insert_axis(Axis(1))
                         .dot(&q_t.clone().insert_axis(Axis(0)));
-                d_M_next.b1 = d_M_next.b1 + &grad_z_q;
+                d_m_next.b1 += &grad_z_q;
             }
 
             global_t_end = global_t_start;
         }
 
-        d_init_memory.add(&d_M_next);
+        d_init_memory.add(&d_m_next);
 
         // Collect all params
         // Core params first (from accum)
@@ -668,7 +664,7 @@ mod tests {
         let poly = PolyAttention::new(input_dim, num_heads, 1, 16, None);
         let memory = NeuralMemory::new(input_dim, input_dim, input_dim, memory_hidden_dim);
 
-        let mut mac = TitansMAC::new(poly, memory, persistent_len, segment_len);
+        let mac = TitansMAC::new(poly, memory, persistent_len, segment_len);
 
         let seq_len = 4;
         let input = Array2::<f32>::ones((seq_len, input_dim));

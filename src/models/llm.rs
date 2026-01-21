@@ -1532,6 +1532,78 @@ impl LLM {
         Ok(())
     }
 
+    #[instrument(skip(self, data))]
+    pub fn train_with_warmup_eprop(
+        &mut self,
+        data: Vec<&str>,
+        epochs: usize,
+        target_lr: f32,
+        batch_size: usize,
+        warmup_epochs: usize,
+    ) -> Result<()> {
+        self.set_trm_training_mode();
+
+        let tokenized_data = data
+            .par_iter()
+            .map(|input| self.tokenize(input))
+            .collect::<Vec<Vec<usize>>>();
+
+        for epoch in 0..epochs {
+            let t_epoch_start = std::time::Instant::now();
+            let mut total_loss = 0.0f32;
+            let mut total_base_loss = 0.0f32;
+            let mut total_grad_norm = 0.0f32;
+            let mut batch_count = 0usize;
+            let mut per_layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
+
+            let effective_lr = if epoch < warmup_epochs {
+                target_lr * ((epoch + 1) as f32 / warmup_epochs.max(1) as f32)
+            } else {
+                let t = (epoch - warmup_epochs) as f32;
+                let t_max = (epochs.saturating_sub(warmup_epochs)).max(1) as f32;
+                let lr_min = target_lr * 0.10;
+                let lr_max = target_lr;
+                lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
+            };
+
+            for batch in tokenized_data.chunks(batch_size.max(1)) {
+                let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
+                    self.train_batch_eprop_profiled(batch, effective_lr)?;
+                total_loss += batch_loss;
+                total_base_loss += batch_base_loss;
+                total_grad_norm += grad_norm;
+                batch_count += 1;
+                for (i, s) in layer_param_grad_norm_sq.into_iter().enumerate() {
+                    if i < per_layer_param_grad_norm_sq.len() {
+                        per_layer_param_grad_norm_sq[i] += s;
+                    }
+                }
+            }
+
+            let avg_loss = total_loss / (batch_count.max(1) as f32);
+            let avg_base_loss = total_base_loss / (batch_count.max(1) as f32);
+            let avg_grad_norm = total_grad_norm / (batch_count.max(1) as f32);
+            let per_layer_rms: Vec<f32> = per_layer_param_grad_norm_sq
+                .iter()
+                .map(|&s| (s / (batch_count.max(1) as f32)).sqrt())
+                .collect();
+
+            let epoch_ms = t_epoch_start.elapsed().as_millis();
+            info!(
+                epoch = epoch,
+                loss = avg_loss,
+                base_loss = avg_base_loss,
+                grad_norm = avg_grad_norm,
+                learning_rate = effective_lr,
+                per_layer_rms = ?per_layer_rms,
+                epoch_ms = epoch_ms,
+                "E-prop-style training epoch completed"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Train TRM layers using autoencoding (pretraining phase)
     /// During autoencoding, the model learns to reconstruct its input through recursive processing
     /// This is the first phase of TRM training before chat-tuning
@@ -2071,6 +2143,17 @@ impl LLM {
         for (acc, grad) in accumulator.iter_mut().zip(new_grads.into_iter()) {
             *acc += &grad;
         }
+    }
+
+    fn train_batch_eprop_profiled(
+        &mut self,
+        batch: &[Vec<usize>],
+        lr: f32,
+    ) -> Result<(f32, f32, f32, Vec<f32>)> {
+        let _ = (batch, lr);
+        Err(crate::errors::ModelError::Training {
+            message: "E-prop training is not wired into LLM layers. Initialize e-prop traces and add layer adapters before enabling --eprop.".to_string(),
+        })
     }
 
     /// Train on a single batch of sequences

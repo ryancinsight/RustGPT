@@ -121,12 +121,22 @@ impl SingleScaleTraces {
 
     fn update(&mut self, state: &NeuronState, input: &Array1<f32>) -> super::Result<()> {
         // Update presynaptic trace: ε^x_t = α·ε^x_{t-1} + x_t
-        self.eps_x = &self.eps_x * self.alpha + input;
+        for (dst, &x) in self.eps_x.iter_mut().zip(input.iter()) {
+            let prev = *dst;
+            *dst = prev * self.alpha + x;
+        }
 
         // Update postsynaptic trace: ε^f_t = α·(D_t ∘ ε^f_{t-1}) + (1-α)·D^f_t
-        let leak_diag = &state.voltage * self.alpha;
-        let sens_diag = &state.surrogate_deriv;
-        self.eps_f = &(&leak_diag * &self.eps_f) * self.alpha + &(sens_diag * (1.0 - self.alpha));
+        let one_minus_alpha = 1.0 - self.alpha;
+        for ((dst, &v), &psi) in self
+            .eps_f
+            .iter_mut()
+            .zip(state.voltage.iter())
+            .zip(state.surrogate_deriv.iter())
+        {
+            let prev = *dst;
+            *dst = self.alpha * (v * self.alpha * prev) + one_minus_alpha * psi;
+        }
 
         Ok(())
     }
@@ -309,7 +319,7 @@ impl TraceUpdater {
     /// # Arguments
     /// * `traces` - Current eligibility traces (will be modified)
     /// * `state` - Current neuron state
-    /// `input` - Current input vector x_t
+    /// * `input` - Current input vector x_t
     pub fn update(
         &self,
         traces: &mut EligibilityTraces,
@@ -355,7 +365,10 @@ impl TraceUpdater {
     /// This implements exponential smoothing of the input history,
     /// capturing temporal correlations in the input stream.
     fn update_presynaptic_trace(&self, traces: &mut EligibilityTraces, input: &Array1<f32>) {
-        traces.eps_x = &traces.eps_x * self.alpha + input;
+        for (dst, &x) in traces.eps_x.iter_mut().zip(input.iter()) {
+            let prev = *dst;
+            *dst = prev * self.alpha + x;
+        }
     }
 
     /// Update postsynaptic trace (neuron-side)
@@ -370,15 +383,17 @@ impl TraceUpdater {
         traces: &mut EligibilityTraces,
         state: &NeuronState,
     ) -> super::Result<()> {
-        // Diagonal leak factor: D_t = diag(α·v_{t-1})
-        let leak_diag = &state.voltage * self.neuron_config.alpha;
-
-        // Postsynaptic sensitivity: D^f_t = ψ_t (surrogate derivative)
-        let sens_diag = &state.surrogate_deriv;
-
-        // Combined update: ε^f_t = α·(D_t ∘ ε^f_{t-1}) + (1-α)·D^f_t
-        traces.eps_f =
-            &(&leak_diag * &traces.eps_f) * self.alpha + &(sens_diag * (1.0 - self.alpha));
+        let one_minus_alpha = 1.0 - self.alpha;
+        let leak_alpha = self.neuron_config.alpha;
+        for ((dst, &v), &psi) in traces
+            .eps_f
+            .iter_mut()
+            .zip(state.voltage.iter())
+            .zip(state.surrogate_deriv.iter())
+        {
+            let prev = *dst;
+            *dst = self.alpha * (v * leak_alpha * prev) + one_minus_alpha * psi;
+        }
 
         Ok(())
     }
@@ -394,15 +409,17 @@ impl TraceUpdater {
         state: &NeuronState,
     ) -> super::Result<()> {
         if let Some(ref mut eps_a) = traces.eps_a {
-            // Compute ψ_t·z̄_{t-1}
-            let psi_z = &state.surrogate_deriv * &state.filtered_spikes;
-
-            // Compute decay factor: (ρ - ψ_t·β)
-            let decay = Array1::from_elem(state.num_neurons(), self.neuron_config.rho)
-                - &(&state.surrogate_deriv * self.neuron_config.beta);
-
-            // Update: ε^a_t = ψ_t·z̄_{t-1} + (ρ - ψ_t·β)·ε^a_{t-1}
-            *eps_a = &(&decay * &*eps_a) + &psi_z;
+            let rho = self.neuron_config.rho;
+            let beta = self.neuron_config.beta;
+            for ((dst, &psi), &z_bar) in eps_a
+                .iter_mut()
+                .zip(state.surrogate_deriv.iter())
+                .zip(state.filtered_spikes.iter())
+            {
+                let prev = *dst;
+                let decay = rho - psi * beta;
+                *dst = decay * prev + psi * z_bar;
+            }
         } else {
             return Err(super::EPropError::InvalidDynamics(
                 "Adaptation trace requested but not initialized".to_string(),
@@ -445,12 +462,42 @@ impl TraceUpdater {
         Ok((modulated_eps_f, traces.eps_x.clone()))
     }
 
+    pub fn compute_gradient_factors_into<'a>(
+        &self,
+        modulated_eps_f_out: &mut Array1<f32>,
+        traces: &'a EligibilityTraces,
+        learning_signal: &Array1<f32>,
+    ) -> super::Result<&'a Array1<f32>> {
+        if learning_signal.len() != traces.eps_f.len() {
+            return Err(super::EPropError::TraceDimensionMismatch {
+                expected: traces.eps_f.len(),
+                actual: learning_signal.len(),
+            });
+        }
+        if modulated_eps_f_out.len() != traces.eps_f.len() {
+            return Err(super::EPropError::TraceDimensionMismatch {
+                expected: traces.eps_f.len(),
+                actual: modulated_eps_f_out.len(),
+            });
+        }
+
+        for ((dst, &ls), &ef) in modulated_eps_f_out
+            .iter_mut()
+            .zip(learning_signal.iter())
+            .zip(traces.eps_f.iter())
+        {
+            *dst = ls * ef;
+        }
+
+        Ok(&traces.eps_x)
+    }
+
     /// Compute trace magnitude (L2 norm)
     ///
     /// Useful for monitoring trace dynamics and detecting anomalies.
     pub fn trace_magnitude(traces: &EligibilityTraces) -> f32 {
-        let norm_x = traces.eps_x.mapv(|x| x * x).sum().sqrt();
-        let norm_f = traces.eps_f.mapv(|x| x * x).sum().sqrt();
+        let norm_x = traces.eps_x.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let norm_f = traces.eps_f.iter().map(|&x| x * x).sum::<f32>().sqrt();
         norm_x * norm_f // Approximate Frobenius norm of rank-one matrix
     }
 
@@ -470,7 +517,7 @@ impl TraceUpdater {
         // Normalize when exceeding 10× expected maximum to prevent explosion
         if magnitude > self.max_trace_magnitude && magnitude.is_finite() {
             // Normalize instead of simple decay: preserves direction, scales magnitude
-            let normalize_factor = self.max_trace_magnitude / magnitude;
+            let normalize_factor = (self.max_trace_magnitude / magnitude) * self.stability_decay;
             traces.eps_x *= normalize_factor;
             traces.eps_f *= normalize_factor;
 
@@ -481,8 +528,8 @@ impl TraceUpdater {
 
         // Component-wise normalization: Prevent individual trace explosion
         // Even if global magnitude is acceptable, individual components can diverge
-        let norm_x = traces.eps_x.mapv(|x| x * x).sum().sqrt();
-        let norm_f = traces.eps_f.mapv(|x| x * x).sum().sqrt();
+        let norm_x = traces.eps_x.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let norm_f = traces.eps_f.iter().map(|&x| x * x).sum::<f32>().sqrt();
 
         const MAX_COMPONENT_NORM: f32 = 15.0; // Per-component threshold
         if norm_x > MAX_COMPONENT_NORM {
@@ -502,7 +549,7 @@ impl TraceUpdater {
             .mapv_inplace(|x| x.clamp(-MAX_TRACE_VALUE, MAX_TRACE_VALUE));
 
         if let Some(ref mut eps_a) = traces.eps_a {
-            let norm_a = eps_a.mapv(|x| x * x).sum().sqrt();
+            let norm_a = eps_a.iter().map(|&x| x * x).sum::<f32>().sqrt();
             if norm_a > MAX_COMPONENT_NORM {
                 *eps_a *= MAX_COMPONENT_NORM / norm_a;
             }

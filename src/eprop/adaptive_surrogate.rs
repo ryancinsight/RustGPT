@@ -366,8 +366,9 @@ impl AdaptiveSurrogate {
         }
 
         // Evaluate all functions and select the best
+        let current_score = self.get_current_performance_score();
         let mut best_function = self.current_function;
-        let mut best_score = self.get_current_performance_score();
+        let mut best_score = current_score;
 
         for function in [
             SurrogateFunction::PiecewiseLinear,
@@ -386,7 +387,9 @@ impl AdaptiveSurrogate {
             }
         }
 
-        if best_function != self.current_function {
+        if best_function != self.current_function
+            && best_score > current_score + self.adaptation_rate
+        {
             self.current_function = best_function;
             self.adapt_function_parameters();
         }

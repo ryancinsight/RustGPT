@@ -167,27 +167,21 @@ impl NeuronDynamics {
         }
 
         // Update adaptive surrogate performance if enabled
-        if self.config.use_adaptive_surrogate {
-            if let Some(ref mut performance) = state.performance {
-                // Compute current loss contribution (approximated from learning signal)
-                let current_loss = if let Some(ref loss_grad) = loss_gradient {
-                    // Use magnitude of loss gradient as proxy for current loss
-                    loss_grad.mapv(|x| x * x).sum().sqrt()
-                } else {
-                    // Fallback: use spike activity as loss proxy
-                    state.spikes.mapv(|x| x * x).sum()
-                };
+        if self.config.use_adaptive_surrogate
+            && let Some(ref mut performance) = state.performance
+        {
+            let current_loss = if let Some(loss_grad) = loss_gradient {
+                loss_grad.mapv(|x| x * x).sum().sqrt()
+            } else {
+                state.spikes.mapv(|x| x * x).sum()
+            };
 
-                // Update performance with surrogate gradients and loss information
-                if let Some(ref loss_grad) = loss_gradient {
-                    let _ =
-                        performance.update_with_gradient(loss_grad, &surrogate_deriv, current_loss);
-                }
+            if let Some(loss_grad) = loss_gradient {
+                let _ = performance.update_with_gradient(loss_grad, &surrogate_deriv, current_loss);
+            }
 
-                // Check if adaptation should be triggered
-                if performance.should_adapt() {
-                    performance.adapt();
-                }
+            if performance.should_adapt() {
+                performance.adapt();
             }
         }
 
@@ -209,7 +203,7 @@ impl NeuronDynamics {
 
         if self.config.model == NeuronModel::ALIF {
             if let Some(ref adaptation) = state.adaptation {
-                threshold = threshold + &(adaptation * self.config.beta);
+                threshold += &(adaptation * self.config.beta);
             } else {
                 return Err(super::EPropError::InvalidDynamics(
                     "ALIF model requires adaptation state".to_string(),
@@ -241,7 +235,7 @@ impl NeuronDynamics {
             .ok_or(super::EPropError::InvalidDynamics(
                 "Adaptive surrogate performance tracking not initialized".to_string(),
             ))?;
-        let mut adaptive = perf.get_current_surrogate();
+        let adaptive = perf.get_current_surrogate();
 
         // Create activity statistics for adaptation
         let activity_stats = adaptive.create_activity_stats(voltage, threshold, &state.spikes);

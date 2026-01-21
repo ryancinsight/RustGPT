@@ -100,8 +100,8 @@ impl QuantizedEligibilityTraces {
     /// Dequantize an i8 value back to f32
     ///
     /// x = q * scale
-    fn dequantize_value(&self, q: i8) -> f32 {
-        q as f32 * self.scale
+    fn dequantize_value(scale: f32, q: i8) -> f32 {
+        q as f32 * scale
     }
 
     /// Update quantized traces from full-precision arrays
@@ -141,27 +141,30 @@ impl QuantizedEligibilityTraces {
         // Simple implementation that doesn't have borrowing conflicts
         // Update presynaptic traces
         if let Some(ref mut eps_x_fp) = self.eps_x_fp {
+            let scale = self.scale;
             let quantized_copy = self.eps_x_q.clone();
             for i in 0..quantized_copy.len() {
-                eps_x_fp[i] = quantized_copy[i] as f32 * self.scale;
+                eps_x_fp[i] = Self::dequantize_value(scale, quantized_copy[i]);
             }
         }
 
         // Update postsynaptic traces
         if let Some(ref mut eps_f_fp) = self.eps_f_fp {
+            let scale = self.scale;
             let quantized_copy = self.eps_f_q.clone();
             for i in 0..quantized_copy.len() {
-                eps_f_fp[i] = quantized_copy[i] as f32 * self.scale;
+                eps_f_fp[i] = Self::dequantize_value(scale, quantized_copy[i]);
             }
         }
 
         // Update adaptation traces if present
-        if let Some(ref mut eps_a_fp) = self.eps_a_fp {
-            if let Some(ref eps_a_q) = self.eps_a_q {
-                let quantized_copy = eps_a_q.clone();
-                for i in 0..quantized_copy.len() {
-                    eps_a_fp[i] = quantized_copy[i] as f32 * self.scale;
-                }
+        if let Some(ref mut eps_a_fp) = self.eps_a_fp
+            && let Some(ref eps_a_q) = self.eps_a_q
+        {
+            let scale = self.scale;
+            let quantized_copy = eps_a_q.clone();
+            for i in 0..quantized_copy.len() {
+                eps_a_fp[i] = Self::dequantize_value(scale, quantized_copy[i]);
             }
         }
     }
@@ -193,24 +196,21 @@ impl QuantizedEligibilityTraces {
         &mut self,
         alpha: f32,
         neuron_state: &super::neuron::NeuronState,
-        input: &Array1<f32>,
+        _input: &Array1<f32>,
     ) {
-        // Simple implementation that avoids borrowing conflicts
-        if let Some(ref adaptation) = neuron_state.adaptation {
-            if let Some(ref mut eps_a_q) = self.eps_a_q {
-                // Extract current values to avoid borrow conflicts
-                let mut new_values = Vec::with_capacity(eps_a_q.len());
+        if let Some(ref adaptation) = neuron_state.adaptation
+            && let Some(ref mut eps_a_q) = self.eps_a_q
+        {
+            let mut new_values = Vec::with_capacity(eps_a_q.len());
 
-                for i in 0..eps_a_q.len() {
-                    let current_fp = eps_a_q[i] as f32 * self.scale;
-                    let updated_fp = alpha * current_fp + adaptation[i];
-                    new_values.push((updated_fp / self.scale).round().clamp(-127.0, 127.0) as i8);
-                }
+            for i in 0..eps_a_q.len() {
+                let current_fp = Self::dequantize_value(self.scale, eps_a_q[i]);
+                let updated_fp = alpha * current_fp + adaptation[i];
+                new_values.push((updated_fp / self.scale).round().clamp(-127.0, 127.0) as i8);
+            }
 
-                // Update the quantized values
-                for (i, &new_val) in new_values.iter().enumerate() {
-                    eps_a_q[i] = new_val;
-                }
+            for (i, &new_val) in new_values.iter().enumerate() {
+                eps_a_q[i] = new_val;
             }
         }
     }
@@ -244,7 +244,7 @@ impl QuantizedEligibilityTraces {
         let full_precision_adaptation = self.eps_a_fp.as_ref().map_or(0, |v| v.len());
 
         // i8 for quantized, f32 for full precision
-        (quantized_size + quantized_adaptation) * 1
+        (quantized_size + quantized_adaptation)
             + (full_precision_size + full_precision_adaptation) * 4
     }
 
@@ -266,7 +266,6 @@ impl QuantizedEligibilityTraces {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eprop::{config::NeuronConfig, neuron::NeuronState};
 
     #[test]
     fn test_quantized_traces_creation() {
@@ -299,7 +298,7 @@ mod tests {
 
         for &val in &test_values {
             let quantized = traces.quantize_value(val);
-            let dequantized = traces.dequantize_value(quantized);
+            let dequantized = QuantizedEligibilityTraces::dequantize_value(traces.scale, quantized);
 
             // Should be close (within quantization error)
             assert!((val - dequantized).abs() < 0.1);

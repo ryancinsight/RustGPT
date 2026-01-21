@@ -440,13 +440,13 @@ impl EPropConfig {
             )));
         }
 
-        if let Some(clip) = self.grad_clip {
-            if clip <= 0.0 {
-                return Err(super::EPropError::InvalidConfig(format!(
-                    "grad_clip must be positive, got {}",
-                    clip
-                )));
-            }
+        if let Some(clip) = self.grad_clip
+            && clip <= 0.0
+        {
+            return Err(super::EPropError::InvalidConfig(format!(
+                "grad_clip must be positive, got {}",
+                clip
+            )));
         }
 
         if self.num_cycles == 0 {
@@ -567,7 +567,7 @@ impl EPropConfig {
 
         // Set optimal number of samples for sampled strategy
         if matches!(self.softmax_strategy, Some(SoftmaxStrategy::Sampled)) {
-            self.num_negative_samples = ((vocab_size as f32).sqrt() as usize).min(5_000).max(100);
+            self.num_negative_samples = ((vocab_size as f32).sqrt() as usize).clamp(100, 5_000);
         }
 
         self
@@ -685,21 +685,21 @@ mod tests {
     fn test_adaptive_alpha_short_sequence() {
         // Short sequence: α should be lower (faster adaptation)
         let alpha = EPropConfig::adaptive_alpha(30);
-        assert!(alpha >= 0.85 && alpha <= 0.90, "alpha={} for T=30", alpha);
+        assert!((0.85..=0.90).contains(&alpha), "alpha={} for T=30", alpha);
     }
 
     #[test]
     fn test_adaptive_alpha_medium_sequence() {
         // Medium sequence: balanced α
         let alpha = EPropConfig::adaptive_alpha(100);
-        assert!(alpha >= 0.90 && alpha <= 0.96, "alpha={} for T=100", alpha);
+        assert!((0.90..=0.96).contains(&alpha), "alpha={} for T=100", alpha);
     }
 
     #[test]
     fn test_adaptive_alpha_long_sequence() {
         // Long sequence: α should be higher (longer memory)
         let alpha = EPropConfig::adaptive_alpha(500);
-        assert!(alpha >= 0.95 && alpha <= 0.98, "alpha={} for T=500", alpha);
+        assert!((0.95..=0.98).contains(&alpha), "alpha={} for T=500", alpha);
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
         let config = EPropConfig::default();
         let interval = config.compute_checkpoint_interval(seq_len);
 
-        let num_checkpoints = (seq_len + interval - 1) / interval;
+        let num_checkpoints = seq_len.div_ceil(interval);
         let reduction_factor = seq_len / num_checkpoints;
 
         // For T=10,000: 100 checkpoints → 100× reduction

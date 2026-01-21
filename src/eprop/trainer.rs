@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Zip};
 
 use crate::{
     eprop::{
@@ -14,7 +14,7 @@ use crate::{
         config::{EPropConfig, NeuronModel},
         neuron::{NeuronDynamics, NeuronState},
         traces::{EligibilityTraces, TraceUpdater},
-        utils::{clip_gradient, outer_product},
+        utils::{fill_active_spike_indices, outer_product_into, sparse_matvec_add_into},
     },
     rng::get_rng,
 };
@@ -104,6 +104,17 @@ pub struct EPropTrainer {
     /// Eligibility traces
     traces: EligibilityTraces,
 
+    input_current_buf: Array1<f32>,
+    learning_signal_buf: Array1<f32>,
+    active_spike_indices: Vec<usize>,
+
+    modulated_eps_f_buf: Array1<f32>,
+    output_grad_buf: Array1<f32>,
+    output_buf: Array1<f32>,
+    grad_in_buf: Array2<f32>,
+    grad_rec_buf: Array2<f32>,
+    grad_out_buf: Array2<f32>,
+
     /// Training statistics
     stats: TrainingStats,
 }
@@ -175,17 +186,37 @@ impl EPropTrainer {
             None // Regression task (output_dim ≤ 2)
         };
 
+        let num_neurons = config.num_neurons;
+        let input_dim = config.input_dim;
+        let output_dim = config.output_dim;
+
+        let state = NeuronState::new(num_neurons, use_adaptation, &config.neuron_config);
+        let traces = EligibilityTraces::new(input_dim, num_neurons, use_adaptation);
+
         Ok(Self {
-            state: NeuronState::new(config.num_neurons, use_adaptation, &config.neuron_config),
-            traces: EligibilityTraces::new(config.input_dim, config.num_neurons, use_adaptation),
-            dynamics,
-            trace_updater,
             config,
             weights_rec,
             weights_in,
             weights_out,
             softmax,
-            stats: TrainingStats::default(),
+            dynamics,
+            trace_updater,
+            state,
+            traces,
+            input_current_buf: Array1::zeros(num_neurons),
+            learning_signal_buf: Array1::zeros(num_neurons),
+            active_spike_indices: Vec::with_capacity(num_neurons / 10),
+            modulated_eps_f_buf: Array1::zeros(num_neurons),
+            output_grad_buf: Array1::zeros(output_dim),
+            output_buf: Array1::zeros(output_dim),
+            grad_in_buf: Array2::zeros((num_neurons, input_dim)),
+            grad_rec_buf: Array2::zeros((num_neurons, num_neurons)),
+            grad_out_buf: Array2::zeros((output_dim, num_neurons)),
+            stats: TrainingStats {
+                grad_norms: Vec::with_capacity(100),
+                losses: Vec::with_capacity(100),
+                ..TrainingStats::default()
+            },
         })
     }
 
@@ -214,6 +245,15 @@ impl EPropTrainer {
         input: &Array1<f32>,
         loss_gradient: Option<&Array1<f32>>,
     ) -> Result<Array1<f32>> {
+        self.forward_step(input, loss_gradient)?;
+        Ok(self.state.spikes.clone())
+    }
+
+    fn forward_step(
+        &mut self,
+        input: &Array1<f32>,
+        loss_gradient: Option<&Array1<f32>>,
+    ) -> Result<()> {
         if input.len() != self.config.input_dim {
             return Err(EPropError::TraceDimensionMismatch {
                 expected: self.config.input_dim,
@@ -221,27 +261,40 @@ impl EPropTrainer {
             });
         }
 
-        // 1. Compute total input current: I_t = W_in @ x_t + W_rec @ z_{t-1}
-        let input_current = self.compute_input_current(input);
+        let profile = tracing::enabled!(tracing::Level::TRACE);
+        let t_total = profile.then(std::time::Instant::now);
 
-        // 2. Update neuron dynamics (LIF/ALIF) with optional gradient for adaptation
+        let t_ic = profile.then(std::time::Instant::now);
+        self.compute_input_current_inplace(input);
+        let ic_us = t_ic.map(|t| t.elapsed().as_micros());
+
+        let t_dyn = profile.then(std::time::Instant::now);
         self.dynamics
-            .update(&mut self.state, &input_current, loss_gradient)?;
+            .update(&mut self.state, &self.input_current_buf, loss_gradient)?;
+        let dyn_us = t_dyn.map(|t| t.elapsed().as_micros());
 
-        // 3. Check for adaptive trace truncation (2-3× speedup)
         self.maybe_truncate_traces();
 
-        // 4. Update eligibility traces (ES-D-RTRL)
+        let t_tr = profile.then(std::time::Instant::now);
         self.trace_updater
             .update(&mut self.traces, &self.state, input)?;
+        let tr_us = t_tr.map(|t| t.elapsed().as_micros());
 
-        // 5. Update position counter for window tracking
         self.traces.step();
 
-        // 6. Update statistics
         self.update_statistics();
 
-        Ok(self.state.spikes.clone())
+        if profile {
+            tracing::trace!(
+                ic_us = ic_us.unwrap_or(0),
+                dyn_us = dyn_us.unwrap_or(0),
+                traces_us = tr_us.unwrap_or(0),
+                total_us = t_total.map(|t| t.elapsed().as_micros()).unwrap_or(0),
+                "eprop_forward_step"
+            );
+        }
+
+        Ok(())
     }
 
     /// Compute total input current to neurons
@@ -251,39 +304,129 @@ impl EPropTrainer {
     /// - Sparse: O(k·D) where k = active spikes, speedup = 1/r
     ///
     /// Automatically switches based on spike sparsity threshold.
-    fn compute_input_current(&self, input: &Array1<f32>) -> Array1<f32> {
-        // Feedforward input: W_in @ x_t (always dense, x_t is full)
-        let feedforward = self.weights_in.dot(input);
-
-        // Recurrent input: W_rec @ z_{t-1}
-        let recurrent = if self.config.use_sparse_spikes && !self.state.spikes.is_empty() {
-            self.compute_recurrent_sparse(&self.state.spikes)
-        } else {
-            self.weights_rec.dot(&self.state.spikes)
-        };
-
-        feedforward + recurrent
+    fn compute_input_current_inplace(&mut self, input: &Array1<f32>) {
+        Self::dense_matvec_into(&mut self.input_current_buf, &self.weights_in, input);
+        self.add_recurrent_current_inplace();
     }
 
-    /// Compute sparse recurrent input when firing rate is low
-    ///
-    /// For firing rate r ≪ 1: reduces complexity from O(N²) to O(r·N²)
-    /// Auto-switches to dense computation if sparsity threshold not met.
-    fn compute_recurrent_sparse(&self, spikes: &Array1<f32>) -> Array1<f32> {
-        use crate::eprop::utils::{get_active_spike_indices, sparse_matvec};
-
-        // Find active (spiking) neurons
-        let active_indices = get_active_spike_indices(spikes, self.config.spike_sparsity_threshold);
-        let sparsity_ratio = active_indices.len() as f32 / spikes.len() as f32;
-
-        // Only use sparse if beneficial (r < 20%)
-        // For r > 0.2, overhead of sparse indexing outweighs benefits
-        if sparsity_ratio < 0.2 && !active_indices.is_empty() {
-            sparse_matvec(&self.weights_rec, spikes, &active_indices)
-        } else {
-            // Fall back to dense computation for high sparsity
-            self.weights_rec.dot(spikes)
+    fn add_recurrent_current_inplace(&mut self) {
+        if self.config.use_sparse_spikes {
+            fill_active_spike_indices(
+                &self.state.spikes,
+                self.config.spike_sparsity_threshold,
+                &mut self.active_spike_indices,
+            );
+            let sparsity_ratio =
+                self.active_spike_indices.len() as f32 / self.state.spikes.len().max(1) as f32;
+            if sparsity_ratio < 0.2 && !self.active_spike_indices.is_empty() {
+                sparse_matvec_add_into(
+                    &mut self.input_current_buf,
+                    &self.weights_rec,
+                    &self.state.spikes,
+                    &self.active_spike_indices,
+                );
+                return;
+            }
         }
+        Self::dense_matvec_add_into(
+            &mut self.input_current_buf,
+            &self.weights_rec,
+            &self.state.spikes,
+        );
+    }
+
+    fn dense_matvec_into(out: &mut Array1<f32>, weights: &Array2<f32>, x: &Array1<f32>) {
+        debug_assert_eq!(weights.ncols(), x.len(), "dense_matvec_into ncols mismatch");
+        debug_assert_eq!(
+            weights.nrows(),
+            out.len(),
+            "dense_matvec_into nrows mismatch"
+        );
+        for (dst, row) in out.iter_mut().zip(weights.outer_iter()) {
+            let mut acc = 0.0f32;
+            for (&w, &xi) in row.iter().zip(x.iter()) {
+                acc += w * xi;
+            }
+            *dst = acc;
+        }
+    }
+
+    fn dense_matvec_add_into(out: &mut Array1<f32>, weights: &Array2<f32>, x: &Array1<f32>) {
+        debug_assert_eq!(
+            weights.ncols(),
+            x.len(),
+            "dense_matvec_add_into ncols mismatch"
+        );
+        debug_assert_eq!(
+            weights.nrows(),
+            out.len(),
+            "dense_matvec_add_into nrows mismatch"
+        );
+        for (dst, row) in out.iter_mut().zip(weights.outer_iter()) {
+            let mut acc = 0.0f32;
+            for (&w, &xi) in row.iter().zip(x.iter()) {
+                acc += w * xi;
+            }
+            *dst += acc;
+        }
+    }
+
+    fn compute_learning_signal_into(
+        learning_signal_out: &mut Array1<f32>,
+        weights_out: &Array2<f32>,
+        output_grad: &Array1<f32>,
+    ) {
+        debug_assert_eq!(
+            output_grad.len(),
+            weights_out.nrows(),
+            "compute_learning_signal_into output_grad len mismatch"
+        );
+        debug_assert_eq!(
+            learning_signal_out.len(),
+            weights_out.ncols(),
+            "compute_learning_signal_into learning_signal len mismatch"
+        );
+
+        learning_signal_out.fill(0.0);
+        for (&g, row) in output_grad.iter().zip(weights_out.outer_iter()) {
+            if g == 0.0 {
+                continue;
+            }
+            for (dst, &w) in learning_signal_out.iter_mut().zip(row.iter()) {
+                *dst += w * g;
+            }
+        }
+    }
+
+    pub fn compute_output_into(&self, out: &mut Array1<f32>) -> Result<()> {
+        if out.len() != self.config.output_dim {
+            return Err(EPropError::TraceDimensionMismatch {
+                expected: self.config.output_dim,
+                actual: out.len(),
+            });
+        }
+        if self.weights_out.ncols() != self.state.spikes.len() {
+            return Err(EPropError::TraceDimensionMismatch {
+                expected: self.weights_out.ncols(),
+                actual: self.state.spikes.len(),
+            });
+        }
+        Self::dense_matvec_into(out, &self.weights_out, &self.state.spikes);
+        Ok(())
+    }
+
+    pub fn forward_cycles_into(
+        &mut self,
+        input: &Array1<f32>,
+        num_cycles: Option<usize>,
+        out: &mut Array1<f32>,
+    ) -> Result<()> {
+        let cycles = num_cycles.unwrap_or(self.config.num_cycles);
+        for _ in 0..cycles {
+            self.forward_step(input, None)?;
+        }
+        self.compute_output_into(out)?;
+        Ok(())
     }
 
     /// Apply adaptive trace window truncation
@@ -357,44 +500,40 @@ impl EPropTrainer {
 
         let eta = self.config.learning_rate;
 
-        // Compute gradient factors from traces
-        let (modulated_eps_f, eps_x) = self
-            .trace_updater
-            .compute_gradient_factors(&self.traces, learning_signal)?;
+        let profile = tracing::enabled!(tracing::Level::TRACE);
+        let t_total = profile.then(std::time::Instant::now);
 
-        // Rank-one gradient: ∇W_in = (L_t · ε^f_t) ⊗ ε^x_t
-        let grad_in = outer_product(&modulated_eps_f, &eps_x);
+        let t_factors = profile.then(std::time::Instant::now);
+        let eps_x = self.trace_updater.compute_gradient_factors_into(
+            &mut self.modulated_eps_f_buf,
+            &self.traces,
+            learning_signal,
+        )?;
+        let factors_us = t_factors.map(|t| t.elapsed().as_micros());
 
-        // Rank-one gradient for recurrent: ∇W_rec = (L_t · ε^f_t) ⊗ z_{t-1}
-        let grad_rec = outer_product(&modulated_eps_f, &self.state.filtered_spikes);
+        let t_outer = profile.then(std::time::Instant::now);
+        outer_product_into(&mut self.grad_in_buf, &self.modulated_eps_f_buf, eps_x);
+        outer_product_into(
+            &mut self.grad_rec_buf,
+            &self.modulated_eps_f_buf,
+            &self.state.filtered_spikes,
+        );
+        let outer_us = t_outer.map(|t| t.elapsed().as_micros());
 
         // Compute gradient norms and corresponding weight norms for trust-ratio LARS
-        let grad_in_norm_raw = grad_in.mapv(|x| x * x).sum().sqrt();
-        let grad_rec_norm_raw = grad_rec.mapv(|x| x * x).sum().sqrt();
-        let w_in_norm = self.weights_in.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        let w_rec_norm = self.weights_rec.iter().map(|&w| w * w).sum::<f32>().sqrt();
+        let (w_in_norm, grad_in_norm_raw) = Self::l2_norm_pair(&self.weights_in, &self.grad_in_buf);
+        let (w_rec_norm, grad_rec_norm_raw) =
+            Self::l2_norm_pair(&self.weights_rec, &self.grad_rec_buf);
 
         // Median of non-zero gradient norms (bidirectional balance target)
         const EPS: f32 = 1e-6;
-        let mut nonzero_norms = Vec::new();
-        if grad_in_norm_raw > EPS {
-            nonzero_norms.push(grad_in_norm_raw);
-        }
-        if grad_rec_norm_raw > EPS {
-            nonzero_norms.push(grad_rec_norm_raw);
-        }
-        let median_grad_norm = match nonzero_norms.len() {
-            0 => (grad_in_norm_raw + grad_rec_norm_raw) * 0.5,
-            1 => nonzero_norms[0],
-            _ => {
-                nonzero_norms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let mid = nonzero_norms.len() / 2;
-                if nonzero_norms.len() % 2 == 0 {
-                    (nonzero_norms[mid - 1] + nonzero_norms[mid]) * 0.5
-                } else {
-                    nonzero_norms[mid]
-                }
-            }
+        let a = (grad_in_norm_raw > EPS).then_some(grad_in_norm_raw);
+        let b = (grad_rec_norm_raw > EPS).then_some(grad_rec_norm_raw);
+        let median_grad_norm = match (a, b) {
+            (Some(x), Some(y)) => (x + y) * 0.5,
+            (Some(x), None) => x,
+            (None, Some(y)) => y,
+            (None, None) => (grad_in_norm_raw + grad_rec_norm_raw) * 0.5,
         };
 
         // Trust-ratio + bidirectional balance adaptive learning rates
@@ -403,19 +542,45 @@ impl EPropTrainer {
         let adaptive_lr_rec =
             Self::compute_adaptive_lr(eta, grad_rec_norm_raw, w_rec_norm, median_grad_norm);
 
-        // Gradient clipping (after LARS, before application)
-        let (grad_in, grad_rec) = if let Some(clip_val) = self.config.grad_clip {
-            (
-                clip_gradient(grad_in, clip_val),
-                clip_gradient(grad_rec, clip_val),
-            )
-        } else {
-            (grad_in, grad_rec)
-        };
+        let (lr_in_eff, lr_rec_eff, grad_in_norm, grad_rec_norm) =
+            if let Some(clip_val) = self.config.grad_clip {
+                let scale_in = if grad_in_norm_raw > clip_val && clip_val > 0.0 {
+                    clip_val / grad_in_norm_raw
+                } else {
+                    1.0
+                };
+                let scale_rec = if grad_rec_norm_raw > clip_val && clip_val > 0.0 {
+                    clip_val / grad_rec_norm_raw
+                } else {
+                    1.0
+                };
+                (
+                    adaptive_lr_in * scale_in,
+                    adaptive_lr_rec * scale_rec,
+                    grad_in_norm_raw * scale_in,
+                    grad_rec_norm_raw * scale_rec,
+                )
+            } else {
+                (
+                    adaptive_lr_in,
+                    adaptive_lr_rec,
+                    grad_in_norm_raw,
+                    grad_rec_norm_raw,
+                )
+            };
 
-        // Update weights with adaptive learning rates: W -= η_adaptive·∇W
-        self.weights_in = &self.weights_in - &(&grad_in * adaptive_lr_in);
-        self.weights_rec = &self.weights_rec - &(&grad_rec * adaptive_lr_rec);
+        let t_apply = profile.then(std::time::Instant::now);
+        Zip::from(&mut self.weights_in)
+            .and(self.grad_in_buf.view())
+            .for_each(|w, &g| {
+                *w -= lr_in_eff * g;
+            });
+        Zip::from(&mut self.weights_rec)
+            .and(self.grad_rec_buf.view())
+            .for_each(|w, &g| {
+                *w -= lr_rec_eff * g;
+            });
+        let apply_us = t_apply.map(|t| t.elapsed().as_micros());
 
         // Apply sparsity pruning (optional)
         if let Some(threshold) = self.config.sparsity_threshold {
@@ -423,8 +588,6 @@ impl EPropTrainer {
         }
 
         // Track gradient statistics (post-clipping norms)
-        let grad_in_norm = grad_in.mapv(|x| x * x).sum().sqrt();
-        let grad_rec_norm = grad_rec.mapv(|x| x * x).sum().sqrt();
         let total_grad_norm = (grad_in_norm * grad_in_norm + grad_rec_norm * grad_rec_norm).sqrt();
         self.stats.grad_norms.push(total_grad_norm);
         if self.stats.grad_norms.len() > 100 {
@@ -433,7 +596,32 @@ impl EPropTrainer {
 
         self.stats.num_updates += 1;
 
+        if profile {
+            tracing::trace!(
+                factors_us = factors_us.unwrap_or(0),
+                outer_us = outer_us.unwrap_or(0),
+                apply_us = apply_us.unwrap_or(0),
+                total_us = t_total.map(|t| t.elapsed().as_micros()).unwrap_or(0),
+                grad_in_norm = grad_in_norm_raw,
+                grad_rec_norm = grad_rec_norm_raw,
+                lr_in = lr_in_eff,
+                lr_rec = lr_rec_eff,
+                "eprop_apply_update"
+            );
+        }
+
         Ok(())
+    }
+
+    fn l2_norm_pair(a: &Array2<f32>, b: &Array2<f32>) -> (f32, f32) {
+        debug_assert_eq!(a.dim(), b.dim(), "l2_norm_pair shape mismatch");
+        let mut sum_a = 0.0f32;
+        let mut sum_b = 0.0f32;
+        for (&xa, &xb) in a.iter().zip(b.iter()) {
+            sum_a += xa * xa;
+            sum_b += xb * xb;
+        }
+        (sum_a.sqrt(), sum_b.sqrt())
     }
 
     /// Compute output layer prediction
@@ -476,7 +664,7 @@ impl EPropTrainer {
         let cycles = num_cycles.unwrap_or(self.config.num_cycles);
 
         for _ in 0..cycles {
-            self.forward(input)?;
+            self.forward_step(input, None)?;
         }
 
         Ok(self.compute_output())
@@ -499,35 +687,75 @@ impl EPropTrainer {
             ));
         }
 
-        // Forward pass with adaptive surrogate support
-        let output = self.forward_cycles(input, None)?;
-
-        // Compute loss (MSE)
-        let loss = (&output - target).mapv(|x| x * x).mean().unwrap_or(0.0);
-
-        // Compute learning signal: ∂E/∂output = 2(output - target)
-        let output_grad = (&output - target) * 2.0;
-
-        // Backpropagate to neurons: L_t = W_out^T @ ∂E/∂output
-        let learning_signal = self.weights_out.t().dot(&output_grad);
-
-        // Enhanced forward pass with gradient for adaptive surrogate adaptation
-        if self.config.neuron_config.use_adaptive_surrogate {
-            // Run forward with gradient to update adaptive surrogates
-            self.forward_with_gradient(input, Some(&learning_signal))?;
-        } else {
-            // Standard forward pass for static surrogates
-            self.forward(input)?;
+        let mut output = std::mem::take(&mut self.output_buf);
+        let fwd_res = self.forward_cycles_into(input, None, &mut output);
+        if let Err(e) = fwd_res {
+            self.output_buf = output;
+            return Err(e);
         }
 
-        // Apply e-prop update
-        self.apply_update(&learning_signal)?;
+        if target.len() != output.len() {
+            let expected = output.len();
+            self.output_buf = output;
+            return Err(EPropError::TraceDimensionMismatch {
+                expected,
+                actual: target.len(),
+            });
+        }
+
+        let mut loss_sum = 0.0f32;
+        for ((dst, &y), &t) in self
+            .output_grad_buf
+            .iter_mut()
+            .zip(output.iter())
+            .zip(target.iter())
+        {
+            let diff = y - t;
+            loss_sum += diff * diff;
+            *dst = 2.0 * diff;
+        }
+        let loss = loss_sum / (output.len().max(1) as f32);
+
+        let mut learning_signal = std::mem::take(&mut self.learning_signal_buf);
+        Self::compute_learning_signal_into(
+            &mut learning_signal,
+            &self.weights_out,
+            &self.output_grad_buf,
+        );
+
+        let forward_res = if self.config.neuron_config.use_adaptive_surrogate {
+            self.forward_step(input, Some(&learning_signal))
+        } else {
+            self.forward_step(input, None)
+        };
+        if let Err(e) = forward_res {
+            self.learning_signal_buf = learning_signal;
+            self.output_buf = output;
+            return Err(e);
+        }
+
+        let update_res = self.apply_update(&learning_signal);
+        self.learning_signal_buf = learning_signal;
+        self.output_buf = output;
+        update_res?;
 
         // Update output weights (standard gradient descent)
-        let grad_out = outer_product(&output_grad, &self.state.spikes);
-        self.weights_out = &self.weights_out - &(&grad_out * self.config.learning_rate);
+        outer_product_into(
+            &mut self.grad_out_buf,
+            &self.output_grad_buf,
+            &self.state.spikes,
+        );
+        let lr = self.config.learning_rate;
+        Zip::from(&mut self.weights_out)
+            .and(self.grad_out_buf.view())
+            .for_each(|w, &g| {
+                *w -= lr * g;
+            });
 
         self.stats.losses.push(loss);
+        if self.stats.losses.len() > 100 {
+            self.stats.losses.remove(0);
+        }
         Ok(loss)
     }
 
@@ -561,36 +789,60 @@ impl EPropTrainer {
             )));
         }
 
-        // Forward pass
-        let output_logits = self.forward_cycles(input, None)?;
+        let mut output = std::mem::take(&mut self.output_buf);
+        let fwd_res = self.forward_cycles_into(input, None, &mut output);
+        if let Err(e) = fwd_res {
+            self.output_buf = output;
+            return Err(e);
+        }
 
         // Compute loss and gradient using adaptive softmax
         // Borrowmut scope ends at end of this block
-        let (loss, output_grad) = {
+        let loss = {
             let softmax = self.softmax.as_mut().unwrap();
-            softmax.loss_and_gradient(&output_logits, target_class)
+            softmax.loss_and_gradient_into(&output, target_class, &mut self.output_grad_buf)
         };
 
-        // Backpropagate to neurons: L_t = W_out^T @ ∂E/∂logits
-        let learning_signal = self.weights_out.t().dot(&output_grad);
+        let mut learning_signal = std::mem::take(&mut self.learning_signal_buf);
+        Self::compute_learning_signal_into(
+            &mut learning_signal,
+            &self.weights_out,
+            &self.output_grad_buf,
+        );
 
-        // Enhanced forward pass with gradient for adaptive surrogate adaptation
-        if self.config.neuron_config.use_adaptive_surrogate {
-            // Run forward with gradient to update adaptive surrogates
-            self.forward_with_gradient(input, Some(&learning_signal))?;
+        let forward_res = if self.config.neuron_config.use_adaptive_surrogate {
+            self.forward_step(input, Some(&learning_signal))
         } else {
-            // Standard forward pass for static surrogates
-            self.forward(input)?;
+            self.forward_step(input, None)
+        };
+        if let Err(e) = forward_res {
+            self.learning_signal_buf = learning_signal;
+            self.output_buf = output;
+            return Err(e);
         }
 
-        // Apply e-prop update
-        self.apply_update(&learning_signal)?;
+        let update_res = self.apply_update(&learning_signal);
+        self.learning_signal_buf = learning_signal;
+        self.output_buf = output;
+        update_res?;
 
         // Update output weights (standard gradient descent)
-        let grad_out = outer_product(&output_grad, &self.state.spikes);
-        self.weights_out = &self.weights_out - &(&grad_out * self.config.learning_rate);
+        outer_product_into(
+            &mut self.grad_out_buf,
+            &self.output_grad_buf,
+            &self.state.spikes,
+        );
+        let lr = self.config.learning_rate;
+        Zip::from(&mut self.weights_out)
+            .and(self.grad_out_buf.view())
+            .for_each(|w, &g| {
+                *w -= lr * g;
+            });
 
         self.stats.losses.push(loss);
+        if self.stats.losses.len() > 100 {
+            self.stats.losses.remove(0);
+        }
         Ok(loss)
     }
 
@@ -784,7 +1036,7 @@ mod tests {
     #[test]
     fn test_export_import_weights() {
         let config = EPropConfig::minimal();
-        let mut trainer1 = EPropTrainer::new(config.clone()).unwrap();
+        let trainer1 = EPropTrainer::new(config.clone()).unwrap();
 
         // Export weights
         let weights = trainer1.export_weights();
@@ -896,7 +1148,7 @@ mod tests {
         // The sparse computation should be activated
         // (This is mainly a smoke test - real benchmarking would need timing)
         let current_firing_rate = trainer.stats.avg_firing_rate;
-        assert!(current_firing_rate >= 0.0 && current_firing_rate <= 1.0);
+        assert!((0.0..=1.0).contains(&current_firing_rate));
 
         // Test that the functionality works with sparse computation enabled
         let test_input = Array1::from_elem(64, 0.5);

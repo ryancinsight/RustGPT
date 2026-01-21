@@ -4,6 +4,7 @@ use crate::{
     layers::{
         diffusion::{DiffusionBlock, DiffusionBlockConfig, EDM_SIGMA_DATA_DEFAULT, NoiseSchedule},
         recurrence::LRM,
+        spiking::{AlifLayer, LifLayer},
         transformer::TransformerBlock,
     },
     model_config::{ArchitectureType, ModelConfig},
@@ -32,6 +33,17 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
     layers.push(LayerEnum::TokenEmbeddings(TokenEmbeddings::new(
         vocab.clone(),
     )));
+
+    if let Some(model) = config.spiking_neuron_model {
+        match model {
+            crate::eprop::NeuronModel::LIF => layers.push(LayerEnum::LifLayer(Box::new(
+                LifLayer::new(config.embedding_dim),
+            ))),
+            crate::eprop::NeuronModel::ALIF => layers.push(LayerEnum::AlifLayer(Box::new(
+                AlifLayer::new(config.embedding_dim),
+            ))),
+        }
+    }
 
     // Build architecture-specific layers
     match config.architecture {

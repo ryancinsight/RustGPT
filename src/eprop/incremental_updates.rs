@@ -133,6 +133,12 @@ impl IncrementalState {
     }
 }
 
+impl Default for IncrementalState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Result of incremental gradient computation
 #[derive(Debug, Clone)]
 pub struct IncrementalGradientResult {
@@ -171,15 +177,18 @@ impl IncrementalGradientUpdater {
     /// Returns whether incremental computation was beneficial
     pub fn compute_incremental_gradient(
         &mut self,
-        grad_in: &mut Array2<f32>,
-        grad_rec: &mut Array2<f32>,
-        current_voltage: &Array1<f32>,
-        current_spikes: &Array1<f32>,
-        current_filtered_spikes: &Array1<f32>,
-        current_eps_x: &Array1<f32>,
-        current_eps_f: &Array1<f32>,
-        learning_signal: &Array1<f32>,
+        inputs: IncrementalGradientInputs<'_>,
     ) -> IncrementalGradientResult {
+        let IncrementalGradientInputs {
+            grad_in,
+            grad_rec,
+            current_voltage,
+            current_spikes,
+            current_filtered_spikes,
+            current_eps_x,
+            current_eps_f,
+            learning_signal,
+        } = inputs;
         assert_eq!(
             learning_signal.len(),
             current_eps_f.len(),
@@ -283,16 +292,16 @@ impl IncrementalGradientUpdater {
             !input_changed && !state_changed && estimated_speedup >= self.min_speedup_threshold;
 
         if should_use_incremental {
-            self.apply_delta_update_inplace(
+            self.apply_delta_update_inplace(DeltaUpdateInputs {
                 grad_in,
                 grad_rec,
-                current_eps_x,
-                current_filtered_spikes,
-                &cached_modulated_eps_f,
-                &delta_modulated_eps_f,
-                &delta_eps_x,
-                &delta_filtered_spikes,
-            );
+                eps_x: current_eps_x,
+                filtered_spikes: current_filtered_spikes,
+                cached_modulated_eps_f: &cached_modulated_eps_f,
+                delta_modulated_eps_f: &delta_modulated_eps_f,
+                delta_eps_x: &delta_eps_x,
+                delta_filtered_spikes: &delta_filtered_spikes,
+            });
 
             self.state.update_cache(
                 current_voltage,
@@ -350,17 +359,18 @@ impl IncrementalGradientUpdater {
         }
     }
 
-    fn apply_delta_update_inplace(
-        &self,
-        grad_in: &mut Array2<f32>,
-        grad_rec: &mut Array2<f32>,
-        eps_x: &Array1<f32>,
-        filtered_spikes: &Array1<f32>,
-        cached_modulated_eps_f: &Array1<f32>,
-        delta_modulated_eps_f: &Array1<f32>,
-        delta_eps_x: &Array1<f32>,
-        delta_filtered_spikes: &Array1<f32>,
-    ) {
+    fn apply_delta_update_inplace(&self, inputs: DeltaUpdateInputs<'_>) {
+        let DeltaUpdateInputs {
+            grad_in,
+            grad_rec,
+            eps_x,
+            filtered_spikes,
+            cached_modulated_eps_f,
+            delta_modulated_eps_f,
+            delta_eps_x,
+            delta_filtered_spikes,
+        } = inputs;
+
         let num_neurons = cached_modulated_eps_f.len();
         let input_dim = eps_x.len();
 
@@ -439,6 +449,28 @@ impl IncrementalGradientUpdater {
     }
 }
 
+pub struct IncrementalGradientInputs<'a> {
+    pub grad_in: &'a mut Array2<f32>,
+    pub grad_rec: &'a mut Array2<f32>,
+    pub current_voltage: &'a Array1<f32>,
+    pub current_spikes: &'a Array1<f32>,
+    pub current_filtered_spikes: &'a Array1<f32>,
+    pub current_eps_x: &'a Array1<f32>,
+    pub current_eps_f: &'a Array1<f32>,
+    pub learning_signal: &'a Array1<f32>,
+}
+
+struct DeltaUpdateInputs<'a> {
+    grad_in: &'a mut Array2<f32>,
+    grad_rec: &'a mut Array2<f32>,
+    eps_x: &'a Array1<f32>,
+    filtered_spikes: &'a Array1<f32>,
+    cached_modulated_eps_f: &'a Array1<f32>,
+    delta_modulated_eps_f: &'a Array1<f32>,
+    delta_eps_x: &'a Array1<f32>,
+    delta_filtered_spikes: &'a Array1<f32>,
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::Array1;
@@ -506,16 +538,16 @@ mod tests {
         let eps_f = Array1::from_vec(vec![0.8, 0.9, 1.0]);
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
 
-        let result = updater.compute_incremental_gradient(
-            &mut grad_in,
-            &mut grad_rec,
-            &voltage,
-            &spikes,
-            &filtered,
-            &eps_x,
-            &eps_f,
-            &learning,
-        );
+        let result = updater.compute_incremental_gradient(IncrementalGradientInputs {
+            grad_in: &mut grad_in,
+            grad_rec: &mut grad_rec,
+            current_voltage: &voltage,
+            current_spikes: &spikes,
+            current_filtered_spikes: &filtered,
+            current_eps_x: &eps_x,
+            current_eps_f: &eps_f,
+            learning_signal: &learning,
+        });
 
         // First call should use full computation (no cache)
         assert!(!result.used_incremental);
@@ -535,16 +567,16 @@ mod tests {
             }
         }
 
-        let result2 = updater.compute_incremental_gradient(
-            &mut grad_in,
-            &mut grad_rec,
-            &voltage,
-            &spikes,
-            &filtered,
-            &eps_x,
-            &eps_f,
-            &learning,
-        );
+        let result2 = updater.compute_incremental_gradient(IncrementalGradientInputs {
+            grad_in: &mut grad_in,
+            grad_rec: &mut grad_rec,
+            current_voltage: &voltage,
+            current_spikes: &spikes,
+            current_filtered_spikes: &filtered,
+            current_eps_x: &eps_x,
+            current_eps_f: &eps_f,
+            learning_signal: &learning,
+        });
         assert!(result2.used_incremental);
     }
 
@@ -561,16 +593,16 @@ mod tests {
         let eps_f = Array1::from_vec(vec![0.8, 0.9, 1.0]);
         let learning = Array1::from_vec(vec![0.2, 0.3, 0.4]);
 
-        let result = updater.compute_incremental_gradient(
-            &mut grad_in,
-            &mut grad_rec,
-            &voltage,
-            &spikes,
-            &filtered,
-            &eps_x,
-            &eps_f,
-            &learning,
-        );
+        let result = updater.compute_incremental_gradient(IncrementalGradientInputs {
+            grad_in: &mut grad_in,
+            grad_rec: &mut grad_rec,
+            current_voltage: &voltage,
+            current_spikes: &spikes,
+            current_filtered_spikes: &filtered,
+            current_eps_x: &eps_x,
+            current_eps_f: &eps_f,
+            learning_signal: &learning,
+        });
 
         // Should never use incremental when disabled
         assert!(!result.used_incremental);
