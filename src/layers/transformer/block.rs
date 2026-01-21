@@ -11,13 +11,15 @@ use crate::{
     adam::Adam,
     attention::poly_attention::PolyAttention,
     errors::Result,
-    layers::components::{
-        adaptive_residuals::AdaptiveResiduals,
-        common::{
-            CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
-            TitanMemoryWorkspace, apply_adaptive_gradients,
+    layers::{
+        components::{
+            adaptive_residuals::AdaptiveResiduals,
+            common::{
+                CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
+                TitanMemoryWorkspace, apply_adaptive_gradients,
+            },
         },
-        eprop_adaptor::{EPropAdaptor, EPropAdaptorConfig},
+        transformer::components::eprop_adaptor::{EPropAdaptor, EPropAdaptorConfig},
     },
     mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
     model_config::{ModelConfig, TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy},
@@ -144,6 +146,9 @@ impl<'de> Deserialize<'de> for TransformerBlock {
 
                 #[serde(default = "default_similarity_context_strength")]
                 similarity_context_strength: Array2<f32>,
+
+                #[serde(default)]
+                eprop_adaptor: Option<EPropAdaptor>,
             },
         }
 
@@ -154,6 +159,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             feedforward,
             config,
             similarity_context_strength_raw,
+            eprop_adaptor,
         ) = match TransformerBlockSerdeCompat::deserialize(deserializer)? {
             TransformerBlockSerdeCompat::V1 {
                 pre_attention_norm,
@@ -169,6 +175,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward,
                 config,
                 similarity_context_strength,
+                None,
             ),
             TransformerBlockSerdeCompat::V2 {
                 pre_attention_norm,
@@ -177,6 +184,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward,
                 config,
                 similarity_context_strength,
+                eprop_adaptor,
             } => (
                 pre_attention_norm,
                 *temporal_mixing,
@@ -184,13 +192,14 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward,
                 config,
                 similarity_context_strength,
+                eprop_adaptor,
             ),
         };
 
         let embed_dim = config.embed_dim;
 
         // Ensure strength is always a 1×1 scalar.
-        let scalar = similarity_context_strength_raw
+        let scalar: f32 = similarity_context_strength_raw
             .get((0, 0))
             .copied()
             .unwrap_or(0.0);
@@ -218,6 +227,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             } else {
                 None
             },
+            eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
         })
     }
@@ -231,6 +241,7 @@ struct ParamPartitions {
     pre_attn_norm: usize,
     similarity_context_strength: usize,
     adaptive_residuals: usize,
+    eprop_adaptor: usize,
 }
 
 /// Configuration for a transformer block
@@ -369,6 +380,12 @@ impl TransformerBlock {
         let similarity_context_strength = Array2::zeros((1, 1));
         let opt_similarity_context_strength = Adam::new((1, 1));
 
+        let eprop_adaptor = if let Some(ref conf) = config.eprop_adaptor {
+            Some(EPropAdaptor::new(conf.clone()))
+        } else {
+            None
+        };
+
         Self {
             pre_attention_norm: layers.pre_attention_norm,
             temporal_mixing: layers.temporal_mixing,
@@ -389,11 +406,7 @@ impl TransformerBlock {
             } else {
                 None
             },
-            eprop_adaptor: if let Some(ref conf) = config.eprop_adaptor {
-                Some(EPropAdaptor::new(conf.clone()))
-            } else {
-                None
-            },
+            eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
@@ -549,7 +562,19 @@ impl TransformerBlock {
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true, // Enable by default
             titan_memory: config.titan_memory.clone(),
-            eprop_adaptor: None, // Default to disabled for now
+            eprop_adaptor: if config.eprop_enabled {
+                Some(EPropAdaptorConfig {
+                    dim: config.embedding_dim,
+                    neuron_config: config
+                        .eprop_neuron_config
+                        .clone()
+                        .unwrap_or_else(crate::eprop::config::NeuronConfig::lif),
+                    adaptation_rate: 0.01,
+                    use_multi_scale: true,
+                })
+            } else {
+                None
+            },
         };
 
         Self::new(block_config)
@@ -612,6 +637,7 @@ impl ParamPartitions {
             + self.pre_attn_norm
             + self.similarity_context_strength
             + self.adaptive_residuals
+            + self.eprop_adaptor
     }
 }
 
@@ -873,9 +899,17 @@ impl Layer for TransformerBlock {
 
             // Compute gradients through the transformer block layers
 
+            // Handle E-Prop backward first (since it's the last operation in forward)
+            let (grads_at_ffn_sum, eprop_param_grads) = if let Some(ref adaptor) = self.eprop_adaptor {
+                 let (d_adaptor_input, p_grads) = adaptor.compute_gradients(output_grads);
+                 (output_grads + &d_adaptor_input, p_grads)
+            } else {
+                 (output_grads.clone(), Vec::new())
+            };
+
             // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out
-            let ffn_grads = output_grads;
-            let residual1_grads = output_grads;
+            let ffn_grads = &grads_at_ffn_sum;
+            let residual1_grads = &grads_at_ffn_sum;
 
             // Get feedforward gradients
             let (ffn_input_grad, ffn_param_grads) = match &self.feedforward {
@@ -982,6 +1016,7 @@ impl Layer for TransformerBlock {
                 pre_attn_norm: pre_attn_param_grads.len(),
                 similarity_context_strength: 1,
                 adaptive_residuals: adaptive_grad_count,
+                eprop_adaptor: eprop_param_grads.len(),
             };
             // Release read lock before acquiring write lock
             drop(guard);
@@ -997,6 +1032,7 @@ impl Layer for TransformerBlock {
             all_param_grads.extend(pre_attn_param_grads);
             all_param_grads.push(similarity_strength_grad);
             all_param_grads.extend(adaptive_param_grads);
+            all_param_grads.extend(eprop_param_grads);
 
             (final_input_grads, all_param_grads)
         } else {
@@ -1160,6 +1196,17 @@ impl Layer for TransformerBlock {
             }
         }
 
+        // Apply eprop gradients
+        let eprop_range = next_range(partitions.eprop_adaptor);
+        let eprop_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[eprop_range.clone()].to_vec();
+        if !eprop_grads.is_empty() && self.eprop_adaptor.is_some() {
+            let owned_grads: Vec<Array2<f32>> =
+                eprop_grads.iter().map(|c| c.as_ref().clone()).collect();
+            if let Some(ref mut adaptor) = self.eprop_adaptor {
+                adaptor.apply_gradients(&owned_grads, lr)?;
+            }
+        }
+
         if let Ok(mut guard) = self.param_partitions.write() {
             *guard = None;
         }
@@ -1209,6 +1256,7 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
 
         let block = TransformerBlock::new(config);
@@ -1250,6 +1298,7 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
 
         let mut block = TransformerBlock::new(config);
@@ -1287,6 +1336,7 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1320,6 +1370,7 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1356,6 +1407,7 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1399,6 +1451,7 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
 
         let mut block = TransformerBlock::new(config);
@@ -1872,5 +1925,70 @@ mod tests {
         );
 
         println!("✅ Stability tests passed: Adaptive residuals handle edge cases robustly!");
+    }
+
+    #[test]
+    fn test_transformer_block_with_eprop() {
+        use crate::layers::transformer::components::eprop_adaptor::EPropAdaptorConfig;
+
+        let embed_dim = 32;
+        let seq_len = 5;
+        let config = TransformerBlockConfig {
+            embed_dim,
+            hidden_dim: 64,
+            num_heads: 4,
+            poly_degree: 3,
+            max_pos: 31,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            temporal_mixing: TemporalMixingType::Attention,
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
+            use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: Some(EPropAdaptorConfig {
+                dim: embed_dim,
+                ..Default::default()
+            }),
+        };
+
+        let mut block = TransformerBlock::new(config);
+        
+        // Check initial adaptation weights are 1.0 (via adaptor access if possible, or infer from behavior)
+        // Since we can't easily access internal state without making fields public, we'll rely on functional tests.
+
+        // Forward with non-zero input to ensure traces are active
+        let input = Array2::<f32>::from_elem((seq_len, embed_dim), 0.5);
+        let out = block.forward(&input);
+        assert_eq!(out.shape(), input.shape());
+        
+        // Backward
+        let grads = Array2::<f32>::ones((seq_len, embed_dim));
+        let (in_grad, param_grads) = block.compute_gradients(&input, &grads);
+        
+        assert_eq!(in_grad.shape(), input.shape());
+        assert!(!param_grads.is_empty());
+        
+        // Verify we have gradients for the adaptor
+        // The last gradient should be for the eprop adaptor if it's appended last, or we check if any gradient corresponds to it.
+        // E-Prop adaptor returns a Vec<Array2> but flattened into the block's param_grads list.
+        // We just check that *some* gradients are non-zero.
+        let has_nonzero_grads = param_grads.iter().any(|g| g.iter().any(|&x| x.abs() > 1e-6));
+        assert!(has_nonzero_grads, "Should have non-zero gradients with active input");
+
+        // Apply gradients
+        block.apply_gradients(&param_grads, 1e-1).unwrap();
+        
+        // Run forward again - output should be different due to updated weights
+        let out_new = block.forward(&input);
+        
+        // Check difference
+        let diff = (&out_new - &out).mapv(|x| x.abs()).sum();
+        assert!(diff > 1e-6, "Output should change after applying gradients (diff: {})", diff);
     }
 }

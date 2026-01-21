@@ -88,6 +88,12 @@ pub struct NeuronConfig {
     pub monitor_surrogate_performance: bool,
 }
 
+impl NeuronConfig {
+    pub fn is_alif(&self) -> bool {
+        self.model == NeuronModel::ALIF
+    }
+}
+
 impl Default for NeuronConfig {
     fn default() -> Self {
         Self {

@@ -113,6 +113,19 @@ impl HRM {
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true,
             titan_memory: config.titan_memory.clone(),
+            eprop_adaptor: if config.eprop_enabled {
+                Some(crate::layers::transformer::components::eprop_adaptor::EPropAdaptorConfig {
+                    dim: config.embedding_dim,
+                    neuron_config: config
+                        .eprop_neuron_config
+                        .clone()
+                        .unwrap_or_else(crate::eprop::config::NeuronConfig::lif),
+                    adaptation_rate: 0.01,
+                    use_multi_scale: true,
+                })
+            } else {
+                None
+            },
         };
 
         // Top block might have larger effective window or different capacity
@@ -477,6 +490,7 @@ mod tests {
             entropy_ema_alpha: 0.1,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let top_cfg = bottom_cfg.clone();
 
@@ -516,6 +530,7 @@ mod tests {
             entropy_ema_alpha: 0.1,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let top_cfg = bottom_cfg.clone();
 

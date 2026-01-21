@@ -28,6 +28,7 @@ fn main() {
         entropy_ema_alpha: 0.2,
         use_advanced_adaptive_residuals: true,
         titan_memory: llm::model_config::TitanMemoryConfig::default(),
+        eprop_adaptor: None,
     };
     let mut tblock = TransformerBlock::new(tcfg.clone());
 

@@ -28,6 +28,16 @@ pub enum ModelError {
 
     #[error("Gradient computation error: {message}")]
     GradientError { message: String },
+
+    #[error("Shape mismatch: expected {expected:?}, actual {actual:?}. {message}")]
+    ShapeMismatch {
+        expected: Vec<usize>,
+        actual: Vec<usize>,
+        message: String,
+    },
+
+    #[error("Generic error: {0}")]
+    Generic(String),
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;

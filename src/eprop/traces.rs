@@ -159,7 +159,7 @@ impl SingleScaleTraces {
 /// Optional features:
 /// - Windowed traces for adaptive truncation (2-3× speedup)
 /// - Gradient variance tracking for window adaptation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EligibilityTraces {
     /// Presynaptic trace ε^x_t: smoothed input history
     /// Shape: (input_dim,)

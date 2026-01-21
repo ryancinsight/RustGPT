@@ -370,3 +370,12 @@ impl From<SpikingNeuronCli> for crate::eprop::NeuronModel {
         }
     }
 }
+
+impl From<SpikingNeuronCli> for crate::eprop::config::NeuronConfig {
+    fn from(value: SpikingNeuronCli) -> Self {
+        match value {
+            SpikingNeuronCli::Lif => crate::eprop::config::NeuronConfig::lif(),
+            SpikingNeuronCli::Alif => crate::eprop::config::NeuronConfig::alif(),
+        }
+    }
+}

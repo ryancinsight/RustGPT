@@ -118,6 +118,7 @@ impl Default for LRMConfig {
                 entropy_ema_alpha: 0.2,
                 use_advanced_adaptive_residuals: true,
                 titan_memory: crate::model_config::TitanMemoryConfig::default(),
+                eprop_adaptor: None,
             }),
             embed_dim: 64,
             num_recursions: 1,
@@ -426,6 +427,7 @@ impl LRM {
                 entropy_ema_alpha: config.entropy_ema_alpha,
                 use_advanced_adaptive_residuals: true,
                 titan_memory: config.titan_memory.clone(),
+                eprop_adaptor: None,
             })
         };
 
