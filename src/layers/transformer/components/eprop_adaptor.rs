@@ -6,7 +6,7 @@
 //! It maintains neuron state and eligibility traces, processing inputs sequentially
 //! to update internal dynamics and generate adaptation signals.
 
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::eprop::{
@@ -63,6 +63,10 @@ pub struct EPropAdaptor {
     
     /// Learned adaptation weights (simple diagonal scaling for now)
     adaptation_weights: Array1<f32>,
+
+    /// Cached traces for gradient computation
+    #[serde(skip)]
+    cached_traces: Option<Array2<f32>>,
 }
 
 impl EPropAdaptor {
@@ -82,13 +86,6 @@ impl EPropAdaptor {
         
         if config.use_multi_scale {
              // Initialize multi-scale traces if enabled
-             // Note: EligibilityTraces::new doesn't init multi-scale by default
-             // We need to manually set it or use a method if available.
-             // Looking at traces.rs, there isn't a direct method to enable it after creation 
-             // except via direct field access if pub, but let's check `traces.rs` again.
-             // It has `pub multi_scale_traces: Option<MultiScaleTraces>`.
-             // And `MultiScaleTraces::new`.
-             
              traces.multi_scale_traces = Some(crate::eprop::traces::MultiScaleTraces::new(
                  config.dim, 
                  config.dim, 
@@ -104,6 +101,7 @@ impl EPropAdaptor {
             traces,
             dynamics: Some(dynamics),
             adaptation_weights: Array1::ones(config.dim), // Initialize to identity scaling
+            cached_traces: None,
         }
     }
 
@@ -113,7 +111,7 @@ impl EPropAdaptor {
     /// * `input` - Input sequence of shape (seq_len, dim)
     ///
     /// # Returns
-    /// Adaptation signal of shape (seq_len, dim)
+    /// Process a sequence of inputs and return the adaptation signal
     pub fn forward(&mut self, input: &Array2<f32>) -> crate::errors::Result<Array2<f32>> {
         let (seq_len, dim) = input.dim();
         
@@ -125,7 +123,37 @@ impl EPropAdaptor {
             });
         }
 
+        // Initialize state if needed (e.g. after deserialization)
+        if self.dynamics.is_none() {
+            self.dynamics = Some(NeuronDynamics::new(self.config.neuron_config.clone()));
+        }
+        
+        if self.neuron_state.voltage.len() != self.config.dim {
+            self.neuron_state = NeuronState::new(
+                self.config.dim,
+                self.config.neuron_config.is_alif(),
+                &self.config.neuron_config,
+            );
+            
+            self.traces = EligibilityTraces::new(
+                self.config.dim,
+                self.config.dim,
+                self.config.neuron_config.is_alif(),
+            );
+            
+            if self.config.use_multi_scale {
+                 self.traces.multi_scale_traces = Some(crate::eprop::traces::MultiScaleTraces::new(
+                     self.config.dim, 
+                     self.config.dim, 
+                     [0.8, 0.95, 0.99]
+                 ));
+            }
+        }
+
         let mut output = Array2::zeros((seq_len, dim));
+        // Allocate cache for traces
+        let mut trace_cache = Array2::zeros((seq_len, dim));
+        
         let dynamics = self.dynamics.as_ref().unwrap();
 
         // Process sequence step-by-step
@@ -141,45 +169,82 @@ impl EPropAdaptor {
             if let Some(multi_scale) = &mut self.traces.multi_scale_traces {
                 multi_scale.update_all_scales(&self.neuron_state, &input_t)
                     .map_err(|e| crate::errors::ModelError::Generic(e.to_string()))?;
-            } else {
-                // Update standard traces if multi-scale is not used (fallback)
-                // However, EligibilityTraces doesn't have a direct `update` method for single scale exposed easily 
-                // without internal logic duplication or if it's not public.
-                // Looking at `traces.rs`, `SingleScaleTraces` has `update`.
-                // `EligibilityTraces` has `eps_x` and `eps_f` but no top-level update method shown in the snippet?
-                // Wait, I missed checking if `EligibilityTraces` has an `update` method.
-                // Let's assume for now we primarily use multi-scale or I'll implement a simple update here.
-                
-                // For now, let's assume we rely on multi-scale or simple accumulation.
-                // I'll stick to using the `multi_scale_traces` as the primary mechanism for this adaptor.
             }
             
             // 3. Compute adaptation signal
-            // We use the traces to modulate the input.
-            // For example, we can use the postsynaptic trace `eps_f` as a sensitivity gating.
-            // Or use the `eps_x` as a memory trace.
-            
             let adaptation_signal = if let Some(multi_scale) = &self.traces.multi_scale_traces {
-                let (eps_x, eps_f) = multi_scale.compute_weighted_traces();
-                // Combine traces: element-wise product or sum?
-                // Let's use eps_f (sensitivity) to scale the weights
-                // signal = eps_f * adaptation_weights
+                let (_eps_x, eps_f) = multi_scale.compute_weighted_traces();
+                // Store trace for gradient computation
+                trace_cache.row_mut(t).assign(&eps_f);
+                
                 eps_f * &self.adaptation_weights
             } else {
                 // Fallback: use spikes as simple adaptation
+                // Store spikes as "trace"
+                trace_cache.row_mut(t).assign(&self.neuron_state.spikes);
+                
                 &self.neuron_state.spikes * &self.adaptation_weights
             };
 
             // 4. Apply adaptation to generate output
-            // This could be additive or multiplicative.
-            // Let's make it additive to the input for residual-like behavior?
-            // Or return just the signal and let the block decide.
-            // The method returns "Adaptation signal".
-            
             output.row_mut(t).assign(&adaptation_signal);
         }
 
+        // Save traces for backward pass
+        self.cached_traces = Some(trace_cache);
+
         Ok(output)
+    }
+
+    /// Compute gradients using cached traces and output gradients (e-prop rule)
+    ///
+    /// # Arguments
+    /// * `output_grads` - Gradients w.r.t. the output of the adaptor
+    ///
+    /// # Returns
+    /// * `input_grads` - Gradients w.r.t. the input (pass-through of output_grads)
+    /// * `param_grads` - Gradients w.r.t. adaptation weights
+    pub fn compute_gradients(&self, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
+        // e-prop rule: dW = sum(dL/dy * trace)
+        // input_grads = dL/dy (ignoring backprop through dynamics for now)
+        
+        let mut param_grads = Array1::zeros(self.config.dim);
+        
+        if let Some(traces) = &self.cached_traces {
+            let (seq_len, _dim) = output_grads.dim();
+            let (trace_seq, _trace_dim) = traces.dim();
+            
+            let len = seq_len.min(trace_seq);
+            
+            for t in 0..len {
+                let grad_t = output_grads.row(t);
+                let trace_t = traces.row(t);
+                // Element-wise multiplication and accumulation
+                param_grads = param_grads + (&grad_t * &trace_t);
+            }
+        }
+        
+        // Return gradients. Convert param_grads to Array2 (dim, 1) for compatibility
+        let param_grads_2d = param_grads.insert_axis(ndarray::Axis(1));
+        
+        // Pass-through gradients for input
+        (output_grads.clone(), vec![param_grads_2d])
+    }
+    
+    /// Apply gradients to adaptation weights
+    pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
+        if grads.is_empty() {
+            return Ok(());
+        }
+        
+        // We expect one gradient matrix of shape (dim, 1)
+        let grad = &grads[0];
+        let grad_1d = grad.column(0);
+        
+        // Simple SGD update: W = W - lr * grad
+        self.adaptation_weights = &self.adaptation_weights - &(grad_1d.mapv(|x| x * lr));
+        
+        Ok(())
     }
     
     /// Reset the internal state

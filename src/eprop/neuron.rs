@@ -22,7 +22,7 @@ use crate::eprop::config::{NeuronConfig, NeuronModel};
 /// - Filtered spikes (low-pass)
 /// - Adaptation current (ALIF only)
 /// - Surrogate derivatives for gradient computation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NeuronState {
     /// Membrane potential v_t
     pub voltage: Array1<f32>,
@@ -102,6 +102,7 @@ impl NeuronState {
 /// - Spike generation with adaptive thresholds
 /// - Surrogate gradient computation
 /// - State updates
+#[derive(Debug)]
 pub struct NeuronDynamics {
     config: NeuronConfig,
 }

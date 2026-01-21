@@ -153,6 +153,16 @@ pub struct ModelConfig {
     /// Default: None (use MHA for backward compatibility)
     pub num_kv_heads: Option<usize>,
 
+    /// Enable E-Prop (Eligibility Propagation) trace-based adaptation
+    /// This adds an EPropAdaptor to each transformer block
+    #[serde(default)]
+    pub eprop_enabled: bool,
+
+    /// Configuration for neurons used in E-Prop adaptor
+    /// If None, defaults to LIF neurons
+    #[serde(default)]
+    pub eprop_neuron_config: Option<crate::eprop::config::NeuronConfig>,
+
     /// Sliding window size for attention (Sliding Window Attention)
     ///
     /// If None, uses full attention (all tokens attend to all previous tokens)
@@ -374,6 +384,8 @@ impl ModelConfig {
             residual_hardneg_margin: residual_hardneg_margin_default(),
             residual_hardneg_temperature: residual_hardneg_temperature_default(),
             residual_hardneg_bank_size: residual_hardneg_bank_size_default(),
+            eprop_enabled: false,
+            eprop_neuron_config: None,
         }
     }
 }
