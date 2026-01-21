@@ -1001,135 +1001,133 @@ impl PolyAttention {
                     // Only done if training mode is Coupled
                     if self.moh.head_selection_config.gating.training_mode
                         == crate::mixtures::gating::GatingTrainingMode::Coupled
+                        && let Some(threshold_grad_accum) = threshold_grad_accum.as_mut()
                     {
-                        if let Some(threshold_grad_accum) = threshold_grad_accum.as_mut() {
-                            // Compute ∂L/∂g_yh_pre_row for this position i
-                            // This comes from all the gradient computations that used g_yh_pre_row
-                            let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                        // Compute ∂L/∂g_yh_pre_row for this position i
+                        // This comes from all the gradient computations that used g_yh_pre_row
+                        let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
 
-                            // Contribution from grad_v: each j contributes phi * coefficient
-                            for j in j_start..=j_end {
-                                let base = q.row(i).dot(&k.row(j)) * dk_scale;
-                                let mut s = base;
-                                let pos = i.saturating_sub(j);
-                                if pos < q_pe.len() {
-                                    s += q_pe[pos];
-                                }
-
-                                // Smoothly bound attention scores to avoid hard clamp
-                                // discontinuities.
-                                let s_stable = smooth_clip_tanh(s, 8.0);
-
-                                // Numerically stable polynomial computation with overflow
-                                // protection
-                                let sp = if p_i32 <= 3 {
-                                    match p_i32 {
-                                        1 => s_stable,
-                                        2 => s_stable * s_stable,
-                                        3 => s_stable * s_stable * s_stable,
-                                        _ => unreachable!(),
-                                    }
-                                } else {
-                                    let mut result = 1.0;
-                                    let current = s_stable;
-                                    for _ in 0..p_i32 {
-                                        result *= current;
-                                        if !result.is_finite() {
-                                            result =
-                                                if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
-                                            break;
-                                        }
-                                    }
-                                    result
-                                };
-
-                                let _phi = scale * (a * sp + b);
-
-                                // dV contribution: phi affects grad_v, and grad_v doesn't depend on
-                                // g_yh_pre_row Wait, actually grad_v does
-                                // depend on g_yh_pre_row: grad_v[[j, h]] += phi * g_yh_pre_row[[0,
-                                // h]] So this doesn't create
-                                // additional gradient w.r.t. g_yh_pre_row
-
-                                // The main contribution comes from dphi_ij and its downstream
-                                // effects dphi_ij affects:
-                                // grad_scale_scalar, grad_a_scalar, grad_b_scalar,
-                                // d_s_ij Since these are scalars, their
-                                // gradients don't create additional terms for g_yh_pre_row
-
-                                // But d_s_ij affects grad_q and grad_k, which also don't depend on
-                                // g_yh_pre_row
-
-                                // Actually, the key insight is that dphi_ij = sum_h
-                                // g_yh_pre_row[[0, h]] * v[[j, h]]
-                                // So ∂dphi_ij/ ∂g_yh_pre_row[[0,
-                                // h]] = v[[j, h]] And dphi_ij
-                                // affects the scalar gradients and d_s_ij
-                                // So ∂L/∂g_yh_pre_row[[0, h]] = sum_j v[[j, h]] * ∂L/∂dphi_ij
-                                // Where ∂L/∂dphi_ij comes from its use in scalar gradients and
-                                // d_s_ij
-
-                                // Let's compute this properly:
-                                let contrib_to_dphi = (a * sp + b) * scale; // from grad_scale_scalar
-                                let contrib_to_a = scale * sp; // from grad_a_scalar
-                                let contrib_to_b = scale; // from grad_b_scalar
-
-                                // Plus the contribution through d_s_ij
-                                let _spm1 = match p_i32 {
-                                    1 => 1.0,
-                                    2 => s,
-                                    3 => s * s,
-                                    _ => s.powi(p_i32 - 1),
-                                };
-
-                                // d_s_ij affects grad_q and grad_k, but these don't create cycles
-                                // The total ∂L/∂dphi_ij = contrib_to_dphi + contrib_to_a +
-                                // contrib_to_b
-                                // + (d_s_ij_coeff affects downstream)
-
-                                // Actually, this is getting complex. Let's use the chain rule more
-                                // directly. Since the only place
-                                // g_yh_pre_row is used is in computing dphi_ij and grad_v,
-                                // and dphi_ij is used in scalar computations, the gradient w.r.t.
-                                // g_yh_pre_row comes from
-                                // ∂dphi_ij/∂g_yh_pre_row * ∂L/∂dphi_ij
-
-                                // ∂dphi_ij/∂g_yh_pre_row[[0, h]] = v[[j, h]]
-                                // ∂L/∂dphi_ij = contribution to all scalar gradients and d_s_ij
-                                // effects
-
-                                // For simplicity, let's accumulate the total gradient by computing
-                                // how much each component of g_yh_pre_row affects the final loss
-
-                                // The gradient w.r.t. m_i is g_yh_gated_row[h] * g_col[i] *
-                                // ∂L/∂g_yh_pre_row[h] But to avoid double
-                                // computation, let's compute it directly from the chain rule
-
-                                let v_j = v.row(j);
-                                let dphi_contrib = contrib_to_dphi + contrib_to_a + contrib_to_b;
-
-                                for h in 0..self.head_dim {
-                                    // Contribution from dphi_ij path
-                                    d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
-
-                                    // Contribution from d_s_ij path through Q/K gradients
-                                    // d_s_ij affects grad_q and grad_k, but not g_yh_pre_row, so no
-                                    // additional term
-
-                                    // Actually, the dV term doesn't create gradient w.r.t.
-                                    // g_yh_pre_row since grad_v
-                                    // is accumulated but doesn't depend on g_yh_pre_row in
-                                    // a way that creates cycles
-                                }
+                        // Contribution from grad_v: each j contributes phi * coefficient
+                        for j in j_start..=j_end {
+                            let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                            let mut s = base;
+                            let pos = i.saturating_sub(j);
+                            if pos < q_pe.len() {
+                                s += q_pe[pos];
                             }
 
-                            // Now compute gradient w.r.t. m_col[[i, 0]]
-                            let g_i = g_col[[i, 0]];
+                            // Smoothly bound attention scores to avoid hard clamp
+                            // discontinuities.
+                            let s_stable = smooth_clip_tanh(s, 8.0);
+
+                            // Numerically stable polynomial computation with overflow
+                            // protection
+                            let sp = if p_i32 <= 3 {
+                                match p_i32 {
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                let mut result = 1.0;
+                                let current = s_stable;
+                                for _ in 0..p_i32 {
+                                    result *= current;
+                                    if !result.is_finite() {
+                                        result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
+                                        break;
+                                    }
+                                }
+                                result
+                            };
+
+                            let _phi = scale * (a * sp + b);
+
+                            // dV contribution: phi affects grad_v, and grad_v doesn't depend on
+                            // g_yh_pre_row Wait, actually grad_v does
+                            // depend on g_yh_pre_row: grad_v[[j, h]] += phi * g_yh_pre_row[[0,
+                            // h]] So this doesn't create
+                            // additional gradient w.r.t. g_yh_pre_row
+
+                            // The main contribution comes from dphi_ij and its downstream
+                            // effects dphi_ij affects:
+                            // grad_scale_scalar, grad_a_scalar, grad_b_scalar,
+                            // d_s_ij Since these are scalars, their
+                            // gradients don't create additional terms for g_yh_pre_row
+
+                            // But d_s_ij affects grad_q and grad_k, which also don't depend on
+                            // g_yh_pre_row
+
+                            // Actually, the key insight is that dphi_ij = sum_h
+                            // g_yh_pre_row[[0, h]] * v[[j, h]]
+                            // So ∂dphi_ij/ ∂g_yh_pre_row[[0,
+                            // h]] = v[[j, h]] And dphi_ij
+                            // affects the scalar gradients and d_s_ij
+                            // So ∂L/∂g_yh_pre_row[[0, h]] = sum_j v[[j, h]] * ∂L/∂dphi_ij
+                            // Where ∂L/∂dphi_ij comes from its use in scalar gradients and
+                            // d_s_ij
+
+                            // Let's compute this properly:
+                            let contrib_to_dphi = (a * sp + b) * scale; // from grad_scale_scalar
+                            let contrib_to_a = scale * sp; // from grad_a_scalar
+                            let contrib_to_b = scale; // from grad_b_scalar
+
+                            // Plus the contribution through d_s_ij
+                            let _spm1 = match p_i32 {
+                                1 => 1.0,
+                                2 => s,
+                                3 => s * s,
+                                _ => s.powi(p_i32 - 1),
+                            };
+
+                            // d_s_ij affects grad_q and grad_k, but these don't create cycles
+                            // The total ∂L/∂dphi_ij = contrib_to_dphi + contrib_to_a +
+                            // contrib_to_b
+                            // + (d_s_ij_coeff affects downstream)
+
+                            // Actually, this is getting complex. Let's use the chain rule more
+                            // directly. Since the only place
+                            // g_yh_pre_row is used is in computing dphi_ij and grad_v,
+                            // and dphi_ij is used in scalar computations, the gradient w.r.t.
+                            // g_yh_pre_row comes from
+                            // ∂dphi_ij/∂g_yh_pre_row * ∂L/∂dphi_ij
+
+                            // ∂dphi_ij/∂g_yh_pre_row[[0, h]] = v[[j, h]]
+                            // ∂L/∂dphi_ij = contribution to all scalar gradients and d_s_ij
+                            // effects
+
+                            // For simplicity, let's accumulate the total gradient by computing
+                            // how much each component of g_yh_pre_row affects the final loss
+
+                            // The gradient w.r.t. m_i is g_yh_gated_row[h] * g_col[i] *
+                            // ∂L/∂g_yh_pre_row[h] But to avoid double
+                            // computation, let's compute it directly from the chain rule
+
+                            let v_j = v.row(j);
+                            let dphi_contrib = contrib_to_dphi + contrib_to_a + contrib_to_b;
+
                             for h in 0..self.head_dim {
-                                let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                                threshold_grad_accum[[i, h]] +=
-                                    g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                                // Contribution from dphi_ij path
+                                d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
+
+                                // Contribution from d_s_ij path through Q/K gradients
+                                // d_s_ij affects grad_q and grad_k, but not g_yh_pre_row, so no
+                                // additional term
+
+                                // Actually, the dV term doesn't create gradient w.r.t.
+                                // g_yh_pre_row since grad_v
+                                // is accumulated but doesn't depend on g_yh_pre_row in
+                                // a way that creates cycles
                             }
+                        }
+
+                        // Now compute gradient w.r.t. m_col[[i, 0]]
+                        let g_i = g_col[[i, 0]];
+                        for h in 0..self.head_dim {
+                            let g_yh_gated_h = g_yh_gated_row[[0, h]];
+                            threshold_grad_accum[[i, h]] +=
+                                g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
                         }
                     }
                 }
@@ -1740,49 +1738,47 @@ impl PolyAttention {
 
                     if self.moh.head_selection_config.gating.training_mode
                         == crate::mixtures::gating::GatingTrainingMode::Coupled
+                        && let Some(threshold_grad_accum) = threshold_accum_local.as_mut()
                     {
-                        if let Some(threshold_grad_accum) = threshold_accum_local.as_mut() {
-                            let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
-                            for j in j_start..=j_end {
-                                let base = q.row(i).dot(&k.row(j)) * dk_scale;
-                                let mut s = base;
-                                let pos = i.saturating_sub(j);
-                                if pos < q_pe.len() {
-                                    s += q_pe[pos];
-                                }
-                                let s_stable = smooth_clip_tanh(s, 8.0);
-                                let sp = if p_i32 <= 3 {
-                                    match p_i32 {
-                                        1 => s_stable,
-                                        2 => s_stable * s_stable,
-                                        3 => s_stable * s_stable * s_stable,
-                                        _ => unreachable!(),
-                                    }
-                                } else {
-                                    let mut result = 1.0;
-                                    let current = s_stable;
-                                    for _ in 0..p_i32 {
-                                        result *= current;
-                                        if !result.is_finite() {
-                                            result =
-                                                if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
-                                            break;
-                                        }
-                                    }
-                                    result
-                                };
-                                let v_j = v.row(j);
-                                let dphi_contrib = (a * sp + b) * scale;
-                                for h in 0..self.head_dim {
-                                    d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
-                                }
+                        let mut d_g_yh_pre_row = Array2::<f32>::zeros((1, self.head_dim));
+                        for j in j_start..=j_end {
+                            let base = q.row(i).dot(&k.row(j)) * dk_scale;
+                            let mut s = base;
+                            let pos = i.saturating_sub(j);
+                            if pos < q_pe.len() {
+                                s += q_pe[pos];
                             }
-                            let g_i = g_col[[i, 0]];
+                            let s_stable = smooth_clip_tanh(s, 8.0);
+                            let sp = if p_i32 <= 3 {
+                                match p_i32 {
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                let mut result = 1.0;
+                                let current = s_stable;
+                                for _ in 0..p_i32 {
+                                    result *= current;
+                                    if !result.is_finite() {
+                                        result = if s_stable >= 0.0 { f32::MAX } else { f32::MIN };
+                                        break;
+                                    }
+                                }
+                                result
+                            };
+                            let v_j = v.row(j);
+                            let dphi_contrib = (a * sp + b) * scale;
                             for h in 0..self.head_dim {
-                                let g_yh_gated_h = g_yh_gated_row[[0, h]];
-                                threshold_grad_accum[[i, h_idx]] +=
-                                    g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
+                                d_g_yh_pre_row[[0, h]] += v_j[[h]] * dphi_contrib;
                             }
+                        }
+                        let g_i = g_col[[i, 0]];
+                        for h in 0..self.head_dim {
+                            let g_yh_gated_h = g_yh_gated_row[[0, h]];
+                            threshold_grad_accum[[i, h_idx]] +=
+                                g_yh_gated_h * g_i * d_g_yh_pre_row[[0, h]];
                         }
                     }
                 }

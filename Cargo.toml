@@ -1,8 +1,8 @@
 [package]
 name = "llm"
 version = "0.1.0"
-# 2024 = latest edition
 edition = "2024"
+rust-version = "1.75"
 
 [dependencies]
 bincode = { version = "2.0.1", features = ["serde"] }
@@ -32,6 +32,21 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "llm"
 path = "src/lib.rs"
 
+# Main binary
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+# Utility binaries
+[[bin]]
+name = "infer"
+path = "src/bin/infer.rs"
+
+[[bin]]
+name = "debug_counts"
+path = "src/bin/debug_counts.rs"
+
+# Benchmarks
 [[bench]]
 name = "encoding"
 harness = false
@@ -52,50 +67,14 @@ harness = false
 name = "mamba_scan"
 harness = false
 
-[[bin]]
-name = "main"
-path = "src/main.rs"
-
-[[bin]]
-name = "test_fix_validation_simple"
-path = "test_fix_validation_simple.rs"
-
-[[bin]]
-name = "test_sigmoid_gompertz_validation"
-path = "test_sigmoid_gompertz_validation.rs"
-
-[[bin]]
-name = "test_richards_attention"
-path = "test_richards_attention.rs"
-
-[[bin]]
-name = "test_swiglu_richards"
-path = "test_swiglu_richards.rs"
-
-[[bin]]
-name = "test_none_variant"
-path = "test_none_variant.rs"
-
-[[bin]]
-name = "test_parameter_learning_validation"
-path = "test_parameter_learning_validation.rs"
-
-[[bin]]
-name = "test_dramatic_learning"
-path = "test_dramatic_learning.rs"
-
-[[bin]]
-name = "test_poly_attention_none_variant"
-path = "test_poly_attention_none_variant.rs"
-
-[[bin]]
-name = "test_learning_bug_demo"
-path = "test_learning_bug_demo.rs"
-
-[[bin]]
-name = "debug_counts"
-path = "src/bin/debug_counts.rs"
-
 [[bench]]
 name = "csv_loading"
 harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

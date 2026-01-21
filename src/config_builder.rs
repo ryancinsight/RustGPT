@@ -33,6 +33,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     config.diffusion_min_snr_gamma = args.diffusion_min_snr_gamma.max(1e-6);
     config.diffusion_noise_schedule = args.diffusion_noise_schedule.into();
     config.diffusion_timestep_strategy = args.diffusion_timestep_strategy.into();
+    config.spiking_neuron_model = args.spiking.map(Into::into);
 
     // Apply TRM-specific settings
     if args.trm {
@@ -71,6 +72,24 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     config.residual_hardneg_margin = args.residual_hardneg_margin;
     config.residual_hardneg_temperature = args.residual_hardneg_temperature.max(1e-6);
     config.residual_hardneg_bank_size = args.residual_hardneg_bank_size;
+
+    let num_heads = config.get_num_heads().max(1);
+    if args.hard_heads {
+        config.head_selection = crate::mixtures::moh::HeadSelectionStrategy::Fixed {
+            num_active: num_heads,
+        };
+    } else if args.eprop && args.moe {
+        let num_active = num_heads.div_ceil(2).max(1);
+        config.head_selection = crate::mixtures::moh::HeadSelectionStrategy::Learned {
+            num_active,
+            load_balance_weight: 0.01,
+            complexity_loss_weight: 0.005,
+            sparsity_weight: 0.001,
+            importance_loss_weight: 0.0,
+            switch_balance_weight: 0.0,
+            training_mode: crate::mixtures::gating::GatingTrainingMode::Coupled,
+        };
+    }
 
     // Enable MoE if requested
     if args.moe {

@@ -6,5 +6,6 @@
 pub mod components;
 pub mod diffusion;
 pub mod recurrence;
+pub mod spiking;
 pub mod ssm;
 pub mod transformer;

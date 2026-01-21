@@ -230,6 +230,9 @@ pub struct ModelConfig {
     #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
 
+    #[serde(default)]
+    pub spiking_neuron_model: Option<crate::eprop::NeuronModel>,
+
     /// Use diffusion-conditioned blocks inside TRM when architecture=TRM
     pub trm_use_diffusion: bool,
 
@@ -350,6 +353,7 @@ impl ModelConfig {
             temporal_mixing: TemporalMixingType::Attention,
             moe_router: None, // Default: no MoE (standard feedforward)
             titan_memory: TitanMemoryConfig::default(),
+            spiking_neuron_model: None,
             trm_use_diffusion: false,
             trm_num_recursions: None,
             trm_max_supervision_steps: None,

@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     embeddings::TokenEmbeddings,
-    layers::{recurrence::LRM, transformer::TransformerBlock},
+    layers::{
+        recurrence::LRM,
+        spiking::{AlifLayer, LifLayer},
+        transformer::TransformerBlock,
+    },
     models::titans::memory::NeuralMemory,
     output_projection::OutputProjection,
     richards::{RichardsGlu, RichardsNorm},
@@ -51,97 +55,49 @@ pub enum LayerEnum {
     DiffusionBlock(Box<crate::layers::diffusion::DiffusionBlock>),
     LRM(Box<LRM>),
     TitansMemory(Box<NeuralMemory>),
+    LifLayer(Box<LifLayer>),
+    AlifLayer(Box<AlifLayer>),
+}
+
+/// Macro to reduce boilerplate in LayerEnum trait implementations
+macro_rules! delegate_to_variant {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            LayerEnum::TokenEmbeddings(layer) => layer.$method($($arg),*),
+            LayerEnum::RichardsGlu(layer) => layer.$method($($arg),*),
+            LayerEnum::MixtureOfExperts(layer) => layer.$method($($arg),*),
+            LayerEnum::DynamicTanhNorm(layer) => layer.$method($($arg),*),
+            LayerEnum::OutputProjection(layer) => layer.$method($($arg),*),
+            LayerEnum::PolyAttention(layer) => layer.$method($($arg),*),
+            LayerEnum::TransformerBlock(layer) => layer.$method($($arg),*),
+            LayerEnum::DiffusionBlock(layer) => layer.$method($($arg),*),
+            LayerEnum::LRM(layer) => layer.$method($($arg),*),
+            LayerEnum::TitansMemory(layer) => layer.$method($($arg),*),
+            LayerEnum::LifLayer(layer) => layer.$method($($arg),*),
+            LayerEnum::AlifLayer(layer) => layer.$method($($arg),*),
+        }
+    };
 }
 
 impl Layer for LayerEnum {
     fn layer_type(&self) -> &str {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.layer_type(),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.layer_type(),
-            LayerEnum::MixtureOfExperts(layer) => layer.layer_type(),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.layer_type(),
-            LayerEnum::OutputProjection(layer) => layer.layer_type(),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.layer_type(),
-            LayerEnum::TransformerBlock(layer) => layer.layer_type(),
-            LayerEnum::DiffusionBlock(layer) => layer.layer_type(),
-            LayerEnum::LRM(layer) => layer.layer_type(),
-            LayerEnum::TitansMemory(layer) => layer.layer_type(),
-        }
+        delegate_to_variant!(self, layer_type)
     }
 
     fn parameters(&self) -> usize {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.parameters(),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.parameters(),
-            LayerEnum::MixtureOfExperts(layer) => layer.parameters(),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.parameters(),
-            LayerEnum::OutputProjection(layer) => layer.parameters(),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.parameters(),
-            LayerEnum::TransformerBlock(layer) => layer.parameters(),
-            LayerEnum::DiffusionBlock(layer) => layer.parameters(),
-            LayerEnum::LRM(layer) => layer.parameters(),
-            LayerEnum::TitansMemory(layer) => layer.parameters(),
-        }
+        delegate_to_variant!(self, parameters)
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.forward(input),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.forward(input),
-            LayerEnum::MixtureOfExperts(layer) => layer.forward(input),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.forward(input),
-            LayerEnum::OutputProjection(layer) => layer.forward(input),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.forward(input),
-            LayerEnum::TransformerBlock(layer) => layer.forward(input),
-            LayerEnum::DiffusionBlock(layer) => layer.forward(input),
-            LayerEnum::LRM(layer) => layer.forward(input),
-            LayerEnum::TitansMemory(layer) => layer.forward(input),
-        }
+        delegate_to_variant!(self, forward, input)
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.backward(grads, lr),
-            LayerEnum::RichardsGlu(layer) => layer.backward(grads, lr),
-            LayerEnum::MixtureOfExperts(layer) => layer.backward(grads, lr),
-            LayerEnum::DynamicTanhNorm(layer) => layer.backward(grads, lr),
-            LayerEnum::OutputProjection(layer) => layer.backward(grads, lr),
-            LayerEnum::PolyAttention(layer) => layer.backward(grads, lr),
-            LayerEnum::TransformerBlock(layer) => layer.backward(grads, lr),
-            LayerEnum::DiffusionBlock(layer) => layer.backward(grads, lr),
-            LayerEnum::LRM(layer) => layer.backward(grads, lr),
-            LayerEnum::TitansMemory(layer) => layer.backward(grads, lr),
-        }
+        delegate_to_variant!(self, backward, grads, lr)
     }
 
     fn weight_norm(&self) -> f32 {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.weight_norm(),
-            LayerEnum::RichardsGlu(layer) => layer.weight_norm(),
-            LayerEnum::MixtureOfExperts(layer) => layer.weight_norm(),
-            LayerEnum::DynamicTanhNorm(layer) => layer.weight_norm(),
-            LayerEnum::OutputProjection(layer) => layer.weight_norm(),
-            LayerEnum::PolyAttention(layer) => layer.weight_norm(),
-            LayerEnum::TransformerBlock(layer) => layer.weight_norm(),
-            LayerEnum::DiffusionBlock(layer) => layer.weight_norm(),
-            LayerEnum::LRM(layer) => layer.weight_norm(),
-            LayerEnum::TitansMemory(layer) => layer.weight_norm(),
-        }
+        delegate_to_variant!(self, weight_norm)
     }
 
     fn compute_gradients(
@@ -149,23 +105,7 @@ impl Layer for LayerEnum {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.compute_gradients(input, output_grads),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::MixtureOfExperts(layer) => layer.compute_gradients(input, output_grads),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::OutputProjection(layer) => layer.compute_gradients(input, output_grads),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::TransformerBlock(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::DiffusionBlock(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::LRM(layer) => layer.compute_gradients(input, output_grads),
-            LayerEnum::TitansMemory(layer) => layer.compute_gradients(input, output_grads),
-        }
+        delegate_to_variant!(self, compute_gradients, input, output_grads)
     }
 
     fn apply_gradients(
@@ -173,42 +113,10 @@ impl Layer for LayerEnum {
         gradients: &[Array2<f32>],
         learning_rate: f32,
     ) -> crate::errors::Result<()> {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.apply_gradients(gradients, learning_rate),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.apply_gradients(gradients, learning_rate),
-            LayerEnum::MixtureOfExperts(layer) => layer.apply_gradients(gradients, learning_rate),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.apply_gradients(gradients, learning_rate),
-            LayerEnum::OutputProjection(layer) => layer.apply_gradients(gradients, learning_rate),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.apply_gradients(gradients, learning_rate),
-            LayerEnum::TransformerBlock(layer) => layer.apply_gradients(gradients, learning_rate),
-            LayerEnum::DiffusionBlock(layer) => layer.apply_gradients(gradients, learning_rate),
-            LayerEnum::LRM(layer) => layer.apply_gradients(gradients, learning_rate),
-            LayerEnum::TitansMemory(layer) => layer.apply_gradients(gradients, learning_rate),
-        }
+        delegate_to_variant!(self, apply_gradients, gradients, learning_rate)
     }
 
     fn zero_gradients(&mut self) {
-        match self {
-            LayerEnum::TokenEmbeddings(layer) => layer.zero_gradients(),
-            // Removed SelfAttention arm
-            // Removed FeedForward arm
-            LayerEnum::RichardsGlu(layer) => layer.zero_gradients(),
-            LayerEnum::MixtureOfExperts(layer) => layer.zero_gradients(),
-
-            LayerEnum::DynamicTanhNorm(layer) => layer.zero_gradients(),
-            LayerEnum::OutputProjection(layer) => layer.zero_gradients(),
-
-            // Removed TRMBlock arm
-            LayerEnum::PolyAttention(layer) => layer.zero_gradients(),
-            LayerEnum::TransformerBlock(layer) => layer.zero_gradients(),
-            LayerEnum::DiffusionBlock(layer) => layer.zero_gradients(),
-            LayerEnum::LRM(layer) => layer.zero_gradients(),
-            LayerEnum::TitansMemory(layer) => layer.zero_gradients(),
-        }
+        delegate_to_variant!(self, zero_gradients)
     }
 }

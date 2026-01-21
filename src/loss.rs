@@ -24,15 +24,6 @@ impl Default for SymmetricCEConfig {
     }
 }
 
-#[allow(dead_code)]
-fn one_hot_row(vocab: usize, target: usize) -> Array1<f32> {
-    let mut y = Array1::<f32>::zeros(vocab);
-    if target < vocab {
-        y[target] = 1.0;
-    }
-    y
-}
-
 pub fn cross_entropy(probs: &Array2<f32>, targets: &[usize]) -> f32 {
     let vocab = probs.ncols();
     let rows = probs.nrows().min(targets.len());
@@ -128,40 +119,40 @@ pub fn residual_decorrelation_loss(features: &ArrayView2<f32>) -> f32 {
         return 0.0;
     }
 
-    // Compute per-dimension mean.
-    let mut mean = vec![0.0f64; d];
-    for i in 0..n {
-        for j in 0..d {
-            let v = features[[i, j]];
+    // Compute per-dimension mean using ndarray operations for better performance
+    let mut mean = Array1::<f64>::zeros(d);
+    for row in features.outer_iter() {
+        for (j, &v) in row.iter().enumerate() {
             mean[j] += if v.is_finite() { v as f64 } else { 0.0 };
         }
     }
-    for m in mean.iter_mut().take(d) {
-        *m /= n as f64;
-    }
+    mean.mapv_inplace(|x| x / (n as f64));
 
-    // Covariance: C = X^T X / n, where X is centered.
-    let inv_n = 1.0f64 / (n as f64);
-    let mut loss = 0.0f64;
-    for i in 0..d {
-        for j in 0..d {
-            if i == j {
-                continue;
-            }
-            let mut dot = 0.0f64;
-            for t in 0..n {
-                let xi = (features[[t, i]] as f64) - mean[i];
-                let xj = (features[[t, j]] as f64) - mean[j];
-                let xi = if xi.is_finite() { xi } else { 0.0 };
-                let xj = if xj.is_finite() { xj } else { 0.0 };
-                dot += xi * xj;
-            }
-            let cij = dot * inv_n;
-            loss += cij * cij;
+    // Center features
+    let mut centered = Array2::<f64>::zeros((n, d));
+    for (i, row) in features.outer_iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            let val = (v as f64) - mean[j];
+            centered[[i, j]] = if val.is_finite() { val } else { 0.0 };
         }
     }
 
-    // Normalize by number of off-diagonal entries for scale stability.
+    // Compute covariance matrix: C = X^T X / n
+    let inv_n = 1.0f64 / (n as f64);
+    let cov = centered.t().dot(&centered) * inv_n;
+
+    // Sum squared off-diagonal elements
+    let mut loss = 0.0f64;
+    for i in 0..d {
+        for j in 0..d {
+            if i != j {
+                let cij = cov[[i, j]];
+                loss += cij * cij;
+            }
+        }
+    }
+
+    // Normalize by number of off-diagonal entries for scale stability
     let denom = (d * (d - 1)) as f64;
     (loss / denom.max(1.0)) as f32
 }
@@ -181,86 +172,52 @@ pub fn residual_decorrelation_gradients(features: &ArrayView2<f32>) -> Array2<f3
         return grad;
     }
 
-    // Mean over tokens.
-    let mut mean = vec![0.0f64; d];
-    for i in 0..n {
-        for j in 0..d {
-            let v = features[[i, j]];
+    // Compute per-dimension mean
+    let mut mean = Array1::<f64>::zeros(d);
+    for row in features.outer_iter() {
+        for (j, &v) in row.iter().enumerate() {
             mean[j] += if v.is_finite() { v as f64 } else { 0.0 };
         }
     }
-    for m in mean.iter_mut().take(d) {
-        *m /= n as f64;
-    }
+    mean.mapv_inplace(|x| x / (n as f64));
 
-    // Centered X (as f64 for stability).
-    let mut x = vec![0.0f64; n * d];
-    for i in 0..n {
-        for j in 0..d {
-            let v = (features[[i, j]] as f64) - mean[j];
-            x[i * d + j] = if v.is_finite() { v } else { 0.0 };
+    // Center features
+    let mut centered = Array2::<f64>::zeros((n, d));
+    for (i, row) in features.outer_iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            let val = (v as f64) - mean[j];
+            centered[[i, j]] = if val.is_finite() { val } else { 0.0 };
         }
     }
 
-    // Compute covariance C = X^T X / n.
+    // Compute covariance C = X^T X / n
     let inv_n = 1.0f64 / (n as f64);
-    let mut c = vec![0.0f64; d * d];
+    let cov = centered.t().dot(&centered) * inv_n;
+
+    // G = dL/dC: zero diagonal, 2*C_ij off-diagonal
+    let mut g = cov.mapv(|x| 2.0 * x);
     for i in 0..d {
-        for j in 0..d {
-            let mut dot = 0.0f64;
-            for t in 0..n {
-                dot += x[t * d + i] * x[t * d + j];
-            }
-            c[i * d + j] = dot * inv_n;
-        }
+        g[[i, i]] = 0.0;
     }
 
-    // G = dL/dC.
-    let mut g = vec![0.0f64; d * d];
-    for i in 0..d {
-        for j in 0..d {
-            if i == j {
-                g[i * d + j] = 0.0;
-            } else {
-                g[i * d + j] = 2.0 * c[i * d + j];
-            }
-        }
-    }
-
-    // dL/dX = (2/n) * X * G.
+    // dL/dX = (2/n) * X * G
     let scale = 2.0f64 * inv_n;
-    let mut dx = vec![0.0f64; n * d];
-    for t in 0..n {
-        for j in 0..d {
-            let mut acc = 0.0f64;
-            for k in 0..d {
-                acc += x[t * d + k] * g[k * d + j];
-            }
-            dx[t * d + j] = scale * acc;
-        }
+    let dx = centered.dot(&g) * scale;
+
+    // Project through centering: subtract token-mean gradient per dimension
+    let dx_mean = dx.mean_axis(ndarray::Axis(0)).unwrap();
+    let mut dx_centered = dx;
+    for mut row in dx_centered.outer_iter_mut() {
+        row -= &dx_mean;
     }
 
-    // Project through centering: subtract token-mean gradient per dimension.
-    let mut dx_mean = vec![0.0f64; d];
-    for t in 0..n {
-        for j in 0..d {
-            dx_mean[j] += dx[t * d + j];
-        }
-    }
-    for m in dx_mean.iter_mut().take(d) {
-        *m /= n as f64;
-    }
-    for t in 0..n {
-        for j in 0..d {
-            let v = dx[t * d + j] - dx_mean[j];
-            grad[[t, j]] = if v.is_finite() { v as f32 } else { 0.0 };
-        }
-    }
-
-    // Normalize by number of off-diagonal entries for scale stability.
+    // Convert to f32 and normalize
     let denom = (d * (d - 1)) as f32;
-    if denom > 0.0 {
-        grad.mapv_inplace(|x| x / denom);
+    for (i, row) in dx_centered.outer_iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            let val = if v.is_finite() { v as f32 } else { 0.0 };
+            grad[[i, j]] = if denom > 0.0 { val / denom } else { val };
+        }
     }
 
     grad

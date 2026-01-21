@@ -1,25 +1,35 @@
+//! Adam optimizer with AMSGrad and AdamW variants
+//!
+//! Provides efficient, numerically stable implementations of:
+//! - Standard Adam optimizer
+//! - AMSGrad variant with maximum tracking
+//! - AdamW with decoupled weight decay
+
 use ndarray::{Array2, Zip};
 use serde::{Deserialize, Serialize};
 
+/// Adam optimizer with optional AMSGrad and AdamW variants
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Adam {
     beta1: f32,
     beta2: f32,
     epsilon: f32,
-    timestep: usize,
+    timestep: u32, // Changed from usize to avoid casting issues
     pub m: Array2<f32>,
     pub v: Array2<f32>,
-    /// AMSGrad variant: tracks maximum of past squared gradients
+    /// `AMSGrad` variant: tracks maximum of past squared gradients
     pub v_hat_max: Option<Array2<f32>>,
-    /// Enable AMSGrad variant for better convergence guarantees
+    /// Enable `AMSGrad` variant for better convergence guarantees
     pub use_amsgrad: bool,
-    /// Weight decay coefficient (AdamW)
+    /// Weight decay coefficient (`AdamW`)
     pub weight_decay: f32,
-    /// Use decoupled weight decay (AdamW style)
+    /// Use decoupled weight decay (`AdamW` style)
     pub use_decoupled_wd: bool,
 }
 
 impl Adam {
+    /// Create a new Adam optimizer with default hyperparameters
+    #[must_use]
     pub fn new(shape: (usize, usize)) -> Self {
         Self {
             beta1: 0.9,
@@ -29,13 +39,13 @@ impl Adam {
             m: Array2::zeros(shape),
             v: Array2::zeros(shape),
             v_hat_max: None,
-            use_amsgrad: false, // Default to standard Adam for backward compatibility
-            weight_decay: 0.0,  // No weight decay by default
-            use_decoupled_wd: false, // Use L2 regularization style by default
+            use_amsgrad: false,
+            weight_decay: 0.0,
+            use_decoupled_wd: false,
         }
     }
 
-    /// Enable or disable AMSGrad variant
+    /// Enable or disable `AMSGrad` variant
     pub fn set_amsgrad(&mut self, enable: bool) {
         self.use_amsgrad = enable;
         if enable && self.v_hat_max.is_none() {
@@ -45,7 +55,8 @@ impl Adam {
         }
     }
 
-    /// Create Adam optimizer with AMSGrad variant enabled
+    /// Create Adam optimizer with `AMSGrad` variant enabled
+    #[must_use]
     pub fn new_amsgrad(shape: (usize, usize)) -> Self {
         Self {
             beta1: 0.9,
@@ -61,7 +72,8 @@ impl Adam {
         }
     }
 
-    /// Create AdamW optimizer (Adam with decoupled weight decay)
+    /// Create `AdamW` optimizer (Adam with decoupled weight decay)
+    #[must_use]
     pub fn new_adamw(shape: (usize, usize), weight_decay: f32) -> Self {
         Self {
             beta1: 0.9,
@@ -70,7 +82,7 @@ impl Adam {
             timestep: 0,
             m: Array2::zeros(shape),
             v: Array2::zeros(shape),
-            v_hat_max: Some(Array2::zeros(shape)), // AdamW typically uses AMSGrad
+            v_hat_max: Some(Array2::zeros(shape)),
             use_amsgrad: true,
             weight_decay,
             use_decoupled_wd: true,
@@ -93,9 +105,18 @@ impl Adam {
         }
     }
 
+    /// Perform optimization step
+    ///
+    /// # Panics
+    /// This method validates shapes and will resize buffers if needed, so it won't panic
     #[inline]
     pub fn step(&mut self, params: &mut Array2<f32>, grads: &Array2<f32>, lr: f32) {
-        // Validate shapes to avoid runtime panics
+        // Early exit for zero learning rate
+        if lr == 0.0 {
+            return;
+        }
+
+        // Validate and resize buffers if needed
         if params.dim() != grads.dim() {
             tracing::warn!(
                 "Adam::step shape mismatch: params={:?}, grads={:?} — skipping update",
@@ -104,6 +125,7 @@ impl Adam {
             );
             return;
         }
+
         if self.m.dim() != grads.dim() || self.v.dim() != grads.dim() {
             self.m = Array2::zeros(grads.dim());
             self.v = Array2::zeros(grads.dim());
@@ -111,25 +133,21 @@ impl Adam {
                 self.v_hat_max = Some(Array2::zeros(grads.dim()));
             }
         }
+
         self.timestep += 1;
 
-        if lr == 0.0 {
-            return;
-        }
-
-        // Bias-correction scalars.
+        // Bias-correction factors (using u32 to avoid casting issues)
         let inv_bias1 = 1.0 / (1.0 - self.beta1.powi(self.timestep as i32));
         let inv_bias2 = 1.0 / (1.0 - self.beta2.powi(self.timestep as i32));
 
-        // Apply weight decay (AdamW style: decoupled from gradients).
+        // Apply decoupled weight decay (AdamW style)
         if self.use_decoupled_wd && self.weight_decay > 0.0 {
-            // AdamW: Apply weight decay directly to parameters, not gradients
-            *params *= 1.0 - self.weight_decay * lr;
+            params.mapv_inplace(|p| p * (1.0 - self.weight_decay * lr));
         }
 
-        let use_l2_wd = (!self.use_decoupled_wd) && self.weight_decay > 0.0;
+        let use_l2_wd = !self.use_decoupled_wd && self.weight_decay > 0.0;
 
-        // Ensure AMSGrad buffer exists and has correct shape.
+        // Ensure AMSGrad buffer exists with correct shape
         if self.use_amsgrad {
             let need_init = self
                 .v_hat_max
@@ -140,31 +158,39 @@ impl Adam {
             }
         }
 
-        // Update moments in-place (no intermediate allocations).
+        // Update moments and parameters in-place
         if self.use_amsgrad {
-            let v_hat_max = self.v_hat_max.as_mut().expect("AMSGrad buffer must exist");
+            let v_hat_max = self.v_hat_max.as_mut().expect(\"AMSGrad buffer must exist\");
+
             Zip::from(&mut self.m)
                 .and(&mut self.v)
                 .and(&mut *v_hat_max)
                 .and(params.view())
                 .and(grads)
                 .for_each(|m, v, v_max, &p, &g_in| {
+                    // Sanitize gradient
                     let mut g = if g_in.is_finite() { g_in } else { 0.0 };
+
+                    // Add L2 weight decay to gradient if enabled
                     if use_l2_wd {
                         let wd_term = p * self.weight_decay;
                         g += if wd_term.is_finite() { wd_term } else { 0.0 };
                     }
+
+                    // Update first moment (momentum)
                     *m = *m * self.beta1 + g * (1.0 - self.beta1);
+
+                    // Update second moment (variance)
                     *v = *v * self.beta2 + (g * g) * (1.0 - self.beta2);
 
-                    // Track max of bias-corrected v_hat (AMSGrad).
-                    let v_hat = (*v) * inv_bias2;
+                    // Track maximum of bias-corrected second moment
+                    let v_hat = *v * inv_bias2;
                     if v_hat.is_finite() {
                         *v_max = v_max.max(v_hat);
                     }
                 });
 
-            // Apply update.
+            // Apply parameter update
             Zip::from(params)
                 .and(self.m.view())
                 .and(v_hat_max.view())
@@ -176,16 +202,19 @@ impl Adam {
                     }
                 });
         } else {
+            // Standard Adam
             Zip::from(&mut self.m)
                 .and(&mut self.v)
                 .and(params.view())
                 .and(grads)
                 .for_each(|m, v, &p, &g_in| {
                     let mut g = if g_in.is_finite() { g_in } else { 0.0 };
+
                     if use_l2_wd {
                         let wd_term = p * self.weight_decay;
                         g += if wd_term.is_finite() { wd_term } else { 0.0 };
                     }
+
                     *m = *m * self.beta1 + g * (1.0 - self.beta1);
                     *v = *v * self.beta2 + (g * g) * (1.0 - self.beta2);
                 });
@@ -202,5 +231,70 @@ impl Adam {
                     }
                 });
         }
+    }
+}
+
+impl Default for Adam {
+    fn default() -> Self {
+        Self::new((1, 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+
+    #[test]
+    fn test_adam_basic_update() {
+        let mut adam = Adam::new((2, 2));
+        let mut params = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let grads = Array2::from_shape_vec((2, 2), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        let initial = params.clone();
+        adam.step(&mut params, &grads, 0.01);
+
+        // Parameters should have changed
+        assert!((params[[0, 0]] - initial[[0, 0]]).abs() > 1e-6);
+    }
+
+    #[test]
+    fn test_adam_zero_lr() {
+        let mut adam = Adam::new((2, 2));
+        let mut params = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let grads = Array2::from_shape_vec((2, 2), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        let initial = params.clone();
+        adam.step(&mut params, &grads, 0.0);
+
+        // Parameters should not change with zero learning rate
+        assert_abs_diff_eq!(params, initial, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_amsgrad_tracking() {
+        let mut adam = Adam::new_amsgrad((2, 2));
+        let mut params = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let grads = Array2::from_shape_vec((2, 2), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        adam.step(&mut params, &grads, 0.01);
+
+        // v_hat_max should be populated
+        assert!(adam.v_hat_max.is_some());
+        let v_max = adam.v_hat_max.as_ref().unwrap();
+        assert!(v_max.iter().all(|&x| x >= 0.0));
+    }
+
+    #[test]
+    fn test_adamw_weight_decay() {
+        let mut adam = Adam::new_adamw((2, 2), 0.01);
+        let mut params = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let grads = Array2::zeros((2, 2));
+
+        let initial = params.clone();
+        adam.step(&mut params, &grads, 0.1);
+
+        // With zero gradients, AdamW should still decay weights
+        assert!(params.iter().zip(initial.iter()).all(|(p, i)| p < i));
     }
 }

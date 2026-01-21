@@ -44,6 +44,9 @@ pub struct Args {
     #[arg(long)]
     pub trm: bool,
 
+    #[arg(long, value_enum)]
+    pub spiking: Option<SpikingNeuronCli>,
+
     #[arg(long, default_value_t = 0.5)]
     pub diffusion_ce_weight: f32,
 
@@ -349,6 +352,21 @@ impl From<DiffusionTimestepCli> for DiffusionTimestepStrategy {
             DiffusionTimestepCli::Uniform => DiffusionTimestepStrategy::Uniform,
             DiffusionTimestepCli::MinSnr => DiffusionTimestepStrategy::MinSnr,
             DiffusionTimestepCli::EdmLogNormal => DiffusionTimestepStrategy::EdmLogNormal,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum SpikingNeuronCli {
+    Lif,
+    Alif,
+}
+
+impl From<SpikingNeuronCli> for crate::eprop::NeuronModel {
+    fn from(value: SpikingNeuronCli) -> Self {
+        match value {
+            SpikingNeuronCli::Lif => crate::eprop::NeuronModel::LIF,
+            SpikingNeuronCli::Alif => crate::eprop::NeuronModel::ALIF,
         }
     }
 }

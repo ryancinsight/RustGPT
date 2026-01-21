@@ -31,10 +31,6 @@ use std::cell::RefCell;
 
 use super::{EPropError, EligibilityTraces, Result};
 
-/// Thread-local storage for eligibility traces
-///
-/// Maintains one set of traces per layer, persisting across sequences
-/// within a single epoch. Thread-local ensures no cross-thread interference.
 thread_local! {
     #[allow(clippy::missing_const_for_thread_local)]
     static EPROP_TRACES: RefCell<Option<Vec<EligibilityTraces>>> = const { RefCell::new(None) };
@@ -530,7 +526,7 @@ mod tests {
     fn test_adaptive_alpha_short_sequence() {
         // Short sequences should have lower alpha for faster adaptation
         let alpha = ContextConfig::adaptive_alpha(30);
-        assert!(alpha >= 0.85 && alpha <= 0.90);
+        assert!((0.85..=0.90).contains(&alpha));
         // α = 1 - 4/30 = 0.866...
         assert!((alpha - 0.8667).abs() < 0.01);
     }
@@ -539,7 +535,7 @@ mod tests {
     fn test_adaptive_alpha_medium_sequence() {
         // Medium sequences should have moderate alpha
         let alpha = ContextConfig::adaptive_alpha(100);
-        assert!(alpha >= 0.90 && alpha <= 0.96);
+        assert!((0.90..=0.96).contains(&alpha));
         // α = 1 - 4/100 = 0.96
         assert!((alpha - 0.96).abs() < 0.01);
     }
@@ -548,7 +544,7 @@ mod tests {
     fn test_adaptive_alpha_long_sequence() {
         // Long sequences should have high alpha for long memory
         let alpha = ContextConfig::adaptive_alpha(500);
-        assert!(alpha >= 0.95 && alpha <= 0.98);
+        assert!((0.95..=0.98).contains(&alpha));
         // α = 1 - 4/500 = 0.992, clamped to 0.98
         assert!((alpha - 0.98).abs() < 0.01);
     }
@@ -557,7 +553,7 @@ mod tests {
     fn test_adaptive_alpha_minimum_sequence() {
         // Very short sequences should be clamped to minimum
         let alpha = ContextConfig::adaptive_alpha(10);
-        assert!(alpha >= 0.85 && alpha <= 0.98);
+        assert!((0.85..=0.98).contains(&alpha));
         // α = 1 - 4/20 = 0.80, clamped to 0.85
         assert!((alpha - 0.85).abs() < 0.01);
     }
@@ -566,7 +562,7 @@ mod tests {
     fn test_with_adaptive_alpha() {
         let config = ContextConfig::with_adaptive_alpha(200);
         assert!(config.enabled);
-        assert!(config.alpha >= 0.85 && config.alpha <= 0.98);
+        assert!((0.85..=0.98).contains(&config.alpha));
         // For sequence length 200: α = 1 - 4/200 = 0.98
         assert!((config.alpha - 0.98).abs() < 0.01);
     }

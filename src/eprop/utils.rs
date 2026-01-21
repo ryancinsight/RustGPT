@@ -7,16 +7,11 @@
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 
-/// Enhanced sparse computation with block-wise operations and dynamic thresholds
-///
-/// Phase 2 Enhancement: Provides 2-4× additional speedup over basic sparse operations
-/// through cache-friendly block processing and adaptive sparsity detection.
-
 /// Block size for enhanced sparse operations (tuned for L1/L2 cache)
 const ENHANCED_BLOCK_SIZE: usize = 64;
 
 /// Sparsity threshold for automatic mode selection
-const AUTO_SPARSITY_THRESHOLD: f32 = 0.1;
+pub const AUTO_SPARSITY_THRESHOLD: f32 = 0.1;
 
 /// Compute outer product: a ⊗ b
 ///
@@ -54,6 +49,24 @@ pub fn outer_product(a: &Array1<f32>, b: &Array1<f32>) -> Array2<f32> {
     }
 
     result
+}
+
+pub fn outer_product_into(out: &mut Array2<f32>, a: &Array1<f32>, b: &Array1<f32>) {
+    debug_assert_eq!(
+        out.dim(),
+        (a.len(), b.len()),
+        "outer_product_into shape mismatch"
+    );
+
+    let rows = a.len();
+
+    for i in 0..rows {
+        let ai = a[i];
+        let mut row = out.row_mut(i);
+        for (dst, &bj) in row.iter_mut().zip(b.iter()) {
+            *dst = ai * bj;
+        }
+    }
 }
 
 /// Clip gradient by global norm
@@ -294,6 +307,17 @@ pub fn get_active_spike_indices(spikes: &Array1<f32>, threshold: f32) -> Vec<usi
         .collect()
 }
 
+pub fn fill_active_spike_indices(spikes: &Array1<f32>, threshold: f32, out: &mut Vec<usize>) {
+    out.clear();
+    out.extend(
+        spikes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &spike)| spike > threshold)
+            .map(|(idx, _)| idx),
+    );
+}
+
 /// Compute sparse outer product using active spike indices
 ///
 /// For sparse spikes with k active neurons out of N total:
@@ -371,6 +395,43 @@ pub fn sparse_matvec(
     }
 
     result
+}
+
+pub fn sparse_matvec_into(
+    out: &mut Array1<f32>,
+    weights: &Array2<f32>,
+    input: &Array1<f32>,
+    active_indices: &[usize],
+) {
+    debug_assert_eq!(
+        out.len(),
+        weights.nrows(),
+        "sparse_matvec_into nrows mismatch"
+    );
+    out.fill(0.0);
+    sparse_matvec_add_into(out, weights, input, active_indices);
+}
+
+pub fn sparse_matvec_add_into(
+    out: &mut Array1<f32>,
+    weights: &Array2<f32>,
+    input: &Array1<f32>,
+    active_indices: &[usize],
+) {
+    debug_assert_eq!(
+        out.len(),
+        weights.nrows(),
+        "sparse_matvec_add_into nrows mismatch"
+    );
+    // Only accumulate columns corresponding to active inputs
+    for &col_idx in active_indices {
+        let weight_col = weights.column(col_idx);
+        let input_val = input[col_idx];
+
+        for (dst, &w) in out.iter_mut().zip(weight_col.iter()) {
+            *dst += w * input_val;
+        }
+    }
 }
 
 /// Auto-select between dense and sparse computation based on sparsity level

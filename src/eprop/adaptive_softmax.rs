@@ -54,7 +54,7 @@ use std::{
     collections::{BinaryHeap, HashSet},
 };
 
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use rand::{SeedableRng, prelude::*};
 use serde::{Deserialize, Serialize};
 
@@ -132,7 +132,7 @@ impl SoftmaxConfig {
 
         // Compute optimal number of samples for sampled strategy
         let num_samples = if strategy == SoftmaxStrategy::Sampled {
-            ((vocab_size as f32).sqrt() as usize).min(5_000).max(100)
+            ((vocab_size as f32).sqrt() as usize).clamp(100, 5_000)
         } else {
             vocab_size
         };
@@ -158,7 +158,7 @@ impl SoftmaxConfig {
 
     /// Create config for large vocabulary (force sampled softmax)
     pub fn large_vocab(vocab_size: usize, frequencies: Option<Vec<f32>>) -> Self {
-        let num_samples = ((vocab_size as f32).sqrt() as usize).min(5_000).max(100);
+        let num_samples = ((vocab_size as f32).sqrt() as usize).clamp(100, 5_000);
         Self {
             vocab_size,
             strategy: Some(SoftmaxStrategy::Sampled),
@@ -170,7 +170,7 @@ impl SoftmaxConfig {
 
     /// Create config for massive vocabulary (force hierarchical softmax)
     pub fn massive_vocab(vocab_size: usize, frequencies: Vec<f32>) -> Self {
-        let num_samples = ((vocab_size as f32).sqrt() as usize).min(5_000).max(100);
+        let num_samples = ((vocab_size as f32).sqrt() as usize).clamp(100, 5_000);
         Self {
             vocab_size,
             strategy: Some(SoftmaxStrategy::Sampled),
@@ -338,20 +338,41 @@ impl AdaptiveSoftmax {
             "Target index out of bounds"
         );
 
+        let mut grad = Array1::zeros(self.config.vocab_size);
+        let loss = self.loss_and_gradient_into(logits, target, &mut grad);
+        (loss, grad)
+    }
+
+    pub fn loss_and_gradient_into(
+        &mut self,
+        logits: &Array1<f32>,
+        target: usize,
+        grad_out: &mut Array1<f32>,
+    ) -> f32 {
+        assert!(
+            target < self.config.vocab_size,
+            "Target index out of bounds"
+        );
+        assert_eq!(
+            grad_out.len(),
+            self.config.vocab_size,
+            "Gradient output shape mismatch"
+        );
+
         match self.strategy {
             SoftmaxStrategy::Sampled | SoftmaxStrategy::Adaptive => {
                 if let Some(ref mut sampled) = self.sampled {
-                    sampled.loss_and_gradient(logits, target)
+                    sampled.loss_and_gradient_into(logits, target, grad_out)
                 } else {
-                    self.full_softmax_loss_and_gradient(logits, target)
+                    self.full_softmax_loss_and_gradient_into(logits, target, grad_out)
                 }
             }
             SoftmaxStrategy::Hierarchical => self
                 .hierarchical
                 .as_ref()
                 .unwrap()
-                .loss_and_gradient(logits, target),
-            _ => self.full_softmax_loss_and_gradient(logits, target),
+                .loss_and_gradient_into(logits, target, grad_out),
+            _ => self.full_softmax_loss_and_gradient_into(logits, target, grad_out),
         }
     }
 
@@ -370,20 +391,32 @@ impl AdaptiveSoftmax {
         -probs[target].ln()
     }
 
-    // Internal: Standard full softmax loss + gradient
-    fn full_softmax_loss_and_gradient(
+    fn full_softmax_loss_and_gradient_into(
         &self,
         logits: &Array1<f32>,
         target: usize,
-    ) -> (f32, Array1<f32>) {
-        let probs = self.full_softmax_forward(logits);
-        let loss = -probs[target].ln();
+        grad_out: &mut Array1<f32>,
+    ) -> f32 {
+        let tau = self.config.temperature;
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
-        // Gradient: p_i - 1[i == target]
-        let mut grad = probs.clone();
-        grad[target] -= 1.0;
+        let mut sum_exp = 0.0f32;
+        for (dst, &x) in grad_out.iter_mut().zip(logits.iter()) {
+            let e = ((x - max_logit) / tau).exp();
+            *dst = e;
+            sum_exp += e;
+        }
+        let sum_exp = sum_exp.max(1e-30);
 
-        (loss, grad)
+        let prob_target = grad_out[target] / sum_exp;
+        let loss = -prob_target.ln();
+
+        for dst in grad_out.iter_mut() {
+            *dst /= sum_exp;
+        }
+        grad_out[target] -= 1.0;
+
+        loss
     }
 }
 
@@ -398,10 +431,12 @@ impl Default for AdaptiveSoftmax {
 struct SampledSoftmaxImpl {
     vocab_size: usize,
     num_samples: usize,
-    unigram_dist: Vec<f32>,
     cumulative_dist: Vec<f32>,
     rng: StdRng,
     use_full: bool,
+    sample_set: HashSet<usize>,
+    samples_buf: Vec<usize>,
+    exp_logits_buf: Vec<f32>,
 }
 
 impl SampledSoftmaxImpl {
@@ -433,7 +468,7 @@ impl SampledSoftmaxImpl {
             }
         }
 
-        let rng = if let Some(seed) = config.seed.or_else(|| crate::rng::get_seed()) {
+        let rng = if let Some(seed) = config.seed.or_else(crate::rng::get_seed) {
             // Mix in a constant so this stream is stable but doesn't exactly match other
             // modules' streams for the same base seed.
             StdRng::seed_from_u64(seed.wrapping_add(0xA3B1_C2D3_E4F5_0617))
@@ -444,22 +479,26 @@ impl SampledSoftmaxImpl {
         Self {
             vocab_size: config.vocab_size,
             num_samples: config.num_samples,
-            unigram_dist,
             cumulative_dist,
             rng,
             use_full,
+            sample_set: HashSet::with_capacity((config.num_samples.min(config.vocab_size) + 1) * 2),
+            samples_buf: Vec::with_capacity(config.num_samples.min(config.vocab_size) + 1),
+            exp_logits_buf: Vec::with_capacity(config.num_samples.min(config.vocab_size) + 1),
         }
     }
 
-    fn sample_negatives(&mut self, target: usize, num_samples: usize) -> Vec<usize> {
+    fn sample_negatives(&mut self, target: usize, num_samples: usize) {
         if self.use_full {
-            return (0..self.vocab_size).collect();
+            self.samples_buf.clear();
+            self.samples_buf.extend(0..self.vocab_size);
+            return;
         }
 
-        let mut samples = HashSet::new();
-        samples.insert(target);
+        self.sample_set.clear();
+        self.sample_set.insert(target);
 
-        while samples.len() < num_samples.min(self.vocab_size) + 1 {
+        while self.sample_set.len() < num_samples.min(self.vocab_size) + 1 {
             let r: f32 = self.rng.random();
             let idx = match self
                 .cumulative_dist
@@ -468,10 +507,11 @@ impl SampledSoftmaxImpl {
                 Ok(i) => i,
                 Err(i) => i.min(self.vocab_size - 1),
             };
-            samples.insert(idx);
+            self.sample_set.insert(idx);
         }
 
-        samples.into_iter().collect()
+        self.samples_buf.clear();
+        self.samples_buf.extend(self.sample_set.iter().copied());
     }
 
     fn loss(&mut self, logits: &Array1<f32>, target: usize) -> f32 {
@@ -479,14 +519,15 @@ impl SampledSoftmaxImpl {
             return self.full_loss(logits, target);
         }
 
-        let samples = self.sample_negatives(target, self.num_samples);
-        let max_logit = samples
+        self.sample_negatives(target, self.num_samples);
+        let max_logit = self
+            .samples_buf
             .iter()
             .map(|&i| logits[i])
             .fold(f32::NEG_INFINITY, f32::max);
 
         let mut sum_exp = 0.0;
-        for &i in &samples {
+        for &i in &self.samples_buf {
             sum_exp += (logits[i] - max_logit).exp();
         }
 
@@ -494,35 +535,45 @@ impl SampledSoftmaxImpl {
         log_sum - logits[target]
     }
 
-    fn loss_and_gradient(&mut self, logits: &Array1<f32>, target: usize) -> (f32, Array1<f32>) {
+    fn loss_and_gradient_into(
+        &mut self,
+        logits: &Array1<f32>,
+        target: usize,
+        grad_out: &mut Array1<f32>,
+    ) -> f32 {
+        debug_assert_eq!(grad_out.len(), self.vocab_size);
+
         if self.use_full {
-            return self.full_loss_and_gradient(logits, target);
+            return self.full_loss_and_gradient_into(logits, target, grad_out);
         }
 
-        let samples = self.sample_negatives(target, self.num_samples);
+        self.sample_negatives(target, self.num_samples);
+        let samples = std::mem::take(&mut self.samples_buf);
         let max_logit = samples
             .iter()
             .map(|&i| logits[i])
             .fold(f32::NEG_INFINITY, f32::max);
 
-        let mut sum_exp = 0.0;
-        let mut exp_logits = vec![0.0; samples.len()];
+        let mut sum_exp = 0.0f32;
+        self.exp_logits_buf.clear();
+        self.exp_logits_buf.resize(samples.len(), 0.0);
         for (j, &i) in samples.iter().enumerate() {
-            exp_logits[j] = (logits[i] - max_logit).exp();
-            sum_exp += exp_logits[j];
+            let e = (logits[i] - max_logit).exp();
+            self.exp_logits_buf[j] = e;
+            sum_exp += e;
         }
 
         let loss = max_logit + sum_exp.ln() - logits[target];
 
-        // Sparse gradient
-        let mut grad = Array1::zeros(self.vocab_size);
+        grad_out.fill(0.0);
         for (j, &i) in samples.iter().enumerate() {
-            let prob = exp_logits[j] / sum_exp;
-            grad[i] += prob;
+            let prob = self.exp_logits_buf[j] / sum_exp;
+            grad_out[i] += prob;
         }
-        grad[target] -= 1.0;
+        grad_out[target] -= 1.0;
 
-        (loss, grad)
+        self.samples_buf = samples;
+        loss
     }
 
     fn full_loss(&self, logits: &Array1<f32>, target: usize) -> f32 {
@@ -532,17 +583,27 @@ impl SampledSoftmaxImpl {
         log_sum - logits[target]
     }
 
-    fn full_loss_and_gradient(&self, logits: &Array1<f32>, target: usize) -> (f32, Array1<f32>) {
+    fn full_loss_and_gradient_into(
+        &self,
+        logits: &Array1<f32>,
+        target: usize,
+        grad_out: &mut Array1<f32>,
+    ) -> f32 {
         let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp_logits = logits.mapv(|x| (x - max_logit).exp());
-        let sum_exp = exp_logits.sum();
-        let probs = &exp_logits / sum_exp;
-
-        let loss = -probs[target].ln();
-        let mut grad = probs;
-        grad[target] -= 1.0;
-
-        (loss, grad)
+        let mut sum_exp = 0.0f32;
+        for (dst, &x) in grad_out.iter_mut().zip(logits.iter()) {
+            let e = (x - max_logit).exp();
+            *dst = e;
+            sum_exp += e;
+        }
+        let sum_exp = sum_exp.max(1e-30);
+        let prob_target = grad_out[target] / sum_exp;
+        let loss = -prob_target.ln();
+        for dst in grad_out.iter_mut() {
+            *dst /= sum_exp;
+        }
+        grad_out[target] -= 1.0;
+        loss
     }
 }
 
@@ -750,22 +811,26 @@ impl HierarchicalSoftmaxImpl {
         loss
     }
 
-    fn loss_and_gradient(&self, logits: &Array1<f32>, target: usize) -> (f32, Array1<f32>) {
-        let mut loss = 0.0;
-        let mut grad = Array1::zeros(self.vocab_size);
+    fn loss_and_gradient_into(
+        &self,
+        logits: &Array1<f32>,
+        target: usize,
+        grad_out: &mut Array1<f32>,
+    ) -> f32 {
+        debug_assert_eq!(grad_out.len(), self.vocab_size);
+        grad_out.fill(0.0);
 
+        let mut loss = 0.0f32;
         for &(node_idx, go_left) in &self.paths[target] {
             let logit = logits[node_idx];
             let p_left = sigmoid(logit);
             let prob = if go_left { p_left } else { 1.0 - p_left };
-
             loss -= prob.ln();
 
             let g = if go_left { p_left - 1.0 } else { p_left };
-            grad[node_idx] += g;
+            grad_out[node_idx] += g;
         }
-
-        (loss, grad)
+        loss
     }
 }
 
@@ -809,7 +874,7 @@ mod tests {
         assert_eq!(config.vocab_size, 50_000);
         assert_eq!(config.strategy, Some(SoftmaxStrategy::Sampled));
         // sqrt(50000) ≈ 223, but capped at max/min
-        assert!(config.num_samples >= 100 && config.num_samples <= 5_000);
+        assert!((100..=5_000).contains(&config.num_samples));
     }
 
     #[test]
@@ -989,19 +1054,14 @@ mod tests {
     fn test_hierarchical_creation() {
         let config = SoftmaxConfig::massive_vocab(1000, vec![1.0; 1000]);
         let softmax = AdaptiveSoftmax::new(config);
-        match softmax.strategy() {
-            SoftmaxStrategy::Sampled => {
-                // The massive_vocab helper might force Sampled. Let's check logic.
-                // "massive_vocab" calls: strategy: Some(SoftmaxStrategy::Sampled).
-                // Ah, the helper forces Sampled.
-            }
-            _ => {}
-        }
+        assert_eq!(softmax.strategy(), SoftmaxStrategy::Sampled);
 
         // Manually force Hierarchical
-        let mut config = SoftmaxConfig::default();
-        config.vocab_size = 100;
-        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+        let config = SoftmaxConfig {
+            vocab_size: 100,
+            strategy: Some(SoftmaxStrategy::Hierarchical),
+            ..Default::default()
+        };
 
         let softmax = AdaptiveSoftmax::new(config);
         assert_eq!(softmax.strategy(), SoftmaxStrategy::Hierarchical);
@@ -1009,9 +1069,11 @@ mod tests {
 
     #[test]
     fn test_hierarchical_forward_sum() {
-        let mut config = SoftmaxConfig::default();
-        config.vocab_size = 10;
-        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+        let config = SoftmaxConfig {
+            vocab_size: 10,
+            strategy: Some(SoftmaxStrategy::Hierarchical),
+            ..Default::default()
+        };
 
         let softmax = AdaptiveSoftmax::new(config);
         let logits = Array1::from_vec(vec![0.5; 10]); // Node scores
@@ -1046,9 +1108,11 @@ mod tests {
         // logits[1] is root score.
         // logits[0] is child score.
 
-        let mut config = SoftmaxConfig::default();
-        config.vocab_size = 3;
-        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+        let config = SoftmaxConfig {
+            vocab_size: 3,
+            strategy: Some(SoftmaxStrategy::Hierarchical),
+            ..Default::default()
+        };
 
         let softmax = AdaptiveSoftmax::new(config);
 
@@ -1057,7 +1121,7 @@ mod tests {
         // sigmoid(large) -> 1.0.
         // sigmoid(-large) -> 0.0.
 
-        let mut logits = Array1::zeros(3);
+        let logits = Array1::zeros(3);
         // logits[1] (root) = 0.0 -> p_left = 0.5. p_right = 0.5.
         // Left child is Leaf(0). P(0) = 0.5.
         // Right child is Internal(0). P_node = 0.5.
@@ -1074,9 +1138,11 @@ mod tests {
 
     #[test]
     fn test_hierarchical_loss_gradient() {
-        let mut config = SoftmaxConfig::default();
-        config.vocab_size = 5;
-        config.strategy = Some(SoftmaxStrategy::Hierarchical);
+        let config = SoftmaxConfig {
+            vocab_size: 5,
+            strategy: Some(SoftmaxStrategy::Hierarchical),
+            ..Default::default()
+        };
 
         let mut softmax = AdaptiveSoftmax::new(config);
         let logits = Array1::zeros(5);

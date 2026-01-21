@@ -17,6 +17,7 @@ use crate::{
             CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
             TitanMemoryWorkspace, apply_adaptive_gradients,
         },
+        eprop_adaptor::{EPropAdaptor, EPropAdaptorConfig},
     },
     mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
     model_config::{ModelConfig, TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy},
@@ -105,6 +106,10 @@ pub struct TransformerBlock {
     /// Adaptive residuals component for similarity-based residual connections
     #[serde(skip_serializing, skip_deserializing)]
     adaptive_residuals: Option<AdaptiveResiduals>,
+
+    /// E-Prop trace-based adaptor (if enabled)
+    #[serde(skip_serializing, skip_deserializing)]
+    eprop_adaptor: Option<EPropAdaptor>,
 
     #[serde(skip_serializing, skip_deserializing)]
     titan_memory_workspace: TitanMemoryWorkspace,
@@ -278,6 +283,10 @@ pub struct TransformerBlockConfig {
 
     #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
+
+    /// E-Prop trace-based adaptor configuration
+    #[serde(default)]
+    pub eprop_adaptor: Option<EPropAdaptorConfig>,
 }
 
 /// Pre-allocated workspace for transformer block operations.
@@ -377,6 +386,11 @@ impl TransformerBlock {
             similarity_update_rate: 0.01,
             adaptive_residuals: if use_advanced_adaptive_residuals {
                 Some(AdaptiveResiduals::new_minimal(embed_dim))
+            } else {
+                None
+            },
+            eprop_adaptor: if let Some(ref conf) = config.eprop_adaptor {
+                Some(EPropAdaptor::new(conf.clone()))
             } else {
                 None
             },
@@ -535,6 +549,7 @@ impl TransformerBlock {
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true, // Enable by default
             titan_memory: config.titan_memory.clone(),
+            eprop_adaptor: None, // Default to disabled for now
         };
 
         Self::new(block_config)
@@ -562,6 +577,10 @@ impl TransformerBlock {
             count += residuals.parameter_count();
         }
 
+        if let Some(ref adaptor) = self.eprop_adaptor {
+            count += adaptor.parameter_count();
+        }
+
         count
     }
 
@@ -575,6 +594,10 @@ impl TransformerBlock {
 
         if let Some(ref residuals) = self.adaptive_residuals {
             sum_sq += residuals.weight_norm().powi(2);
+        }
+
+        if let Some(ref adaptor) = self.eprop_adaptor {
+            sum_sq += adaptor.weight_norm().powi(2);
         }
 
         sum_sq.sqrt()
@@ -779,7 +802,14 @@ impl Layer for TransformerBlock {
 
         // In-place final residual: reuse ffn_out allocation
         ffn_out += &residual1;
-        let output = ffn_out;
+        let mut output = ffn_out;
+
+        // Apply E-Prop adaptation if enabled
+        if let Some(ref mut adaptor) = self.eprop_adaptor {
+            if let Ok(adaptation) = adaptor.forward(&output) {
+                output += &adaptation;
+            }
+        }
 
         // Cache intermediates with Arc for zero-copy backward pass access
         *self.cached_intermediates.write().unwrap() = Some((
