@@ -100,7 +100,7 @@ struct MacForwardTrace {
 /// As described in "Titans: Learning to Memorize at Test Time" (Arxiv 2501.00663).
 /// This module acts as a meta-learner that updates its own parameters at test time
 /// based on the "surprise" (gradient) of the input data.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NeuralMemory {
     // Configuration
     pub input_dim: usize,
