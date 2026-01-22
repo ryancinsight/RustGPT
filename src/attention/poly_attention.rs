@@ -497,7 +497,7 @@ impl PolyAttention {
             let old_p = self.p;
             self.p = new_p;
             self.adaptive_state.last_change_epoch = m.epoch_index;
-            tracing::info!(
+            tracing::debug!(
                 old_p,
                 new_p,
                 epoch = m.epoch_index,
@@ -1390,10 +1390,6 @@ impl PolyAttention {
         // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w +
         // threshold_predictor
         let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
-        tracing::info!(
-            "PolyAttention::apply_gradients: use_learned_predictor = {}",
-            self.moh.head_selection_config.gating.use_learned_predictor
-        );
         if self.moh.head_selection_config.gating.use_learned_predictor {
             expected += 6;
         } // weights1, bias1, weights2, bias2, cond_w, activation_params
@@ -2232,7 +2228,7 @@ impl PolyAttention {
         // Debug logging for high loss investigation
         if lb * g.load_balance_weight + cx * g.complexity_loss_weight + sp * g.sparsity_weight > 1.0
         {
-            tracing::info!(
+            tracing::debug!(
                 "High MoH Aux Loss: Total={}, LB={} (w={}), CX={} (w={}), SP={} (w={})",
                 lb * g.load_balance_weight + cx * g.complexity_loss_weight + sp * g.sparsity_weight,
                 lb,
