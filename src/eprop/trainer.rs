@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use ndarray::{Array1, Array2, Zip};
+use ndarray::{Array1, Array2};
 
 use crate::{
     eprop::{
@@ -570,16 +570,8 @@ impl EPropTrainer {
             };
 
         let t_apply = profile.then(std::time::Instant::now);
-        Zip::from(&mut self.weights_in)
-            .and(self.grad_in_buf.view())
-            .for_each(|w, &g| {
-                *w -= lr_in_eff * g;
-            });
-        Zip::from(&mut self.weights_rec)
-            .and(self.grad_rec_buf.view())
-            .for_each(|w, &g| {
-                *w -= lr_rec_eff * g;
-            });
+        self.weights_in.scaled_add(-lr_in_eff, &self.grad_in_buf);
+        self.weights_rec.scaled_add(-lr_rec_eff, &self.grad_rec_buf);
         let apply_us = t_apply.map(|t| t.elapsed().as_micros());
 
         // Apply sparsity pruning (optional)
@@ -746,11 +738,7 @@ impl EPropTrainer {
             &self.state.spikes,
         );
         let lr = self.config.learning_rate;
-        Zip::from(&mut self.weights_out)
-            .and(self.grad_out_buf.view())
-            .for_each(|w, &g| {
-                *w -= lr * g;
-            });
+        self.weights_out.scaled_add(-lr, &self.grad_out_buf);
 
         self.stats.losses.push(loss);
         if self.stats.losses.len() > 100 {
@@ -833,11 +821,7 @@ impl EPropTrainer {
             &self.state.spikes,
         );
         let lr = self.config.learning_rate;
-        Zip::from(&mut self.weights_out)
-            .and(self.grad_out_buf.view())
-            .for_each(|w, &g| {
-                *w -= lr * g;
-            });
+        self.weights_out.scaled_add(-lr, &self.grad_out_buf);
 
         self.stats.losses.push(loss);
         if self.stats.losses.len() > 100 {

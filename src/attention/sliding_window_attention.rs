@@ -1,10 +1,11 @@
 use ndarray::{s, Array1, Array2, Axis};
-use rand::distributions::{Distribution, Uniform};
+use rand::distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
 
 use crate::network::Layer;
 
+#[derive(Debug)]
 struct AttentionCache {
     q: Array2<f32>,
     k: Array2<f32>,
@@ -26,8 +27,8 @@ pub struct SlidingWindowAttention {
 
 impl SlidingWindowAttention {
     pub fn new(embed_dim: usize, window_size: usize) -> Self {
-        let mut rng = rand::thread_rng();
-        let uniform = Uniform::new(-0.1, 0.1);
+        let mut rng = rand::rng();
+        let uniform = Uniform::new(-0.1, 0.1).unwrap();
 
         let w_q = Array2::from_shape_fn((embed_dim, embed_dim), |_| uniform.sample(&mut rng));
         let w_k = Array2::from_shape_fn((embed_dim, embed_dim), |_| uniform.sample(&mut rng));
@@ -108,7 +109,7 @@ impl Layer for SlidingWindowAttention {
 
             // Backprop through weighted sum of V
             let d_scores_t = d_output_t.dot(&window_v_t.t());
-            let d_window_v = scores_t.insert_axis(Axis(1)).dot(&d_output_t.insert_axis(Axis(0)));
+            let d_window_v = scores_t.clone().insert_axis(Axis(1)).dot(&d_output_t.insert_axis(Axis(0)));
             grad_v.slice_mut(s![start..=t, ..]).add_assign(&d_window_v);
 
             // Backprop through softmax
@@ -143,5 +144,33 @@ impl Layer for SlidingWindowAttention {
 
     fn parameters(&self) -> usize {
         self.w_q.len() + self.w_k.len() + self.w_v.len()
+    }
+
+    fn weight_norm(&self) -> f32 {
+         (self.w_q.mapv(|x| x.powi(2)).sum() +
+          self.w_k.mapv(|x| x.powi(2)).sum() +
+          self.w_v.mapv(|x| x.powi(2)).sum()).sqrt()
+    }
+
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+         // Placeholder implementation
+         (Array2::zeros((1, 1)), vec![])
+    }
+
+    fn apply_gradients(
+        &mut self,
+        _gradients: &[Array2<f32>],
+        _learning_rate: f32,
+    ) -> crate::errors::Result<()> {
+        // Placeholder
+        Ok(())
+    }
+
+    fn zero_gradients(&mut self) {
+        // Placeholder
     }
 }
