@@ -61,7 +61,7 @@ fn main() {
     );
 
     // Spot-check a few points
-    for &x in &[-0.2, -0.15, -0.1, 0.1, 0.15, 0.2, 1.2] {
+    for &x in &[-0.2f64, -0.15f64, -0.1f64, 0.1f64, 0.15f64, 0.2f64, 1.2f64] {
         let a = PadeExp::exp(x);
         let b = x.exp();
         let rel = if b != 0.0 { ((a - b) / b).abs() } else { 0.0 };

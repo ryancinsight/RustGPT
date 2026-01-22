@@ -1,10 +1,11 @@
 use ndarray::{s, Array1, Array2, Axis};
-use rand::distributions::{Distribution, Uniform};
+use rand::distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
 
 use crate::network::Layer;
 
+#[derive(Debug)]
 struct AttentionCache {
     q: Array2<f32>,
     k: Array2<f32>,
@@ -26,8 +27,8 @@ pub struct SlidingWindowAttention {
 
 impl SlidingWindowAttention {
     pub fn new(embed_dim: usize, window_size: usize) -> Self {
-        let mut rng = rand::thread_rng();
-        let uniform = Uniform::new(-0.1, 0.1);
+        let mut rng = rand::rng();
+        let uniform = Uniform::new(-0.1, 0.1).unwrap();
 
         let w_q = Array2::from_shape_fn((embed_dim, embed_dim), |_| uniform.sample(&mut rng));
         let w_k = Array2::from_shape_fn((embed_dim, embed_dim), |_| uniform.sample(&mut rng));
@@ -89,6 +90,20 @@ impl Layer for SlidingWindowAttention {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
+        self.apply_gradients(&param_grads, lr).unwrap();
+        input_grads
+    }
+
+    fn parameters(&self) -> usize {
+        self.w_q.len() + self.w_k.len() + self.w_v.len()
+    }
+
+    fn compute_gradients(
+        &self,
+        _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let cache = self.cache.as_ref().expect("Cache should be present before backward pass");
         let seq_len = cache.input.nrows();
         let scale = (self.embed_dim as f32).sqrt();
@@ -99,7 +114,7 @@ impl Layer for SlidingWindowAttention {
 
         for t in (0..seq_len).rev() {
             let start = t.saturating_sub(self.window_size - 1);
-            let d_output_t = grads.row(t);
+            let d_output_t = output_grads.row(t);
 
             let scores_t = &cache.attention_scores[t];
             let window_v_t = cache.v.slice(s![start..=t, ..]);
@@ -108,7 +123,7 @@ impl Layer for SlidingWindowAttention {
 
             // Backprop through weighted sum of V
             let d_scores_t = d_output_t.dot(&window_v_t.t());
-            let d_window_v = scores_t.insert_axis(Axis(1)).dot(&d_output_t.insert_axis(Axis(0)));
+            let d_window_v = scores_t.clone().insert_axis(Axis(1)).dot(&d_output_t.insert_axis(Axis(0)));
             grad_v.slice_mut(s![start..=t, ..]).add_assign(&d_window_v);
 
             // Backprop through softmax
@@ -128,20 +143,42 @@ impl Layer for SlidingWindowAttention {
         let grad_w_k = cache.input.t().dot(&grad_k);
         let grad_w_v = cache.input.t().dot(&grad_v);
 
-        // Update weights
-        self.w_q.scaled_add(-lr, &grad_w_q);
-        self.w_k.scaled_add(-lr, &grad_w_k);
-        self.w_v.scaled_add(-lr, &grad_w_v);
-
         // Gradients for input
         let d_input_from_q = grad_q.dot(&self.w_q.t());
         let d_input_from_k = grad_k.dot(&self.w_k.t());
         let d_input_from_v = grad_v.dot(&self.w_v.t());
 
-        d_input_from_q + d_input_from_k + d_input_from_v
+        let input_grads = d_input_from_q + d_input_from_k + d_input_from_v;
+
+        (input_grads, vec![grad_w_q, grad_w_k, grad_w_v])
     }
 
-    fn parameters(&self) -> usize {
-        self.w_q.len() + self.w_k.len() + self.w_v.len()
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::errors::Result<()> {
+        if gradients.len() != 3 {
+             return Err(crate::errors::ModelError::GradientError {
+                message: format!("Expected 3 gradients for SlidingWindowAttention, got {}", gradients.len()),
+            });
+        }
+
+        self.w_q.scaled_add(-learning_rate, &gradients[0]);
+        self.w_k.scaled_add(-learning_rate, &gradients[1]);
+        self.w_v.scaled_add(-learning_rate, &gradients[2]);
+        Ok(())
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let mut sum = 0.0;
+        sum += self.w_q.iter().map(|x| x * x).sum::<f32>();
+        sum += self.w_k.iter().map(|x| x * x).sum::<f32>();
+        sum += self.w_v.iter().map(|x| x * x).sum::<f32>();
+        sum.sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // No stateful gradients to zero
     }
 }

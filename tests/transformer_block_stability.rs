@@ -3,6 +3,7 @@ use llm::{
     layers::transformer::{TransformerBlock, TransformerBlockConfig},
     mixtures::HeadSelectionStrategy,
 };
+use core::iter::Iterator;
 use ndarray::Array2;
 use proptest::prelude::*;
 
@@ -28,6 +29,7 @@ proptest! {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: llm::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
