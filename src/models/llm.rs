@@ -3088,8 +3088,8 @@ impl LLM {
                                 if scratch.accumulated_param_grads[t_idx].is_empty() {
                                     scratch.accumulated_param_grads[t_idx] = lrm_param_grads_step;
                                 } else {
-                                    for (acc_grad, new_grad) in
-                                        scratch.accumulated_param_grads[t_idx]
+                                    for (acc_grad, new_grad) in scratch.accumulated_param_grads
+                                        [t_idx]
                                         .iter_mut()
                                         .zip(lrm_param_grads_step)
                                     {
@@ -4371,7 +4371,8 @@ impl LLM {
                     }
                 }
                 // Apply averaged grads per layer after batch
-                let mut grads_per_layer = std::mem::take(&mut self.training_scratch.grads_per_layer);
+                let mut grads_per_layer =
+                    std::mem::take(&mut self.training_scratch.grads_per_layer);
                 for (idx, maybe_grads) in grads_per_layer.iter_mut().enumerate() {
                     if let Some(mut grads) = maybe_grads.take() {
                         if examples_in_batch > 0 {

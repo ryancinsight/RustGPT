@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis, s, Zip};
+use ndarray::{Array1, Array2, Axis, Zip, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -36,11 +36,7 @@ fn mlp_forward(weights: &MemoryWeights, input: &Array1<f32>) -> (Array1<f32>, Ar
 }
 
 impl TitansMAG {
-    pub fn new(
-        swa: SlidingWindowAttention,
-        memory: NeuralMemory,
-        segment_len: usize,
-    ) -> Self {
+    pub fn new(swa: SlidingWindowAttention, memory: NeuralMemory, segment_len: usize) -> Self {
         let input_dim = swa.embed_dim;
         let mut rng = rand::rng();
         let normal = Normal::new(0.0, 0.02).unwrap();
@@ -50,9 +46,7 @@ impl TitansMAG {
             .collect();
         let gate_w = Array2::from_shape_vec((2 * input_dim, input_dim), w_vec).unwrap();
 
-        let b_vec: Vec<f32> = (0..input_dim)
-            .map(|_| normal.sample(&mut rng))
-            .collect();
+        let b_vec: Vec<f32> = (0..input_dim).map(|_| normal.sample(&mut rng)).collect();
         let gate_b = Array1::from_shape_vec(input_dim, b_vec).unwrap();
 
         Self {
@@ -110,7 +104,7 @@ impl Layer for TitansMAG {
                 // Concat [y, m]
                 let mut concat = Array1::<f32>::zeros(2 * dim);
                 concat.slice_mut(s![0..dim]).assign(&y);
-                concat.slice_mut(s![dim..2*dim]).assign(&m);
+                concat.slice_mut(s![dim..2 * dim]).assign(&m);
 
                 let z = concat.dot(&self.gate_w) + &self.gate_b;
                 let g = z.mapv(|x| Self::sigmoid(x));
@@ -132,7 +126,10 @@ impl Layer for TitansMAG {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let input = self.cached_input.as_ref().expect("forward must be called before backward");
+        let input = self
+            .cached_input
+            .as_ref()
+            .expect("forward must be called before backward");
         let (input_grads, param_grads) = self.compute_gradients(input, grads);
         self.apply_gradients(&param_grads, lr).unwrap();
         input_grads
@@ -185,7 +182,11 @@ impl Layer for TitansMAG {
         let mut trace = Vec::with_capacity(seq_len);
 
         let mut curr_memory = self.memory.init_memory.clone();
-        let mut momentum = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+        let mut momentum = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
         let mut retrieval_memory_snapshot;
 
         processed = 0;
@@ -210,7 +211,7 @@ impl Layer for TitansMAG {
                 // Gating
                 let mut concat = Array1::<f32>::zeros(2 * dim);
                 concat.slice_mut(s![0..dim]).assign(&swa_t);
-                concat.slice_mut(s![dim..2*dim]).assign(&y_mem);
+                concat.slice_mut(s![dim..2 * dim]).assign(&y_mem);
                 let z = concat.dot(&self.gate_w) + &self.gate_b;
                 let g = z.mapv(|x| Self::sigmoid_static(x));
 
@@ -244,12 +245,18 @@ impl Layer for TitansMAG {
                 let (v_pred, h) = mlp_forward(&curr_memory, &k_t);
                 let grad_output = &v_pred - &v_t;
 
-                let grad_w2 = grad_output.clone().insert_axis(Axis(1)).dot(&h.clone().insert_axis(Axis(0)));
+                let grad_w2 = grad_output
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&h.clone().insert_axis(Axis(0)));
                 let grad_b2 = grad_output.clone();
                 let grad_h = curr_memory.w2.t().dot(&grad_output);
                 let z_k = curr_memory.w1.dot(&k_t) + &curr_memory.b1;
                 let grad_z = grad_h * z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-                let grad_w1 = grad_z.clone().insert_axis(Axis(1)).dot(&k_t.clone().insert_axis(Axis(0)));
+                let grad_w1 = grad_z
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&k_t.clone().insert_axis(Axis(0)));
                 let grad_b1 = grad_z;
 
                 momentum.scale(eta_t);
@@ -290,12 +297,28 @@ impl Layer for TitansMAG {
         let mut d_w_alpha = Array1::<f32>::zeros(self.memory.w_alpha.raw_dim());
         let mut d_w_eta = Array1::<f32>::zeros(self.memory.w_eta.raw_dim());
         let mut d_w_theta = Array1::<f32>::zeros(self.memory.w_theta.raw_dim());
-        let mut d_init_memory = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+        let mut d_init_memory = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
 
         // State for backward loop
-        let mut d_m_next = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
-        let mut d_s_next = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
-        let mut d_m_chunk_start = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+        let mut d_m_next = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
+        let mut d_s_next = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
+        let mut d_m_chunk_start = MemoryWeights::zeros(
+            self.memory.key_dim,
+            self.memory.memory_hidden_dim,
+            self.memory.val_dim,
+        );
 
         for t in (0..seq_len).rev() {
             let data = &trace[t];
@@ -308,8 +331,12 @@ impl Layer for TitansMAG {
 
             // Check logic for memory accumulation
             if (t + 1) % self.segment_len == 0 && t + 1 < seq_len {
-                 d_m_next.add(&d_m_chunk_start);
-                 d_m_chunk_start = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+                d_m_next.add(&d_m_chunk_start);
+                d_m_chunk_start = MemoryWeights::zeros(
+                    self.memory.key_dim,
+                    self.memory.memory_hidden_dim,
+                    self.memory.val_dim,
+                );
             }
 
             let d_m_curr = d_m_next.clone();
@@ -337,9 +364,13 @@ impl Layer for TitansMAG {
 
             d_m_next.scale(1.0 - alpha);
 
-             if t % self.segment_len == 0 {
+            if t % self.segment_len == 0 {
                 d_m_next.add(&d_m_chunk_start);
-                d_m_chunk_start = MemoryWeights::zeros(self.memory.key_dim, self.memory.memory_hidden_dim, self.memory.val_dim);
+                d_m_chunk_start = MemoryWeights::zeros(
+                    self.memory.key_dim,
+                    self.memory.memory_hidden_dim,
+                    self.memory.val_dim,
+                );
             }
 
             let mut d_uin = Array1::<f32>::zeros(dim);
@@ -370,11 +401,17 @@ impl Layer for TitansMAG {
             let v_pred = m_prev.w2.dot(&h_k) + &m_prev.b2;
             let delta = &v_pred - v_t;
 
-            let g_w2 = delta.clone().insert_axis(Axis(1)).dot(&h_k.clone().insert_axis(Axis(0)));
+            let g_w2 = delta
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&h_k.clone().insert_axis(Axis(0)));
             let g_b2 = delta.clone();
             let grad_h_k = m_prev.w2.t().dot(&delta);
             let grad_z_k = &grad_h_k * z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-            let g_w1 = grad_z_k.clone().insert_axis(Axis(1)).dot(&k_t.clone().insert_axis(Axis(0)));
+            let g_w1 = grad_z_k
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&k_t.clone().insert_axis(Axis(0)));
             let g_b1 = grad_z_k.clone();
 
             let mut val_theta = 0.0;
@@ -388,85 +425,108 @@ impl Layer for TitansMAG {
             d_uin = d_uin + (&self.memory.w_theta * d_z_theta);
 
             // d_G_t path (to k, v)
-             let u_w1 = d_s_t.w1.mapv(|x| -theta * x);
-             let u_b1 = d_s_t.b1.mapv(|x| -theta * x);
-             let u_w2 = d_s_t.w2.mapv(|x| -theta * x);
-             let u_b2 = d_s_t.b2.mapv(|x| -theta * x);
+            let u_w1 = d_s_t.w1.mapv(|x| -theta * x);
+            let u_b1 = d_s_t.b1.mapv(|x| -theta * x);
+            let u_w2 = d_s_t.w2.mapv(|x| -theta * x);
+            let u_b2 = d_s_t.b2.mapv(|x| -theta * x);
 
-             let sigma_prime = z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-             let u_w2_t_delta = u_w2.t().dot(&delta);
-             let term1_inner = &sigma_prime * &u_w2_t_delta;
-             let term1 = m_prev.w1.t().dot(&term1_inner);
-             let w2_t_delta = m_prev.w2.t().dot(&delta);
-             let epsilon = &w2_t_delta * &sigma_prime;
-             let term2 = u_w1.t().dot(&epsilon);
-             let d_kt = term1 + term2;
+            let sigma_prime = z_k.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
+            let u_w2_t_delta = u_w2.t().dot(&delta);
+            let term1_inner = &sigma_prime * &u_w2_t_delta;
+            let term1 = m_prev.w1.t().dot(&term1_inner);
+            let w2_t_delta = m_prev.w2.t().dot(&delta);
+            let epsilon = &w2_t_delta * &sigma_prime;
+            let term2 = u_w1.t().dot(&epsilon);
+            let d_kt = term1 + term2;
 
-             d_wk = d_wk + d_kt.clone().insert_axis(Axis(1)).dot(&u_in.clone().insert_axis(Axis(0)));
-             d_uin = d_uin + self.memory.w_k.t().dot(&d_kt);
+            d_wk = d_wk
+                + d_kt
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&u_in.clone().insert_axis(Axis(0)));
+            d_uin = d_uin + self.memory.w_k.t().dot(&d_kt);
 
-             let u_w1_k_ub1 = u_w1.dot(k_t) + &u_b1;
-             let term_v_2 = m_prev.w2.dot(&(&sigma_prime * &u_w1_k_ub1));
-             let term_v_1 = u_w2.dot(&h_k) + &u_b2;
-             let d_vt = -(term_v_1 + term_v_2);
+            let u_w1_k_ub1 = u_w1.dot(k_t) + &u_b1;
+            let term_v_2 = m_prev.w2.dot(&(&sigma_prime * &u_w1_k_ub1));
+            let term_v_1 = u_w2.dot(&h_k) + &u_b2;
+            let d_vt = -(term_v_1 + term_v_2);
 
-             d_wv = d_wv + d_vt.clone().insert_axis(Axis(1)).dot(&u_in.clone().insert_axis(Axis(0)));
-             d_uin = d_uin + self.memory.w_v.t().dot(&d_vt);
+            d_wv = d_wv
+                + d_vt
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&u_in.clone().insert_axis(Axis(0)));
+            d_uin = d_uin + self.memory.w_v.t().dot(&d_vt);
 
-             d_s_next = d_s_t;
+            d_s_next = d_s_t;
 
-             // Now add d_uin to d_o_t
-             d_o_t += &d_uin;
+            // Now add d_uin to d_o_t
+            d_o_t += &d_uin;
 
-             // 2. Backprop through Gate Combination
-             let d_g = &d_o_t * (swa_t - mem_t);
-             let d_y = &d_o_t * g;
-             let d_m = &d_o_t * (1.0 - g);
+            // 2. Backprop through Gate Combination
+            let d_g = &d_o_t * (swa_t - mem_t);
+            let d_y = &d_o_t * g;
+            let d_m = &d_o_t * (1.0 - g);
 
-             // Backprop through Gate Weights
-             let d_z = d_g * g * (1.0 - g);
+            // Backprop through Gate Weights
+            let d_z = d_g * g * (1.0 - g);
 
-             d_gate_b = d_gate_b + &d_z;
+            d_gate_b = d_gate_b + &d_z;
 
-             let mut concat = Array1::<f32>::zeros(2 * dim);
-             concat.slice_mut(s![0..dim]).assign(swa_t);
-             concat.slice_mut(s![dim..2*dim]).assign(mem_t);
+            let mut concat = Array1::<f32>::zeros(2 * dim);
+            concat.slice_mut(s![0..dim]).assign(swa_t);
+            concat.slice_mut(s![dim..2 * dim]).assign(mem_t);
 
-             d_gate_w = d_gate_w + concat.insert_axis(Axis(1)).dot(&d_z.clone().insert_axis(Axis(0)));
+            d_gate_w = d_gate_w
+                + concat
+                    .insert_axis(Axis(1))
+                    .dot(&d_z.clone().insert_axis(Axis(0)));
 
-             let d_concat = self.gate_w.dot(&d_z);
-             let d_y_from_gate = d_concat.slice(s![0..dim]);
-             let d_m_from_gate = d_concat.slice(s![dim..2*dim]);
+            let d_concat = self.gate_w.dot(&d_z);
+            let d_y_from_gate = d_concat.slice(s![0..dim]);
+            let d_m_from_gate = d_concat.slice(s![dim..2 * dim]);
 
-             let d_y_total = d_y + d_y_from_gate;
-             let d_m_total = d_m + d_m_from_gate;
+            let d_y_total = d_y + d_y_from_gate;
+            let d_m_total = d_m + d_m_from_gate;
 
-             d_swa_out.row_mut(t).assign(&d_y_total);
+            d_swa_out.row_mut(t).assign(&d_y_total);
 
-             // Retrieval Gradients
-             let chunk_start_idx = t - (t % self.segment_len);
-             let m_snapshot = &trace[chunk_start_idx].m_prev;
+            // Retrieval Gradients
+            let chunk_start_idx = t - (t % self.segment_len);
+            let m_snapshot = &trace[chunk_start_idx].m_prev;
 
-             let q_t = &trace[t].q_t;
-             let dy_t = d_m_total;
+            let q_t = &trace[t].q_t;
+            let dy_t = d_m_total;
 
-             let z_q = m_snapshot.w1.dot(q_t) + &m_snapshot.b1;
-             let h_q = z_q.mapv(|x| x.max(0.0));
+            let z_q = m_snapshot.w1.dot(q_t) + &m_snapshot.b1;
+            let h_q = z_q.mapv(|x| x.max(0.0));
 
-             let grad_h_q = m_snapshot.w2.t().dot(&dy_t);
-             let grad_z_q = &grad_h_q * z_q.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
-             let d_qt = m_snapshot.w1.t().dot(&grad_z_q);
+            let grad_h_q = m_snapshot.w2.t().dot(&dy_t);
+            let grad_z_q = &grad_h_q * z_q.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
+            let d_qt = m_snapshot.w1.t().dot(&grad_z_q);
 
-             let input_t = input.row(t);
-             d_wq = d_wq + d_qt.clone().insert_axis(Axis(1)).dot(&input_t.insert_axis(Axis(0)));
-             let d_xt_from_q = self.memory.w_q.t().dot(&d_qt);
+            let input_t = input.row(t);
+            d_wq = d_wq
+                + d_qt
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&input_t.insert_axis(Axis(0)));
+            let d_xt_from_q = self.memory.w_q.t().dot(&d_qt);
 
-             input_grads.row_mut(t).add_assign(&d_xt_from_q);
+            input_grads.row_mut(t).add_assign(&d_xt_from_q);
 
-             d_m_chunk_start.w2 = d_m_chunk_start.w2 + dy_t.clone().insert_axis(Axis(1)).dot(&h_q.insert_axis(Axis(0)));
-             d_m_chunk_start.b2.zip_mut_with(&dy_t, |a, &b| *a += b);
-             d_m_chunk_start.w1 = d_m_chunk_start.w1 + grad_z_q.clone().insert_axis(Axis(1)).dot(&q_t.clone().insert_axis(Axis(0)));
-             d_m_chunk_start.b1 += &grad_z_q;
+            d_m_chunk_start.w2 = d_m_chunk_start.w2
+                + dy_t
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&h_q.insert_axis(Axis(0)));
+            d_m_chunk_start.b2.zip_mut_with(&dy_t, |a, &b| *a += b);
+            d_m_chunk_start.w1 = d_m_chunk_start.w1
+                + grad_z_q
+                    .clone()
+                    .insert_axis(Axis(1))
+                    .dot(&q_t.clone().insert_axis(Axis(0)));
+            d_m_chunk_start.b1 += &grad_z_q;
         }
 
         d_init_memory.add(&d_m_next);
@@ -532,10 +592,13 @@ use std::ops::AddAssign;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::attention::sliding_window_attention::SlidingWindowAttention;
-    use crate::models::titans::memory::NeuralMemory;
     use ndarray::Array2;
+
+    use super::*;
+    use crate::{
+        attention::sliding_window_attention::SlidingWindowAttention,
+        models::titans::memory::NeuralMemory,
+    };
 
     #[test]
     fn test_titans_mag_forward() {
@@ -590,7 +653,11 @@ mod tests {
 
         // Check for finiteness
         for (i, g) in param_grads.iter().enumerate() {
-            assert!(g.iter().all(|x| x.is_finite()), "Gradient {} contains non-finite values", i);
+            assert!(
+                g.iter().all(|x| x.is_finite()),
+                "Gradient {} contains non-finite values",
+                i
+            );
         }
     }
 }
