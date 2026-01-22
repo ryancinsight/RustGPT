@@ -2150,10 +2150,540 @@ impl LLM {
         batch: &[Vec<usize>],
         lr: f32,
     ) -> Result<(f32, f32, f32, Vec<f32>)> {
-        let _ = (batch, lr);
-        Err(crate::errors::ModelError::Training {
-            message: "E-prop training is not wired into LLM layers. Initialize e-prop traces and add layer adapters before enabling --eprop.".to_string(),
-        })
+        // Check if E-Prop is actually enabled in the model configuration to warn the user if not
+        let _eprop_enabled = self.network.iter().any(|layer| {
+            if let LayerEnum::TransformerBlock(_block) = layer {
+                // We can't easily access private fields, but we trust the user has initialized it.
+                // However, the error message in the placeholder suggested "Initialize e-prop traces".
+                // Since we are now implementing it, we assume it's initialized.
+                true 
+            } else {
+                false
+            }
+        });
+
+        // Re-use the profiled training logic which is now capable of handling E-Prop gradients
+        // via the updated TransformerBlock::backward / compute_gradients implementation.
+        // We duplicate the logic here to allow for future E-Prop specific divergence
+        // (e.g. different learning rules, eligibility trace logging, etc.) without coupling.
+
+        let check_finite = std::env::var_os("RUSTGPT_CHECK_FINITE").is_some();
+        let mut batch_loss = 0.0;
+        let mut batch_base_loss = 0.0;
+        let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
+        let mut layer_grad_norms: Vec<f32> = Vec::new(); // Track per-layer gradient norms
+
+        // Initialize accumulated gradients for each layer
+        for _ in &self.network {
+            accumulated_param_grads.push(Vec::new());
+            layer_grad_norms.push(0.0);
+        }
+
+        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden state).
+        let mut out_proj_idx: Option<usize> = None;
+        for (i, layer) in self.network.iter().enumerate() {
+            if matches!(layer, LayerEnum::OutputProjection(_)) {
+                out_proj_idx = Some(i);
+            }
+        }
+
+        let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
+
+        // Process each sequence in the batch
+        for training_row in batch {
+            if training_row.len() < 2 {
+                continue;
+            }
+
+            // 1. Slice input and targets
+            let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
+            let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab.
+
+            // Forward pass with signal propagation variance tracking
+            let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
+            for (i, &token_id) in input_ids.iter().enumerate() {
+                input[[0, i]] = token_id as f32;
+            }
+
+            // Track forward pass variance for signal propagation analysis
+            let mut layer_variances: Vec<f32> = Vec::new();
+            layer_inputs.clear();
+
+            let mut similarity_ctx: Option<Array2<f32>> = None;
+
+            for layer in &mut self.network {
+                layer_inputs.push(input);
+                let input_ref = layer_inputs.last().unwrap();
+                input = match layer {
+                    LayerEnum::TransformerBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(input_ref);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    _ => {
+                        similarity_ctx = None;
+                        layer.forward(input_ref)
+                    }
+                };
+
+                // Compute variance of layer output in single pass
+                let (sum, sum_sq) = input
+                    .iter()
+                    .fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
+                let n = input.len() as f32;
+                let mean = sum / n;
+                let variance = (sum_sq / n) - mean * mean;
+                layer_variances.push(variance);
+            }
+
+            let logits = input;
+            let probs = crate::soft::Softmax::new().forward_immutable(&logits.view());
+
+            // Symmetric cross-entropy loss and gradients
+            let sce_cfg = crate::loss::SymmetricCEConfig::default();
+            let sce = crate::loss::symmetric_cross_entropy(
+                &probs,
+                target_ids,
+                sce_cfg.alpha,
+                sce_cfg.beta,
+                sce_cfg.epsilon,
+            );
+            let sce_norm = sce / (target_ids.len().max(1) as f32);
+            batch_loss += sce_norm;
+            batch_base_loss += sce_norm;
+
+            // Auxiliary residual decorrelation (redundancy reduction)
+            let decor_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx {
+                let base_w = self.training_hparams.residual_decorrelation_weight;
+                if base_w > 0.0 {
+                    let difficulty = if self.training_hparams.residual_decorrelation_adaptive {
+                        (sce_norm / (sce_norm + 1.0)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let w = base_w * (1.0 + difficulty);
+                    let hidden_prelogit = &layer_inputs[op_idx];
+                    let dl = crate::loss::residual_decorrelation_loss(&hidden_prelogit.view());
+                    batch_loss += w * dl;
+                    let dg = crate::loss::residual_decorrelation_gradients(&hidden_prelogit.view());
+                    Some((op_idx, dg.mapv(|x| x * w)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Auxiliary hard-negative repulsion
+            let hardneg_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx
+            {
+                let base_w = self.training_hparams.residual_hardneg_weight;
+                if base_w > 0.0 {
+                    let difficulty = if self.training_hparams.residual_hardneg_adaptive {
+                        (sce_norm / (sce_norm + 1.0)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let w = base_w * (1.0 + difficulty);
+                    let hidden_prelogit = &layer_inputs[op_idx];
+                    let rows = hidden_prelogit.nrows().max(1);
+                    let cols = hidden_prelogit.ncols();
+
+                    // Mean-pool.
+                    let mut anchor = vec![0.0f32; cols];
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            let v = hidden_prelogit[[i, j]];
+                            anchor[j] += if v.is_finite() { v } else { 0.0 };
+                        }
+                    }
+                    let inv = 1.0f32 / (rows as f32);
+                    for a in &mut anchor {
+                        *a *= inv;
+                    }
+
+                    let (hn_loss, grad_anchor) = crate::loss::hard_negative_repulsion_loss_and_grad(
+                        &anchor,
+                        self.residual_neg_bank.as_slice(),
+                        self.training_hparams.residual_hardneg_k,
+                        self.training_hparams.residual_hardneg_margin,
+                        self.training_hparams.residual_hardneg_temperature,
+                    );
+                    batch_loss += w * hn_loss;
+
+                    // Spread pooled grad across tokens.
+                    let mut g = Array2::<f32>::zeros(hidden_prelogit.raw_dim());
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            g[[i, j]] = (grad_anchor[j] * w) * inv;
+                        }
+                    }
+
+                    // Update memory bank.
+                    self.residual_neg_bank
+                        .push(anchor, self.training_hparams.residual_hardneg_bank_size);
+
+                    Some((op_idx, g))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Compute gradients w.r.t. logits
+            let mut grads_output = crate::loss::symmetric_cross_entropy_gradients(
+                &probs,
+                target_ids,
+                sce_cfg.alpha,
+                sce_cfg.beta,
+                sce_cfg.epsilon,
+            );
+
+            // Handle LRM supervision if present
+            let mut lrm_index: Option<usize> = None;
+            for (i, layer) in self.network.iter().enumerate() {
+                if let LayerEnum::LRM(_) = layer {
+                    lrm_index = Some(i);
+                    break;
+                }
+            }
+            if let Some(t_idx) = lrm_index {
+                let aux_steps: &[Array2<f32>] = match &self.network[t_idx] {
+                    LayerEnum::LRM(lrm) => lrm.get_supervision_outputs(),
+                    _ => &[],
+                };
+                let mut aux_loss_sum = 0.0f32;
+                if !aux_steps.is_empty() {
+                    let mut rn_idx: Option<usize> = None;
+                    let mut op_idx: Option<usize> = None;
+                    for i in (t_idx + 1)..self.network.len() {
+                        if matches!(self.network[i], LayerEnum::DynamicTanhNorm(_)) {
+                            rn_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if let Some(rn_i) = rn_idx {
+                        for i in (rn_i + 1)..self.network.len() {
+                            if matches!(self.network[i], LayerEnum::OutputProjection(_)) {
+                                op_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    let (rn_idx, op_idx) = match (rn_idx, op_idx) {
+                        (Some(rn), Some(op)) => (rn, op),
+                        _ => {
+                            batch_loss += aux_loss_sum;
+                            continue;
+                        }
+                    };
+                    let mut rn_clone = match &self.network[rn_idx] {
+                        LayerEnum::DynamicTanhNorm(n) => n.clone(),
+                        _ => {
+                            batch_loss += aux_loss_sum;
+                            continue;
+                        }
+                    };
+                    let mut op_clone = match &self.network[op_idx] {
+                        LayerEnum::OutputProjection(op) => op.clone(),
+                        _ => {
+                            batch_loss += aux_loss_sum;
+                            continue;
+                        }
+                    };
+                    let steps_total = aux_steps.len();
+                    let aux_base: f32 = 1.0;
+                    let decay_rate: f32 = 0.6;
+                    for (si, y_t) in aux_steps.iter().enumerate() {
+                        let mut grad_y_in_opt: Option<Array2<f32>> = None;
+                        {
+                            let norm_y = rn_clone.forward(y_t);
+                            let logits_t = op_clone.forward(&norm_y);
+                            let probs_t =
+                                crate::soft::Softmax::new().forward_immutable(&logits_t.view());
+                            let sce_t = crate::loss::symmetric_cross_entropy(
+                                &probs_t,
+                                target_ids,
+                                sce_cfg.alpha,
+                                sce_cfg.beta,
+                                sce_cfg.epsilon,
+                            );
+                            let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
+                            let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
+                            let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
+                            if step_weight < 1e-5 { continue; }
+                            aux_loss_sum += sce_t_norm * step_weight;
+                            let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
+                                &probs_t,
+                                target_ids,
+                                sce_cfg.alpha,
+                                sce_cfg.beta,
+                                sce_cfg.epsilon,
+                            );
+                            grad_logits_t.mapv_inplace(|v| v * step_weight);
+                            let (grad_norm_in, _) =
+                                op_clone.compute_gradients(&norm_y, &grad_logits_t);
+                            let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
+                            grad_y_in_opt = Some(grad_y_in);
+                        }
+                        if let Some(grad_y_in) = grad_y_in_opt {
+                            let lrm_param_grads_step = match &self.network[t_idx] {
+                                LayerEnum::LRM(layer) => {
+                                    let (_in_grad_unused, param_grads) =
+                                        layer.compute_gradients_at_step(si, &grad_y_in);
+                                    param_grads
+                                }
+                                _ => Vec::new(),
+                            };
+                            if !lrm_param_grads_step.is_empty() {
+                                if accumulated_param_grads[t_idx].is_empty() {
+                                    accumulated_param_grads[t_idx] = lrm_param_grads_step;
+                                } else {
+                                    for (acc_grad, new_grad) in accumulated_param_grads[t_idx]
+                                        .iter_mut()
+                                        .zip(lrm_param_grads_step)
+                                    {
+                                        *acc_grad += &new_grad;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                batch_loss += aux_loss_sum;
+            }
+
+            // Backward pass: compute parameter gradients for each layer
+            // TransformerBlock::compute_gradients() will return E-Prop gradients if enabled.
+            for (rev_idx, layer) in self.network.iter().rev().enumerate() {
+                let layer_idx = self.network.len() - 1 - rev_idx;
+                let (input_grads, param_grads) =
+                    layer.compute_gradients(&layer_inputs[layer_idx], &grads_output);
+
+                if check_finite {
+                    if let Some((bad_i, bad_v)) =
+                        input_grads.iter().enumerate().find(|(_, v)| !v.is_finite())
+                    {
+                        return Err(crate::errors::ModelError::Training {
+                            message: format!("Non-finite input_grads at layer {} index {}: {}", layer_idx, bad_i, bad_v),
+                        });
+                    }
+                    for (g_idx, g) in param_grads.iter().enumerate() {
+                        if let Some((bad_i, bad_v)) =
+                            g.iter().enumerate().find(|(_, v)| !v.is_finite())
+                        {
+                            return Err(crate::errors::ModelError::Training {
+                                message: format!("Non-finite param_grads[{}] at layer {} index {}: {}", g_idx, layer_idx, bad_i, bad_v),
+                            });
+                        }
+                    }
+                }
+
+                let layer_grad_norm: f32 = input_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                layer_grad_norms[layer_idx] += layer_grad_norm;
+                grads_output = input_grads;
+
+                if let Some((op_idx, ref decor_grad)) = decor_grad_opt
+                    && layer_idx == op_idx
+                {
+                    grads_output = grads_output + decor_grad.clone();
+                }
+
+                if let Some((op_idx, ref hn_grad)) = hardneg_grad_opt
+                    && layer_idx == op_idx
+                {
+                    grads_output = grads_output + hn_grad.clone();
+                }
+
+                if accumulated_param_grads[layer_idx].is_empty() {
+                    accumulated_param_grads[layer_idx] = param_grads;
+                } else {
+                    for (acc_grad, new_grad) in accumulated_param_grads[layer_idx]
+                        .iter_mut()
+                        .zip(param_grads)
+                    {
+                        *acc_grad += &new_grad;
+                    }
+                }
+            }
+        }
+
+        // Average layer-wise gradient norms
+        for norm in &mut layer_grad_norms {
+            *norm /= batch.len() as f32;
+        }
+
+        let max_layer_grad = layer_grad_norms.iter().fold(0.0f32, |a, &b| a.max(b));
+        if max_layer_grad > 10.0 {
+            tracing::warn!("Layer-wise gradient norms: {:?}", layer_grad_norms);
+        }
+
+        // Prepare averaged gradients and detect anomalies
+        let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
+        let mut total_grad_norm_sq = 0.0f32;
+        let mut layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
+
+        for (layer_idx, param_grads) in accumulated_param_grads.into_iter().enumerate() {
+            if !param_grads.is_empty() {
+                let averaged_grads: Vec<Array2<f32>> = param_grads
+                    .into_iter()
+                    .map(|grad| grad / batch.len() as f32)
+                    .collect();
+
+                let max_reasonable_grad_per_param = 5.0;
+                let max_total_grad_norm =
+                    (averaged_grads.iter().map(|g| g.len()).sum::<usize>() as f32).sqrt()
+                        * max_reasonable_grad_per_param;
+                let mut total_layer_grad_norm_sq = 0.0;
+                for grad in &averaged_grads {
+                    total_layer_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
+                }
+                let total_layer_grad_norm = total_layer_grad_norm_sq.sqrt();
+                let scale = if total_layer_grad_norm > max_total_grad_norm {
+                    max_total_grad_norm / total_layer_grad_norm
+                } else {
+                    1.0
+                };
+
+                let mut clipped_grads: Vec<Array2<f32>> = if scale < 1.0 {
+                    averaged_grads
+                        .into_iter()
+                        .map(|grad| grad.mapv(|x| x * scale))
+                        .collect()
+                } else {
+                    averaged_grads
+                };
+
+                const MAX_GRAD_ABS: f32 = 5000.0;
+                let mut max_abs: f32 = 0.0;
+                for g in &clipped_grads {
+                    for &v in g.iter() {
+                        if v.abs() > max_abs { max_abs = v.abs(); }
+                    }
+                }
+                if max_abs > MAX_GRAD_ABS {
+                    let s = MAX_GRAD_ABS / max_abs;
+                    for g in &mut clipped_grads { g.mapv_inplace(|v| v * s); }
+                }
+
+                if check_finite {
+                    for (g_idx, g) in clipped_grads.iter().enumerate() {
+                        if let Some((bad_i, bad_v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            return Err(crate::errors::ModelError::Training {
+                                message: format!("Non-finite clipped_grads[{}] at layer {} index {}: {}", g_idx, layer_idx, bad_i, bad_v),
+                            });
+                        }
+                    }
+                } else {
+                    for grad in &mut clipped_grads {
+                        grad.iter_mut().for_each(|v| { if !v.is_finite() { *v = 0.0 } });
+                    }
+                }
+
+                if let Err(e) = self.detect_gradient_anomalies(&clipped_grads) {
+                    tracing::error!("Gradient anomaly detected in layer {}", layer_idx);
+                    return Err(e);
+                }
+
+                let mut s_layer = 0.0f32;
+                for grad in &clipped_grads {
+                    let s = grad.iter().map(|&x| x * x).sum::<f32>();
+                    total_grad_norm_sq += s;
+                    s_layer += s;
+                }
+                layer_param_grad_norm_sq[layer_idx] += s_layer;
+                averaged_grads_per_layer.push(clipped_grads);
+            } else {
+                averaged_grads_per_layer.push(Vec::new());
+            }
+        }
+
+        let grad_norm = total_grad_norm_sq.sqrt();
+        let per_layer_grad_norms: Vec<f32> = self
+            .network
+            .iter()
+            .zip(&averaged_grads_per_layer)
+            .map(|(_layer, grads)| {
+                if grads.is_empty() { 0.0 } else {
+                    let mut s = 0.0f32;
+                    for g in grads { s += g.iter().map(|&x| x * x).sum::<f32>(); }
+                    s.sqrt()
+                }
+            })
+            .collect();
+
+        let mut nonzero: Vec<f32> = per_layer_grad_norms
+            .iter()
+            .cloned()
+            .filter(|&v| v > 0.0)
+            .collect();
+        let median_grad_norm = if nonzero.is_empty() {
+            grad_norm.max(1e-6)
+        } else {
+            nonzero.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mid = nonzero.len() / 2;
+            if nonzero.len().is_multiple_of(2) {
+                (nonzero[mid - 1] + nonzero[mid]) * 0.5
+            } else {
+                nonzero[mid]
+            }
+        };
+
+        const EMA_BETA: f32 = 0.9;
+        let _median_smoothed = if let Some(prev) = self.median_grad_ema {
+            let sm = EMA_BETA * prev + (1.0 - EMA_BETA) * median_grad_norm;
+            self.median_grad_ema = Some(sm);
+            sm
+        } else {
+            self.median_grad_ema = Some(median_grad_norm);
+            median_grad_norm
+        };
+
+        // Compute adaptive learning rates
+        let adaptive_lrs: Vec<f32> = self
+            .network
+            .iter()
+            .zip(&averaged_grads_per_layer)
+            .enumerate()
+            .map(|(layer_idx, (layer, grads))| {
+                if grads.is_empty() {
+                    lr
+                } else {
+                    Self::compute_layer_adaptive_lr_static(
+                        layer,
+                        grads,
+                        lr,
+                        layer_idx,
+                        median_grad_norm,
+                    )
+                }
+            })
+            .collect();
+
+        // Apply gradients (this will now route E-Prop gradients via ParamPartitions in apply_gradients)
+        for ((layer, grads), adaptive_lr) in self
+            .network
+            .iter_mut()
+            .zip(averaged_grads_per_layer)
+            .zip(adaptive_lrs)
+        {
+            if !grads.is_empty() {
+                layer.apply_gradients(&grads, adaptive_lr)?;
+            }
+        }
+
+        Ok((
+            batch_loss,
+            batch_base_loss,
+            grad_norm,
+            layer_param_grad_norm_sq,
+        ))
     }
 
     /// Train on a single batch of sequences

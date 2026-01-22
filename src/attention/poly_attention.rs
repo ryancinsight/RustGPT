@@ -507,6 +507,20 @@ impl PolyAttention {
         self.cached_input = Some(input.clone());
         self.last_causal = causal;
         self.moh.cached_soft_top_p_mask = None;
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+            crate::attention::config::ensure_threshold_predictor_initialized(
+                &mut self.moh.threshold_predictor,
+                self.embed_dim,
+                self.num_heads,
+                crate::attention::config::ThresholdPredictorOptimizers {
+                    opt_w_tau: &mut self.moh.opt_w_tau,
+                    opt_b_tau: &mut self.moh.opt_b_tau,
+                    opt_w2_tau: &mut self.moh.opt_w2_tau,
+                    opt_b2_tau: &mut self.moh.opt_b2_tau,
+                    opt_cond_w_tau: &mut self.moh.opt_cond_w_tau,
+                },
+            );
+        }
 
         let mut ctx = ForwardContext {
             input,
@@ -557,6 +571,20 @@ impl PolyAttention {
         self.cached_input = Some(input.clone());
         self.last_causal = causal;
         self.moh.cached_soft_top_p_mask = None;
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+            crate::attention::config::ensure_threshold_predictor_initialized(
+                &mut self.moh.threshold_predictor,
+                self.embed_dim,
+                self.num_heads,
+                crate::attention::config::ThresholdPredictorOptimizers {
+                    opt_w_tau: &mut self.moh.opt_w_tau,
+                    opt_b_tau: &mut self.moh.opt_b_tau,
+                    opt_w2_tau: &mut self.moh.opt_w2_tau,
+                    opt_b2_tau: &mut self.moh.opt_b2_tau,
+                    opt_cond_w_tau: &mut self.moh.opt_cond_w_tau,
+                },
+            );
+        }
         let mut ctx = ForwardContext {
             input,
             heads: &mut self.heads,
@@ -655,62 +683,11 @@ impl PolyAttention {
                 None
             };
 
-        // Threshold predictor grads - computed from accumulated gradients
-        let (
-            grad_w_tau,
-            grad_b_tau,
-            grad_w2_tau,
-            grad_b2_tau,
-            grad_cond_w_tau,
-            grad_activation_tau,
-        ): ThresholdPredictorGrads = if self.moh.head_selection_config.gating.use_learned_predictor
-        {
-            if let Some(predictor) = &self.moh.threshold_predictor {
-                // Compute actual gradients using the accumulated threshold_grad_accum from all
-                // heads
-                if let Some(threshold_grad_accum) = threshold_grad_accum.as_ref() {
-                    // The predictor must have been used in forward pass, so compute_gradients
-                    // should work
-                    let (grad_w1, grad_b1_1d, grad_w2, grad_b2_1d, grad_cond_w, grad_activation) =
-                        predictor.compute_gradients(threshold_grad_accum);
-                    // Convert biases to 2D arrays as expected by optimizer
-                    let grad_b1 = grad_b1_1d
-                        .clone()
-                        .to_shape((grad_b1_1d.len(), 1))
-                        .unwrap()
-                        .to_owned();
-                    let grad_b2 = grad_b2_1d
-                        .clone()
-                        .to_shape((grad_b2_1d.len(), 1))
-                        .unwrap()
-                        .to_owned();
-                    (
-                        Some(grad_w1),
-                        Some(grad_b1),
-                        Some(grad_w2),
-                        Some(grad_b2),
-                        grad_cond_w,
-                        Some(grad_activation),
-                    )
-                } else {
-                    // Fallback to zeros if no gradients accumulated (shouldn't happen)
-                    let hidden_dim = predictor.weights1.ncols();
-                    let num_outputs = predictor.weights2.ncols();
-                    (
-                        Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
-                        Some(Array2::<f32>::zeros((hidden_dim, 1))),
-                        Some(Array2::<f32>::zeros((hidden_dim, num_outputs))),
-                        Some(Array2::<f32>::zeros((num_outputs, 1))),
-                        Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
-                        Some(vec![0.0_f64; predictor.activation.scalar_weights_len()]),
-                    )
-                }
-            } else {
-                (None, None, None, None, None, None)
-            }
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+            tracing::info!("PolyAttention::compute_gradients: use_learned_predictor is TRUE");
         } else {
-            (None, None, None, None, None, None)
-        };
+            tracing::info!("PolyAttention::compute_gradients: use_learned_predictor is FALSE");
+        }
 
         // CoPE grads accumulator (shared across heads)
         let mut grad_cope_pos =
@@ -1280,28 +1257,94 @@ impl PolyAttention {
 
         // Threshold predictor grads
         if self.moh.head_selection_config.gating.use_learned_predictor {
-            all_param_grads.push(grad_w_tau.unwrap());
-            all_param_grads.push(grad_b_tau.unwrap());
-            all_param_grads.push(grad_w2_tau.unwrap());
-            all_param_grads.push(grad_b2_tau.unwrap());
+            let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
+            
+            let (
+                grad_w_tau,
+                grad_b_tau,
+                grad_w2_tau,
+                grad_b2_tau,
+                grad_cond_w_tau,
+                grad_activation_tau,
+            ) = if let Some(predictor) = &self.moh.threshold_predictor {
+                // Compute actual gradients using the accumulated threshold_grad_accum from all heads
+                if let Some(threshold_grad_accum) = threshold_grad_accum.as_ref() {
+                    // The predictor must have been used in forward pass, so compute_gradients should work
+                    let (grad_w1, grad_b1_1d, grad_w2, grad_b2_1d, grad_cond_w, grad_activation) =
+                        predictor.compute_gradients(threshold_grad_accum);
+                    // Convert biases to 2D arrays as expected by optimizer
+                    let grad_b1 = grad_b1_1d
+                        .clone()
+                        .to_shape((grad_b1_1d.len(), 1))
+                        .unwrap()
+                        .to_owned();
+                    let grad_b2 = grad_b2_1d
+                        .clone()
+                        .to_shape((grad_b2_1d.len(), 1))
+                        .unwrap()
+                        .to_owned();
+                    (
+                        Some(grad_w1),
+                        Some(grad_b1),
+                        Some(grad_w2),
+                        Some(grad_b2),
+                        grad_cond_w,
+                        Some(grad_activation),
+                    )
+                } else {
+                    // Fallback to zeros if no gradients accumulated (shouldn't happen)
+                    let hidden_dim = predictor.weights1.ncols();
+                    let num_outputs = predictor.weights2.ncols();
+                    (
+                        Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
+                        Some(Array2::<f32>::zeros((hidden_dim, 1))),
+                        Some(Array2::<f32>::zeros((hidden_dim, num_outputs))),
+                        Some(Array2::<f32>::zeros((num_outputs, 1))),
+                        Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
+                        Some(vec![0.0_f64; predictor.activation.scalar_weights_len()]),
+                    )
+                }
+            } else {
+                tracing::warn!("PolyAttention::compute_gradients: threshold_predictor is None but use_learned_predictor is true. Returning zero gradients.");
+                // Construct zero gradients with expected shapes to satisfy apply_gradients contract
+                let hidden_dim = predictor_hidden_dim;
+                let num_outputs = self.num_heads;
+                // Default RichardsCurve has 3 scalar weights (sigmoid variant)
+                let activation_len = 3; 
+                (
+                    Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
+                    Some(Array2::<f32>::zeros((hidden_dim, 1))),
+                    Some(Array2::<f32>::zeros((hidden_dim, num_outputs))),
+                    Some(Array2::<f32>::zeros((num_outputs, 1))),
+                    Some(Array2::<f32>::zeros((self.embed_dim, hidden_dim))),
+                    Some(vec![0.0_f64; activation_len]),
+                )
+            };
+
+            if let Some(g) = grad_w_tau { all_param_grads.push(g); }
+            if let Some(g) = grad_b_tau { all_param_grads.push(g); }
+            if let Some(g) = grad_w2_tau { all_param_grads.push(g); }
+            if let Some(g) = grad_b2_tau { all_param_grads.push(g); }
             if let Some(gcw) = grad_cond_w_tau {
                 all_param_grads.push(gcw);
             } else {
+                // Should match opt_cond_w_tau shape if it exists, or default
                 all_param_grads.push(Array2::<f32>::zeros((
                     self.embed_dim,
-                    self.moh.alpha_g.ncols(),
+                    predictor_hidden_dim, 
                 )));
             }
-            let grad_activation_tau_f32 = Array2::<f32>::from_shape_vec(
-                (1, grad_activation_tau.as_ref().unwrap().len()),
-                grad_activation_tau
-                    .unwrap()
-                    .into_iter()
-                    .map(|v| v as f32)
-                    .collect(),
-            )
-            .unwrap();
-            all_param_grads.push(grad_activation_tau_f32);
+            if let Some(grad_activation) = grad_activation_tau {
+                let grad_activation_tau_f32 = Array2::<f32>::from_shape_vec(
+                    (1, grad_activation.len()),
+                    grad_activation
+                        .into_iter()
+                        .map(|v| v as f32)
+                        .collect(),
+                )
+                .unwrap();
+                all_param_grads.push(grad_activation_tau_f32);
+            }
         }
 
         all_param_grads.push(grad_cope_pos);
@@ -1365,9 +1408,19 @@ impl PolyAttention {
         }
         let param_grads = &sanitized;
 
+        if self.moh.head_selection_config.gating.use_learned_predictor
+            && self.moh.threshold_predictor.is_none()
+        {
+            return Err(crate::errors::ModelError::GradientError {
+                message: "PolyAttention invariant violated: use_learned_predictor=true but threshold_predictor=None"
+                    .to_string(),
+            });
+        }
+
         // Expect 3 per head + w_out + a + b + scale + w_g + alpha_g + beta_g + gate_poly_w +
         // threshold_predictor
         let mut expected = self.num_heads * 3 + 1 + 3 + 3 + 1; // + gate_poly_w
+        tracing::info!("PolyAttention::apply_gradients: use_learned_predictor = {}", self.moh.head_selection_config.gating.use_learned_predictor);
         if self.moh.head_selection_config.gating.use_learned_predictor {
             expected += 6;
         } // weights1, bias1, weights2, bias2, cond_w, activation_params
@@ -2021,6 +2074,7 @@ impl PolyAttention {
         .unwrap();
         all_param_grads.push(grad_gate_poly);
         if self.moh.head_selection_config.gating.use_learned_predictor {
+            let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
             match (
                 grad_w_tau,
                 grad_b_tau,
@@ -2029,12 +2083,14 @@ impl PolyAttention {
                 grad_cond_w_tau,
                 grad_activation_tau,
             ) {
-                (Some(gw1), Some(gb1), Some(gw2), Some(gb2), Some(gcw), Some(ga)) => {
+                (Some(gw1), Some(gb1), Some(gw2), Some(gb2), gcw, Some(ga)) => {
                     all_param_grads.push(gw1);
                     all_param_grads.push(gb1);
                     all_param_grads.push(gw2);
                     all_param_grads.push(gb2);
-                    all_param_grads.push(gcw);
+                    all_param_grads.push(gcw.unwrap_or_else(|| {
+                        Array2::<f32>::zeros((self.embed_dim, predictor_hidden_dim))
+                    }));
                     let grad_activation_tau_f32 = Array2::<f32>::from_shape_vec(
                         (1, ga.len()),
                         ga.into_iter().map(|v| v as f32).collect(),
@@ -2043,9 +2099,8 @@ impl PolyAttention {
                     all_param_grads.push(grad_activation_tau_f32);
                 }
                 _ => {
-                    tracing::warn!(
-                        target: "poly_attention",
-                        "Learned threshold predictor gradients unavailable; skipping predictor params"
+                    panic!(
+                        "PolyAttention invariant violated: learned predictor enabled but its gradients are missing"
                     );
                 }
             }
