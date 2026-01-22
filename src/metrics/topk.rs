@@ -72,10 +72,10 @@ pub fn compute_nim(scores: &[f32]) -> f32 {
     let mut sum_all = 0.0f32;
     let mut sum_sq = 0.0f32;
 
-    let (chunks_8, remainder) = scores.as_chunks::<8>();
+    let mut chunks_8 = scores.chunks_exact(8);
 
     // Process 8 elements at a time for optimal cache usage
-    for chunk in chunks_8 {
+    for chunk in chunks_8.by_ref() {
         let s0 = chunk[0];
         let s1 = chunk[1];
         let s2 = chunk[2];
@@ -90,7 +90,7 @@ pub fn compute_nim(scores: &[f32]) -> f32 {
     }
 
     // Handle remainder elements
-    for &s in remainder {
+    for &s in chunks_8.remainder() {
         sum_all += s;
         sum_sq += s * s;
     }
@@ -124,14 +124,14 @@ pub fn compute_nim_from_normalized(normalized_probs: &[f32]) -> f32 {
     let mut sum_p_sq = 0.0f32;
 
     // Manual unrolling for small arrays (common case)
-    let (chunks_4, remainder) = normalized_probs.as_chunks::<4>();
-    for chunk in chunks_4 {
+    let mut chunks_4 = normalized_probs.chunks_exact(4);
+    for chunk in chunks_4.by_ref() {
         sum_p_sq +=
             chunk[0] * chunk[0] + chunk[1] * chunk[1] + chunk[2] * chunk[2] + chunk[3] * chunk[3];
     }
 
     // Handle remainder
-    for &p in remainder {
+    for &p in chunks_4.remainder() {
         sum_p_sq += p * p;
     }
 

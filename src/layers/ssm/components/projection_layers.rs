@@ -6,8 +6,10 @@
 use ndarray::{Array1, Array2, Axis};
 use serde::{Deserialize, Serialize};
 
-use crate::adam::Adam;
-use crate::eprop::{context::EpropContext, utils::outer_product_into, EPropError};
+use crate::{
+    adam::Adam,
+    eprop::{EPropError, context::EpropContext, utils::outer_product_into},
+};
 
 /// Projection layer configuration
 #[derive(Debug, Clone, Copy)]

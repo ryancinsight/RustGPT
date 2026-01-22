@@ -146,7 +146,7 @@ pub struct MoHRgLru {
 impl MoHRgLru {
     pub fn new(embed_dim: usize, num_heads: usize, head_selection: &HeadSelectionStrategy) -> Self {
         let mut nh = num_heads.max(1);
-        if embed_dim == 0 || !embed_dim.is_multiple_of(nh) {
+        if embed_dim == 0 || embed_dim % nh != 0 {
             nh = 1;
         }
         let head_dim = if nh > 0 { embed_dim / nh } else { embed_dim };

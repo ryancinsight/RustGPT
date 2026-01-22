@@ -1,7 +1,8 @@
-use ndarray::{s, Array1, Array2, Axis};
+use std::ops::AddAssign;
+
+use ndarray::{Array1, Array2, Axis, s};
 use rand::distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
-use std::ops::AddAssign;
 
 use crate::network::Layer;
 
@@ -104,7 +105,10 @@ impl Layer for SlidingWindowAttention {
         _input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let cache = self.cache.as_ref().expect("Cache should be present before backward pass");
+        let cache = self
+            .cache
+            .as_ref()
+            .expect("Cache should be present before backward pass");
         let seq_len = cache.input.nrows();
         let scale = (self.embed_dim as f32).sqrt();
 
@@ -123,7 +127,10 @@ impl Layer for SlidingWindowAttention {
 
             // Backprop through weighted sum of V
             let d_scores_t = d_output_t.dot(&window_v_t.t());
-            let d_window_v = scores_t.clone().insert_axis(Axis(1)).dot(&d_output_t.insert_axis(Axis(0)));
+            let d_window_v = scores_t
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&d_output_t.insert_axis(Axis(0)));
             grad_v.slice_mut(s![start..=t, ..]).add_assign(&d_window_v);
 
             // Backprop through softmax
@@ -133,7 +140,9 @@ impl Layer for SlidingWindowAttention {
 
             // Backprop through QK dot product
             let d_q_t = d_raw_scores_t.dot(&window_k_t);
-            let d_window_k = d_raw_scores_t.insert_axis(Axis(1)).dot(&q_t.insert_axis(Axis(0)));
+            let d_window_k = d_raw_scores_t
+                .insert_axis(Axis(1))
+                .dot(&q_t.insert_axis(Axis(0)));
             grad_q.row_mut(t).add_assign(&d_q_t);
             grad_k.slice_mut(s![start..=t, ..]).add_assign(&d_window_k);
         }
@@ -159,8 +168,11 @@ impl Layer for SlidingWindowAttention {
         learning_rate: f32,
     ) -> crate::errors::Result<()> {
         if gradients.len() != 3 {
-             return Err(crate::errors::ModelError::GradientError {
-                message: format!("Expected 3 gradients for SlidingWindowAttention, got {}", gradients.len()),
+            return Err(crate::errors::ModelError::GradientError {
+                message: format!(
+                    "Expected 3 gradients for SlidingWindowAttention, got {}",
+                    gradients.len()
+                ),
             });
         }
 

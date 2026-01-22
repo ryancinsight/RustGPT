@@ -495,7 +495,7 @@ impl CheckpointManager {
     /// # Returns
     /// `true` if this timestep is a checkpoint boundary
     pub fn should_checkpoint(&self, t: usize) -> bool {
-        t.is_multiple_of(self.interval)
+        self.interval > 0 && t % self.interval == 0
     }
 
     /// Save checkpoint using rkyv zero-copy serialization

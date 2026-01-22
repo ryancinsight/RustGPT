@@ -1,0 +1,46 @@
+thread 'rustc' panicked at /rustc-dev/4068bafedd8ba724e332a5221c06a6fa531a30d2\compiler\rustc_codegen_ssa\src\back\write.rs:1649:6:
+failed to spawn coordinator thread: Os { code: 1455, kind: Uncategorized, message: "The paging file is too small for this operation to complete." }
+stack backtrace:
+   0:     0x7ff83ae67f62 - std::backtrace::Backtrace::create::hc439ab1efc4c4e41
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\std\src\..\..\backtrace\src\backtrace/win64.rs:85:14
+   1:     0x7ff83ae67eaa - std::backtrace::Backtrace::force_capture::hb9c4deea5389923a
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\std\src/backtrace.rs:312:9
+   2:     0x7fff2ffce159 - <alloc[f0f6b698a206f1cb]::boxed::Box<rustc_driver_impl[855bf9a493649e8a]::install_ice_hook::{closure#1}> as core[6e35c7afac6a389f]::ops::function::Fn<(&dyn for<'a, 'b> core[6e35c7afac6a389f]::ops::function::Fn<(&'a std[a38a111353e95e0e]::panic::PanicHookInfo<'b>,), Output = ()> + core[6e35c7afac6a389f]::marker::Sync + core[6e35c7afac6a389f]::marker::Send, &std[a38a111353e95e0e]::panic::PanicHookInfo)>>::call
+   3:     0x7ff83ae69412 - std::panicking::panic_with_hook::h357b1ed29b29b2d8
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\alloc\src/boxed.rs:2019:9
+   4:     0x7ff83ae690f2 - std::panicking::panic_handler::{{closure}}::he234546f2e5972f9
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\std\src/panicking.rs:707:13
+   5:     0x7ff83ae615df - std::sys::backtrace::__rust_end_short_backtrace::hc2dfb7cca8ee7fd0
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\std\src\sys/backtrace.rs:174:18
+   6:     0x7ff83ae4163e - __rustc[ba2e1ebbfa867e37]::rust_begin_unwind
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\std\src/panicking.rs:698:5
+   7:     0x7ff83aed4d91 - core::panicking::panic_fmt::h5e3fd52d56df71f1
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\core\src/panicking.rs:80:14
+   8:     0x7ff83aed35f0 - core::result::unwrap_failed::h472855d5b1ece865
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\core\src/result.rs:1862:5
+   9:     0x7fff3034505a - rustc_codegen_ssa[350143403c1f5c1c]::back::write::start_executing_work::<rustc_codegen_llvm[24798331888356df]::LlvmCodegenBackend>
+  10:     0x7fff3034033b - rustc_codegen_ssa[350143403c1f5c1c]::back::write::start_async_codegen::<rustc_codegen_llvm[24798331888356df]::LlvmCodegenBackend>
+  11:     0x7fff3046cbae - rustc_codegen_ssa[350143403c1f5c1c]::base::codegen_crate::<rustc_codegen_llvm[24798331888356df]::LlvmCodegenBackend>
+  12:     0x7fff30390c61 - <rustc_codegen_llvm[24798331888356df]::LlvmCodegenBackend as rustc_codegen_ssa[350143403c1f5c1c]::traits::backend::CodegenBackend>::codegen_crate
+  13:     0x7fff302c64a1 - <rustc_session[7482f1e30df51f51]::session::Session>::time::<alloc[f0f6b698a206f1cb]::boxed::Box<dyn core[6e35c7afac6a389f]::any::Any>, rustc_interface[6088318780cf1795]::passes::start_codegen::{closure#0}>
+  14:     0x7fff302740e4 - rustc_interface[6088318780cf1795]::passes::start_codegen
+  15:     0x7fff3022a5a2 - <rustc_interface[6088318780cf1795]::queries::Linker>::codegen_and_build_linker
+  16:     0x7fff2ff7c84c - <std[a38a111353e95e0e]::thread::local::LocalKey<core[6e35c7afac6a389f]::cell::Cell<*const ()>>>::with::<rustc_middle[88ce5b6305bb321f]::ty::context::tls::enter_context<<rustc_middle[88ce5b6305bb321f]::ty::context::GlobalCtxt>::enter<rustc_interface[6088318780cf1795]::passes::create_and_enter_global_ctxt<core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>, rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}::{closure#2}>::{closure#2}::{closure#0}, core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>>::{closure#1}, core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>>::{closure#0}, core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>>
+  17:     0x7fff2ff87975 - <rustc_middle[88ce5b6305bb321f]::ty::context::TyCtxt>::create_global_ctxt::<core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>, rustc_interface[6088318780cf1795]::passes::create_and_enter_global_ctxt<core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>, rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}::{closure#2}>::{closure#2}::{closure#0}>
+  18:     0x7fff2ffb8de9 - <rustc_interface[6088318780cf1795]::passes::create_and_enter_global_ctxt<core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>, rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}::{closure#2}>::{closure#2} as core[6e35c7afac6a389f]::ops::function::FnOnce<(&rustc_session[7482f1e30df51f51]::session::Session, rustc_middle[88ce5b6305bb321f]::ty::context::CurrentGcx, alloc[f0f6b698a206f1cb]::sync::Arc<rustc_data_structures[ac8c3e7ef05c9cb1]::jobserver::Proxy>, &std[a38a111353e95e0e]::sync::once_lock::OnceLock<rustc_middle[88ce5b6305bb321f]::ty::context::GlobalCtxt>, &rustc_data_structures[ac8c3e7ef05c9cb1]::sync::worker_local::WorkerLocal<rustc_middle[88ce5b6305bb321f]::arena::Arena>, &rustc_data_structures[ac8c3e7ef05c9cb1]::sync::worker_local::WorkerLocal<rustc_hir[274848207163b565]::Arena>, rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}::{closure#2})>>::call_once::{shim:vtable#0}
+  19:     0x7fff2ffa3172 - rustc_interface[6088318780cf1795]::passes::create_and_enter_global_ctxt::<core[6e35c7afac6a389f]::option::Option<rustc_interface[6088318780cf1795]::queries::Linker>, rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}::{closure#2}>
+  20:     0x7fff2fff2c73 - rustc_interface[6088318780cf1795]::interface::run_compiler::<(), rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}>::{closure#1}
+  21:     0x7fff2ffe515e - rustc_span[315bc1f41a72aad1]::create_session_globals_then::<(), rustc_interface[6088318780cf1795]::util::run_in_thread_with_globals<rustc_interface[6088318780cf1795]::util::run_in_thread_pool_with_globals<rustc_interface[6088318780cf1795]::interface::run_compiler<(), rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>
+  22:     0x7fff2ff72f14 - std[a38a111353e95e0e]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[6088318780cf1795]::util::run_in_thread_with_globals<rustc_interface[6088318780cf1795]::util::run_in_thread_pool_with_globals<rustc_interface[6088318780cf1795]::interface::run_compiler<(), rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  23:     0x7fff2ff84135 - <<std[a38a111353e95e0e]::thread::Builder>::spawn_unchecked_<rustc_interface[6088318780cf1795]::util::run_in_thread_with_globals<rustc_interface[6088318780cf1795]::util::run_in_thread_pool_with_globals<rustc_interface[6088318780cf1795]::interface::run_compiler<(), rustc_driver_impl[855bf9a493649e8a]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[6e35c7afac6a389f]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  24:     0x7ff83ae5ab4d - std::sys::thread::windows::Thread::new::thread_start::h390760304fc9b56b
+                               at /rustc/4068bafedd8ba724e332a5221c06a6fa531a30d2/library\alloc\src/boxed.rs:2005:9
+  25:     0x7ff8b9abe8d7 - <unknown>
+  26:     0x7ff8bac0c3dc - <unknown>
+
+
+rustc version: 1.92.0-nightly (4068bafed 2025-10-20)
+platform: x86_64-pc-windows-gnu
+
+query stack during panic:
+end of query stack

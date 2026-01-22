@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     adam::Adam,
-    eprop::{context::EpropContext, utils::outer_product_into, EPropError},
+    eprop::{EPropError, context::EpropContext, utils::outer_product_into},
     network::Layer,
     rng::get_rng,
 };

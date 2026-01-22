@@ -1,9 +1,10 @@
+use core::iter::Iterator;
+
 use llm::{
     Layer,
     layers::transformer::{TransformerBlock, TransformerBlockConfig},
     mixtures::HeadSelectionStrategy,
 };
-use core::iter::Iterator;
 use ndarray::Array2;
 use proptest::prelude::*;
 

@@ -384,7 +384,7 @@ impl AdaptiveResiduals {
         // - off_abs_mean: mean |alignment| with a small deterministic sample of other channels
         let off_samples = 16usize.min(embed_dim.saturating_sub(1));
         let mut stride = (embed_dim / off_samples.max(1)).max(1);
-        if stride.is_multiple_of(2) {
+        if stride % 2 == 0 {
             stride += 1;
         }
 

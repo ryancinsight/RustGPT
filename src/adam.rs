@@ -242,8 +242,9 @@ impl Default for Adam {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use approx::assert_abs_diff_eq;
+
+    use super::*;
 
     #[test]
     fn test_adam_basic_update() {
