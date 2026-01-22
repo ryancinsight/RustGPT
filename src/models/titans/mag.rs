@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis, Zip, s};
+use ndarray::{Array1, Array2, Axis, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -107,9 +107,9 @@ impl Layer for TitansMAG {
                 concat.slice_mut(s![dim..2 * dim]).assign(&m);
 
                 let z = concat.dot(&self.gate_w) + &self.gate_b;
-                let g = z.mapv(|x| Self::sigmoid(x));
+                let g = z.mapv(Self::sigmoid);
 
-                let o = &g * &y + (1.0 - &g) * &m;
+                let o = &g * &y + (1.0 - &g) * m;
                 o_seg.row_mut(t).assign(&o);
             }
 
@@ -189,7 +189,6 @@ impl Layer for TitansMAG {
         );
         let mut retrieval_memory_snapshot;
 
-        processed = 0;
         while processed < seq_len {
             let end = std::cmp::min(processed + self.segment_len, seq_len);
             let segment_len = end - processed;
@@ -213,7 +212,7 @@ impl Layer for TitansMAG {
                 concat.slice_mut(s![0..dim]).assign(&swa_t);
                 concat.slice_mut(s![dim..2 * dim]).assign(&y_mem);
                 let z = concat.dot(&self.gate_w) + &self.gate_b;
-                let g = z.mapv(|x| Self::sigmoid_static(x));
+                let g = z.mapv(Self::sigmoid_static);
 
                 let o = &g * &swa_t + (1.0 - &g) * &y_mem;
                 o_seg.row_mut(t).assign(&o);
@@ -230,8 +229,8 @@ impl Layer for TitansMAG {
                 trace.push(StepData {
                     y: swa_t,
                     m: y_mem,
-                    g: g,
-                    q_t: q_t,
+                    g,
+                    q_t,
                     k_t: k_t.clone(),
                     v_val: v_t.clone(),
                     alpha: alpha_t,
@@ -471,7 +470,7 @@ impl Layer for TitansMAG {
             // Backprop through Gate Weights
             let d_z = d_g * g * (1.0 - g);
 
-            d_gate_b = d_gate_b + &d_z;
+            d_gate_b += &d_z;
 
             let mut concat = Array1::<f32>::zeros(2 * dim);
             concat.slice_mut(s![0..dim]).assign(swa_t);
