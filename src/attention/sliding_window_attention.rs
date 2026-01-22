@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::network::Layer;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AttentionCache {
     q: Array2<f32>,
     k: Array2<f32>,
@@ -15,7 +15,7 @@ struct AttentionCache {
     input: Array2<f32>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SlidingWindowAttention {
     pub embed_dim: usize,
     pub window_size: usize,

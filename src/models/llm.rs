@@ -937,9 +937,8 @@ impl LLM {
                 } else {
                     (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
                 };
-
                 // Process data in batches
-                for batch in tokenized_data.chunks(batch_size) {
+                for batch in tokenized_data.chunks(batch_size.max(1)) {
                     let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
                         self.train_batch_profiled(batch, effective_lr, &mut scratch)?;
                     total_loss += batch_loss;
@@ -948,7 +947,9 @@ impl LLM {
                     batch_count += 1;
                     total_examples += batch.len();
                     for (i, s) in layer_param_grad_norm_sq.into_iter().enumerate() {
-                        per_layer_param_grad_norm_sq[i] += s;
+                        if i < per_layer_param_grad_norm_sq.len() {
+                            per_layer_param_grad_norm_sq[i] += s;
+                        }
                     }
                 }
 
@@ -1701,9 +1702,8 @@ impl LLM {
                 let mut total_base_loss = 0.0;
                 let mut total_grad_norm = 0.0;
                 let mut batch_count = 0;
-
                 // Process data in batches
-                for batch in tokenized_data.chunks(batch_size) {
+                for batch in tokenized_data.chunks(batch_size.max(1)) {
                     let (batch_loss, batch_base_loss, grad_norm) =
                         self.train_batch_trm_autoencoding(batch, lr, &mut scratch)?;
                     total_loss += batch_loss;
@@ -3088,8 +3088,8 @@ impl LLM {
                                 if scratch.accumulated_param_grads[t_idx].is_empty() {
                                     scratch.accumulated_param_grads[t_idx] = lrm_param_grads_step;
                                 } else {
-                                    for (acc_grad, new_grad) in scratch.accumulated_param_grads
-                                        [t_idx]
+                                    for (acc_grad, new_grad) in
+                                        scratch.accumulated_param_grads[t_idx]
                                         .iter_mut()
                                         .zip(lrm_param_grads_step)
                                     {
@@ -4371,9 +4371,8 @@ impl LLM {
                     }
                 }
                 // Apply averaged grads per layer after batch
-                for (idx, maybe_grads) in
-                    self.training_scratch.grads_per_layer.iter_mut().enumerate()
-                {
+                let mut grads_per_layer = std::mem::take(&mut self.training_scratch.grads_per_layer);
+                for (idx, maybe_grads) in grads_per_layer.iter_mut().enumerate() {
                     if let Some(mut grads) = maybe_grads.take() {
                         if examples_in_batch > 0 {
                             for g in &mut grads {
@@ -4404,6 +4403,7 @@ impl LLM {
                         }
                     }
                 }
+                self.training_scratch.grads_per_layer = grads_per_layer;
                 batch_start = batch_end;
             }
 
