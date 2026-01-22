@@ -5,7 +5,7 @@ use std::ops::AddAssign;
 
 use crate::network::Layer;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AttentionCache {
     q: Array2<f32>,
     k: Array2<f32>,
@@ -14,7 +14,7 @@ struct AttentionCache {
     input: Array2<f32>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SlidingWindowAttention {
     pub embed_dim: usize,
     pub window_size: usize,
@@ -180,33 +180,5 @@ impl Layer for SlidingWindowAttention {
 
     fn zero_gradients(&mut self) {
         // No stateful gradients to zero
-    }
-
-    fn weight_norm(&self) -> f32 {
-         (self.w_q.mapv(|x| x.powi(2)).sum() +
-          self.w_k.mapv(|x| x.powi(2)).sum() +
-          self.w_v.mapv(|x| x.powi(2)).sum()).sqrt()
-    }
-
-    fn compute_gradients(
-        &self,
-        _input: &Array2<f32>,
-        _output_grads: &Array2<f32>,
-    ) -> (Array2<f32>, Vec<Array2<f32>>) {
-         // Placeholder implementation
-         (Array2::zeros((1, 1)), vec![])
-    }
-
-    fn apply_gradients(
-        &mut self,
-        _gradients: &[Array2<f32>],
-        _learning_rate: f32,
-    ) -> crate::errors::Result<()> {
-        // Placeholder
-        Ok(())
-    }
-
-    fn zero_gradients(&mut self) {
-        // Placeholder
     }
 }
