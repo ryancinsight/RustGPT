@@ -20,13 +20,13 @@ use crate::eprop::{
 pub struct EPropAdaptorConfig {
     /// Dimension of the input/output features
     pub dim: usize,
-    
+
     /// Neuron configuration
     pub neuron_config: NeuronConfig,
-    
+
     /// Learning rate for the adaptation
     pub adaptation_rate: f32,
-    
+
     /// Whether to use multi-scale traces
     pub use_multi_scale: bool,
 }
@@ -48,19 +48,19 @@ impl Default for EPropAdaptorConfig {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EPropAdaptor {
     config: EPropAdaptorConfig,
-    
+
     /// Neuron state (voltage, spikes, etc.)
     #[serde(skip)]
     neuron_state: NeuronState,
-    
+
     /// Eligibility traces
     #[serde(skip)]
     traces: EligibilityTraces,
-    
+
     /// Neuron dynamics engine
     #[serde(skip)]
     dynamics: Option<NeuronDynamics>,
-    
+
     /// Learned adaptation weights (simple diagonal scaling for now)
     adaptation_weights: Array1<f32>,
 
@@ -77,20 +77,17 @@ impl EPropAdaptor {
             config.neuron_config.is_alif(),
             &config.neuron_config,
         );
-        
-        let mut traces = EligibilityTraces::new(
-            config.dim,
-            config.dim,
-            config.neuron_config.is_alif(),
-        );
-        
+
+        let mut traces =
+            EligibilityTraces::new(config.dim, config.dim, config.neuron_config.is_alif());
+
         if config.use_multi_scale {
-             // Initialize multi-scale traces if enabled
-             traces.multi_scale_traces = Some(crate::eprop::traces::MultiScaleTraces::new(
-                 config.dim, 
-                 config.dim, 
-                 [0.8, 0.95, 0.99]
-             ));
+            // Initialize multi-scale traces if enabled
+            traces.multi_scale_traces = Some(crate::eprop::traces::MultiScaleTraces::new(
+                config.dim,
+                config.dim,
+                [0.8, 0.95, 0.99],
+            ));
         }
 
         let dynamics = NeuronDynamics::new(config.neuron_config.clone());
@@ -114,9 +111,9 @@ impl EPropAdaptor {
     /// Process a sequence of inputs and return the adaptation signal
     pub fn forward(&mut self, input: &Array2<f32>) -> crate::errors::Result<Array2<f32>> {
         let (seq_len, dim) = input.dim();
-        
+
         if dim != self.config.dim {
-             return Err(crate::errors::ModelError::ShapeMismatch {
+            return Err(crate::errors::ModelError::ShapeMismatch {
                 expected: vec![seq_len, self.config.dim],
                 actual: vec![seq_len, dim],
                 message: "Input dimension mismatch in EPropAdaptor".to_string(),
@@ -127,62 +124,64 @@ impl EPropAdaptor {
         if self.dynamics.is_none() {
             self.dynamics = Some(NeuronDynamics::new(self.config.neuron_config.clone()));
         }
-        
+
         if self.neuron_state.voltage.len() != self.config.dim {
             self.neuron_state = NeuronState::new(
                 self.config.dim,
                 self.config.neuron_config.is_alif(),
                 &self.config.neuron_config,
             );
-            
+
             self.traces = EligibilityTraces::new(
                 self.config.dim,
                 self.config.dim,
                 self.config.neuron_config.is_alif(),
             );
-            
+
             if self.config.use_multi_scale {
-                 self.traces.multi_scale_traces = Some(crate::eprop::traces::MultiScaleTraces::new(
-                     self.config.dim, 
-                     self.config.dim, 
-                     [0.8, 0.95, 0.99]
-                 ));
+                self.traces.multi_scale_traces = Some(crate::eprop::traces::MultiScaleTraces::new(
+                    self.config.dim,
+                    self.config.dim,
+                    [0.8, 0.95, 0.99],
+                ));
             }
         }
 
         let mut output = Array2::zeros((seq_len, dim));
         // Allocate cache for traces
         let mut trace_cache = Array2::zeros((seq_len, dim));
-        
+
         let dynamics = self.dynamics.as_ref().unwrap();
 
         // Process sequence step-by-step
         for t in 0..seq_len {
             let input_t = input.row(t).to_owned();
-            
+
             // 1. Update neuron dynamics
             // We treat the input as the current injection
-            dynamics.update(&mut self.neuron_state, &input_t, None)
+            dynamics
+                .update(&mut self.neuron_state, &input_t, None)
                 .map_err(|e| crate::errors::ModelError::Generic(e.to_string()))?;
-            
+
             // 2. Update eligibility traces
             if let Some(multi_scale) = &mut self.traces.multi_scale_traces {
-                multi_scale.update_all_scales(&self.neuron_state, &input_t)
+                multi_scale
+                    .update_all_scales(&self.neuron_state, &input_t)
                     .map_err(|e| crate::errors::ModelError::Generic(e.to_string()))?;
             }
-            
+
             // 3. Compute adaptation signal
             let adaptation_signal = if let Some(multi_scale) = &self.traces.multi_scale_traces {
                 let (_eps_x, eps_f) = multi_scale.compute_weighted_traces();
                 // Store trace for gradient computation
                 trace_cache.row_mut(t).assign(&eps_f);
-                
+
                 eps_f * &self.adaptation_weights
             } else {
                 // Fallback: use spikes as simple adaptation
                 // Store spikes as "trace"
                 trace_cache.row_mut(t).assign(&self.neuron_state.spikes);
-                
+
                 &self.neuron_state.spikes * &self.adaptation_weights
             };
 
@@ -207,15 +206,15 @@ impl EPropAdaptor {
     pub fn compute_gradients(&self, output_grads: &Array2<f32>) -> (Array2<f32>, Vec<Array2<f32>>) {
         // e-prop rule: dW = sum(dL/dy * trace)
         // input_grads = dL/dy (ignoring backprop through dynamics for now)
-        
+
         let mut param_grads = Array1::zeros(self.config.dim);
-        
+
         if let Some(traces) = &self.cached_traces {
             let (seq_len, _dim) = output_grads.dim();
             let (trace_seq, _trace_dim) = traces.dim();
-            
+
             let len = seq_len.min(trace_seq);
-            
+
             for t in 0..len {
                 let grad_t = output_grads.row(t);
                 let trace_t = traces.row(t);
@@ -223,30 +222,30 @@ impl EPropAdaptor {
                 param_grads = param_grads + (&grad_t * &trace_t);
             }
         }
-        
+
         // Return gradients. Convert param_grads to Array2 (dim, 1) for compatibility
         let param_grads_2d = param_grads.insert_axis(ndarray::Axis(1));
-        
+
         // Pass-through gradients for input
         (output_grads.clone(), vec![param_grads_2d])
     }
-    
+
     /// Apply gradients to adaptation weights
     pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::errors::Result<()> {
         if grads.is_empty() {
             return Ok(());
         }
-        
+
         // We expect one gradient matrix of shape (dim, 1)
         let grad = &grads[0];
         let grad_1d = grad.column(0);
-        
+
         // Simple SGD update: W = W - lr * grad
         self.adaptation_weights = &self.adaptation_weights - &(grad_1d.mapv(|x| x * lr));
-        
+
         Ok(())
     }
-    
+
     /// Reset the internal state
     pub fn reset(&mut self) {
         self.neuron_state.reset();
@@ -264,6 +263,10 @@ impl EPropAdaptor {
 
     /// Get weight norm
     pub fn weight_norm(&self) -> f32 {
-        self.adaptation_weights.iter().map(|x| x * x).sum::<f32>().sqrt()
+        self.adaptation_weights
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
     }
 }

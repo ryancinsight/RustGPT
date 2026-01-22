@@ -338,6 +338,7 @@ impl ModelConfig {
         hypernetwork_hidden_dim: Option<usize>,
         num_heads: Option<usize>,
     ) -> Self {
+        let default_num_heads = num_heads.unwrap_or(8).max(1);
         Self {
             architecture: ArchitectureType::Autoregressive,
             embedding_dim,
@@ -355,9 +356,14 @@ impl ModelConfig {
             max_window_size: 4096,
             window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
             entropy_ema_alpha: 0.2,
-            head_selection: HeadSelectionStrategy::SoftTopP {
-                top_p: 0.9,
-                soft_top_p_alpha: 15.0, // Reduced for numerical stability
+            head_selection: HeadSelectionStrategy::Learned {
+                num_active: default_num_heads,
+                load_balance_weight: 0.01,
+                complexity_loss_weight: 0.005,
+                sparsity_weight: 0.001,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
+                training_mode: crate::mixtures::gating::GatingTrainingMode::Coupled,
             },
             attention: AttentionType::SelfAttention,
             temporal_mixing: TemporalMixingType::Attention,

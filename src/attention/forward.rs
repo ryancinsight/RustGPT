@@ -33,6 +33,7 @@ pub struct ForwardContext<'a> {
     pub scale: &'a Array2<f32>,
     pub window_size: Option<usize>,
     pub cached_soft_top_p_mask: &'a mut Option<Array2<f32>>,
+    pub cached_thresholds_global: &'a mut Option<Array2<f32>>,
     pub token_threshold_scale: &'a Option<Array2<f32>>,
     pub token_latent_features: &'a Option<Array2<f32>>,
     pub eff_skip_threshold: f32,
@@ -59,13 +60,14 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
 
     // Reset cached soft top-p mask for this forward pass
     ctx.cached_soft_top_p_mask.take();
+    ctx.cached_thresholds_global.take();
 
     let dk_scale = 1.0f32 / (ctx.head_dim as f32).sqrt();
 
     let mut out = ndarray::Array2::<f32>::zeros((n, ctx.embed_dim));
 
     // Pre-compute threshold predictor or soft top-p selection
-    let thresholds_global = if ctx.head_selection_config.gating.use_learned_predictor {
+    if ctx.head_selection_config.gating.use_learned_predictor {
         if let Some(predictor) = ctx.threshold_predictor {
             // Avoid allocating a scaled copy unless per-token scaling is requested.
             let mut scaled_input: Option<Array2<f32>> = None;
@@ -106,9 +108,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                     }
                 }
             }
-            Some(t)
-        } else {
-            None
+            *ctx.cached_thresholds_global = Some(t);
         }
     } else if ctx.head_selection_config.gating.use_soft_top_p {
         // For SoftTopP, compute gating values for all heads and apply soft top-p selection
@@ -163,10 +163,9 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         // Cache the final per-token per-head selection weights that were actually used.
         // This is consumed by the backward path (PolyAttention::compute_gradients*).
         *ctx.cached_soft_top_p_mask = Some(soft_weights.clone());
-        Some(soft_weights)
-    } else {
-        None
-    };
+    }
+
+    let thresholds_global = ctx.cached_thresholds_global.as_ref();
 
     // Zero-copy iterator-based head processing with accumulation
     let (
@@ -207,7 +206,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 let g_count = n;
 
                 // Learned threshold predictor or soft top-p selection
-                let (tau_metrics, eff_col) = if let Some(ref thresholds) = thresholds_global {
+                let (tau_metrics, eff_col) = if let Some(thresholds) = thresholds_global {
                     if ctx.head_selection_config.gating.use_learned_predictor {
                         // Use learned thresholds per head (n_tokens x n_heads)
                         let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
@@ -478,6 +477,7 @@ pub fn compute_poly_attention_forward_baseline(
     let (n, d_model) = (ctx.input.nrows(), ctx.input.ncols());
     assert_eq!(d_model, ctx.embed_dim);
     ctx.cached_soft_top_p_mask.take();
+    ctx.cached_thresholds_global.take();
     let dk_scale = 1.0f32 / (ctx.head_dim as f32).sqrt();
     let mut out = ndarray::Array2::<f32>::zeros((n, ctx.embed_dim));
 

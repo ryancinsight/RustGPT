@@ -178,15 +178,6 @@ struct TrainingScratch {
 }
 
 impl TrainingScratch {
-    fn new(network_len: usize) -> Self {
-        Self {
-            accumulated_param_grads: (0..network_len).map(|_| Vec::new()).collect(),
-            layer_grad_norms: vec![0.0; network_len],
-            layer_inputs: Vec::with_capacity(network_len),
-            grads_per_layer: vec![None; network_len],
-        }
-    }
-
     /// Reset scratch buffers for a new training batch.
     fn reset(&mut self, network_len: usize) {
         // Ensure outer vectors have correct length, but reuse inner allocations.
@@ -911,251 +902,260 @@ impl LLM {
         // Store previous richards_glu richards weights for delta tracking
         let mut prev_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
 
-        for epoch in 0..epochs {
-            let t_epoch_start = std::time::Instant::now();
-            let mut total_loss = 0.0;
-            let mut total_base_loss = 0.0;
-            let mut total_grad_norm = 0.0;
-            let mut batch_count = 0;
-            let mut total_examples = 0usize;
-            let mut per_layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
+        let mut scratch = std::mem::take(&mut self.training_scratch);
+        let res: Result<()> = (|| {
+            for epoch in 0..epochs {
+                let t_epoch_start = std::time::Instant::now();
+                let mut total_loss = 0.0;
+                let mut total_base_loss = 0.0;
+                let mut total_grad_norm = 0.0;
+                let mut batch_count = 0;
+                let mut total_examples = 0usize;
+                let mut per_layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
 
-            // Learning rate warmup + cosine annealing
-            // Reference: "SGDR: Stochastic Gradient Descent with Warm Restarts" (Loshchilov &
-            // Hutter, 2016)
-            let effective_lr = if epoch < warmup_epochs {
-                // Linear warmup: gradually increase LR from 0 to target
-                target_lr * ((epoch + 1) as f32 / warmup_epochs as f32)
-            } else {
-                // Cosine annealing after warmup to escape loss plateaus
-                // Formula: lr_t = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(π * t / T))
-                let t = (epoch - warmup_epochs) as f32;
-                let t_max = (epochs - warmup_epochs) as f32;
-                let lr_min = target_lr * 0.10; // Minimum LR is 10% of base LR (gentler decay)
-                let lr_max = target_lr;
+                // Learning rate warmup + cosine annealing
+                // Reference: "SGDR: Stochastic Gradient Descent with Warm Restarts" (Loshchilov &
+                // Hutter, 2016)
+                let effective_lr = if epoch < warmup_epochs {
+                    // Linear warmup: gradually increase LR from 0 to target
+                    target_lr * ((epoch + 1) as f32 / warmup_epochs as f32)
+                } else {
+                    // Cosine annealing after warmup to escape loss plateaus
+                    // Formula: lr_t = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(π * t / T))
+                    let t = (epoch - warmup_epochs) as f32;
+                    let t_max = (epochs - warmup_epochs) as f32;
+                    let lr_min = target_lr * 0.10; // Minimum LR is 10% of base LR (gentler decay)
+                    let lr_max = target_lr;
 
-                lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
-            };
+                    lr_min
+                        + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
+                };
 
-            // Compute training progress for adaptive MoH
-            let _training_progress = if epoch < warmup_epochs {
-                0.0
-            } else {
-                (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
-            };
+                // Compute training progress for adaptive MoH
+                let _training_progress = if epoch < warmup_epochs {
+                    0.0
+                } else {
+                    (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
+                };
 
-            // Process data in batches
-            for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) = self
-                    .train_batch_profiled(batch, effective_lr, &mut self.training_scratch)?;
-                total_loss += batch_loss;
-                total_base_loss += batch_base_loss;
-                total_grad_norm += grad_norm;
-                batch_count += 1;
-                total_examples += batch.len();
-                for (i, s) in layer_param_grad_norm_sq.into_iter().enumerate() {
-                    per_layer_param_grad_norm_sq[i] += s;
-                }
-            }
-
-            let avg_loss = total_loss / batch_count as f32;
-            let avg_base_loss = total_base_loss / batch_count as f32;
-            let avg_grad_norm = total_grad_norm / batch_count as f32;
-            let per_layer_rms: Vec<f32> = per_layer_param_grad_norm_sq
-                .iter()
-                .map(|&s| (s / (batch_count as f32).max(1.0)).sqrt())
-                .collect();
-
-            // Normalize by parameter count so layers with fewer parameters (e.g., RichardsNorm)
-            // are not misinterpreted as "dead" purely due to scale differences.
-            let layer_param_counts: Vec<usize> = self
-                .network
-                .iter()
-                .map(|layer| layer.parameters().max(1))
-                .collect();
-            let per_layer_rms_per_param: Vec<f32> = per_layer_rms
-                .iter()
-                .enumerate()
-                .map(|(i, &raw)| {
-                    let param_count = layer_param_counts.get(i).copied().unwrap_or(1) as f32;
-                    if param_count > 0.0 {
-                        raw / param_count.sqrt()
-                    } else {
-                        raw
-                    }
-                })
-                .collect();
-
-            tracing::info!(
-                epoch = epoch,
-                per_layer_rms = ?per_layer_rms,
-                per_layer_rms_per_param = ?per_layer_rms_per_param,
-                layer_param_counts = ?layer_param_counts,
-                "Transformer epoch layer param grad RMS"
-            );
-            let names: Vec<&str> = self.network.iter().map(|l| l.layer_type()).collect();
-            tracing::debug!(epoch = epoch, per_layer = ?names, per_layer_rms = ?per_layer_rms, "Layer RMS breakdown");
-
-            // NFR-5.2: Training divergence detection
-            if avg_loss.is_nan() || avg_loss.is_infinite() {
-                return Err(ModelError::Training {
-                    message: format!(
-                        "Training diverged at epoch {}: loss is {} (NaN or Inf detected)",
-                        epoch, avg_loss
-                    ),
-                });
-            }
-
-            if avg_loss > 1e6 {
-                return Err(ModelError::Training {
-                    message: format!(
-                        "Training diverged at epoch {}: loss exceeded threshold (loss = {:.2e} > 1e6)",
-                        epoch, avg_loss
-                    ),
-                });
-            }
-
-            // Aggregate MoH instrumentation from PolyAttention layers at epoch end
-            let mut tau_min_epoch = f32::INFINITY;
-            let mut tau_max_epoch = f32::NEG_INFINITY;
-            let mut tau_available = false;
-            let mut pred_norm_sum = 0.0f32;
-            let mut pred_norm_count = 0usize;
-            let mut avg_heads_per_token_sum = 0.0f32;
-            let mut heads_layers_count = 0usize;
-            let mut total_heads_sum = 0usize;
-            let mut avg_experts_sum = 0.0f32;
-            let mut significant_experts_sum = 0.0f32;
-            let mut routing_entropy_sum = 0.0f32;
-            let mut experts_load_cv_sum = 0.0f32;
-            let mut experts_load_cv_count = 0usize;
-            let mut experts_layers_count = 0usize;
-            let mut total_experts_sum = 0usize;
-
-            for layer in &mut self.network {
-                if let LayerEnum::PolyAttention(pa) = layer {
-                    if let Some((min_tau, max_tau)) = pa.take_tau_metrics() {
-                        tau_available = true;
-                        if min_tau < tau_min_epoch {
-                            tau_min_epoch = min_tau;
-                        }
-                        if max_tau > tau_max_epoch {
-                            tau_max_epoch = max_tau;
-                        }
-                    }
-                    if let Some(rms_g) = pa.take_pred_norm() {
-                        pred_norm_sum += rms_g;
-                        pred_norm_count += 1;
-                    }
-                    let per_head = pa.get_head_metrics_and_reset();
-                    if !per_head.is_empty() {
-                        let layer_avg_active_heads =
-                            per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                        avg_heads_per_token_sum += layer_avg_active_heads;
-                        heads_layers_count += 1;
-                        total_heads_sum += per_head.len();
+                // Process data in batches
+                for batch in tokenized_data.chunks(batch_size) {
+                    let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
+                        self.train_batch_profiled(batch, effective_lr, &mut scratch)?;
+                    total_loss += batch_loss;
+                    total_base_loss += batch_base_loss;
+                    total_grad_norm += grad_norm;
+                    batch_count += 1;
+                    total_examples += batch.len();
+                    for (i, s) in layer_param_grad_norm_sq.into_iter().enumerate() {
+                        per_layer_param_grad_norm_sq[i] += s;
                     }
                 }
-                if let LayerEnum::TransformerBlock(block) = layer {
-                    // Pull through MoH instrumentation from the temporal-mixing layer.
-                    match &mut block.temporal_mixing {
-                        crate::layers::components::common::TemporalMixingLayer::Attention(attn) => {
-                            if let Some((min_tau, max_tau)) = attn.take_tau_metrics() {
-                                tau_available = true;
-                                if min_tau < tau_min_epoch {
-                                    tau_min_epoch = min_tau;
-                                }
-                                if max_tau > tau_max_epoch {
-                                    tau_max_epoch = max_tau;
-                                }
-                            }
-                            if let Some(rms_g) = attn.take_pred_norm() {
-                                pred_norm_sum += rms_g;
-                                pred_norm_count += 1;
-                            }
-                            let per_head = attn.get_head_metrics_and_reset();
-                            if !per_head.is_empty() {
-                                let layer_avg_active_heads =
-                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                avg_heads_per_token_sum += layer_avg_active_heads;
-                                heads_layers_count += 1;
-                                total_heads_sum += per_head.len();
-                            }
-                        }
-                        crate::layers::components::common::TemporalMixingLayer::RgLruMoH(rglru) => {
-                            if let Some((min_tau, max_tau)) = rglru.take_tau_metrics() {
-                                tau_available = true;
-                                if min_tau < tau_min_epoch {
-                                    tau_min_epoch = min_tau;
-                                }
-                                if max_tau > tau_max_epoch {
-                                    tau_max_epoch = max_tau;
-                                }
-                            }
-                            if let Some(rms_g) = rglru.take_pred_norm() {
-                                pred_norm_sum += rms_g;
-                                pred_norm_count += 1;
-                            }
-                            let per_head = rglru.get_head_metrics_and_reset();
-                            if !per_head.is_empty() {
-                                let layer_avg_active_heads =
-                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                avg_heads_per_token_sum += layer_avg_active_heads;
-                                heads_layers_count += 1;
-                                total_heads_sum += per_head.len();
-                            }
-                        }
-                        crate::layers::components::common::TemporalMixingLayer::MambaMoH(m) => {
-                            if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
-                                tau_available = true;
-                                if min_tau < tau_min_epoch {
-                                    tau_min_epoch = min_tau;
-                                }
-                                if max_tau > tau_max_epoch {
-                                    tau_max_epoch = max_tau;
-                                }
-                            }
-                            if let Some(rms_g) = m.take_pred_norm() {
-                                pred_norm_sum += rms_g;
-                                pred_norm_count += 1;
-                            }
-                            let per_head = m.get_head_metrics_and_reset();
-                            if !per_head.is_empty() {
-                                let layer_avg_active_heads =
-                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                avg_heads_per_token_sum += layer_avg_active_heads;
-                                heads_layers_count += 1;
-                                total_heads_sum += per_head.len();
-                            }
-                        }
-                        crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(m) => {
-                            if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
-                                tau_available = true;
-                                if min_tau < tau_min_epoch {
-                                    tau_min_epoch = min_tau;
-                                }
-                                if max_tau > tau_max_epoch {
-                                    tau_max_epoch = max_tau;
-                                }
-                            }
-                            if let Some(rms_g) = m.take_pred_norm() {
-                                pred_norm_sum += rms_g;
-                                pred_norm_count += 1;
-                            }
-                            let per_head = m.get_head_metrics_and_reset();
-                            if !per_head.is_empty() {
-                                let layer_avg_active_heads =
-                                    per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                avg_heads_per_token_sum += layer_avg_active_heads;
-                                heads_layers_count += 1;
-                                total_heads_sum += per_head.len();
-                            }
-                        }
-                        _ => {}
-                    }
 
-                    // Pull through MoE metrics when MoE is used inside the block.
-                    if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(
+                let avg_loss = total_loss / batch_count as f32;
+                let avg_base_loss = total_base_loss / batch_count as f32;
+                let avg_grad_norm = total_grad_norm / batch_count as f32;
+                let per_layer_rms: Vec<f32> = per_layer_param_grad_norm_sq
+                    .iter()
+                    .map(|&s| (s / (batch_count as f32).max(1.0)).sqrt())
+                    .collect();
+
+                // Normalize by parameter count so layers with fewer parameters (e.g., RichardsNorm)
+                // are not misinterpreted as "dead" purely due to scale differences.
+                let layer_param_counts: Vec<usize> = self
+                    .network
+                    .iter()
+                    .map(|layer| layer.parameters().max(1))
+                    .collect();
+                let per_layer_rms_per_param: Vec<f32> = per_layer_rms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &raw)| {
+                        let param_count = layer_param_counts.get(i).copied().unwrap_or(1) as f32;
+                        if param_count > 0.0 {
+                            raw / param_count.sqrt()
+                        } else {
+                            raw
+                        }
+                    })
+                    .collect();
+
+                tracing::info!(
+                    epoch = epoch,
+                    per_layer_rms = ?per_layer_rms,
+                    per_layer_rms_per_param = ?per_layer_rms_per_param,
+                    layer_param_counts = ?layer_param_counts,
+                    "Transformer epoch layer param grad RMS"
+                );
+                let names: Vec<&str> = self.network.iter().map(|l| l.layer_type()).collect();
+                tracing::debug!(epoch = epoch, per_layer = ?names, per_layer_rms = ?per_layer_rms, "Layer RMS breakdown");
+
+                // NFR-5.2: Training divergence detection
+                if avg_loss.is_nan() || avg_loss.is_infinite() {
+                    return Err(ModelError::Training {
+                        message: format!(
+                            "Training diverged at epoch {}: loss is {} (NaN or Inf detected)",
+                            epoch, avg_loss
+                        ),
+                    });
+                }
+
+                if avg_loss > 1e6 {
+                    return Err(ModelError::Training {
+                        message: format!(
+                            "Training diverged at epoch {}: loss exceeded threshold (loss = {:.2e} > 1e6)",
+                            epoch, avg_loss
+                        ),
+                    });
+                }
+
+                // Aggregate MoH instrumentation from PolyAttention layers at epoch end
+                let mut tau_min_epoch = f32::INFINITY;
+                let mut tau_max_epoch = f32::NEG_INFINITY;
+                let mut tau_available = false;
+                let mut pred_norm_sum = 0.0f32;
+                let mut pred_norm_count = 0usize;
+                let mut avg_heads_per_token_sum = 0.0f32;
+                let mut heads_layers_count = 0usize;
+                let mut total_heads_sum = 0usize;
+                let mut avg_experts_sum = 0.0f32;
+                let mut significant_experts_sum = 0.0f32;
+                let mut routing_entropy_sum = 0.0f32;
+                let mut experts_load_cv_sum = 0.0f32;
+                let mut experts_load_cv_count = 0usize;
+                let mut experts_layers_count = 0usize;
+                let mut total_experts_sum = 0usize;
+
+                for layer in &mut self.network {
+                    if let LayerEnum::PolyAttention(pa) = layer {
+                        if let Some((min_tau, max_tau)) = pa.take_tau_metrics() {
+                            tau_available = true;
+                            if min_tau < tau_min_epoch {
+                                tau_min_epoch = min_tau;
+                            }
+                            if max_tau > tau_max_epoch {
+                                tau_max_epoch = max_tau;
+                            }
+                        }
+                        if let Some(rms_g) = pa.take_pred_norm() {
+                            pred_norm_sum += rms_g;
+                            pred_norm_count += 1;
+                        }
+                        let per_head = pa.get_head_metrics_and_reset();
+                        if !per_head.is_empty() {
+                            let layer_avg_active_heads =
+                                per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                            avg_heads_per_token_sum += layer_avg_active_heads;
+                            heads_layers_count += 1;
+                            total_heads_sum += per_head.len();
+                        }
+                    }
+                    if let LayerEnum::TransformerBlock(block) = layer {
+                        // Pull through MoH instrumentation from the temporal-mixing layer.
+                        match &mut block.temporal_mixing {
+                            crate::layers::components::common::TemporalMixingLayer::Attention(
+                                attn,
+                            ) => {
+                                if let Some((min_tau, max_tau)) = attn.take_tau_metrics() {
+                                    tau_available = true;
+                                    if min_tau < tau_min_epoch {
+                                        tau_min_epoch = min_tau;
+                                    }
+                                    if max_tau > tau_max_epoch {
+                                        tau_max_epoch = max_tau;
+                                    }
+                                }
+                                if let Some(rms_g) = attn.take_pred_norm() {
+                                    pred_norm_sum += rms_g;
+                                    pred_norm_count += 1;
+                                }
+                                let per_head = attn.get_head_metrics_and_reset();
+                                if !per_head.is_empty() {
+                                    let layer_avg_active_heads =
+                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                    avg_heads_per_token_sum += layer_avg_active_heads;
+                                    heads_layers_count += 1;
+                                    total_heads_sum += per_head.len();
+                                }
+                            }
+                            crate::layers::components::common::TemporalMixingLayer::RgLruMoH(
+                                rglru,
+                            ) => {
+                                if let Some((min_tau, max_tau)) = rglru.take_tau_metrics() {
+                                    tau_available = true;
+                                    if min_tau < tau_min_epoch {
+                                        tau_min_epoch = min_tau;
+                                    }
+                                    if max_tau > tau_max_epoch {
+                                        tau_max_epoch = max_tau;
+                                    }
+                                }
+                                if let Some(rms_g) = rglru.take_pred_norm() {
+                                    pred_norm_sum += rms_g;
+                                    pred_norm_count += 1;
+                                }
+                                let per_head = rglru.get_head_metrics_and_reset();
+                                if !per_head.is_empty() {
+                                    let layer_avg_active_heads =
+                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                    avg_heads_per_token_sum += layer_avg_active_heads;
+                                    heads_layers_count += 1;
+                                    total_heads_sum += per_head.len();
+                                }
+                            }
+                            crate::layers::components::common::TemporalMixingLayer::MambaMoH(m) => {
+                                if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
+                                    tau_available = true;
+                                    if min_tau < tau_min_epoch {
+                                        tau_min_epoch = min_tau;
+                                    }
+                                    if max_tau > tau_max_epoch {
+                                        tau_max_epoch = max_tau;
+                                    }
+                                }
+                                if let Some(rms_g) = m.take_pred_norm() {
+                                    pred_norm_sum += rms_g;
+                                    pred_norm_count += 1;
+                                }
+                                let per_head = m.get_head_metrics_and_reset();
+                                if !per_head.is_empty() {
+                                    let layer_avg_active_heads =
+                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                    avg_heads_per_token_sum += layer_avg_active_heads;
+                                    heads_layers_count += 1;
+                                    total_heads_sum += per_head.len();
+                                }
+                            }
+                            crate::layers::components::common::TemporalMixingLayer::Mamba2MoH(
+                                m,
+                            ) => {
+                                if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
+                                    tau_available = true;
+                                    if min_tau < tau_min_epoch {
+                                        tau_min_epoch = min_tau;
+                                    }
+                                    if max_tau > tau_max_epoch {
+                                        tau_max_epoch = max_tau;
+                                    }
+                                }
+                                if let Some(rms_g) = m.take_pred_norm() {
+                                    pred_norm_sum += rms_g;
+                                    pred_norm_count += 1;
+                                }
+                                let per_head = m.get_head_metrics_and_reset();
+                                if !per_head.is_empty() {
+                                    let layer_avg_active_heads =
+                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                                    avg_heads_per_token_sum += layer_avg_active_heads;
+                                    heads_layers_count += 1;
+                                    total_heads_sum += per_head.len();
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        // Pull through MoE metrics when MoE is used inside the block.
+                        if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(
                         moe,
                     ) = &block.feedforward
                     {
@@ -1171,10 +1171,10 @@ impl LLM {
                         experts_layers_count += 1;
                         total_experts_sum += moe.config.num_experts;
                     }
-                }
-                if let LayerEnum::DiffusionBlock(block) = layer {
-                    // Pull through MoE metrics when MoE is used inside the diffusion block.
-                    if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(
+                    }
+                    if let LayerEnum::DiffusionBlock(block) = layer {
+                        // Pull through MoE metrics when MoE is used inside the diffusion block.
+                        if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(
                         moe,
                     ) = &block.feedforward
                     {
@@ -1190,34 +1190,35 @@ impl LLM {
                         experts_layers_count += 1;
                         total_experts_sum += moe.config.num_experts;
                     }
-                }
-                if let LayerEnum::LRM(lrm) = layer {
-                    if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
-                        tau_available = true;
-                        if min_tau < tau_min_epoch {
-                            tau_min_epoch = min_tau;
+                    }
+                    if let LayerEnum::LRM(lrm) = layer {
+                        if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
+                            tau_available = true;
+                            if min_tau < tau_min_epoch {
+                                tau_min_epoch = min_tau;
+                            }
+                            if max_tau > tau_max_epoch {
+                                tau_max_epoch = max_tau;
+                            }
                         }
-                        if max_tau > tau_max_epoch {
-                            tau_max_epoch = max_tau;
+                        if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
+                            pred_norm_sum += rms_g;
+                            pred_norm_count += 1;
                         }
-                    }
-                    if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
-                        pred_norm_sum += rms_g;
-                        pred_norm_count += 1;
-                    }
-                    let per_head = lrm.attention_mut().get_head_metrics_and_reset();
-                    if !per_head.is_empty() {
-                        let layer_avg_active_heads =
-                            per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                        avg_heads_per_token_sum += layer_avg_active_heads;
-                        heads_layers_count += 1;
-                        total_heads_sum += per_head.len();
-                    }
+                        let per_head = lrm.attention_mut().get_head_metrics_and_reset();
+                        if !per_head.is_empty() {
+                            let layer_avg_active_heads =
+                                per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                            avg_heads_per_token_sum += layer_avg_active_heads;
+                            heads_layers_count += 1;
+                            total_heads_sum += per_head.len();
+                        }
 
-                    // Pull through MoE metrics when MoE is used inside the recursive core block.
-                    // LRM wraps either a TransformerBlock or DiffusionBlock.
-                    let guard = lrm.block.read().unwrap();
-                    match &*guard {
+                        // Pull through MoE metrics when MoE is used inside the recursive core
+                        // block. LRM wraps either a TransformerBlock or
+                        // DiffusionBlock.
+                        let guard = lrm.block.read().unwrap();
+                        match &*guard {
                         crate::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
                             if let crate::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) =
                                 &b.feedforward
@@ -1253,341 +1254,347 @@ impl LLM {
                             }
                         }
                     }
-                }
-                if let LayerEnum::MixtureOfExperts(moe) = layer {
-                    let layer_avg_active_experts = moe.config.get_avg_active_experts();
-                    let layer_significant_experts = moe.config.get_avg_significant_experts();
-                    let layer_routing_entropy = moe.config.get_routing_entropy();
-                    let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
-                    avg_experts_sum += layer_avg_active_experts;
-                    significant_experts_sum += layer_significant_experts;
-                    routing_entropy_sum += layer_routing_entropy;
-                    experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
-                    experts_load_cv_count += 1;
-                    experts_layers_count += 1;
-                    total_experts_sum += moe.config.num_experts;
-                }
-            }
-
-            let tau_min_log = if tau_available {
-                Some(tau_min_epoch)
-            } else {
-                None
-            };
-            let tau_max_log = if tau_available {
-                Some(tau_max_epoch)
-            } else {
-                None
-            };
-            let tau_range_log = if tau_available {
-                Some(tau_max_epoch - tau_min_epoch)
-            } else {
-                None
-            };
-            let pred_norm_rms = if pred_norm_count > 0 {
-                pred_norm_sum / pred_norm_count as f32
-            } else {
-                0.0
-            };
-            let pred_norm_rms_log = if pred_norm_count > 0 {
-                Some(pred_norm_rms)
-            } else {
-                None
-            };
-            let avg_active_heads = if heads_layers_count > 0 {
-                avg_heads_per_token_sum / heads_layers_count as f32
-            } else {
-                0.0
-            };
-            let avg_active_heads_log = if heads_layers_count > 0 {
-                Some(avg_active_heads)
-            } else {
-                None
-            };
-            let avg_active_experts = if experts_layers_count > 0 {
-                avg_experts_sum / experts_layers_count as f32
-            } else {
-                0.0
-            };
-            let avg_significant_experts = if experts_layers_count > 0 {
-                significant_experts_sum / experts_layers_count as f32
-            } else {
-                0.0
-            };
-            let avg_routing_entropy = if experts_layers_count > 0 {
-                routing_entropy_sum / experts_layers_count as f32
-            } else {
-                0.0
-            };
-            let experts_load_cv = if experts_load_cv_count > 0 {
-                experts_load_cv_sum / experts_load_cv_count as f32
-            } else {
-                0.0
-            };
-
-            // Presentable (active/total) counts and a coupled ratio.
-            let total_heads = if heads_layers_count > 0 {
-                ((total_heads_sum as f32) / (heads_layers_count as f32))
-                    .round()
-                    .max(0.0) as usize
-            } else {
-                0
-            };
-            let total_experts = if experts_layers_count > 0 {
-                ((total_experts_sum as f32) / (experts_layers_count as f32))
-                    .round()
-                    .max(0.0) as usize
-            } else {
-                0
-            };
-
-            let avg_active_heads_s = if avg_active_heads.is_finite() {
-                avg_active_heads.max(0.0)
-            } else {
-                0.0
-            };
-            let avg_significant_experts_s = if avg_significant_experts.is_finite() {
-                avg_significant_experts.max(0.0)
-            } else {
-                0.0
-            };
-
-            let active_heads = if total_heads > 0 {
-                avg_active_heads_s.round().clamp(0.0, total_heads as f32) as usize
-            } else {
-                0
-            };
-            // For display, treat "active experts" as those with significant weight (> 0.1).
-            let active_experts = if total_experts > 0 {
-                avg_significant_experts_s
-                    .round()
-                    .clamp(0.0, total_experts as f32) as usize
-            } else {
-                0
-            };
-            let heads_per_expert = if active_experts > 0 {
-                active_heads as f32 / active_experts as f32
-            } else {
-                0.0
-            };
-
-            // Balanced discrete distribution implied by (active_heads, active_experts).
-            // If active_heads is not divisible by active_experts, the best possible split is:
-            // - remainder experts get ceil(active_heads/active_experts)
-            // - the rest get floor(active_heads/active_experts)
-            let (heads_per_expert_min, heads_per_expert_max, heads_per_expert_remainder) =
-                if active_experts > 0 {
-                    let min_h = active_heads / active_experts;
-                    let rem = active_heads % active_experts;
-                    let max_h = min_h + if rem > 0 { 1 } else { 0 };
-                    (min_h, max_h, rem)
-                } else {
-                    (0, 0, 0)
-                };
-
-            tracing::info!(
-                epoch = epoch,
-                tau_available = tau_available,
-                tau_min = ?tau_min_log,
-                tau_max = ?tau_max_log,
-                tau_range = ?tau_range_log,
-                pred_norm_rms = ?pred_norm_rms_log,
-                avg_active_heads = ?avg_active_heads_log,
-                active_heads = active_heads,
-                total_heads = total_heads,
-                avg_active_experts = avg_active_experts,
-                avg_significant_experts = avg_significant_experts,
-                active_experts = active_experts,
-                total_experts = total_experts,
-                heads_per_expert = heads_per_expert,
-                heads_per_expert_min = heads_per_expert_min,
-                heads_per_expert_max = heads_per_expert_max,
-                heads_per_expert_remainder = heads_per_expert_remainder,
-                avg_routing_entropy = avg_routing_entropy,
-                experts_load_cv = experts_load_cv,
-                "Attention/MoH/MoE metrics: heads {}/{}; experts {}/{}; heads/expert {:.2}",
-                active_heads,
-                total_heads,
-                active_experts,
-                total_experts,
-                heads_per_expert
-            );
-
-            // Collect current richards_glu richards weights for delta tracking
-            let mut current_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
-            let mut richards_training_status: Vec<bool> = Vec::new();
-            for layer in &self.network {
-                if let LayerEnum::RichardsGlu(richards_glu) = layer {
-                    current_richards_glu_weights.push(richards_glu.gate.weights());
-                    richards_training_status.push(richards_glu.gate.has_trained_parameters());
-                }
-            }
-
-            // Debug: Check if Richards parameters are being trained
-            let trained_layers = richards_training_status
-                .iter()
-                .filter(|&&trained| trained)
-                .count();
-            if !current_richards_glu_weights.is_empty() {
-                tracing::debug!(
-                    "RichardsGlu training status: {}/{} layers have trained parameters",
-                    trained_layers,
-                    current_richards_glu_weights.len()
-                );
-            }
-
-            // Compute delta changes in richards_glu richards coefficients
-            let mut richards_glu_delta_sum = 0.0;
-            let mut richards_glu_param_count = 0;
-            let mut total_weight_changes = 0;
-            let mut significant_changes = 0;
-
-            if !prev_richards_glu_weights.is_empty()
-                && current_richards_glu_weights.len() == prev_richards_glu_weights.len()
-            {
-                for (layer_idx, (prev_layer, curr_layer)) in prev_richards_glu_weights
-                    .iter()
-                    .zip(current_richards_glu_weights.iter())
-                    .enumerate()
-                {
-                    if prev_layer.len() == curr_layer.len() {
-                        for (param_idx, (prev_w, curr_w)) in
-                            prev_layer.iter().zip(curr_layer.iter()).enumerate()
-                        {
-                            let delta = (curr_w - prev_w).abs();
-                            richards_glu_delta_sum += delta;
-                            richards_glu_param_count += 1;
-                            total_weight_changes += 1;
-
-                            // Count significant changes (> 1e-6 relative change)
-                            if delta > 1e-6 {
-                                significant_changes += 1;
-                            }
-
-                            // Debug: Log unusual parameter values
-                            if delta > 1.0 {
-                                tracing::debug!(
-                                    "Large Richards parameter change in layer {} param {}: {:.6} -> {:.6} (delta: {:.6})",
-                                    layer_idx,
-                                    param_idx,
-                                    prev_w,
-                                    curr_w,
-                                    delta
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            "RichardsGlu layer {} weight length mismatch: prev={}, curr={}",
-                            layer_idx,
-                            prev_layer.len(),
-                            curr_layer.len()
-                        );
+                    }
+                    if let LayerEnum::MixtureOfExperts(moe) = layer {
+                        let layer_avg_active_experts = moe.config.get_avg_active_experts();
+                        let layer_significant_experts = moe.config.get_avg_significant_experts();
+                        let layer_routing_entropy = moe.config.get_routing_entropy();
+                        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
+                        avg_experts_sum += layer_avg_active_experts;
+                        significant_experts_sum += layer_significant_experts;
+                        routing_entropy_sum += layer_routing_entropy;
+                        experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+                        experts_load_cv_count += 1;
+                        experts_layers_count += 1;
+                        total_experts_sum += moe.config.num_experts;
                     }
                 }
-            } else if prev_richards_glu_weights.is_empty() {
-                tracing::debug!("No previous RichardsGlu weights available (first epoch)");
-            } else {
-                tracing::warn!(
-                    "RichardsGlu layer count mismatch: prev={}, curr={}",
-                    prev_richards_glu_weights.len(),
-                    current_richards_glu_weights.len()
-                );
-            }
 
-            // Debug: Log parameter change statistics
-            if richards_glu_param_count > 0 {
-                let avg_delta = richards_glu_delta_sum / richards_glu_param_count as f64;
-                let significant_ratio = significant_changes as f64 / total_weight_changes as f64;
-
-                tracing::debug!(
-                    "RichardsGlu delta stats: {} params, avg_delta={:.2e}, significant_changes={}/{} ({:.1}%)",
-                    richards_glu_param_count,
-                    avg_delta,
-                    significant_changes,
-                    total_weight_changes,
-                    significant_ratio * 100.0
-                );
-            }
-            let avg_richards_glu_delta = if richards_glu_param_count > 0 {
-                richards_glu_delta_sum / richards_glu_param_count as f64
-            } else {
-                0.0
-            };
-
-            // Update previous weights
-            prev_richards_glu_weights = current_richards_glu_weights;
-
-            // NFR-7.3: Training metrics
-            let warmup_status = if epoch < warmup_epochs {
-                format!(" (warmup {}/{})", epoch + 1, warmup_epochs)
-            } else {
-                String::new()
-            };
-
-            let epoch_ms = t_epoch_start.elapsed().as_secs_f64() as f32 * 1000.0;
-            let tokens_per_sec = if total_examples > 0 {
-                (total_examples as f32) / (t_epoch_start.elapsed().as_secs_f32().max(1e-6))
-            } else {
-                0.0
-            };
-            let tau_opt = if tau_available {
-                Some((tau_min_epoch, tau_max_epoch))
-            } else {
-                None
-            };
-            let metrics = crate::attention::poly_attention::DegreeAdaptationMetrics {
-                epoch_index: epoch,
-                loss_delta: 0.0,
-                grad_norm: avg_grad_norm,
-                epoch_ms,
-                tokens_per_sec,
-                tau_range: tau_opt,
-                pred_norm_rms: if pred_norm_rms.is_finite() {
+                let tau_min_log = if tau_available {
+                    Some(tau_min_epoch)
+                } else {
+                    None
+                };
+                let tau_max_log = if tau_available {
+                    Some(tau_max_epoch)
+                } else {
+                    None
+                };
+                let tau_range_log = if tau_available {
+                    Some(tau_max_epoch - tau_min_epoch)
+                } else {
+                    None
+                };
+                let pred_norm_rms = if pred_norm_count > 0 {
+                    pred_norm_sum / pred_norm_count as f32
+                } else {
+                    0.0
+                };
+                let pred_norm_rms_log = if pred_norm_count > 0 {
                     Some(pred_norm_rms)
                 } else {
                     None
-                },
-            };
-            for layer in &mut self.network {
-                if let LayerEnum::TransformerBlock(tb) = layer
-                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut tb.temporal_mixing
+                };
+                let avg_active_heads = if heads_layers_count > 0 {
+                    avg_heads_per_token_sum / heads_layers_count as f32
+                } else {
+                    0.0
+                };
+                let avg_active_heads_log = if heads_layers_count > 0 {
+                    Some(avg_active_heads)
+                } else {
+                    None
+                };
+                let avg_active_experts = if experts_layers_count > 0 {
+                    avg_experts_sum / experts_layers_count as f32
+                } else {
+                    0.0
+                };
+                let avg_significant_experts = if experts_layers_count > 0 {
+                    significant_experts_sum / experts_layers_count as f32
+                } else {
+                    0.0
+                };
+                let avg_routing_entropy = if experts_layers_count > 0 {
+                    routing_entropy_sum / experts_layers_count as f32
+                } else {
+                    0.0
+                };
+                let experts_load_cv = if experts_load_cv_count > 0 {
+                    experts_load_cv_sum / experts_load_cv_count as f32
+                } else {
+                    0.0
+                };
+
+                // Presentable (active/total) counts and a coupled ratio.
+                let total_heads = if heads_layers_count > 0 {
+                    ((total_heads_sum as f32) / (heads_layers_count as f32))
+                        .round()
+                        .max(0.0) as usize
+                } else {
+                    0
+                };
+                let total_experts = if experts_layers_count > 0 {
+                    ((total_experts_sum as f32) / (experts_layers_count as f32))
+                        .round()
+                        .max(0.0) as usize
+                } else {
+                    0
+                };
+
+                let avg_active_heads_s = if avg_active_heads.is_finite() {
+                    avg_active_heads.max(0.0)
+                } else {
+                    0.0
+                };
+                let avg_significant_experts_s = if avg_significant_experts.is_finite() {
+                    avg_significant_experts.max(0.0)
+                } else {
+                    0.0
+                };
+
+                let active_heads = if total_heads > 0 {
+                    avg_active_heads_s.round().clamp(0.0, total_heads as f32) as usize
+                } else {
+                    0
+                };
+                // For display, treat "active experts" as those with significant weight (> 0.1).
+                let active_experts = if total_experts > 0 {
+                    avg_significant_experts_s
+                        .round()
+                        .clamp(0.0, total_experts as f32) as usize
+                } else {
+                    0
+                };
+                let heads_per_expert = if active_experts > 0 {
+                    active_heads as f32 / active_experts as f32
+                } else {
+                    0.0
+                };
+
+                // Balanced discrete distribution implied by (active_heads, active_experts).
+                // If active_heads is not divisible by active_experts, the best possible split is:
+                // - remainder experts get ceil(active_heads/active_experts)
+                // - the rest get floor(active_heads/active_experts)
+                let (heads_per_expert_min, heads_per_expert_max, heads_per_expert_remainder) =
+                    if active_experts > 0 {
+                        let min_h = active_heads / active_experts;
+                        let rem = active_heads % active_experts;
+                        let max_h = min_h + if rem > 0 { 1 } else { 0 };
+                        (min_h, max_h, rem)
+                    } else {
+                        (0, 0, 0)
+                    };
+
+                tracing::info!(
+                    epoch = epoch,
+                    tau_available = tau_available,
+                    tau_min = ?tau_min_log,
+                    tau_max = ?tau_max_log,
+                    tau_range = ?tau_range_log,
+                    pred_norm_rms = ?pred_norm_rms_log,
+                    avg_active_heads = ?avg_active_heads_log,
+                    active_heads = active_heads,
+                    total_heads = total_heads,
+                    avg_active_experts = avg_active_experts,
+                    avg_significant_experts = avg_significant_experts,
+                    active_experts = active_experts,
+                    total_experts = total_experts,
+                    heads_per_expert = heads_per_expert,
+                    heads_per_expert_min = heads_per_expert_min,
+                    heads_per_expert_max = heads_per_expert_max,
+                    heads_per_expert_remainder = heads_per_expert_remainder,
+                    avg_routing_entropy = avg_routing_entropy,
+                    experts_load_cv = experts_load_cv,
+                    "Attention/MoH/MoE metrics: heads {}/{}; experts {}/{}; heads/expert {:.2}",
+                    active_heads,
+                    total_heads,
+                    active_experts,
+                    total_experts,
+                    heads_per_expert
+                );
+
+                // Collect current richards_glu richards weights for delta tracking
+                let mut current_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
+                let mut richards_training_status: Vec<bool> = Vec::new();
+                for layer in &self.network {
+                    if let LayerEnum::RichardsGlu(richards_glu) = layer {
+                        current_richards_glu_weights.push(richards_glu.gate.weights());
+                        richards_training_status.push(richards_glu.gate.has_trained_parameters());
+                    }
+                }
+
+                // Debug: Check if Richards parameters are being trained
+                let trained_layers = richards_training_status
+                    .iter()
+                    .filter(|&&trained| trained)
+                    .count();
+                if !current_richards_glu_weights.is_empty() {
+                    tracing::debug!(
+                        "RichardsGlu training status: {}/{} layers have trained parameters",
+                        trained_layers,
+                        current_richards_glu_weights.len()
+                    );
+                }
+
+                // Compute delta changes in richards_glu richards coefficients
+                let mut richards_glu_delta_sum = 0.0;
+                let mut richards_glu_param_count = 0;
+                let mut total_weight_changes = 0;
+                let mut significant_changes = 0;
+
+                if !prev_richards_glu_weights.is_empty()
+                    && current_richards_glu_weights.len() == prev_richards_glu_weights.len()
                 {
-                    attn.adapt_degree(&metrics);
+                    for (layer_idx, (prev_layer, curr_layer)) in prev_richards_glu_weights
+                        .iter()
+                        .zip(current_richards_glu_weights.iter())
+                        .enumerate()
+                    {
+                        if prev_layer.len() == curr_layer.len() {
+                            for (param_idx, (prev_w, curr_w)) in
+                                prev_layer.iter().zip(curr_layer.iter()).enumerate()
+                            {
+                                let delta = (curr_w - prev_w).abs();
+                                richards_glu_delta_sum += delta;
+                                richards_glu_param_count += 1;
+                                total_weight_changes += 1;
+
+                                // Count significant changes (> 1e-6 relative change)
+                                if delta > 1e-6 {
+                                    significant_changes += 1;
+                                }
+
+                                // Debug: Log unusual parameter values
+                                if delta > 1.0 {
+                                    tracing::debug!(
+                                        "Large Richards parameter change in layer {} param {}: {:.6} -> {:.6} (delta: {:.6})",
+                                        layer_idx,
+                                        param_idx,
+                                        prev_w,
+                                        curr_w,
+                                        delta
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "RichardsGlu layer {} weight length mismatch: prev={}, curr={}",
+                                layer_idx,
+                                prev_layer.len(),
+                                curr_layer.len()
+                            );
+                        }
+                    }
+                } else if prev_richards_glu_weights.is_empty() {
+                    tracing::debug!("No previous RichardsGlu weights available (first epoch)");
+                } else {
+                    tracing::warn!(
+                        "RichardsGlu layer count mismatch: prev={}, curr={}",
+                        prev_richards_glu_weights.len(),
+                        current_richards_glu_weights.len()
+                    );
                 }
-                if let LayerEnum::DiffusionBlock(db) = layer
-                    && let crate::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut db.temporal_mixing
-                {
-                    attn.adapt_degree(&metrics);
+
+                // Debug: Log parameter change statistics
+                if richards_glu_param_count > 0 {
+                    let avg_delta = richards_glu_delta_sum / richards_glu_param_count as f64;
+                    let significant_ratio =
+                        significant_changes as f64 / total_weight_changes as f64;
+
+                    tracing::debug!(
+                        "RichardsGlu delta stats: {} params, avg_delta={:.2e}, significant_changes={}/{} ({:.1}%)",
+                        richards_glu_param_count,
+                        avg_delta,
+                        significant_changes,
+                        total_weight_changes,
+                        significant_ratio * 100.0
+                    );
                 }
-                if let LayerEnum::PolyAttention(pa) = layer {
-                    pa.adapt_degree(&metrics);
+                let avg_richards_glu_delta = if richards_glu_param_count > 0 {
+                    richards_glu_delta_sum / richards_glu_param_count as f64
+                } else {
+                    0.0
+                };
+
+                // Update previous weights
+                prev_richards_glu_weights = current_richards_glu_weights;
+
+                // NFR-7.3: Training metrics
+                let warmup_status = if epoch < warmup_epochs {
+                    format!(" (warmup {}/{})", epoch + 1, warmup_epochs)
+                } else {
+                    String::new()
+                };
+
+                let epoch_ms = t_epoch_start.elapsed().as_secs_f64() as f32 * 1000.0;
+                let tokens_per_sec = if total_examples > 0 {
+                    (total_examples as f32) / (t_epoch_start.elapsed().as_secs_f32().max(1e-6))
+                } else {
+                    0.0
+                };
+                let tau_opt = if tau_available {
+                    Some((tau_min_epoch, tau_max_epoch))
+                } else {
+                    None
+                };
+                let metrics = crate::attention::poly_attention::DegreeAdaptationMetrics {
+                    epoch_index: epoch,
+                    loss_delta: 0.0,
+                    grad_norm: avg_grad_norm,
+                    epoch_ms,
+                    tokens_per_sec,
+                    tau_range: tau_opt,
+                    pred_norm_rms: if pred_norm_rms.is_finite() {
+                        Some(pred_norm_rms)
+                    } else {
+                        None
+                    },
+                };
+                for layer in &mut self.network {
+                    if let LayerEnum::TransformerBlock(tb) = layer
+                        && let crate::layers::components::common::TemporalMixingLayer::Attention(
+                            attn,
+                        ) = &mut tb.temporal_mixing
+                    {
+                        attn.adapt_degree(&metrics);
+                    }
+                    if let LayerEnum::DiffusionBlock(db) = layer
+                        && let crate::layers::components::common::TemporalMixingLayer::Attention(
+                            attn,
+                        ) = &mut db.temporal_mixing
+                    {
+                        attn.adapt_degree(&metrics);
+                    }
+                    if let LayerEnum::PolyAttention(pa) = layer {
+                        pa.adapt_degree(&metrics);
+                    }
                 }
+
+                info!(
+                    epoch = epoch,
+                    loss = avg_loss,
+                    base_loss = avg_base_loss,
+                    grad_norm = avg_grad_norm,
+                    learning_rate = effective_lr,
+                    tau_min = tau_min_log,
+                    tau_max = tau_max_log,
+                    tau_range = tau_range_log,
+                    pred_norm_rms = pred_norm_rms,
+                    avg_active_heads = avg_active_heads,
+                    avg_active_experts = avg_active_experts,
+                    avg_significant_experts = avg_significant_experts,
+                    avg_routing_entropy = avg_routing_entropy,
+                    richards_glu_richards_delta = avg_richards_glu_delta,
+                    "Training epoch completed{}",
+                    warmup_status
+                );
             }
 
-            info!(
-                epoch = epoch,
-                loss = avg_loss,
-                base_loss = avg_base_loss,
-                grad_norm = avg_grad_norm,
-                learning_rate = effective_lr,
-                tau_min = tau_min_log,
-                tau_max = tau_max_log,
-                tau_range = tau_range_log,
-                pred_norm_rms = pred_norm_rms,
-                avg_active_heads = avg_active_heads,
-                avg_active_experts = avg_active_experts,
-                avg_significant_experts = avg_significant_experts,
-                avg_routing_entropy = avg_routing_entropy,
-                richards_glu_richards_delta = avg_richards_glu_delta,
-                "Training epoch completed{}",
-                warmup_status
-            );
-        }
-
-        Ok(())
+            Ok(())
+        })();
+        self.training_scratch = scratch;
+        res
     }
 
     #[instrument(skip(self, data))]
@@ -1687,190 +1694,195 @@ impl LLM {
             tokenized_data.len()
         );
 
-        for epoch in 0..epochs {
-            let mut total_loss = 0.0;
-            let mut total_base_loss = 0.0;
-            let mut total_grad_norm = 0.0;
-            let mut batch_count = 0;
+        let mut scratch = std::mem::take(&mut self.training_scratch);
+        let res: Result<()> = (|| {
+            for epoch in 0..epochs {
+                let mut total_loss = 0.0;
+                let mut total_base_loss = 0.0;
+                let mut total_grad_norm = 0.0;
+                let mut batch_count = 0;
 
-            // Process data in batches
-            for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, batch_base_loss, grad_norm) = self
-                    .train_batch_trm_autoencoding(batch, lr, &mut self.training_scratch)?;
-                total_loss += batch_loss;
-                total_base_loss += batch_base_loss;
-                total_grad_norm += grad_norm;
-                batch_count += 1;
-            }
-
-            let avg_loss = total_loss / tokenized_data.len() as f32;
-            let avg_base_loss = total_base_loss / tokenized_data.len() as f32;
-            let avg_grad_norm = total_grad_norm / batch_count as f32;
-
-            // NFR-5.2: Training divergence detection
-            if avg_loss.is_nan() || avg_loss.is_infinite() {
-                return Err(ModelError::Training {
-                    message: format!(
-                        "TRM autoencoding diverged at epoch {}: loss is {} (NaN or Inf detected)",
-                        epoch, avg_loss
-                    ),
-                });
-            }
-
-            let mut tau_min_epoch = f32::INFINITY;
-            let mut tau_max_epoch = f32::NEG_INFINITY;
-            let mut tau_available = false;
-            let mut pred_norm_sum = 0.0f32;
-            let mut pred_norm_count = 0usize;
-            let mut avg_heads_per_token_sum = 0.0f32;
-            let mut heads_layers_count = 0usize;
-            for layer in &mut self.network {
-                if let LayerEnum::LRM(lrm) = layer {
-                    if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
-                        tau_available = true;
-                        if min_tau < tau_min_epoch {
-                            tau_min_epoch = min_tau;
-                        }
-                        if max_tau > tau_max_epoch {
-                            tau_max_epoch = max_tau;
-                        }
-                    }
-                    if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
-                        pred_norm_sum += rms_g;
-                        pred_norm_count += 1;
-                    }
-                    let per_head = lrm.attention_mut().get_head_metrics_and_reset();
-                    if !per_head.is_empty() {
-                        let layer_avg_active_heads =
-                            per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                        avg_heads_per_token_sum += layer_avg_active_heads;
-                        heads_layers_count += 1;
-                    }
+                // Process data in batches
+                for batch in tokenized_data.chunks(batch_size) {
+                    let (batch_loss, batch_base_loss, grad_norm) =
+                        self.train_batch_trm_autoencoding(batch, lr, &mut scratch)?;
+                    total_loss += batch_loss;
+                    total_base_loss += batch_base_loss;
+                    total_grad_norm += grad_norm;
+                    batch_count += 1;
                 }
-            }
-            let tau_min_log = if tau_available {
-                tau_min_epoch
-            } else {
-                f32::NAN
-            };
-            let tau_max_log = if tau_available {
-                tau_max_epoch
-            } else {
-                f32::NAN
-            };
-            let tau_range_log = if tau_available {
-                tau_max_epoch - tau_min_epoch
-            } else {
-                f32::NAN
-            };
-            let pred_norm_rms = if pred_norm_count > 0 {
-                pred_norm_sum / pred_norm_count as f32
-            } else {
-                f32::NAN
-            };
-            let avg_active_heads = if heads_layers_count > 0 {
-                avg_heads_per_token_sum / heads_layers_count as f32
-            } else {
-                f32::NAN
-            };
 
-            let mut lb_loss = f32::NAN;
-            let mut cx_loss = f32::NAN;
-            let mut sp_loss = f32::NAN;
-            let mut rec_avg_heads = f32::NAN;
-            let mut rec_tau_min = f32::NAN;
-            let mut rec_tau_max = f32::NAN;
-            for layer in &self.network {
-                if let LayerEnum::LRM(lrm) = layer {
-                    lb_loss = lrm
-                        .attention()
-                        .moh
-                        .head_selection_config
-                        .compute_load_balance_loss();
-                    cx_loss = lrm
-                        .attention()
-                        .moh
-                        .head_selection_config
-                        .compute_complexity_loss(lrm.attention().moh_num_active() as f32);
-                    sp_loss = lrm
-                        .attention()
-                        .moh
-                        .head_selection_config
-                        .compute_sparsity_loss();
-                    if !lrm.recursion_metrics.is_empty() {
-                        let mut hsum = 0.0f32;
-                        let mut c = 0usize;
-                        let mut tmin = f32::INFINITY;
-                        let mut tmax = f32::NEG_INFINITY;
-                        for (h, mn, mx) in lrm.recursion_metrics.iter().cloned() {
-                            hsum += h;
-                            c += 1;
-                            if mn < tmin {
-                                tmin = mn;
+                let avg_loss = total_loss / tokenized_data.len() as f32;
+                let avg_base_loss = total_base_loss / tokenized_data.len() as f32;
+                let avg_grad_norm = total_grad_norm / batch_count as f32;
+
+                // NFR-5.2: Training divergence detection
+                if avg_loss.is_nan() || avg_loss.is_infinite() {
+                    return Err(ModelError::Training {
+                        message: format!(
+                            "TRM autoencoding diverged at epoch {}: loss is {} (NaN or Inf detected)",
+                            epoch, avg_loss
+                        ),
+                    });
+                }
+
+                let mut tau_min_epoch = f32::INFINITY;
+                let mut tau_max_epoch = f32::NEG_INFINITY;
+                let mut tau_available = false;
+                let mut pred_norm_sum = 0.0f32;
+                let mut pred_norm_count = 0usize;
+                let mut avg_heads_per_token_sum = 0.0f32;
+                let mut heads_layers_count = 0usize;
+                for layer in &mut self.network {
+                    if let LayerEnum::LRM(lrm) = layer {
+                        if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
+                            tau_available = true;
+                            if min_tau < tau_min_epoch {
+                                tau_min_epoch = min_tau;
                             }
-                            if mx > tmax {
-                                tmax = mx;
+                            if max_tau > tau_max_epoch {
+                                tau_max_epoch = max_tau;
                             }
                         }
-                        rec_avg_heads = if c > 0 { hsum / c as f32 } else { f32::NAN };
-                        rec_tau_min = if c > 0 { tmin } else { f32::NAN };
-                        rec_tau_max = if c > 0 { tmax } else { f32::NAN };
+                        if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
+                            pred_norm_sum += rms_g;
+                            pred_norm_count += 1;
+                        }
+                        let per_head = lrm.attention_mut().get_head_metrics_and_reset();
+                        if !per_head.is_empty() {
+                            let layer_avg_active_heads =
+                                per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
+                            avg_heads_per_token_sum += layer_avg_active_heads;
+                            heads_layers_count += 1;
+                        }
                     }
-                    break;
                 }
-            }
+                let tau_min_log = if tau_available {
+                    tau_min_epoch
+                } else {
+                    f32::NAN
+                };
+                let tau_max_log = if tau_available {
+                    tau_max_epoch
+                } else {
+                    f32::NAN
+                };
+                let tau_range_log = if tau_available {
+                    tau_max_epoch - tau_min_epoch
+                } else {
+                    f32::NAN
+                };
+                let pred_norm_rms = if pred_norm_count > 0 {
+                    pred_norm_sum / pred_norm_count as f32
+                } else {
+                    f32::NAN
+                };
+                let avg_active_heads = if heads_layers_count > 0 {
+                    avg_heads_per_token_sum / heads_layers_count as f32
+                } else {
+                    f32::NAN
+                };
 
-            info!(
-                epoch = epoch,
-                loss = avg_loss,
-                base_loss = avg_base_loss,
-                grad_norm = avg_grad_norm,
-                tau_min = tau_min_log,
-                tau_max = tau_max_log,
-                tau_range = tau_range_log,
-                pred_norm_rms = pred_norm_rms,
-                avg_active_heads = avg_active_heads,
-                rec_avg_heads = rec_avg_heads,
-                rec_tau_min = rec_tau_min,
-                rec_tau_max = rec_tau_max,
-                moh_lb = lb_loss,
-                moh_cx = cx_loss,
-                moh_sp = sp_loss,
-                "LRM autoencoding epoch completed"
-            );
-
-            for layer in &mut self.network {
-                if let LayerEnum::LRM(lrm) = layer {
-                    let heads = lrm.attention().num_heads() as f32;
-                    let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 {
-                        (avg_active_heads / heads).clamp(0.1, 1.0)
-                    } else {
-                        0.5
-                    };
-                    lrm.set_latent_update_alpha(0.03 + 0.05 * (1.0 - h_ratio));
-                    let ent = lrm
-                        .attention()
-                        .moh
-                        .head_selection_config
-                        .gating
-                        .get_gating_entropy();
-                    let g = &mut lrm.attention_mut().moh.head_selection_config.gating;
-                    if ent < 0.2 {
-                        g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2);
+                let mut lb_loss = f32::NAN;
+                let mut cx_loss = f32::NAN;
+                let mut sp_loss = f32::NAN;
+                let mut rec_avg_heads = f32::NAN;
+                let mut rec_tau_min = f32::NAN;
+                let mut rec_tau_max = f32::NAN;
+                for layer in &self.network {
+                    if let LayerEnum::LRM(lrm) = layer {
+                        lb_loss = lrm
+                            .attention()
+                            .moh
+                            .head_selection_config
+                            .compute_load_balance_loss();
+                        cx_loss = lrm
+                            .attention()
+                            .moh
+                            .head_selection_config
+                            .compute_complexity_loss(lrm.attention().moh_num_active() as f32);
+                        sp_loss = lrm
+                            .attention()
+                            .moh
+                            .head_selection_config
+                            .compute_sparsity_loss();
+                        if !lrm.recursion_metrics.is_empty() {
+                            let mut hsum = 0.0f32;
+                            let mut c = 0usize;
+                            let mut tmin = f32::INFINITY;
+                            let mut tmax = f32::NEG_INFINITY;
+                            for (h, mn, mx) in lrm.recursion_metrics.iter().cloned() {
+                                hsum += h;
+                                c += 1;
+                                if mn < tmin {
+                                    tmin = mn;
+                                }
+                                if mx > tmax {
+                                    tmax = mx;
+                                }
+                            }
+                            rec_avg_heads = if c > 0 { hsum / c as f32 } else { f32::NAN };
+                            rec_tau_min = if c > 0 { tmin } else { f32::NAN };
+                            rec_tau_max = if c > 0 { tmax } else { f32::NAN };
+                        }
+                        break;
                     }
-                    if avg_active_heads.is_finite() {
-                        if avg_active_heads > heads * 0.5 {
-                            g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2);
+                }
+
+                info!(
+                    epoch = epoch,
+                    loss = avg_loss,
+                    base_loss = avg_base_loss,
+                    grad_norm = avg_grad_norm,
+                    tau_min = tau_min_log,
+                    tau_max = tau_max_log,
+                    tau_range = tau_range_log,
+                    pred_norm_rms = pred_norm_rms,
+                    avg_active_heads = avg_active_heads,
+                    rec_avg_heads = rec_avg_heads,
+                    rec_tau_min = rec_tau_min,
+                    rec_tau_max = rec_tau_max,
+                    moh_lb = lb_loss,
+                    moh_cx = cx_loss,
+                    moh_sp = sp_loss,
+                    "LRM autoencoding epoch completed"
+                );
+
+                for layer in &mut self.network {
+                    if let LayerEnum::LRM(lrm) = layer {
+                        let heads = lrm.attention().num_heads() as f32;
+                        let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 {
+                            (avg_active_heads / heads).clamp(0.1, 1.0)
                         } else {
-                            g.sparsity_weight = (g.sparsity_weight * 0.95).max(0.0);
+                            0.5
+                        };
+                        lrm.set_latent_update_alpha(0.03 + 0.05 * (1.0 - h_ratio));
+                        let ent = lrm
+                            .attention()
+                            .moh
+                            .head_selection_config
+                            .gating
+                            .get_gating_entropy();
+                        let g = &mut lrm.attention_mut().moh.head_selection_config.gating;
+                        if ent < 0.2 {
+                            g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2);
                         }
+                        if avg_active_heads.is_finite() {
+                            if avg_active_heads > heads * 0.5 {
+                                g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2);
+                            } else {
+                                g.sparsity_weight = (g.sparsity_weight * 0.95).max(0.0);
+                            }
+                        }
+                        g.complexity_loss_weight = (g.complexity_loss_weight * 0.9) + 0.01;
                     }
-                    g.complexity_loss_weight = (g.complexity_loss_weight * 0.9) + 0.01;
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })();
+        self.training_scratch = scratch;
+        res
     }
 
     /// Complete TRM training pipeline: autoencoding pretraining + chat-tuning
@@ -2215,9 +2227,10 @@ impl LLM {
         let _eprop_enabled = self.network.iter().any(|layer| {
             if let LayerEnum::TransformerBlock(_block) = layer {
                 // We can't easily access private fields, but we trust the user has initialized it.
-                // However, the error message in the placeholder suggested "Initialize e-prop traces".
-                // Since we are now implementing it, we assume it's initialized.
-                true 
+                // However, the error message in the placeholder suggested "Initialize e-prop
+                // traces". Since we are now implementing it, we assume it's
+                // initialized.
+                true
             } else {
                 false
             }
@@ -2240,7 +2253,8 @@ impl LLM {
             layer_grad_norms.push(0.0);
         }
 
-        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden state).
+        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden
+        // state).
         let mut out_proj_idx: Option<usize> = None;
         for (i, layer) in self.network.iter().enumerate() {
             if matches!(layer, LayerEnum::OutputProjection(_)) {
@@ -2478,7 +2492,9 @@ impl LLM {
                             let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
                             let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
                             let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
-                            if step_weight < 1e-5 { continue; }
+                            if step_weight < 1e-5 {
+                                continue;
+                            }
                             aux_loss_sum += sce_t_norm * step_weight;
                             let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
                                 &probs_t,
@@ -2532,7 +2548,10 @@ impl LLM {
                         input_grads.iter().enumerate().find(|(_, v)| !v.is_finite())
                     {
                         return Err(crate::errors::ModelError::Training {
-                            message: format!("Non-finite input_grads at layer {} index {}: {}", layer_idx, bad_i, bad_v),
+                            message: format!(
+                                "Non-finite input_grads at layer {} index {}: {}",
+                                layer_idx, bad_i, bad_v
+                            ),
                         });
                     }
                     for (g_idx, g) in param_grads.iter().enumerate() {
@@ -2540,7 +2559,10 @@ impl LLM {
                             g.iter().enumerate().find(|(_, v)| !v.is_finite())
                         {
                             return Err(crate::errors::ModelError::Training {
-                                message: format!("Non-finite param_grads[{}] at layer {} index {}: {}", g_idx, layer_idx, bad_i, bad_v),
+                                message: format!(
+                                    "Non-finite param_grads[{}] at layer {} index {}: {}",
+                                    g_idx, layer_idx, bad_i, bad_v
+                                ),
                             });
                         }
                     }
@@ -2625,29 +2647,42 @@ impl LLM {
                 let mut max_abs: f32 = 0.0;
                 for g in &clipped_grads {
                     for &v in g.iter() {
-                        if v.abs() > max_abs { max_abs = v.abs(); }
+                        if v.abs() > max_abs {
+                            max_abs = v.abs();
+                        }
                     }
                 }
                 if max_abs > MAX_GRAD_ABS {
                     let s = MAX_GRAD_ABS / max_abs;
-                    for g in &mut clipped_grads { g.mapv_inplace(|v| v * s); }
+                    for g in &mut clipped_grads {
+                        g.mapv_inplace(|v| v * s);
+                    }
                 }
 
                 if check_finite {
                     for (g_idx, g) in clipped_grads.iter().enumerate() {
-                        if let Some((bad_i, bad_v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                        if let Some((bad_i, bad_v)) =
+                            g.iter().enumerate().find(|(_, v)| !v.is_finite())
+                        {
                             return Err(crate::errors::ModelError::Training {
-                                message: format!("Non-finite clipped_grads[{}] at layer {} index {}: {}", g_idx, layer_idx, bad_i, bad_v),
+                                message: format!(
+                                    "Non-finite clipped_grads[{}] at layer {} index {}: {}",
+                                    g_idx, layer_idx, bad_i, bad_v
+                                ),
                             });
                         }
                     }
                 } else {
                     for grad in &mut clipped_grads {
-                        grad.iter_mut().for_each(|v| { if !v.is_finite() { *v = 0.0 } });
+                        grad.iter_mut().for_each(|v| {
+                            if !v.is_finite() {
+                                *v = 0.0
+                            }
+                        });
                     }
                 }
 
-                if let Err(e) = self.detect_gradient_anomalies(&clipped_grads) {
+                if let Err(e) = Self::detect_gradient_anomalies(&clipped_grads) {
                     tracing::error!("Gradient anomaly detected in layer {}", layer_idx);
                     return Err(e);
                 }
@@ -2671,9 +2706,13 @@ impl LLM {
             .iter()
             .zip(&averaged_grads_per_layer)
             .map(|(_layer, grads)| {
-                if grads.is_empty() { 0.0 } else {
+                if grads.is_empty() {
+                    0.0
+                } else {
                     let mut s = 0.0f32;
-                    for g in grads { s += g.iter().map(|&x| x * x).sum::<f32>(); }
+                    for g in grads {
+                        s += g.iter().map(|&x| x * x).sum::<f32>();
+                    }
                     s.sqrt()
                 }
             })
@@ -2689,7 +2728,7 @@ impl LLM {
         } else {
             nonzero.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mid = nonzero.len() / 2;
-            if nonzero.len().is_multiple_of(2) {
+            if nonzero.len() % 2 == 0 {
                 (nonzero[mid - 1] + nonzero[mid]) * 0.5
             } else {
                 nonzero[mid]
@@ -2727,7 +2766,8 @@ impl LLM {
             })
             .collect();
 
-        // Apply gradients (this will now route E-Prop gradients via ParamPartitions in apply_gradients)
+        // Apply gradients (this will now route E-Prop gradients via ParamPartitions in
+        // apply_gradients)
         for ((layer, grads), adaptive_lr) in self
             .network
             .iter_mut()
@@ -3045,10 +3085,11 @@ impl LLM {
                                 _ => Vec::new(),
                             };
                             if !lrm_param_grads_step.is_empty() {
-                                if accumulated_param_grads[t_idx].is_empty() {
-                                    accumulated_param_grads[t_idx] = lrm_param_grads_step;
+                                if scratch.accumulated_param_grads[t_idx].is_empty() {
+                                    scratch.accumulated_param_grads[t_idx] = lrm_param_grads_step;
                                 } else {
-                                    for (acc_grad, new_grad) in accumulated_param_grads[t_idx]
+                                    for (acc_grad, new_grad) in scratch.accumulated_param_grads
+                                        [t_idx]
                                         .iter_mut()
                                         .zip(lrm_param_grads_step)
                                     {
@@ -3298,7 +3339,7 @@ impl LLM {
                 }
 
                 // Detect gradient anomalies (poisoning/training instability)
-                if let Err(e) = self.detect_gradient_anomalies(&clipped_grads) {
+                if let Err(e) = Self::detect_gradient_anomalies(&clipped_grads) {
                     tracing::error!(
                         layer_idx = layer_idx,
                         layer_type = self.network[layer_idx].layer_type(),
@@ -3354,7 +3395,7 @@ impl LLM {
         } else {
             nonzero.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mid = nonzero.len() / 2;
-            if nonzero.len().is_multiple_of(2) {
+            if nonzero.len() % 2 == 0 {
                 (nonzero[mid - 1] + nonzero[mid]) * 0.5
             } else {
                 nonzero[mid]
@@ -3494,7 +3535,7 @@ impl LLM {
     }
 
     /// Detect gradient anomalies that may indicate training instability or poisoning
-    fn detect_gradient_anomalies(&self, grads: &[Array2<f32>]) -> Result<()> {
+    fn detect_gradient_anomalies(grads: &[Array2<f32>]) -> Result<()> {
         for (i, grad) in grads.iter().enumerate() {
             let max_grad = grad.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
             if max_grad > crate::GRADIENT_ANOMALY_THRESHOLD {
@@ -4185,7 +4226,8 @@ impl LLM {
                                 }
                             }
                         } else {
-                            self.training_scratch.grads_per_layer[opidx] = Some(op_param_grads.clone());
+                            self.training_scratch.grads_per_layer[opidx] =
+                                Some(op_param_grads.clone());
                         }
                     }
 
@@ -4258,7 +4300,8 @@ impl LLM {
                                     }
                                 }
                             } else {
-                                self.training_scratch.grads_per_layer[idx] = Some(param_grads.clone());
+                                self.training_scratch.grads_per_layer[idx] =
+                                    Some(param_grads.clone());
                             }
                         }
                         grad_pred = in_grad;
@@ -4291,7 +4334,8 @@ impl LLM {
                                     }
                                 }
                             } else {
-                                self.training_scratch.grads_per_layer[eidx] = Some(emb_param_grads.clone());
+                                self.training_scratch.grads_per_layer[eidx] =
+                                    Some(emb_param_grads.clone());
                             }
                         }
                     }
@@ -4327,7 +4371,9 @@ impl LLM {
                     }
                 }
                 // Apply averaged grads per layer after batch
-                for (idx, maybe_grads) in self.training_scratch.grads_per_layer.iter_mut().enumerate() {
+                for (idx, maybe_grads) in
+                    self.training_scratch.grads_per_layer.iter_mut().enumerate()
+                {
                     if let Some(mut grads) = maybe_grads.take() {
                         if examples_in_batch > 0 {
                             for g in &mut grads {
@@ -4343,7 +4389,7 @@ impl LLM {
                             }
                         }
                         // Detect anomalies before applying
-                        self.detect_gradient_anomalies(&grads)?;
+                        Self::detect_gradient_anomalies(&grads)?;
                         match &mut self.network[idx] {
                             LayerEnum::DiffusionBlock(b) => {
                                 b.apply_gradients(&grads, effective_lr)?

@@ -175,7 +175,7 @@ fn enforce_min_max_heads_inplace(
 
         // Optional renormalization to preserve sum=k semantics (used for learned predictor).
         if let Some(k) = renormalize_to_k {
-            let k = k.max(1) as f32;
+            let k = k.max(1).min(h_total) as f32;
             let mut sum = 0.0f32;
             for h in 0..h_total {
                 let v = m_mat[[i, h]];

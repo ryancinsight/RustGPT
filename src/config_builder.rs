@@ -117,10 +117,10 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
         config.eprop_enabled = true;
         // If spiking model is specified, use it for eprop config
         if let Some(spiking_cli) = args.spiking {
-             config.eprop_neuron_config = Some(spiking_cli.into());
+            config.eprop_neuron_config = Some(spiking_cli.into());
         } else {
-             // Default to LIF if not specified
-             config.eprop_neuron_config = Some(crate::eprop::config::NeuronConfig::lif());
+            // Default to LIF if not specified
+            config.eprop_neuron_config = Some(crate::eprop::config::NeuronConfig::lif());
         }
     }
 

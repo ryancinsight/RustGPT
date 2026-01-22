@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{attention::sliding_window_attention::SlidingWindowAttention, models::titans::memory::NeuralMemory};
+use crate::{
+    attention::sliding_window_attention::SlidingWindowAttention,
+    models::titans::memory::NeuralMemory,
+};
 
 /// Memory As Layer (MAL) Architecture
 ///
@@ -12,8 +15,9 @@ pub struct TitansMAL {
     pub attention: SlidingWindowAttention,
 }
 
-use crate::network::Layer;
 use ndarray::Array2;
+
+use crate::network::Layer;
 
 impl TitansMAL {
     pub fn new(

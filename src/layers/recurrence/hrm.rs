@@ -114,15 +114,17 @@ impl HRM {
             use_advanced_adaptive_residuals: true,
             titan_memory: config.titan_memory.clone(),
             eprop_adaptor: if config.eprop_enabled {
-                Some(crate::layers::transformer::components::eprop_adaptor::EPropAdaptorConfig {
-                    dim: config.embedding_dim,
-                    neuron_config: config
-                        .eprop_neuron_config
-                        .clone()
-                        .unwrap_or_else(crate::eprop::config::NeuronConfig::lif),
-                    adaptation_rate: 0.01,
-                    use_multi_scale: true,
-                })
+                Some(
+                    crate::layers::transformer::components::eprop_adaptor::EPropAdaptorConfig {
+                        dim: config.embedding_dim,
+                        neuron_config: config
+                            .eprop_neuron_config
+                            .clone()
+                            .unwrap_or_else(crate::eprop::config::NeuronConfig::lif),
+                        adaptation_rate: 0.01,
+                        use_multi_scale: true,
+                    },
+                )
             } else {
                 None
             },

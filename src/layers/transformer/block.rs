@@ -126,6 +126,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
     {
         #[derive(Deserialize)]
         #[serde(untagged)]
+        #[allow(clippy::large_enum_variant)]
         enum TransformerBlockSerdeCompat {
             V1 {
                 pre_attention_norm: RichardsNorm,
@@ -380,11 +381,10 @@ impl TransformerBlock {
         let similarity_context_strength = Array2::zeros((1, 1));
         let opt_similarity_context_strength = Adam::new((1, 1));
 
-        let eprop_adaptor = if let Some(ref conf) = config.eprop_adaptor {
-            Some(EPropAdaptor::new(conf.clone()))
-        } else {
-            None
-        };
+        let eprop_adaptor = config
+            .eprop_adaptor
+            .as_ref()
+            .map(|conf| EPropAdaptor::new(conf.clone()));
 
         Self {
             pre_attention_norm: layers.pre_attention_norm,
@@ -900,12 +900,13 @@ impl Layer for TransformerBlock {
             // Compute gradients through the transformer block layers
 
             // Handle E-Prop backward first (since it's the last operation in forward)
-            let (grads_at_ffn_sum, eprop_param_grads) = if let Some(ref adaptor) = self.eprop_adaptor {
-                 let (d_adaptor_input, p_grads) = adaptor.compute_gradients(output_grads);
-                 (output_grads + &d_adaptor_input, p_grads)
-            } else {
-                 (output_grads.clone(), Vec::new())
-            };
+            let (grads_at_ffn_sum, eprop_param_grads) =
+                if let Some(ref adaptor) = self.eprop_adaptor {
+                    let (d_adaptor_input, p_grads) = adaptor.compute_gradients(output_grads);
+                    (output_grads + &d_adaptor_input, p_grads)
+                } else {
+                    (output_grads.clone(), Vec::new())
+                };
 
             // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out
             let ffn_grads = &grads_at_ffn_sum;
@@ -1958,37 +1959,143 @@ mod tests {
         };
 
         let mut block = TransformerBlock::new(config);
-        
-        // Check initial adaptation weights are 1.0 (via adaptor access if possible, or infer from behavior)
-        // Since we can't easily access internal state without making fields public, we'll rely on functional tests.
+
+        // Check initial adaptation weights are 1.0 (via adaptor access if possible, or infer from
+        // behavior) Since we can't easily access internal state without making fields
+        // public, we'll rely on functional tests.
 
         // Forward with non-zero input to ensure traces are active
         let input = Array2::<f32>::from_elem((seq_len, embed_dim), 0.5);
         let out = block.forward(&input);
         assert_eq!(out.shape(), input.shape());
-        
+
         // Backward
         let grads = Array2::<f32>::ones((seq_len, embed_dim));
         let (in_grad, param_grads) = block.compute_gradients(&input, &grads);
-        
+
         assert_eq!(in_grad.shape(), input.shape());
         assert!(!param_grads.is_empty());
-        
+
         // Verify we have gradients for the adaptor
-        // The last gradient should be for the eprop adaptor if it's appended last, or we check if any gradient corresponds to it.
-        // E-Prop adaptor returns a Vec<Array2> but flattened into the block's param_grads list.
-        // We just check that *some* gradients are non-zero.
-        let has_nonzero_grads = param_grads.iter().any(|g| g.iter().any(|&x| x.abs() > 1e-6));
-        assert!(has_nonzero_grads, "Should have non-zero gradients with active input");
+        // The last gradient should be for the eprop adaptor if it's appended last, or we check if
+        // any gradient corresponds to it. E-Prop adaptor returns a Vec<Array2> but
+        // flattened into the block's param_grads list. We just check that *some* gradients
+        // are non-zero.
+        let has_nonzero_grads = param_grads
+            .iter()
+            .any(|g| g.iter().any(|&x| x.abs() > 1e-6));
+        assert!(
+            has_nonzero_grads,
+            "Should have non-zero gradients with active input"
+        );
 
         // Apply gradients
         block.apply_gradients(&param_grads, 1e-1).unwrap();
-        
+
         // Run forward again - output should be different due to updated weights
         let out_new = block.forward(&input);
-        
+
         // Check difference
         let diff = (&out_new - &out).mapv(|x| x.abs()).sum();
-        assert!(diff > 1e-6, "Output should change after applying gradients (diff: {})", diff);
+        assert!(
+            diff > 1e-6,
+            "Output should change after applying gradients (diff: {})",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_transformer_block_with_eprop_moe_and_learned_heads() {
+        use crate::{
+            layers::transformer::components::eprop_adaptor::EPropAdaptorConfig,
+            mixtures::{
+                gating::{GatingStrategy, GatingTrainingMode},
+                moe::ExpertRouterConfig,
+            },
+        };
+
+        let embed_dim = 32;
+        let seq_len = 6;
+
+        let mut moe_config = ExpertRouterConfig::default();
+        moe_config.num_experts = 4;
+        moe_config.expert_hidden_dim = 16;
+        moe_config.use_head_conditioning = true;
+        moe_config.use_learned_k_adaptation = true;
+        moe_config.metrics_avg_routing_prob = vec![0.0; moe_config.num_experts];
+        moe_config.gating = crate::mixtures::gating::GatingConfig::from_strategy(
+            &GatingStrategy::Learned {
+                num_active: 2,
+                load_balance_weight: 0.01,
+                complexity_loss_weight: 0.005,
+                sparsity_weight: 0.001,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
+                training_mode: GatingTrainingMode::Coupled,
+            },
+            moe_config.num_experts,
+        );
+
+        let config = TransformerBlockConfig {
+            embed_dim,
+            hidden_dim: 64,
+            num_heads: 4,
+            poly_degree: 3,
+            max_pos: 31,
+            window_size: None,
+            use_moe: true,
+            moe_config: Some(moe_config),
+            head_selection: HeadSelectionStrategy::Learned {
+                num_active: 2,
+                load_balance_weight: 0.01,
+                complexity_loss_weight: 0.005,
+                sparsity_weight: 0.001,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
+                training_mode: GatingTrainingMode::Coupled,
+            },
+            temporal_mixing: TemporalMixingType::Attention,
+            use_adaptive_window: false,
+            min_window_size: 16,
+            max_window_size: 4096,
+            window_adaptation_strategy: crate::model_config::WindowAdaptationStrategy::Fixed,
+            entropy_ema_alpha: 0.2,
+            use_advanced_adaptive_residuals: false,
+            titan_memory: crate::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: Some(EPropAdaptorConfig {
+                dim: embed_dim,
+                ..Default::default()
+            }),
+        };
+
+        let mut block = TransformerBlock::new(config);
+
+        let input = Array2::<f32>::from_shape_fn((seq_len, embed_dim), |(i, j)| {
+            ((i * embed_dim + j) as f32 * 0.01).sin()
+        });
+        let out = block.forward(&input);
+        assert_eq!(out.shape(), input.shape());
+
+        let TemporalMixingLayer::Attention(attn) = &block.temporal_mixing else {
+            panic!("expected attention temporal mixing");
+        };
+        assert!(attn.last_tau_metrics.is_some());
+        assert!(attn.last_pred_norm.is_some());
+
+        let grads = Array2::<f32>::from_shape_fn((seq_len, embed_dim), |(i, j)| {
+            ((i + j) as f32 * 0.0007).cos()
+        });
+        let (in_grad, param_grads) = block.compute_gradients(&input, &grads);
+        assert_eq!(in_grad.shape(), input.shape());
+        assert!(!param_grads.is_empty());
+
+        let has_non_finite = in_grad.iter().any(|x| !x.is_finite())
+            || param_grads.iter().any(|g| g.iter().any(|x| !x.is_finite()));
+        assert!(!has_non_finite);
+
+        block.apply_gradients(&param_grads, 1e-2).unwrap();
+        let out_new = block.forward(&input);
+        let diff = (&out_new - &out).mapv(|x| x.abs()).sum();
+        assert!(diff > 1e-6);
     }
 }

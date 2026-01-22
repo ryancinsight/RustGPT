@@ -38,6 +38,7 @@ fn bench_transformer_block_forward(c: &mut Criterion) {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: true,
             titan_memory: llm::model_config::TitanMemoryConfig::default(),
+            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(tcfg);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
