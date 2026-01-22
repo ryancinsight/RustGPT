@@ -118,6 +118,10 @@ pub struct LLM {
     /// Non-serialized memory bank for hard-negative residual repulsion.
     #[serde(skip, default)]
     residual_neg_bank: ResidualNegBank,
+
+    /// Non-serialized scratch buffers for training to avoid re-allocations.
+    #[serde(skip, default)]
+    training_scratch: TrainingScratch,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -163,6 +167,57 @@ impl ResidualNegBank {
     }
 }
 
+#[derive(Debug, Default)]
+struct TrainingScratch {
+    accumulated_param_grads: Vec<Vec<Array2<f32>>>,
+    layer_grad_norms: Vec<f32>,
+    layer_inputs: Vec<Array2<f32>>,
+
+    // For train_diffusion_ce
+    grads_per_layer: Vec<Option<Vec<Array2<f32>>>>,
+}
+
+impl TrainingScratch {
+    fn new(network_len: usize) -> Self {
+        Self {
+            accumulated_param_grads: (0..network_len).map(|_| Vec::new()).collect(),
+            layer_grad_norms: vec![0.0; network_len],
+            layer_inputs: Vec::with_capacity(network_len),
+            grads_per_layer: vec![None; network_len],
+        }
+    }
+
+    /// Reset scratch buffers for a new training batch.
+    fn reset(&mut self, network_len: usize) {
+        // Ensure outer vectors have correct length, but reuse inner allocations.
+        if self.accumulated_param_grads.len() != network_len {
+            self.accumulated_param_grads = (0..network_len).map(|_| Vec::new()).collect();
+        } else {
+            for grads in &mut self.accumulated_param_grads {
+                grads.clear();
+            }
+        }
+
+        if self.layer_grad_norms.len() != network_len {
+            self.layer_grad_norms = vec![0.0; network_len];
+        } else {
+            for norm in &mut self.layer_grad_norms {
+                *norm = 0.0;
+            }
+        }
+
+        if self.grads_per_layer.len() != network_len {
+            self.grads_per_layer = vec![None; network_len];
+        } else {
+            for slot in &mut self.grads_per_layer {
+                *slot = None;
+            }
+        }
+
+        self.layer_inputs.clear();
+    }
+}
+
 impl std::fmt::Debug for LLM {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LLM")
@@ -194,6 +249,7 @@ impl Default for LLM {
             diffusion_steps_override: None,
             training_hparams: TrainingHyperParams::default(),
             residual_neg_bank: ResidualNegBank::default(),
+            training_scratch: TrainingScratch::default(),
         }
     }
 }
@@ -214,6 +270,7 @@ impl LLM {
             diffusion_steps_override: None,
             training_hparams: TrainingHyperParams::default(),
             residual_neg_bank: ResidualNegBank::default(),
+            training_scratch: TrainingScratch::default(),
         }
     }
 
@@ -254,6 +311,7 @@ impl LLM {
             diffusion_steps_override: None,
             training_hparams: TrainingHyperParams::default(),
             residual_neg_bank: ResidualNegBank::default(),
+            training_scratch: TrainingScratch::default(),
         }
     }
 
@@ -888,8 +946,8 @@ impl LLM {
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
-                    self.train_batch_profiled(batch, effective_lr)?;
+                let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) = self
+                    .train_batch_profiled(batch, effective_lr, &mut self.training_scratch)?;
                 total_loss += batch_loss;
                 total_base_loss += batch_base_loss;
                 total_grad_norm += grad_norm;
@@ -1637,8 +1695,8 @@ impl LLM {
 
             // Process data in batches
             for batch in tokenized_data.chunks(batch_size) {
-                let (batch_loss, batch_base_loss, grad_norm) =
-                    self.train_batch_trm_autoencoding(batch, lr)?;
+                let (batch_loss, batch_base_loss, grad_norm) = self
+                    .train_batch_trm_autoencoding(batch, lr, &mut self.training_scratch)?;
                 total_loss += batch_loss;
                 total_base_loss += batch_base_loss;
                 total_grad_norm += grad_norm;
@@ -1855,16 +1913,13 @@ impl LLM {
         &mut self,
         batch: &[Vec<usize>],
         lr: f32,
+        scratch: &mut TrainingScratch,
     ) -> Result<(f32, f32, f32)> {
         let mut batch_loss = 0.0;
         let mut batch_base_loss = 0.0;
-        let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
-        let mut layer_grad_norms: Vec<f32> = Vec::new();
 
-        for _ in &self.network {
-            accumulated_param_grads.push(Vec::new());
-            layer_grad_norms.push(0.0);
-        }
+        // Reset scratch buffers for the new batch, reusing allocations.
+        scratch.reset(self.network.len());
 
         let mut embeddings_idx: Option<usize> = None;
         let mut trm_idx: Option<usize> = None;
@@ -2076,7 +2131,7 @@ impl LLM {
             }
             if let Some(opidx) = out_proj_idx {
                 Self::accumulate_layer_gradients(
-                    &mut accumulated_param_grads[opidx],
+                    &mut scratch.accumulated_param_grads[opidx],
                     op_param_grads,
                     "OutputProjection",
                 );
@@ -2095,15 +2150,16 @@ impl LLM {
             };
             let _ = trm_in_grad;
             Self::accumulate_layer_gradients(
-                &mut accumulated_param_grads[t_idx],
+                &mut scratch.accumulated_param_grads[t_idx],
                 trm_param_grads,
                 "LRM",
             );
-            layer_grad_norms[t_idx] += grad_hidden.iter().map(|&x| x * x).sum::<f32>().sqrt();
+            scratch.layer_grad_norms[t_idx] +=
+                grad_hidden.iter().map(|&x| x * x).sum::<f32>().sqrt();
         }
 
         let batch_scale = 1.0 / batch.len().max(1) as f32;
-        for (layer_idx, param_grads) in accumulated_param_grads.iter_mut().enumerate() {
+        for (layer_idx, param_grads) in scratch.accumulated_param_grads.iter_mut().enumerate() {
             if param_grads.is_empty() {
                 continue;
             }
@@ -2114,7 +2170,12 @@ impl LLM {
             self.network[layer_idx].apply_gradients(grads_slice, lr)?;
         }
 
-        let total_grad_norm = layer_grad_norms.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let total_grad_norm = scratch
+            .layer_grad_norms
+            .iter()
+            .map(|&x| x * x)
+            .sum::<f32>()
+            .sqrt();
         Ok((batch_loss, batch_base_loss, total_grad_norm))
     }
 
@@ -2692,18 +2753,14 @@ impl LLM {
         &mut self,
         batch: &[Vec<usize>],
         lr: f32,
+        scratch: &mut TrainingScratch,
     ) -> Result<(f32, f32, f32, Vec<f32>)> {
         let check_finite = std::env::var_os("RUSTGPT_CHECK_FINITE").is_some();
         let mut batch_loss = 0.0;
         let mut batch_base_loss = 0.0;
-        let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
-        let mut layer_grad_norms: Vec<f32> = Vec::new(); // Track per-layer gradient norms
 
-        // Initialize accumulated gradients for each layer
-        for _ in &self.network {
-            accumulated_param_grads.push(Vec::new());
-            layer_grad_norms.push(0.0);
-        }
+        // Reset scratch buffers for the new batch, reusing allocations.
+        scratch.reset(self.network.len());
 
         // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden
         // state).
@@ -2713,8 +2770,6 @@ impl LLM {
                 out_proj_idx = Some(i);
             }
         }
-
-        let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
 
         // Process each sequence in the batch
         for training_row in batch {
@@ -2736,13 +2791,13 @@ impl LLM {
             // Reference: "Deep Information Propagation" (Schoenholz et al., 2017)
             // Ideal: Var(x_l) ≈ Var(x_0) for all layers (isometry condition)
             let mut layer_variances: Vec<f32> = Vec::new();
-            layer_inputs.clear();
+            scratch.layer_inputs.clear();
 
             let mut similarity_ctx: Option<Array2<f32>> = None;
 
             for layer in &mut self.network {
-                layer_inputs.push(input);
-                let input_ref = layer_inputs.last().unwrap();
+                scratch.layer_inputs.push(input);
+                let input_ref = scratch.layer_inputs.last().unwrap();
                 input = match layer {
                     LayerEnum::TransformerBlock(block) => {
                         block.set_incoming_similarity_context(similarity_ctx.as_ref());
@@ -2797,7 +2852,7 @@ impl LLM {
                         0.0
                     };
                     let w = base_w * (1.0 + difficulty);
-                    let hidden_prelogit = &layer_inputs[op_idx];
+                    let hidden_prelogit = &scratch.layer_inputs[op_idx];
                     let dl = crate::loss::residual_decorrelation_loss(&hidden_prelogit.view());
                     batch_loss += w * dl;
                     let dg = crate::loss::residual_decorrelation_gradients(&hidden_prelogit.view());
@@ -2820,7 +2875,7 @@ impl LLM {
                         0.0
                     };
                     let w = base_w * (1.0 + difficulty);
-                    let hidden_prelogit = &layer_inputs[op_idx];
+                    let hidden_prelogit = &scratch.layer_inputs[op_idx];
                     let rows = hidden_prelogit.nrows().max(1);
                     let cols = hidden_prelogit.ncols();
 
@@ -3055,7 +3110,7 @@ impl LLM {
                 let layer_idx = self.network.len() - 1 - rev_idx;
 
                 let (input_grads, param_grads) =
-                    layer.compute_gradients(&layer_inputs[layer_idx], &grads_output);
+                    layer.compute_gradients(&scratch.layer_inputs[layer_idx], &grads_output);
 
                 if check_finite {
                     if let Some((bad_i, bad_v)) =
@@ -3091,7 +3146,7 @@ impl LLM {
                 }
 
                 let layer_grad_norm: f32 = input_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
-                layer_grad_norms[layer_idx] += layer_grad_norm;
+                scratch.layer_grad_norms[layer_idx] += layer_grad_norm;
 
                 grads_output = input_grads;
 
@@ -3108,10 +3163,10 @@ impl LLM {
                     grads_output = grads_output + hn_grad.clone();
                 }
 
-                if accumulated_param_grads[layer_idx].is_empty() {
-                    accumulated_param_grads[layer_idx] = param_grads;
+                if scratch.accumulated_param_grads[layer_idx].is_empty() {
+                    scratch.accumulated_param_grads[layer_idx] = param_grads;
                 } else {
-                    for (acc_grad, new_grad) in accumulated_param_grads[layer_idx]
+                    for (acc_grad, new_grad) in scratch.accumulated_param_grads[layer_idx]
                         .iter_mut()
                         .zip(param_grads)
                     {
@@ -3122,16 +3177,20 @@ impl LLM {
         }
 
         // Average layer-wise gradient norms
-        for norm in &mut layer_grad_norms {
+        for norm in &mut scratch.layer_grad_norms {
             *norm /= batch.len() as f32;
         }
 
         // Log layer-wise gradient norms for debugging (only if any exceed threshold)
-        let max_layer_grad = layer_grad_norms.iter().fold(0.0f32, |a, &b| a.max(b));
+        let max_layer_grad = scratch
+            .layer_grad_norms
+            .iter()
+            .fold(0.0f32, |a, &b| a.max(b));
         if max_layer_grad > 10.0 {
             tracing::warn!(
                 "Layer-wise gradient norms: {:?}",
-                layer_grad_norms
+                scratch
+                    .layer_grad_norms
                     .iter()
                     .enumerate()
                     .map(|(i, &norm)| format!("L{}: {:.2}", i, norm))
@@ -3146,10 +3205,10 @@ impl LLM {
         let mut total_grad_norm_sq = 0.0f32;
         let mut layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
 
-        for (layer_idx, param_grads) in accumulated_param_grads.into_iter().enumerate() {
+        for (layer_idx, param_grads) in scratch.accumulated_param_grads.iter_mut().enumerate() {
             if !param_grads.is_empty() {
                 let averaged_grads: Vec<Array2<f32>> = param_grads
-                    .into_iter()
+                    .iter()
                     .map(|grad| grad / batch.len() as f32)
                     .collect();
 
@@ -3786,8 +3845,7 @@ impl LLM {
             let mut batch_start = 0usize;
             while batch_start < tokenized_data.len() {
                 let batch_end = (batch_start + effective_batch_size).min(tokenized_data.len());
-                let mut grads_per_layer: Vec<Option<Vec<Array2<f32>>>> =
-                    vec![None; self.network.len()];
+                self.training_scratch.reset(self.network.len());
                 let mut examples_in_batch = 0usize;
                 for (seq_idx, training_row) in tokenized_data
                     .iter()
@@ -4118,7 +4176,7 @@ impl LLM {
                     if let Some(opidx) = out_proj_idx
                         && !op_param_grads.is_empty()
                     {
-                        if let Some(slot) = &mut grads_per_layer[opidx] {
+                        if let Some(slot) = &mut self.training_scratch.grads_per_layer[opidx] {
                             for (i, g) in op_param_grads.iter().enumerate() {
                                 if i < slot.len() {
                                     slot[i] = &slot[i] + g;
@@ -4127,7 +4185,7 @@ impl LLM {
                                 }
                             }
                         } else {
-                            grads_per_layer[opidx] = Some(op_param_grads.clone());
+                            self.training_scratch.grads_per_layer[opidx] = Some(op_param_grads.clone());
                         }
                     }
 
@@ -4191,7 +4249,7 @@ impl LLM {
                             _ => (grad_pred.clone(), Vec::<Array2<f32>>::new()),
                         };
                         if !param_grads.is_empty() {
-                            if let Some(slot) = &mut grads_per_layer[idx] {
+                            if let Some(slot) = &mut self.training_scratch.grads_per_layer[idx] {
                                 for (i, g) in param_grads.iter().enumerate() {
                                     if i < slot.len() {
                                         slot[i] = &slot[i] + g;
@@ -4200,7 +4258,7 @@ impl LLM {
                                     }
                                 }
                             } else {
-                                grads_per_layer[idx] = Some(param_grads.clone());
+                                self.training_scratch.grads_per_layer[idx] = Some(param_grads.clone());
                             }
                         }
                         grad_pred = in_grad;
@@ -4224,7 +4282,7 @@ impl LLM {
                             layer.compute_gradients(&ids_arr, &grad_x0);
                         let _ = emb_in_grad;
                         if !emb_param_grads.is_empty() {
-                            if let Some(slot) = &mut grads_per_layer[eidx] {
+                            if let Some(slot) = &mut self.training_scratch.grads_per_layer[eidx] {
                                 for (i, g) in emb_param_grads.iter().enumerate() {
                                     if i < slot.len() {
                                         slot[i] = &slot[i] + g;
@@ -4233,7 +4291,7 @@ impl LLM {
                                     }
                                 }
                             } else {
-                                grads_per_layer[eidx] = Some(emb_param_grads.clone());
+                                self.training_scratch.grads_per_layer[eidx] = Some(emb_param_grads.clone());
                             }
                         }
                     }
@@ -4269,8 +4327,8 @@ impl LLM {
                     }
                 }
                 // Apply averaged grads per layer after batch
-                for (idx, maybe_grads) in grads_per_layer.into_iter().enumerate() {
-                    if let Some(mut grads) = maybe_grads {
+                for (idx, maybe_grads) in self.training_scratch.grads_per_layer.iter_mut().enumerate() {
+                    if let Some(mut grads) = maybe_grads.take() {
                         if examples_in_batch > 0 {
                             for g in &mut grads {
                                 *g = g.mapv(|x| x / examples_in_batch as f32);
