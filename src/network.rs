@@ -8,7 +8,7 @@ use crate::{
         spiking::{AlifLayer, LifLayer},
         transformer::TransformerBlock,
     },
-    models::titans::memory::NeuralMemory,
+    memory::titans::NeuralMemory,
     output_projection::OutputProjection,
     richards::{RichardsGlu, RichardsNorm},
 };

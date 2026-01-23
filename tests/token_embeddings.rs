@@ -6,7 +6,10 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
     let vocab = Vocab::default();
     let vocab_size = vocab.size();
 
-    let mut emb = TokenEmbeddings::new(vocab);
+    let mut titan_memory = llm::model_config::TitanMemoryConfig::default();
+    titan_memory.enabled = false;
+    titan_memory.engram_enabled = false;
+    let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory);
     // Make embeddings deterministic for assertions.
     emb.token_embeddings = Array2::from_shape_fn((vocab_size, llm::EMBEDDING_DIM), |(i, j)| {
         (i * 1000 + j) as f32
@@ -42,7 +45,10 @@ fn token_embeddings_compute_gradients_accumulates_repeated_tokens() {
     let vocab = Vocab::default();
     let vocab_size = vocab.size();
 
-    let emb = TokenEmbeddings::new(vocab);
+    let mut titan_memory = llm::model_config::TitanMemoryConfig::default();
+    titan_memory.enabled = false;
+    titan_memory.engram_enabled = false;
+    let emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory);
 
     // token ids: [1, 1, 2]
     let input = Array2::from_shape_vec((1, 3), vec![1.0, 1.0, 2.0]).unwrap();

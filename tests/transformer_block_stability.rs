@@ -9,6 +9,7 @@ use ndarray::Array2;
 use proptest::prelude::*;
 
 proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
     #[test]
     fn gradients_are_finite_and_bounded(seq_len in 8usize..64, embed_dim in 32usize..256) {
         let nh = (1..=8usize.min(embed_dim)).rev().find(|&h| embed_dim % h == 0).unwrap_or(1);

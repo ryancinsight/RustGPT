@@ -12,6 +12,7 @@ pub mod dataset_loader;
 pub mod embeddings;
 pub mod errors;
 pub mod loss;
+pub mod memory;
 pub mod metrics;
 pub mod pade;
 pub mod richards;

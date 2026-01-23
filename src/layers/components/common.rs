@@ -7,12 +7,12 @@ use crate::{
         Mamba, Mamba2, MoHMamba, MoHMamba2,
         rg_lru::{MoHRgLru, RgLru},
     },
+    memory::titans::{NeuralMemory, TitansMAC},
     mixtures::{
         HeadSelectionStrategy,
         moe::{ExpertRouterConfig, MixtureOfExperts},
     },
     model_config::{TemporalMixingType, TitanMemoryConfig},
-    models::titans::{mac::TitansMAC, memory::NeuralMemory},
     network::Layer,
     richards::{RichardsGlu, RichardsNorm},
 };
@@ -264,6 +264,7 @@ mod tests {
             segment_len: 128,
             persistent_len: 32,
             hidden_dim: 64,
+            ..TitanMemoryConfig::default()
         };
 
         let x = Array2::from_shape_fn((7, 5), |(i, j)| (i as f32 * 0.01) - (j as f32 * 0.02));
@@ -299,6 +300,7 @@ mod tests {
             segment_len: 128,
             persistent_len: 32,
             hidden_dim: 64,
+            ..TitanMemoryConfig::default()
         };
 
         let mut rng_x = get_rng_with_subseed(2);
@@ -335,6 +337,7 @@ mod tests {
             segment_len: 128,
             persistent_len: 32,
             hidden_dim: 64,
+            ..TitanMemoryConfig::default()
         };
 
         let x = Array2::from_shape_fn((3, 4), |(i, j)| (i as f32) + (j as f32));
@@ -403,6 +406,7 @@ mod tests {
             segment_len: 128,
             persistent_len: 32,
             hidden_dim: 64,
+            ..TitanMemoryConfig::default()
         };
 
         let g = Array2::from_shape_fn((9, 4), |(i, j)| (i as f32 * 0.02) - (j as f32 * 0.03));
@@ -427,6 +431,7 @@ mod tests {
             segment_len: 128,
             persistent_len: 32,
             hidden_dim: 64,
+            ..TitanMemoryConfig::default()
         };
 
         let x = Array2::from_shape_fn((11, 7), |(i, j)| (i as f32 * 0.007) - (j as f32 * 0.013));
@@ -463,7 +468,16 @@ mod tests {
             prop_assume!(x_flat.len() >= len);
             prop_assume!(g_flat.len() >= len);
 
-            let cfg = TitanMemoryConfig { enabled: true, scale, eta, decay, segment_len: 128, persistent_len: 32, hidden_dim: 64 };
+            let cfg = TitanMemoryConfig {
+                enabled: true,
+                scale,
+                eta,
+                decay,
+                segment_len: 128,
+                persistent_len: 32,
+                hidden_dim: 64,
+                ..TitanMemoryConfig::default()
+            };
             let x = Array2::from_shape_vec((n, d), x_flat[..len].to_vec()).unwrap();
             let g = Array2::from_shape_vec((n, d), g_flat[..len].to_vec()).unwrap();
 

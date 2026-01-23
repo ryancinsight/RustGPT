@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    attention::sliding_window_attention::SlidingWindowAttention,
-    models::titans::memory::NeuralMemory,
-};
+use super::neural::NeuralMemory;
+use crate::attention::sliding_window_attention::SlidingWindowAttention;
 
 /// Memory As Layer (MAL) Architecture
 ///
