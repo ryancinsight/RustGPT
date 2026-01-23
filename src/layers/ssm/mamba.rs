@@ -1987,16 +1987,14 @@ impl Layer for Mamba {
         }
 
         // in-projection grads
-        let mut grad_w_in = Array2::<f32>::zeros((d, 2 * d));
-        let mut grad_b_in = Array2::<f32>::zeros((1, 2 * d));
         let mut d_in2 = Array2::<f32>::zeros((t, 2 * d));
         d_in2.slice_mut(ndarray::s![.., 0..d]).assign(&d_u_pre);
         d_in2
             .slice_mut(ndarray::s![.., d..2 * d])
             .assign(&d_gate_logits);
 
-        grad_w_in = input.t().dot(&d_in2);
-        grad_b_in = d_in2.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_w_in = input.t().dot(&d_in2);
+        let grad_b_in = d_in2.sum_axis(Axis(0)).insert_axis(Axis(0));
 
         // B/C path gradients: B_logits = (input.dot(w_b) + b_b) dot proj_state
         // d_full = d_logits dot proj_state^T

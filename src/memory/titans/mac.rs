@@ -34,12 +34,7 @@ pub struct TitansMAC {
 
 #[derive(Clone, Debug)]
 struct SegmentForwardData {
-    segment: Array2<f32>,
-    context: Array2<f32>,
-    h_t: Array2<f32>,
     seg_out: Array2<f32>,
-    memory_before: MemoryWeights,
-    momentum_before: MemoryWeights,
 }
 
 impl TitansMAC {
@@ -70,10 +65,7 @@ impl TitansMAC {
     }
 
     // Helper to retrieve and concat
-    fn process_segment(
-        &mut self,
-        segment: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+    fn process_segment(&mut self, segment: &Array2<f32>) -> Array2<f32> {
         // 1. Retrieve h_t from Memory using input context (segment) as query.
         let h_t = self.memory.retrieve(segment);
 
@@ -105,7 +97,7 @@ impl TitansMAC {
         // 5. Update Memory using Attention output (segment part)
         self.memory.update(&segment_output);
 
-        (segment_output, context_input, h_t)
+        segment_output
     }
 }
 
@@ -130,21 +122,10 @@ impl Layer for TitansMAC {
             let end = std::cmp::min(processed + self.segment_len, seq_len);
             let segment = input.slice(s![processed..end, ..]).to_owned();
 
-            let (seg_out, context, h_t) = self.process_segment(&segment);
+            let seg_out = self.process_segment(&segment);
             outputs.push(seg_out.clone());
 
-            forward_data.push(SegmentForwardData {
-                segment: segment.clone(),
-                context,
-                h_t,
-                seg_out,
-                memory_before: self.memory.init_memory.clone(),
-                momentum_before: MemoryWeights::zeros(
-                    self.memory.key_dim,
-                    self.memory.memory_hidden_dim,
-                    self.memory.val_dim,
-                ),
-            });
+            forward_data.push(SegmentForwardData { seg_out });
 
             processed = end;
         }
