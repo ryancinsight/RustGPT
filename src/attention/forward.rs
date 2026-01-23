@@ -70,8 +70,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
     if ctx.head_selection_config.gating.use_learned_predictor {
         if let Some(predictor) = ctx.threshold_predictor {
             // Avoid allocating a scaled copy unless per-token scaling is requested.
-            let mut scaled_input: Option<Array2<f32>> = None;
-            let input_view = if let Some(scale) = ctx.token_threshold_scale.as_ref() {
+            let scaled_input = if let Some(scale) = ctx.token_threshold_scale.as_ref() {
                 let mut tmp = ctx.input.to_owned();
                 let n = tmp.nrows();
                 let d = tmp.ncols();
@@ -81,10 +80,13 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                         tmp[[i, j]] *= s;
                     }
                 }
-                scaled_input = Some(tmp);
-                scaled_input.as_ref().unwrap().view()
+                Some(tmp)
             } else {
-                ctx.input.view()
+                None
+            };
+            let input_view = match scaled_input.as_ref() {
+                Some(tmp) => tmp.view(),
+                None => ctx.input.view(),
             };
 
             let mut t = predictor.predict_with_condition(

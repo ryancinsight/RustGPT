@@ -2470,58 +2470,53 @@ impl LLM {
                     let aux_base: f32 = 1.0;
                     let decay_rate: f32 = 0.6;
                     for (si, y_t) in aux_steps.iter().enumerate() {
-                        let mut grad_y_in_opt: Option<Array2<f32>> = None;
-                        {
-                            let norm_y = rn_clone.forward(y_t);
-                            let logits_t = op_clone.forward(&norm_y);
-                            let probs_t =
-                                crate::soft::Softmax::new().forward_immutable(&logits_t.view());
-                            let sce_t = crate::loss::symmetric_cross_entropy(
-                                &probs_t,
-                                target_ids,
-                                sce_cfg.alpha,
-                                sce_cfg.beta,
-                                sce_cfg.epsilon,
-                            );
-                            let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
-                            let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
-                            let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
-                            if step_weight < 1e-5 {
-                                continue;
-                            }
-                            aux_loss_sum += sce_t_norm * step_weight;
-                            let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
-                                &probs_t,
-                                target_ids,
-                                sce_cfg.alpha,
-                                sce_cfg.beta,
-                                sce_cfg.epsilon,
-                            );
-                            grad_logits_t.mapv_inplace(|v| v * step_weight);
-                            let (grad_norm_in, _) =
-                                op_clone.compute_gradients(&norm_y, &grad_logits_t);
-                            let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
-                            grad_y_in_opt = Some(grad_y_in);
+                        let norm_y = rn_clone.forward(y_t);
+                        let logits_t = op_clone.forward(&norm_y);
+                        let probs_t =
+                            crate::soft::Softmax::new().forward_immutable(&logits_t.view());
+                        let sce_t = crate::loss::symmetric_cross_entropy(
+                            &probs_t,
+                            target_ids,
+                            sce_cfg.alpha,
+                            sce_cfg.beta,
+                            sce_cfg.epsilon,
+                        );
+                        let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
+                        let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
+                        let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
+                        if step_weight < 1e-5 {
+                            continue;
                         }
-                        if let Some(grad_y_in) = grad_y_in_opt {
-                            let lrm_param_grads_step = match &self.network[t_idx] {
-                                LayerEnum::LRM(layer) => {
-                                    let (_in_grad_unused, param_grads) =
-                                        layer.compute_gradients_at_step(si, &grad_y_in);
-                                    param_grads
-                                }
-                                _ => Vec::new(),
-                            };
-                            if !lrm_param_grads_step.is_empty() {
-                                if accumulated_param_grads[t_idx].is_empty() {
-                                    accumulated_param_grads[t_idx] = lrm_param_grads_step;
-                                } else {
-                                    for (acc_grad, new_grad) in accumulated_param_grads[t_idx]
-                                        .iter_mut()
-                                        .zip(lrm_param_grads_step)
-                                    {
-                                        *acc_grad += &new_grad;
-                                    }
+                        aux_loss_sum += sce_t_norm * step_weight;
+                        let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
+                            &probs_t,
+                            target_ids,
+                            sce_cfg.alpha,
+                            sce_cfg.beta,
+                            sce_cfg.epsilon,
+                        );
+                        grad_logits_t.mapv_inplace(|v| v * step_weight);
+                        let (grad_norm_in, _) =
+                            op_clone.compute_gradients(&norm_y, &grad_logits_t);
+                        let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
+
+                        let lrm_param_grads_step = match &self.network[t_idx] {
+                            LayerEnum::LRM(layer) => {
+                                let (_in_grad_unused, param_grads) =
+                                    layer.compute_gradients_at_step(si, &grad_y_in);
+                                param_grads
+                            }
+                            _ => Vec::new(),
+                        };
+                        if !lrm_param_grads_step.is_empty() {
+                            if accumulated_param_grads[t_idx].is_empty() {
+                                accumulated_param_grads[t_idx] = lrm_param_grads_step;
+                            } else {
+                                for (acc_grad, new_grad) in accumulated_param_grads[t_idx]
+                                    .iter_mut()
+                                    .zip(lrm_param_grads_step)
+                                {
+                                    *acc_grad += &new_grad;
                                 }
                             }
                         }
@@ -2569,13 +2564,13 @@ impl LLM {
                 if let Some((op_idx, ref decor_grad)) = decor_grad_opt
                     && layer_idx == op_idx
                 {
-                    grads_output = grads_output + decor_grad.clone();
+                    grads_output = &grads_output + decor_grad;
                 }
 
                 if let Some((op_idx, ref hn_grad)) = hardneg_grad_opt
                     && layer_idx == op_idx
                 {
-                    grads_output = grads_output + hn_grad.clone();
+                    grads_output = &grads_output + hn_grad;
                 }
 
                 if accumulated_param_grads[layer_idx].is_empty() {
@@ -3045,62 +3040,55 @@ impl LLM {
                     let aux_base: f32 = 1.0;
                     let decay_rate: f32 = 0.6; // decay towards earlier steps
                     for (si, y_t) in aux_steps.iter().enumerate() {
-                        let mut grad_y_in_opt: Option<Array2<f32>> = None;
-                        {
-                            let norm_y = rn_clone.forward(y_t);
-                            let logits_t = op_clone.forward(&norm_y);
-                            let probs_t =
-                                crate::soft::Softmax::new().forward_immutable(&logits_t.view());
-                            let sce_t = crate::loss::symmetric_cross_entropy(
-                                &probs_t,
-                                target_ids,
-                                sce_cfg.alpha,
-                                sce_cfg.beta,
-                                sce_cfg.epsilon,
-                            );
-                            let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
-                            // per-step weight: heavier on later steps
-                            let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
-                            let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
+                        let norm_y = rn_clone.forward(y_t);
+                        let logits_t = op_clone.forward(&norm_y);
+                        let probs_t =
+                            crate::soft::Softmax::new().forward_immutable(&logits_t.view());
+                        let sce_t = crate::loss::symmetric_cross_entropy(
+                            &probs_t,
+                            target_ids,
+                            sce_cfg.alpha,
+                            sce_cfg.beta,
+                            sce_cfg.epsilon,
+                        );
+                        let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
+                        let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
+                        let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
 
-                            if step_weight < 1e-5 {
-                                continue;
-                            }
-
-                            aux_loss_sum += sce_t_norm * step_weight;
-                            let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
-                                &probs_t,
-                                target_ids,
-                                sce_cfg.alpha,
-                                sce_cfg.beta,
-                                sce_cfg.epsilon,
-                            );
-                            grad_logits_t.mapv_inplace(|v| v * step_weight);
-                            let (grad_norm_in, _) =
-                                op_clone.compute_gradients(&norm_y, &grad_logits_t);
-                            let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
-                            grad_y_in_opt = Some(grad_y_in);
+                        if step_weight < 1e-5 {
+                            continue;
                         }
-                        if let Some(grad_y_in) = grad_y_in_opt {
-                            let lrm_param_grads_step = match &self.network[t_idx] {
-                                LayerEnum::LRM(layer) => {
-                                    let (_in_grad_unused, param_grads) =
-                                        layer.compute_gradients_at_step(si, &grad_y_in);
-                                    param_grads
-                                }
-                                _ => Vec::new(),
-                            };
-                            if !lrm_param_grads_step.is_empty() {
-                                if scratch.accumulated_param_grads[t_idx].is_empty() {
-                                    scratch.accumulated_param_grads[t_idx] = lrm_param_grads_step;
-                                } else {
-                                    for (acc_grad, new_grad) in scratch.accumulated_param_grads
-                                        [t_idx]
-                                        .iter_mut()
-                                        .zip(lrm_param_grads_step)
-                                    {
-                                        *acc_grad += &new_grad;
-                                    }
+
+                        aux_loss_sum += sce_t_norm * step_weight;
+                        let mut grad_logits_t = crate::loss::symmetric_cross_entropy_gradients(
+                            &probs_t,
+                            target_ids,
+                            sce_cfg.alpha,
+                            sce_cfg.beta,
+                            sce_cfg.epsilon,
+                        );
+                        grad_logits_t.mapv_inplace(|v| v * step_weight);
+                        let (grad_norm_in, _) =
+                            op_clone.compute_gradients(&norm_y, &grad_logits_t);
+                        let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
+
+                        let lrm_param_grads_step = match &self.network[t_idx] {
+                            LayerEnum::LRM(layer) => {
+                                let (_in_grad_unused, param_grads) =
+                                    layer.compute_gradients_at_step(si, &grad_y_in);
+                                param_grads
+                            }
+                            _ => Vec::new(),
+                        };
+                        if !lrm_param_grads_step.is_empty() {
+                            if scratch.accumulated_param_grads[t_idx].is_empty() {
+                                scratch.accumulated_param_grads[t_idx] = lrm_param_grads_step;
+                            } else {
+                                for (acc_grad, new_grad) in scratch.accumulated_param_grads[t_idx]
+                                    .iter_mut()
+                                    .zip(lrm_param_grads_step)
+                                {
+                                    *acc_grad += &new_grad;
                                 }
                             }
                         }
@@ -3778,7 +3766,6 @@ impl LLM {
                 vec![1.0f32; num_timesteps]
             };
 
-        let mut sampling_cdf: Vec<f32> = Vec::new();
         let mut denoise_ema_per_t = vec![1.0f32; num_timesteps.max(1)];
         let mut denoise_cnt_per_t = vec![0u32; num_timesteps.max(1)];
         let denoise_ema_decay: f32 = 0.99;
@@ -3841,7 +3828,7 @@ impl LLM {
             let max_t_epoch =
                 ((num_timesteps as f32) * ((epoch + 1) as f32 / epochs as f32)).round() as usize;
             let active_steps_epoch = max_t_epoch.max(1);
-            sampling_cdf = {
+            let sampling_cdf: Vec<f32> = {
                 // Normalize difficulty by mean to avoid collapsing onto a narrow band of
                 // timesteps as the EMA evolves.
                 let mut diff_sum = 0.0f32;

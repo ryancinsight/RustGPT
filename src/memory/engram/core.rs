@@ -183,7 +183,7 @@ mod tests {
     fn test_engram_hash_collision_resilience() {
         let mut memory = EngramMemory::new(128, 128);
 
-        let dummy_tokens = vec![1usize, 2, 3, 4, 5].repeat(100);
+        let dummy_tokens = [1usize, 2, 3, 4, 5].repeat(100);
         let dummy_input = Array2::zeros((5, 128));
 
         let _output = memory.forward(&dummy_input, &dummy_tokens);

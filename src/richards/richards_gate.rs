@@ -378,13 +378,14 @@ impl Layer for RichardsGate {
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         // For RichardsGate, backward pass computes gradients w.r.t the last forward input.
         // If called without a prior forward, fall back to a zero input to avoid panics.
-        let mut fallback_input: Option<Array2<f32>> = None;
+        let fallback_input = if self.cached_input.is_none() {
+            Some(Array2::zeros(grads.raw_dim()))
+        } else {
+            None
+        };
         let input = match self.cached_input.as_ref() {
             Some(x) => x,
-            None => {
-                fallback_input = Some(Array2::zeros(grads.raw_dim()));
-                fallback_input.as_ref().unwrap()
-            }
+            None => fallback_input.as_ref().unwrap(),
         };
 
         let (input_grads, param_grads) = self.compute_gradients(input, grads);

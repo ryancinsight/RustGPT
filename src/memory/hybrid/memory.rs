@@ -7,9 +7,7 @@ use crate::memory::titans::NeuralMemory;
 use crate::network::Layer;
 
 const DEFAULT_SURPRISE_DECAY: f32 = 0.95;
-const DEFAULT_LEARNING_RATE_MEMORY: f32 = 0.01;
 const DEFAULT_FORGET_GATE: f32 = 0.05;
-const DEFAULT_MOMENTUM_BETA: f32 = 0.9;
 const DEFAULT_ADAPTIVE_GATE_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,12 +234,6 @@ impl HybridMemory {
         self.engram_cache_stats.clear_stats();
     }
 
-    fn rms_norm(x: &Array1<f32>, eps: f32) -> Array1<f32> {
-        let sq_norm = x.iter().map(|&v| v * v).sum::<f32>() + eps;
-        let norm = sq_norm.sqrt();
-        x.mapv(|v| v / norm)
-    }
-
     fn sine_positional_encoding(seq_len: usize, dim: usize) -> Array2<f32> {
         let mut encoding = Array2::zeros((seq_len, dim));
         for pos in 0..seq_len {
@@ -275,9 +267,7 @@ impl Layer for HybridMemory {
 
         let pos_encoding = Self::sine_positional_encoding(seq_len, self.config.memory_dim);
 
-        for t in 0..seq_len {
-            let (engram_gate, titans_gate) = gates[t];
-
+        for (t, (engram_gate, titans_gate)) in gates.iter().enumerate().take(seq_len) {
             let input_t = input.row(t).to_owned().insert_axis(Axis(0));
             let engram_out = self.engram_memory.forward(&input_t, &vec![0; 32]);
             let titans_out = self.titans_memory.forward(&input_t);
@@ -287,8 +277,8 @@ impl Layer for HybridMemory {
 
             let pos_enc = pos_encoding.row(t);
 
-            let gated_engram = engram_proj.mapv(|x| x * engram_gate);
-            let gated_titans = titans_proj.mapv(|x| x * titans_gate);
+            let gated_engram = engram_proj.mapv(|x| x * *engram_gate);
+            let gated_titans = titans_proj.mapv(|x| x * *titans_gate);
 
             let combined = &gated_engram + &gated_titans + pos_enc;
 

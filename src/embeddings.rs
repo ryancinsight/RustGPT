@@ -410,8 +410,10 @@ mod tests {
     fn test_engram_disabled_matches_plain_embeddings() {
         set_seed(123);
         let vocab = Vocab::default();
-        let mut cfg = TitanMemoryConfig::default();
-        cfg.engram_enabled = false;
+        let cfg = TitanMemoryConfig {
+            engram_enabled: false,
+            ..Default::default()
+        };
         let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, cfg);
 
         let ids = vec![0usize, 1, 2, 3, 4, 5];
@@ -430,11 +432,13 @@ mod tests {
     fn test_engram_embedding_gradient_matches_finite_difference() {
         set_seed(7);
         let vocab = Vocab::default();
-        let mut cfg = TitanMemoryConfig::default();
-        cfg.engram_enabled = true;
-        cfg.engram_scale = 0.2;
-        cfg.engram_ngram_order = 3;
-        cfg.engram_num_heads = 3;
+        let cfg = TitanMemoryConfig {
+            engram_enabled: true,
+            engram_scale: 0.2,
+            engram_ngram_order: 3,
+            engram_num_heads: 3,
+            ..Default::default()
+        };
         let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, cfg);
 
         let ids = vec![1usize, 2, 3, 1];
