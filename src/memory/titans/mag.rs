@@ -2,11 +2,8 @@ use ndarray::{Array1, Array2, Axis, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    attention::sliding_window_attention::SlidingWindowAttention,
-    models::titans::memory::{MemoryWeights, NeuralMemory},
-    network::Layer,
-};
+use super::neural::{MemoryWeights, NeuralMemory};
+use crate::{attention::sliding_window_attention::SlidingWindowAttention, network::Layer};
 
 /// Memory As Gate (MAG) Architecture
 ///
@@ -25,6 +22,9 @@ pub struct TitansMAG {
 
     #[serde(skip)]
     cached_input: Option<Array2<f32>>,
+
+    #[serde(skip)]
+    cached_swa_output: Option<Array2<f32>>,
 }
 
 // Helpers for NeuralMemory access
@@ -56,6 +56,7 @@ impl TitansMAG {
             gate_b,
             segment_len,
             cached_input: None,
+            cached_swa_output: None,
         }
     }
 
@@ -78,8 +79,9 @@ impl Layer for TitansMAG {
         let seq_len = input.nrows();
         let dim = input.ncols();
 
-        // 1. SWA Forward (on full sequence)
+        // 1. SWA Forward (on full sequence) - cache for use in gradients
         let swa_out = self.swa.forward(input);
+        self.cached_swa_output = Some(swa_out.clone());
 
         // 2. Memory & Gating Loop (in segments)
         let mut outputs = Array2::<f32>::zeros((seq_len, dim));
@@ -153,17 +155,17 @@ impl Layer for TitansMAG {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let mut swa_clone = self.swa.clone(); // Expensive but safe
-        let swa_out = swa_clone.forward(input);
+        let swa_out = self
+            .cached_swa_output
+            .as_ref()
+            .expect("forward must be called before compute_gradients to cache SWA output");
 
-        // 2. Re-run Memory/Gating forward to capture traces and O
+        // Re-run Memory/Gating forward to capture traces and O
         let seq_len = input.nrows();
         let dim = input.ncols();
         let mut _outputs = Array2::<f32>::zeros((seq_len, dim));
 
         let mut processed = 0;
-        let mut memory_clone = self.memory.clone();
-        memory_clone.reset_memory();
 
         struct StepData {
             y: Array1<f32>, // swa out
@@ -187,14 +189,12 @@ impl Layer for TitansMAG {
             self.memory.memory_hidden_dim,
             self.memory.val_dim,
         );
-        let mut retrieval_memory_snapshot;
 
         while processed < seq_len {
             let end = std::cmp::min(processed + self.segment_len, seq_len);
             let segment_len = end - processed;
 
-            // Snapshot for retrieval
-            retrieval_memory_snapshot = curr_memory.clone();
+            let retrieval_memory_snapshot = curr_memory.clone();
 
             let mut o_seg = Array2::<f32>::zeros((segment_len, dim));
 
@@ -267,14 +267,6 @@ impl Layer for TitansMAG {
                 curr_memory.scale(1.0 - alpha_t);
                 curr_memory.add(&momentum);
             }
-
-            // Update Memory with O
-            // Use clone just to keep state aligned if we used memory_clone methods later
-            // But we are manually tracking state in curr_memory/momentum variables.
-            // memory_clone is unused inside loop, only reset before.
-            // Actually we don't need memory_clone if we manually track state!
-            // But let's leave it as is.
-            memory_clone.update(&o_seg);
 
             // Store Output
             _outputs.slice_mut(s![processed..end, ..]).assign(&o_seg);
@@ -530,7 +522,7 @@ impl Layer for TitansMAG {
 
         d_init_memory.add(&d_m_next);
 
-        let (swa_input_grads, swa_param_grads) = swa_clone.compute_gradients(input, &d_swa_out);
+        let (swa_input_grads, swa_param_grads) = self.swa.compute_gradients(input, &d_swa_out);
 
         input_grads = input_grads + swa_input_grads;
 
@@ -594,10 +586,8 @@ mod tests {
     use ndarray::Array2;
 
     use super::*;
-    use crate::{
-        attention::sliding_window_attention::SlidingWindowAttention,
-        models::titans::memory::NeuralMemory,
-    };
+    use crate::attention::sliding_window_attention::SlidingWindowAttention;
+    use crate::memory::titans::NeuralMemory;
 
     #[test]
     fn test_titans_mag_forward() {

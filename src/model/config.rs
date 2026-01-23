@@ -21,6 +21,14 @@ pub struct TitanMemoryConfig {
     pub persistent_len: usize,
     #[serde(default = "titan_memory_hidden_dim_default")]
     pub hidden_dim: usize,
+    #[serde(default = "titan_memory_engram_enabled_default")]
+    pub engram_enabled: bool,
+    #[serde(default = "titan_memory_engram_scale_default")]
+    pub engram_scale: f32,
+    #[serde(default = "titan_memory_engram_ngram_order_default")]
+    pub engram_ngram_order: usize,
+    #[serde(default = "titan_memory_engram_num_heads_default")]
+    pub engram_num_heads: usize,
 }
 
 impl Default for TitanMemoryConfig {
@@ -33,6 +41,10 @@ impl Default for TitanMemoryConfig {
             segment_len: titan_memory_segment_len_default(),
             persistent_len: titan_memory_persistent_len_default(),
             hidden_dim: titan_memory_hidden_dim_default(),
+            engram_enabled: titan_memory_engram_enabled_default(),
+            engram_scale: titan_memory_engram_scale_default(),
+            engram_ngram_order: titan_memory_engram_ngram_order_default(),
+            engram_num_heads: titan_memory_engram_num_heads_default(),
         }
     }
 }
@@ -441,6 +453,22 @@ fn titan_memory_persistent_len_default() -> usize {
 
 fn titan_memory_hidden_dim_default() -> usize {
     64
+}
+
+fn titan_memory_engram_enabled_default() -> bool {
+    true
+}
+
+fn titan_memory_engram_scale_default() -> f32 {
+    0.05
+}
+
+fn titan_memory_engram_ngram_order_default() -> usize {
+    3
+}
+
+fn titan_memory_engram_num_heads_default() -> usize {
+    4
 }
 
 fn residual_decorrelation_weight_default() -> f32 {

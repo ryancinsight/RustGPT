@@ -30,9 +30,9 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
 
     // Add embedding layer (common to all architectures)
     // Position embeddings are handled inside attention (CoPE), so only token embeddings
-    layers.push(LayerEnum::TokenEmbeddings(TokenEmbeddings::new(
-        vocab.clone(),
-    )));
+    layers.push(LayerEnum::TokenEmbeddings(
+        TokenEmbeddings::new_with_titan_memory(vocab.clone(), config.titan_memory.clone()),
+    ));
 
     if let Some(model) = config.spiking_neuron_model {
         match model {

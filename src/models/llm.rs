@@ -2223,18 +2223,12 @@ impl LLM {
         batch: &[Vec<usize>],
         lr: f32,
     ) -> Result<(f32, f32, f32, Vec<f32>)> {
-        // Check if E-Prop is actually enabled in the model configuration to warn the user if not
-        let _eprop_enabled = self.network.iter().any(|layer| {
-            if let LayerEnum::TransformerBlock(_block) = layer {
-                // We can't easily access private fields, but we trust the user has initialized it.
-                // However, the error message in the placeholder suggested "Initialize e-prop
-                // traces". Since we are now implementing it, we assume it's
-                // initialized.
-                true
-            } else {
-                false
-            }
-        });
+        // E-Prop is enabled when TransformerBlock layers are present with eligibility traces
+        // initialized
+        let _eprop_enabled = self
+            .network
+            .iter()
+            .any(|layer| matches!(layer, LayerEnum::TransformerBlock(_)));
 
         // Re-use the profiled training logic which is now capable of handling E-Prop gradients
         // via the updated TransformerBlock::backward / compute_gradients implementation.
@@ -2604,7 +2598,19 @@ impl LLM {
 
         let max_layer_grad = layer_grad_norms.iter().fold(0.0f32, |a, &b| a.max(b));
         if max_layer_grad > 10.0 {
-            tracing::warn!("Layer-wise gradient norms: {:?}", layer_grad_norms);
+            tracing::warn!(
+                "Layer-wise gradient norms: {:?}",
+                layer_grad_norms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &norm)| format!(
+                        "L{}({}): {:.2}",
+                        i,
+                        self.network[i].layer_type(),
+                        norm
+                    ))
+                    .collect::<Vec<_>>()
+            );
         }
 
         // Prepare averaged gradients and detect anomalies
@@ -3234,7 +3240,12 @@ impl LLM {
                     .layer_grad_norms
                     .iter()
                     .enumerate()
-                    .map(|(i, &norm)| format!("L{}: {:.2}", i, norm))
+                    .map(|(i, &norm)| format!(
+                        "L{}({}): {:.2}",
+                        i,
+                        self.network[i].layer_type(),
+                        norm
+                    ))
                     .collect::<Vec<_>>()
             );
         }

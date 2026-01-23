@@ -2,11 +2,8 @@ use ndarray::{Array1, Array2, Axis, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    attention::poly_attention::PolyAttention,
-    models::titans::memory::{MemoryWeights, NeuralMemory},
-    network::Layer,
-};
+use super::neural::{MemoryWeights, NeuralMemory};
+use crate::{attention::poly_attention::PolyAttention, network::Layer};
 
 /// Memory As Context (MAC) Architecture
 ///
@@ -30,6 +27,19 @@ pub struct TitansMAC {
 
     #[serde(skip)]
     cached_input: Option<Array2<f32>>,
+
+    #[serde(skip)]
+    cached_forward_data: Option<Vec<SegmentForwardData>>,
+}
+
+#[derive(Clone, Debug)]
+struct SegmentForwardData {
+    segment: Array2<f32>,
+    context: Array2<f32>,
+    h_t: Array2<f32>,
+    seg_out: Array2<f32>,
+    memory_before: MemoryWeights,
+    momentum_before: MemoryWeights,
 }
 
 impl TitansMAC {
@@ -55,6 +65,7 @@ impl TitansMAC {
             segment_len,
             persistent_len,
             cached_input: None,
+            cached_forward_data: None,
         }
     }
 
@@ -109,17 +120,36 @@ impl Layer for TitansMAC {
         let input_dim = input.ncols();
 
         let mut outputs = Vec::new();
+        let mut forward_data = Vec::new();
         let mut processed = 0;
+
+        // Initialize memory state for tracking
+        self.memory.reset_memory();
 
         while processed < seq_len {
             let end = std::cmp::min(processed + self.segment_len, seq_len);
             let segment = input.slice(s![processed..end, ..]).to_owned();
 
-            let (seg_out, _, _) = self.process_segment(&segment);
-            outputs.push(seg_out);
+            let (seg_out, context, h_t) = self.process_segment(&segment);
+            outputs.push(seg_out.clone());
+
+            forward_data.push(SegmentForwardData {
+                segment: segment.clone(),
+                context,
+                h_t,
+                seg_out,
+                memory_before: self.memory.init_memory.clone(),
+                momentum_before: MemoryWeights::zeros(
+                    self.memory.key_dim,
+                    self.memory.memory_hidden_dim,
+                    self.memory.val_dim,
+                ),
+            });
 
             processed = end;
         }
+
+        self.cached_forward_data = Some(forward_data);
 
         if outputs.is_empty() {
             return Array2::zeros((0, input_dim));
@@ -208,7 +238,7 @@ impl Layer for TitansMAC {
                 let x = segment.row(r).to_owned();
                 let q = self.memory.w_q.dot(&x);
                 let z = curr_memory.w1.dot(&q) + &curr_memory.b1;
-                let h = z.mapv(|x| x.max(0.0));
+                let h = z.mapv(|x: f32| x.max(0.0));
                 let y = curr_memory.w2.dot(&h) + &curr_memory.b2;
                 h_t.row_mut(r).assign(&y);
             }
@@ -226,43 +256,24 @@ impl Layer for TitansMAC {
                 .slice_mut(s![p_len + s_len..total_len, ..])
                 .assign(&segment);
 
-            // Note: We use forward_impl_baseline to set cache on core (PolyAttention).
-            // We assume core doesn't change state other than cache.
-            // Using interior mutability on self.core (via &self -> &mut self requires ref cell or
-            // similar, but compute_gradients is &self).
-            // Wait, PolyAttention::forward_impl requires &mut self.
-            // TitansMAC::compute_gradients is &self.
-            // We cannot call core.forward_impl here!
-            // But PolyAttention::compute_gradients usually works on cached data from previous
-            // forward. If we are re-running logic, we can't populate cache on
-            // `self.core`. But PolyAttention::compute_gradients needs `cached_input`.
+            // NOTE: PolyAttention's compute_gradients relies on cached_input from forward pass.
+            // In TitansMAC, we process segments independently, so we need to reproduce
+            // the attention output for each segment during gradient computation.
+            // Since compute_gradients takes &self (not &mut self), we cannot set cached_input
+            // on self.core. The current workaround clones core and runs forward,
+            // which is expensive but maintains correctness.
 
-            // FIXME: PolyAttention design assumes `forward` was called just before
-            // `backward/compute_gradients`. Here we are chunking. The last chunk's
-            // cache is likely in `self.core`. But previous chunks are lost.
-            // We MUST instantiate a temporary core or bypass the cache check if possible.
-            // Actually, we can use `self.core` as a template but we can't mutate it.
-            // We need to call `core.compute_gradients_parallel` passing `input` explicitly?
-            // `compute_gradients_parallel` signature: `&self, _input, output_grads`.
-            // It reads `self.cached_input`.
-            // So we are STUCK unless we can set `cached_input`.
-
-            // Solution: Use `std::cell::RefCell` or `RwLock` for `cached_input` in PolyAttention?
-            // `PolyAttention` definition uses `Option<Array2<f32>>` directly.
-            // But `compute_gradients` implementation reads it.
-
-            // HACK: We can clone `self.core`, set its cache, and run compute_gradients.
-            // Since `TitansMAC` owns `core`, we can clone it. It's expensive but correct.
-
-            // Forward core (on clone)
-            // Actually we don't need full forward, just enough to reproduce output.
-            // We already ran forward in `TitansMAC::forward`.
-            // But we need to reproduce it for ALL chunks.
-            // Let's use `core_clone`.
-
-            let mut core_clone = self.core.clone();
-            let attn_out = core_clone.forward_impl_baseline(&context, true);
-            let seg_out = attn_out.slice(s![p_len + s_len..total_len, ..]).to_owned();
+            // Try to use cached forward outputs if available (avoids core.clone())
+            let seg_out = if let Some(cached_data) = &self.cached_forward_data
+                && forward_data.len() < cached_data.len()
+            {
+                cached_data[forward_data.len()].seg_out.clone()
+            } else {
+                // Fallback: clone core and run forward (expensive but correct)
+                let mut core_clone = self.core.clone();
+                let attn_out = core_clone.forward_impl_baseline(&context, true);
+                attn_out.slice(s![p_len + s_len..total_len, ..]).to_owned()
+            };
 
             // Update Memory Logic
             let memory_before = curr_memory.clone();
@@ -278,7 +289,7 @@ impl Layer for TitansMAC {
                 let theta = 1.0 / (1.0 + (-self.memory.w_theta.dot(&x)).exp());
 
                 let z = curr_memory.w1.dot(&k) + &curr_memory.b1;
-                let h = z.mapv(|val| val.max(0.0));
+                let h = z.mapv(|val: f32| val.max(0.0));
                 let v_pred = curr_memory.w2.dot(&h) + &curr_memory.b2;
                 let grad_output = &v_pred - &v;
 
@@ -629,7 +640,8 @@ mod tests {
     use ndarray::Array2;
 
     use super::*;
-    use crate::{attention::poly_attention::PolyAttention, models::titans::memory::NeuralMemory};
+    use crate::attention::poly_attention::PolyAttention;
+    use crate::memory::titans::NeuralMemory;
 
     #[test]
     fn test_titans_mac_forward() {

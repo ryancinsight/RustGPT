@@ -1,0 +1,7 @@
+pub const DEFAULT_ENGRAM_NGRAM_ORDER: usize = 3;
+pub const DEFAULT_ENGRAM_NUM_HEADS: usize = 8;
+pub const DEFAULT_ENGRAM_MEMORY_DIM: usize = 1280;
+pub const DEFAULT_ENGRAM_TABLE_SIZE: usize = 16_384;
+pub const DEFAULT_CACHE_TIER_1_SIZE: usize = 16384;
+pub const DEFAULT_CACHE_TIER_2_SIZE: usize = 131072;
+pub const OPTIMAL_MEMORY_COMPUTE_RATIO: f32 = 0.25;

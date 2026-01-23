@@ -436,8 +436,9 @@ impl PolyAttention {
     }
 
     pub fn set_adaptive_degree_config(&mut self, cfg: AdaptiveDegreeConfig) {
-        self.adaptive_cfg = cfg.clone();
-        if cfg.enabled {
+        let enabled = cfg.enabled;
+        self.adaptive_cfg = cfg;
+        if enabled {
             self.p = 1;
         }
     }
