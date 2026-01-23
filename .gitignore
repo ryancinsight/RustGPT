@@ -1,4 +1,5 @@
 /target
+/target_ci/
 
 # Model files
 models/*.bin
