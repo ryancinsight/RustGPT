@@ -258,6 +258,9 @@ pub struct PolyAttention {
     parallel_batch_size: usize,
     #[serde(skip_serializing, skip_deserializing)]
     parallel_timeout_ms: u64,
+
+    #[serde(skip)]
+    training_progress: f64,
 }
 
 impl PolyAttention {
@@ -308,7 +311,7 @@ impl PolyAttention {
             min_heads: 1,
             max_heads: num_heads,
             always_on_heads: Vec::new(),
-            threshold_modulation: 1.0,
+            threshold_modulation: AdaptiveScalar::Fixed(1.0),
             metrics_tau_min: f32::INFINITY,
             metrics_tau_max: f32::NEG_INFINITY,
             metrics_tau_sum: 0.0,
@@ -362,7 +365,13 @@ impl PolyAttention {
             eff_skip_threshold: 1e-4,
             parallel_batch_size: 32,
             parallel_timeout_ms: 0,
+            training_progress: 0.0,
         }
+    }
+
+    pub fn set_training_progress(&mut self, progress: f64) {
+        self.training_progress = progress;
+        self.moh.training_progress = progress;
     }
 
     pub fn set_titan_memory_config(&mut self, cfg: TitanMemoryConfig) {
@@ -554,8 +563,8 @@ impl PolyAttention {
             eff_skip_threshold: self.eff_skip_threshold,
             parallel_batch_size: self.parallel_batch_size,
             parallel_timeout_ms: self.parallel_timeout_ms,
+            training_progress: self.training_progress,
         };
-
         let mut result = compute_poly_attention_forward(&mut ctx, causal);
         self.apply_titan_memory_into(&mut result.output, input);
 
@@ -619,6 +628,7 @@ impl PolyAttention {
             eff_skip_threshold: self.eff_skip_threshold,
             parallel_batch_size: self.parallel_batch_size,
             parallel_timeout_ms: self.parallel_timeout_ms,
+            training_progress: self.training_progress,
         };
         let mut result =
             crate::attention::forward::compute_poly_attention_forward_baseline(&mut ctx, causal);
@@ -2364,6 +2374,10 @@ impl Layer for PolyAttention {
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         PolyAttention::backward(self, grads, lr)
+    }
+
+    fn set_training_progress(&mut self, progress: f64) {
+        self.moh.training_progress = progress;
     }
 
     fn parameters(&self) -> usize {

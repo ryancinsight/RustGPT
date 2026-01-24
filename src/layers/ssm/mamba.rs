@@ -2492,6 +2492,11 @@ impl Layer for MoHMamba {
         self.moh.cached_soft_top_p_mask = None;
         self.clear_caches();
     }
+
+    fn set_training_progress(&mut self, progress: f64) {
+        self.moh.training_progress = progress;
+        self.inner.set_training_progress(progress);
+    }
 }
 
 /// Configuration for Mamba layer with enhanced options

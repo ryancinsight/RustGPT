@@ -1,6 +1,12 @@
 use tracing::warn;
 
-use crate::{Vocab, cli::Args, dataset_loader::Dataset, llm::LLM};
+use crate::{
+    cli::Args,
+    dataset_loader::Dataset,
+    llm::LLM,
+    richards::{AdaptiveScalar, RichardsCurve},
+    Vocab,
+};
 
 pub fn configure_speculative_sampling_from_args(
     args: &Args,
@@ -170,6 +176,34 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         });
     }
 
+    // Construct adaptive scalars for diffusion hyperparameters
+    let ce_weight = if args.diffusion_ce_weight_adaptive {
+        let mut curve = RichardsCurve::new_default();
+        // Sigmoid ramp: centered at m (halfway through training), steepness k
+        // This allows the weight to ramp up from ~0 to output_scale over the course of training
+        curve.m = Some(args.diffusion_ce_weight_curve_m as f64);
+        curve.k = Some(args.diffusion_ce_weight_curve_k as f64);
+        AdaptiveScalar::Richards {
+            curve,
+            output_scale: args.diffusion_ce_weight,
+        }
+    } else {
+        AdaptiveScalar::Fixed(args.diffusion_ce_weight)
+    };
+
+    let min_snr_gamma = if args.diffusion_min_snr_gamma_adaptive {
+        let mut curve = RichardsCurve::new_default();
+        // Sigmoid ramp: centered at m (halfway through training), steepness k
+        curve.m = Some(args.diffusion_min_snr_gamma_curve_m as f64);
+        curve.k = Some(args.diffusion_min_snr_gamma_curve_k as f64);
+        AdaptiveScalar::Richards {
+            curve,
+            output_scale: args.diffusion_min_snr_gamma,
+        }
+    } else {
+        AdaptiveScalar::Fixed(args.diffusion_min_snr_gamma)
+    };
+
     let pre_texts: Vec<&str> = dataset
         .pretraining_data
         .iter()
@@ -181,9 +215,9 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         args.pretrain_epochs,
         0.0005,
         4,
-        args.diffusion_ce_weight,
+        ce_weight.clone(),
         args.validation_ratio,
-        args.diffusion_min_snr_gamma,
+        min_snr_gamma.clone(),
         args.save_every.map(|n| n.get()),
         Some(args.checkpoint_dir.clone()),
         Some("pretrain".to_string()),
@@ -200,9 +234,9 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         args.instruction_epochs,
         0.0005,
         4,
-        args.diffusion_ce_weight,
+        ce_weight,
         args.validation_ratio,
-        args.diffusion_min_snr_gamma,
+        min_snr_gamma,
         args.save_every.map(|n| n.get()),
         Some(args.checkpoint_dir.clone()),
         Some("instruction".to_string()),

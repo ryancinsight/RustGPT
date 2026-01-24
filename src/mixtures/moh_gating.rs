@@ -228,6 +228,10 @@ pub struct MoHGating {
     /// Cached SoftTopP mask (tokens x heads) from last forward pass.
     #[serde(skip_serializing, skip_deserializing)]
     pub cached_soft_top_p_mask: Option<Array2<f32>>,
+
+    /// Training progress (0.0 to 1.0) for adaptive hyperparameters
+    #[serde(skip_serializing, skip_deserializing)]
+    pub training_progress: f64,
 }
 
 impl MoHGating {
@@ -265,6 +269,7 @@ impl MoHGating {
             opt_b2_tau: None,
             opt_cond_w_tau: None,
             cached_soft_top_p_mask: None,
+            training_progress: 0.0,
         }
     }
 
@@ -379,7 +384,7 @@ impl MoHGating {
                     token_latent_features.map(|f| f.view()),
                 );
 
-                let m = self.head_selection_config.threshold_modulation;
+                let m = self.head_selection_config.threshold_modulation.value(self.training_progress);
                 t.mapv_inplace(|v| {
                     let v = if v.is_finite() { v } else { 0.0 };
                     (v * m).max(0.0)
@@ -449,7 +454,10 @@ impl MoHGating {
             let activation_scale = self.head_selection_config.max_heads.max(1) as f32;
             weights.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
 
-            let m = self.head_selection_config.threshold_modulation;
+            let m = self
+                .head_selection_config
+                .threshold_modulation
+                .value(self.training_progress);
             weights.mapv_inplace(|v| (v * m).clamp(0.0, 1.0));
 
             if let Some(scale) = token_threshold_scale {
@@ -728,7 +736,7 @@ impl MoHGating {
             let mut weights = apply_selection_algorithm(&g_mat.view(), &cfg);
             let activation_scale = self.head_selection_config.max_heads.max(1) as f32;
             weights.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
-            let m = self.head_selection_config.threshold_modulation;
+            let m = self.head_selection_config.threshold_modulation.value(self.training_progress);
             weights.mapv_inplace(|v| (v * m).clamp(0.0, 1.0));
             m_mat.assign(&weights);
 

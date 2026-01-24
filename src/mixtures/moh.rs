@@ -48,6 +48,7 @@ use crate::mixtures::{
     routing::{Router, RoutingConfig, RoutingResult, SelectionAlgorithm},
     threshold::ThresholdPredictor,
 };
+use crate::richards::adaptive::AdaptiveScalar;
 
 /// Strategy for selecting which attention heads to activate
 ///
@@ -74,7 +75,7 @@ pub struct HeadSelectionConfig {
     #[serde(default)]
     pub always_on_heads: Vec<usize>,
     /// Modulation factor for thresholds (conditioning)
-    pub threshold_modulation: f32,
+    pub threshold_modulation: AdaptiveScalar,
     /// Threshold predictor metrics: min threshold value seen
     pub metrics_tau_min: f32,
     /// Threshold predictor metrics: max threshold value seen
@@ -96,7 +97,7 @@ impl Default for HeadSelectionConfig {
             min_heads: 1,
             max_heads: 8,
             always_on_heads: Vec::new(),
-            threshold_modulation: 1.0,
+            threshold_modulation: AdaptiveScalar::default(),
             metrics_tau_min: f32::INFINITY,
             metrics_tau_max: f32::NEG_INFINITY,
             metrics_tau_sum: 0.0,
@@ -124,7 +125,7 @@ impl HeadSelectionConfig {
                 min_heads: 1, // Default min, could be parameterized
                 max_heads: *num_active,
                 always_on_heads: Vec::new(),
-                threshold_modulation: 1.0,
+                threshold_modulation: AdaptiveScalar::Fixed(1.0),
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,
@@ -140,7 +141,7 @@ impl HeadSelectionConfig {
                 min_heads: 1,         // Allow flexible selection with soft top-p
                 max_heads: num_heads, // All heads available for selection
                 always_on_heads: Vec::new(),
-                threshold_modulation: 1.0,
+                threshold_modulation: AdaptiveScalar::Fixed(1.0),
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,
@@ -153,7 +154,7 @@ impl HeadSelectionConfig {
                 min_heads: *num_active,
                 max_heads: *num_active,
                 always_on_heads: Vec::new(),
-                threshold_modulation: 1.0,
+                threshold_modulation: AdaptiveScalar::Fixed(1.0),
                 metrics_tau_min: f32::INFINITY,
                 metrics_tau_max: f32::NEG_INFINITY,
                 metrics_tau_sum: 0.0,

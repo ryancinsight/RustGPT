@@ -39,6 +39,7 @@ pub struct ForwardContext<'a> {
     pub eff_skip_threshold: f32,
     pub parallel_batch_size: usize,
     pub parallel_timeout_ms: u64,
+    pub training_progress: f64,
 }
 
 /// Forward computation result containing output and metrics
@@ -93,7 +94,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                 &input_view,
                 ctx.token_latent_features.as_ref().map(|f| f.view()),
             );
-            let m = ctx.head_selection_config.threshold_modulation;
+            let m = ctx.head_selection_config.threshold_modulation.value(ctx.training_progress);
             t.mapv_inplace(|v| v * m);
             let k = ctx.head_selection_config.gating.num_active as f32;
             let n = t.nrows();
@@ -149,7 +150,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         let activation_scale = ctx.head_selection_config.max_heads.max(1) as f32;
         soft_weights.mapv_inplace(|v| smooth_saturate_01(v * activation_scale));
 
-        let m = ctx.head_selection_config.threshold_modulation;
+        let m = ctx.head_selection_config.threshold_modulation.value(ctx.training_progress);
         soft_weights.mapv_inplace(|v| v * m);
         if let Some(scale) = ctx.token_threshold_scale.as_ref() {
             let n = soft_weights.nrows();
