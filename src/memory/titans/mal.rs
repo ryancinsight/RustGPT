@@ -36,3 +36,34 @@ impl TitansMAL {
         self.attention.forward(&memory_output)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn test_titans_mal_forward() {
+        let input_dim = 4;
+        let key_dim = 4;
+        let val_dim = 4;
+        let memory_hidden_dim = 8;
+        let window_size = 2;
+
+        let mut mal = TitansMAL::new(
+            input_dim,
+            key_dim,
+            val_dim,
+            memory_hidden_dim,
+            window_size,
+        );
+
+        let seq_len = 5;
+        let input = Array2::<f32>::zeros((seq_len, input_dim));
+
+        // Just verify it runs and returns correct shape
+        let output = mal.forward(&input);
+
+        assert_eq!(output.dim(), (seq_len, val_dim));
+    }
+}
