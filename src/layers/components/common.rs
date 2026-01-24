@@ -156,6 +156,19 @@ impl TemporalMixingLayer {
         }
     }
 
+    pub fn set_training_progress(&mut self, progress: f64) {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::RgLru(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::MambaMoH(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::Mamba(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::Mamba2(layer) => layer.set_training_progress(progress),
+            TemporalMixingLayer::Titans(layer) => layer.set_training_progress(progress),
+        }
+    }
+
     #[inline]
     pub fn forward_with_causal(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
         match self {
@@ -571,6 +584,8 @@ pub struct CommonLayerConfig {
     pub moe_config: Option<ExpertRouterConfig>,
     pub head_selection: HeadSelectionStrategy,
     #[serde(default)]
+    pub moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar,
+    #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
     #[serde(default)]
     pub temporal_mixing: TemporalMixingType,
@@ -601,17 +616,24 @@ impl CommonLayers {
                     );
                     attention.set_titan_memory_config(config.titan_memory.clone());
                     attention.set_head_selection_config(&config.head_selection);
+                    attention.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
                     TemporalMixingLayer::Attention(Box::new(attention))
                 }
-                TemporalMixingType::RgLru => TemporalMixingLayer::RgLruMoH(Box::new(
-                    MoHRgLru::new(config.embed_dim, config.num_heads, &config.head_selection),
-                )),
-                TemporalMixingType::Mamba => TemporalMixingLayer::MambaMoH(Box::new(
-                    MoHMamba::new(config.embed_dim, config.num_heads, &config.head_selection),
-                )),
-                TemporalMixingType::Mamba2 => TemporalMixingLayer::Mamba2MoH(Box::new(
-                    MoHMamba2::new(config.embed_dim, config.num_heads, &config.head_selection),
-                )),
+                TemporalMixingType::RgLru => TemporalMixingLayer::RgLruMoH(Box::new({
+                    let mut layer = MoHRgLru::new(config.embed_dim, config.num_heads, &config.head_selection);
+                    layer.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
+                    layer
+                })),
+                TemporalMixingType::Mamba => TemporalMixingLayer::MambaMoH(Box::new({
+                    let mut layer = MoHMamba::new(config.embed_dim, config.num_heads, &config.head_selection);
+                    layer.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
+                    layer
+                })),
+                TemporalMixingType::Mamba2 => TemporalMixingLayer::Mamba2MoH(Box::new({
+                    let mut layer = MoHMamba2::new(config.embed_dim, config.num_heads, &config.head_selection);
+                    layer.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
+                    layer
+                })),
                 TemporalMixingType::Titans => {
                     let mut attention = PolyAttention::new(
                         config.embed_dim,

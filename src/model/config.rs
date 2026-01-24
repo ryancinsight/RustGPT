@@ -5,6 +5,9 @@ use crate::{
     mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy},
 };
 
+use crate::richards::adaptive::AdaptiveScalar;
+
+/// Configuration for the Titan Memory module
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TitanMemoryConfig {
     #[serde(default = "titan_memory_enabled_default")]
@@ -377,6 +380,7 @@ impl ModelConfig {
                 switch_balance_weight: 0.0,
                 training_mode: crate::mixtures::gating::GatingTrainingMode::Coupled,
             },
+            moh_threshold_modulation: AdaptiveScalar::default(),
             attention: AttentionType::SelfAttention,
             temporal_mixing: TemporalMixingType::Attention,
             moe_router: None, // Default: no MoE (standard feedforward)

@@ -192,6 +192,13 @@ impl Layer for Mamba2 {
         self.inner.apply_gradients(gradients, learning_rate)
     }
 
+    fn set_training_progress(&mut self, progress: f64) {
+        self.moh.training_progress = progress;
+        for head in &mut self.heads {
+            head.set_training_progress(progress);
+        }
+    }
+
     fn zero_gradients(&mut self) {
         self.inner.zero_gradients();
     }

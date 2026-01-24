@@ -932,11 +932,14 @@ impl LLM {
                 };
 
                 // Compute training progress for adaptive MoH
-                let _training_progress = if epoch < warmup_epochs {
+                let training_progress = if epoch < warmup_epochs {
                     0.0
                 } else {
-                    (epoch - warmup_epochs) as f32 / (epochs - warmup_epochs) as f32
+                    (epoch - warmup_epochs) as f64 / (epochs - warmup_epochs) as f64
                 };
+                for layer in &mut self.network {
+                    layer.set_training_progress(training_progress);
+                }
                 // Process data in batches
                 for batch in tokenized_data.chunks(batch_size.max(1)) {
                     let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
@@ -3644,9 +3647,9 @@ impl LLM {
         epochs: usize,
         lr: f32,
         batch_size: usize,
-        ce_weight: f32,
+        ce_weight: AdaptiveScalar,
         validation_ratio: f32,
-        min_snr_gamma: f32,
+        min_snr_gamma: AdaptiveScalar,
         checkpoint_every: Option<usize>,
         checkpoint_dir: Option<String>,
         checkpoint_stage: Option<String>,
@@ -3727,44 +3730,6 @@ impl LLM {
         };
         let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
         let mut rng = get_rng();
-        let min_snr_gamma = min_snr_gamma.max(1e-6);
-        // Base distribution (schedule/target-aware) + online adaptive reweighting (learned from
-        // data via per-timestep EMA difficulty). This keeps behavior largely self-tuning.
-        let base_weights_full: Vec<f32> =
-            if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                match timestep_strategy {
-                    DiffusionTimestepStrategy::MinSnr => (0..num_timesteps)
-                        .map(|t| b0.min_snr_weight(t, min_snr_gamma).max(1e-12))
-                        .collect(),
-                    DiffusionTimestepStrategy::EdmLogNormal => {
-                        // EDM log-normal sampling over σ, discretized over timesteps.
-                        let p_mean: f32 = -1.2;
-                        let p_std: f32 = 1.2;
-                        let norm_const: f32 = 1.0 / (p_std * (2.0 * std::f32::consts::PI).sqrt());
-                        (0..num_timesteps)
-                            .map(|t| {
-                                if t == 0 {
-                                    return 0.0;
-                                }
-                                let alpha_bar = b0
-                                    .noise_scheduler
-                                    .sqrt_alpha_cumprod(t)
-                                    .powi(2)
-                                    .clamp(1e-12, 1.0 - 1e-12);
-                                let sigma =
-                                    crate::layers::diffusion::edm::sigma_from_alpha_bar(alpha_bar)
-                                        .max(1e-6);
-                                let log_sigma = sigma.ln();
-                                let z = (log_sigma - p_mean) / p_std;
-                                (norm_const * (-0.5 * z * z).exp()).max(1e-12)
-                            })
-                            .collect()
-                    }
-                    DiffusionTimestepStrategy::Uniform => vec![1.0f32; num_timesteps],
-                }
-            } else {
-                vec![1.0f32; num_timesteps]
-            };
 
         let mut denoise_ema_per_t = vec![1.0f32; num_timesteps.max(1)];
         let mut denoise_cnt_per_t = vec![0u32; num_timesteps.max(1)];
@@ -3846,6 +3811,58 @@ impl LLM {
                 };
 
                 let mut weights = Vec::with_capacity(active_steps_epoch);
+                let training_progress = if epochs > warmup_epochs {
+                    (epoch.saturating_sub(warmup_epochs) as f64)
+                        / ((epochs.saturating_sub(warmup_epochs)).max(1) as f64)
+                } else {
+                    0.0
+                };
+                for layer in &mut self.network {
+                    layer.set_training_progress(training_progress);
+                }
+                let current_gamma = min_snr_gamma.value(training_progress);
+                let current_ce_weight = ce_weight.value(training_progress);
+
+                // Base distribution (schedule/target-aware) + online adaptive reweighting (learned from
+                // data via per-timestep EMA difficulty).
+                let base_weights_full: Vec<f32> =
+                    if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
+                        match timestep_strategy {
+                            DiffusionTimestepStrategy::MinSnr => (0..num_timesteps)
+                                .map(|t| b0.min_snr_weight(t, current_gamma).max(1e-12))
+                                .collect(),
+                            DiffusionTimestepStrategy::EdmLogNormal => {
+                                // EDM log-normal sampling over σ, discretized over timesteps.
+                                let p_mean: f32 = -1.2;
+                                let p_std: f32 = 1.2;
+                                let norm_const: f32 =
+                                    1.0 / (p_std * (2.0 * std::f32::consts::PI).sqrt());
+                                (0..num_timesteps)
+                                    .map(|t| {
+                                        if t == 0 {
+                                            return 0.0;
+                                        }
+                                        let alpha_bar = b0
+                                            .noise_scheduler
+                                            .sqrt_alpha_cumprod(t)
+                                            .powi(2)
+                                            .clamp(1e-12, 1.0 - 1e-12);
+                                        let sigma = crate::layers::diffusion::edm::sigma_from_alpha_bar(
+                                            alpha_bar,
+                                        )
+                                        .max(1e-6);
+                                        let log_sigma = sigma.ln();
+                                        let z = (log_sigma - p_mean) / p_std;
+                                        (norm_const * (-0.5 * z * z).exp()).max(1e-12)
+                                    })
+                                    .collect()
+                            }
+                            DiffusionTimestepStrategy::Uniform => vec![1.0f32; num_timesteps],
+                        }
+                    } else {
+                        vec![1.0f32; num_timesteps]
+                    };
+
                 for t in 0..active_steps_epoch {
                     let base = base_weights_full.get(t).copied().unwrap_or(1.0).max(1e-12);
                     let adapt_ready =
@@ -4160,7 +4177,7 @@ impl LLM {
                     let (denoise_target, w_mse_raw) = if discrete_used {
                         (None, 1.0f32)
                     } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                        let mut w = b0.min_snr_weight(t, min_snr_gamma);
+                        let mut w = b0.min_snr_weight(t, current_gamma);
                         if b0.prediction_target()
                             == crate::layers::diffusion::DiffusionPredictionTarget::EdmX0
                         {
@@ -4612,7 +4629,7 @@ impl LLM {
                 let (denoise_target, w_mse) = if discrete_used {
                     (None, 1.0f32)
                 } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                    let mut w = b0.min_snr_weight(t, min_snr_gamma);
+                    let mut w = b0.min_snr_weight(t, current_gamma);
                     if b0.prediction_target()
                         == crate::layers::diffusion::DiffusionPredictionTarget::EdmX0
                     {
@@ -4625,8 +4642,8 @@ impl LLM {
                 let ce = crate::loss::symmetric_cross_entropy(
                     &probs_slice.to_owned(),
                     target_ids,
-                    ce_weight,
-                    ce_weight,
+                    current_ce_weight,
+                    current_ce_weight,
                     1e-4,
                 );
                 let mse = if let Some(target) = denoise_target.as_ref() {

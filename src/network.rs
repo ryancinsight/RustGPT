@@ -35,6 +35,8 @@ pub trait Layer {
         learning_rate: f32,
     ) -> crate::errors::Result<()>;
     fn zero_gradients(&mut self);
+    /// Set training progress (0.0 to 1.0) for adaptive hyperparameters
+    fn set_training_progress(&mut self, _progress: f64) {}
 }
 
 /// Enumeration of all possible layer types in the network
@@ -90,6 +92,10 @@ impl Layer for LayerEnum {
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         delegate_to_variant!(self, forward, input)
+    }
+
+    fn set_training_progress(&mut self, progress: f64) {
+        delegate_to_variant!(self, set_training_progress, progress)
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {

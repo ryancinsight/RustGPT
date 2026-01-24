@@ -1666,6 +1666,10 @@ impl Layer for DiffusionBlock {
         self.forward_with_timestep(input, self.current_timestep)
     }
 
+    fn set_training_progress(&mut self, progress: f64) {
+        self.temporal_mixing.set_training_progress(progress);
+    }
+
     #[allow(dead_code)]
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);

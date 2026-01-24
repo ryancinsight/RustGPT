@@ -50,8 +50,51 @@ pub struct Args {
     #[arg(long, default_value_t = 0.5)]
     pub diffusion_ce_weight: f32,
 
+    /// Use adaptive (Richards curve) modulation for ce_weight.
+    /// If enabled, ce_weight acts as the peak value, modulated by a sigmoid schedule.
+    #[arg(long)]
+    pub diffusion_ce_weight_adaptive: bool,
+
+    /// Richards curve midpoint (0.0-1.0) for ce_weight adaptive modulation.
+    #[arg(long, default_value_t = 0.5)]
+    pub diffusion_ce_weight_curve_m: f32,
+
+    /// Richards curve steepness for ce_weight adaptive modulation.
+    #[arg(long, default_value_t = 5.0)]
+    pub diffusion_ce_weight_curve_k: f32,
+
     #[arg(long, default_value_t = 3.0)]
     pub diffusion_min_snr_gamma: f32,
+
+    /// Use adaptive (Richards curve) modulation for min_snr_gamma.
+    /// If enabled, min_snr_gamma acts as the peak value, modulated by a sigmoid schedule.
+    #[arg(long)]
+    pub diffusion_min_snr_gamma_adaptive: bool,
+
+    /// Richards curve midpoint (0.0-1.0) for min_snr_gamma adaptive modulation.
+    #[arg(long, default_value_t = 0.5)]
+    pub diffusion_min_snr_gamma_curve_m: f32,
+
+    /// Richards curve steepness for min_snr_gamma adaptive modulation.
+    #[arg(long, default_value_t = 5.0)]
+    pub diffusion_min_snr_gamma_curve_k: f32,
+
+    /// Base value for MoH threshold modulation (default: 1.0)
+    #[arg(long, default_value_t = 1.0)]
+    pub moh_threshold_modulation: f32,
+
+    /// Use adaptive (Richards curve) modulation for MoH threshold.
+    /// If enabled, threshold_modulation acts as the peak value, modulated by a sigmoid schedule.
+    #[arg(long)]
+    pub moh_threshold_modulation_adaptive: bool,
+
+    /// Richards curve midpoint (0.0-1.0) for MoH threshold adaptive modulation.
+    #[arg(long, default_value_t = 0.5)]
+    pub moh_threshold_modulation_curve_m: f32,
+
+    /// Richards curve steepness for MoH threshold adaptive modulation.
+    #[arg(long, default_value_t = 5.0)]
+    pub moh_threshold_modulation_curve_k: f32,
 
     #[arg(long, value_enum, default_value_t = DiffusionTargetCli::Epsilon)]
     pub diffusion_prediction_target: DiffusionTargetCli,

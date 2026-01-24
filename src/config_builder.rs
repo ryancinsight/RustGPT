@@ -73,6 +73,19 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     config.residual_hardneg_temperature = args.residual_hardneg_temperature.max(1e-6);
     config.residual_hardneg_bank_size = args.residual_hardneg_bank_size;
 
+    // Adaptive MoH threshold modulation
+    config.moh_threshold_modulation = if args.moh_threshold_modulation_adaptive {
+        let mut curve = crate::richards::RichardsCurve::default();
+        curve.m = Some(args.moh_threshold_modulation_curve_m as f64);
+        curve.k = Some(args.moh_threshold_modulation_curve_k as f64);
+        crate::richards::adaptive::AdaptiveScalar::Richards {
+            curve,
+            output_scale: args.moh_threshold_modulation,
+        }
+    } else {
+        crate::richards::adaptive::AdaptiveScalar::Fixed(args.moh_threshold_modulation)
+    };
+
     let num_heads = config.get_num_heads().max(1);
     if args.hard_heads {
         config.head_selection = crate::mixtures::moh::HeadSelectionStrategy::Fixed {

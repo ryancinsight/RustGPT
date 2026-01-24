@@ -275,6 +275,10 @@ pub struct TransformerBlockConfig {
     /// Head selection strategy for attention
     pub head_selection: HeadSelectionStrategy,
 
+    /// Adaptive scalar for MoH threshold modulation
+    #[serde(default)]
+    pub moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar,
+
     /// Temporal mixing mechanism (attention or RG-LRU)
     #[serde(default)]
     pub temporal_mixing: TemporalMixingType,
@@ -353,6 +357,7 @@ impl From<&TransformerBlockConfig> for CommonLayerConfig {
             use_moe: config.use_moe,
             moe_config: config.moe_config.clone(),
             head_selection: config.head_selection.clone(),
+            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
             temporal_mixing: config.temporal_mixing,
             titan_memory: config.titan_memory.clone(),
         }
@@ -554,6 +559,7 @@ impl TransformerBlock {
                 .as_ref()
                 .map(ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
+            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
             temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
             min_window_size: config.min_window_size,
@@ -647,7 +653,13 @@ impl Layer for TransformerBlock {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        let mut reuse_ffn_out_cache = None;
+        // For Layer trait compatibility, use current timestep set by set_timestep()
+        self.forward(input)
+    }
+
+    fn set_training_progress(&mut self, progress: f64) {
+        self.temporal_mixing.set_training_progress(progress);
+    }
         if let Ok(mut guard) = self.cached_intermediates.write()
             && let Some((_a, _b, _c, _d, _e, _f, ffn_out_arc)) = guard.take()
         {
@@ -1249,6 +1261,7 @@ mod tests {
                 top_p: 0.9,
                 soft_top_p_alpha: 15.0,
             },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
@@ -1291,6 +1304,7 @@ mod tests {
                 top_p: 0.9,
                 soft_top_p_alpha: 15.0,
             },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
