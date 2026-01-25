@@ -112,6 +112,7 @@ fn bench_forward_vs_transformer(c: &mut Criterion) {
         head_selection: HeadSelectionStrategy::Fixed {
             num_active: num_heads,
         },
+        moh_threshold_modulation: llm::richards::adaptive::AdaptiveScalar::default(),
         temporal_mixing: TemporalMixingType::Attention,
         use_adaptive_window: false,
         min_window_size: 16,

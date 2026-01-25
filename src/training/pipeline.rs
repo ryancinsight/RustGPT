@@ -184,7 +184,7 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         curve.m = Some(args.diffusion_ce_weight_curve_m as f64);
         curve.k = Some(args.diffusion_ce_weight_curve_k as f64);
         AdaptiveScalar::Richards {
-            curve,
+            curve: Box::new(curve),
             output_scale: args.diffusion_ce_weight,
         }
     } else {
@@ -197,7 +197,7 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> crat
         curve.m = Some(args.diffusion_min_snr_gamma_curve_m as f64);
         curve.k = Some(args.diffusion_min_snr_gamma_curve_k as f64);
         AdaptiveScalar::Richards {
-            curve,
+            curve: Box::new(curve),
             output_scale: args.diffusion_min_snr_gamma,
         }
     } else {

@@ -18,6 +18,7 @@ use crate::{
         MoHGating,
         moh::{HeadSelectionConfig, HeadSelectionStrategy},
     },
+    richards::AdaptiveScalar,
     model_config::TitanMemoryConfig,
     network::Layer,
 };
@@ -2570,7 +2571,8 @@ mod tests {
         pa.moh.head_selection_config.gating.top_p = 0.9;
         pa.moh.head_selection_config.gating.soft_top_p_alpha = 2.0;
         pa.moh.head_selection_config.max_heads = 1;
-        pa.moh.head_selection_config.threshold_modulation = 1.25;
+        pa.moh.head_selection_config.threshold_modulation =
+            crate::richards::adaptive::AdaptiveScalar::Fixed(1.25);
 
         let n = 4;
         let d = 32;

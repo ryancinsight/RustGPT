@@ -114,6 +114,7 @@ fn build_diffusion_layers(
                 .as_ref()
                 .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
+            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
             titan_memory: config.titan_memory.clone(),
             time_embed_dim: config.embedding_dim,
             num_timesteps: 1000,

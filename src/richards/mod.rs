@@ -1,4 +1,5 @@
 pub mod act;
+pub mod adaptive;
 pub mod curve;
 pub mod gate;
 pub mod glu;
@@ -12,5 +13,6 @@ pub use self::{
     gate::RichardsGate,
     glu::RichardsGlu,
     norm::RichardsNorm,
+    adaptive::AdaptiveScalar,
     types::Variant,
 };

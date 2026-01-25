@@ -375,6 +375,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             titan_memory: TitanMemoryConfig::default(),
             temporal_mixing: TemporalMixingType::Mamba,
         };
@@ -398,6 +399,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             titan_memory: TitanMemoryConfig::default(),
             temporal_mixing: TemporalMixingType::Mamba2,
         };

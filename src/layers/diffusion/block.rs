@@ -78,6 +78,8 @@ pub struct DiffusionBlockConfig {
     pub moe_config: Option<ExpertRouterConfig>,
     pub head_selection: HeadSelectionStrategy,
     #[serde(default)]
+    pub moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar,
+    #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
     pub time_embed_dim: usize,
     pub mask_token_id: Option<usize>,
@@ -830,6 +832,7 @@ impl DiffusionBlock {
             use_moe: config.use_moe,
             moe_config: config.moe_config.clone(),
             head_selection: config.head_selection.clone(),
+            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
             temporal_mixing: config.temporal_mixing,
             titan_memory: config.titan_memory.clone(),
         };
@@ -2078,6 +2081,7 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
             use_moe: t.use_moe,
             moe_config: t.moe_config,
             head_selection: t.head_selection,
+            moh_threshold_modulation: t.moh_threshold_modulation,
             titan_memory: t.titan_memory,
             time_embed_dim: t.embed_dim * 4,
             mask_token_id: None,
@@ -2246,6 +2250,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             titan_memory: TitanMemoryConfig::default(),
             time_embed_dim: 8,
             mask_token_id: None,
@@ -2441,6 +2446,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             titan_memory: TitanMemoryConfig::default(),
             time_embed_dim: 8,
             mask_token_id: None,

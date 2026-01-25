@@ -681,7 +681,10 @@ impl MoHGating {
         if self.head_selection_config.gating.use_learned_predictor {
             if let Some(pred) = &mut self.threshold_predictor {
                 let mut p = pred.predict_with_condition(&input.view(), None);
-                let mod_f = self.head_selection_config.threshold_modulation;
+                let mod_f = self
+                    .head_selection_config
+                    .threshold_modulation
+                    .value(self.training_progress);
                 p.mapv_inplace(|v| {
                     let v = if v.is_finite() { v } else { 0.0 };
                     (v * mod_f).max(0.0)
@@ -854,7 +857,10 @@ impl MoHGating {
 
                 // u = modulation * predictor_output (modulation is a scalar).
                 // Therefore dL/d(predictor_output) = modulation * dL/du.
-                let mod_f = self.head_selection_config.threshold_modulation;
+                let mod_f = self
+                    .head_selection_config
+                    .threshold_modulation
+                    .value(self.training_progress);
                 let mut d_p = d_u;
                 d_p.mapv_inplace(|v| v * mod_f);
 

@@ -653,13 +653,7 @@ impl Layer for TransformerBlock {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // For Layer trait compatibility, use current timestep set by set_timestep()
-        self.forward(input)
-    }
-
-    fn set_training_progress(&mut self, progress: f64) {
-        self.temporal_mixing.set_training_progress(progress);
-    }
+        let mut reuse_ffn_out_cache = None;
         if let Ok(mut guard) = self.cached_intermediates.write()
             && let Some((_a, _b, _c, _d, _e, _f, ffn_out_arc)) = guard.take()
         {
@@ -861,6 +855,10 @@ impl Layer for TransformerBlock {
         ));
 
         output
+    }
+
+    fn set_training_progress(&mut self, progress: f64) {
+        self.temporal_mixing.set_training_progress(progress);
     }
 
     #[allow(dead_code)]
@@ -1343,6 +1341,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
@@ -1377,6 +1376,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
@@ -1414,6 +1414,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
@@ -1458,6 +1459,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
@@ -1958,6 +1960,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,
@@ -2068,6 +2071,7 @@ mod tests {
                 switch_balance_weight: 0.0,
                 training_mode: GatingTrainingMode::Coupled,
             },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 16,

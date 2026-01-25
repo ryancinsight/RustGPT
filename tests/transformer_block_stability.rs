@@ -23,6 +23,7 @@ proptest! {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
+            moh_threshold_modulation: llm::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: llm::model_config::TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: seq_len,

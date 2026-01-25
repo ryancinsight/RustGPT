@@ -105,6 +105,7 @@ impl HRM {
                 .as_ref()
                 .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
             head_selection: config.head_selection.clone(),
+            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
             temporal_mixing: config.temporal_mixing,
             use_adaptive_window: config.use_adaptive_window,
             min_window_size: config.min_window_size,
@@ -484,6 +485,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: crate::model_config::TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 4,
@@ -524,6 +526,7 @@ mod tests {
             use_moe: false,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: crate::model_config::TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: 4,

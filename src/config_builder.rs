@@ -75,11 +75,11 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
 
     // Adaptive MoH threshold modulation
     config.moh_threshold_modulation = if args.moh_threshold_modulation_adaptive {
-        let mut curve = crate::richards::RichardsCurve::default();
+        let mut curve = crate::richards::RichardsCurve::new_default();
         curve.m = Some(args.moh_threshold_modulation_curve_m as f64);
         curve.k = Some(args.moh_threshold_modulation_curve_k as f64);
         crate::richards::adaptive::AdaptiveScalar::Richards {
-            curve,
+            curve: Box::new(curve),
             output_scale: args.moh_threshold_modulation,
         }
     } else {

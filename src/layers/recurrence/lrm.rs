@@ -109,6 +109,7 @@ impl Default for LRMConfig {
                 use_moe: false,
                 moe_config: None,
                 head_selection: crate::mixtures::HeadSelectionStrategy::Fixed { num_active: 8 },
+                moh_threshold_modulation: crate::richards::adaptive::AdaptiveScalar::default(),
                 temporal_mixing: crate::model_config::TemporalMixingType::Attention,
                 use_adaptive_window: false,
                 min_window_size: 512,
@@ -389,6 +390,7 @@ impl LRM {
                     .as_ref()
                     .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
                 head_selection: config.head_selection.clone(),
+                moh_threshold_modulation: config.moh_threshold_modulation.clone(),
                 titan_memory: config.titan_memory.clone(),
                 time_embed_dim: config.embedding_dim,
                 mask_token_id: None,
@@ -419,6 +421,7 @@ impl LRM {
                     .as_ref()
                     .map(crate::mixtures::moe::ExpertRouterConfig::from_router),
                 head_selection: config.head_selection.clone(),
+                moh_threshold_modulation: config.moh_threshold_modulation.clone(),
                 temporal_mixing: config.temporal_mixing,
                 use_adaptive_window: config.use_adaptive_window,
                 min_window_size: config.min_window_size,
