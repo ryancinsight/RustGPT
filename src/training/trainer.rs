@@ -1,4 +1,4 @@
-use crate::{errors::Result, llm::LLM};
+use crate::{errors::Result, llm::LLM, richards::AdaptiveScalar};
 
 /// Training functionality for language models
 pub struct Trainer;

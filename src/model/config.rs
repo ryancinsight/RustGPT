@@ -237,6 +237,10 @@ pub struct ModelConfig {
     /// Default: `Learned` gating with adaptive component selection
     pub head_selection: HeadSelectionStrategy,
 
+    /// Adaptive modulation of MoH activation thresholds.
+    #[serde(default)]
+    pub moh_threshold_modulation: AdaptiveScalar,
+
     /// Attention mechanism selection (SelfAttention vs PolyAttention)
     pub attention: AttentionType,
 

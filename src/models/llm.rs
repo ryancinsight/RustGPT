@@ -15,6 +15,7 @@ use crate::{
     metrics::text::corpus_bleu_1_2,
     model_config::DiffusionTimestepStrategy,
     network::{Layer, LayerEnum},
+    richards::AdaptiveScalar,
     rng::get_rng,
 };
 
@@ -3789,6 +3790,18 @@ impl LLM {
             };
             let effective_lr = base_lr * lr_scale;
 
+            let training_progress = if epochs > warmup_epochs {
+                (epoch.saturating_sub(warmup_epochs) as f64)
+                    / ((epochs.saturating_sub(warmup_epochs)).max(1) as f64)
+            } else {
+                0.0
+            };
+            for layer in &mut self.network {
+                layer.set_training_progress(training_progress);
+            }
+            let current_gamma = min_snr_gamma.value(training_progress);
+            let current_ce_weight = ce_weight.value(training_progress);
+
             // Epoch-level adaptive sampling CDF over the curriculum-active timesteps.
             let max_t_epoch =
                 ((num_timesteps as f32) * ((epoch + 1) as f32 / epochs as f32)).round() as usize;
@@ -3811,18 +3824,6 @@ impl LLM {
                 };
 
                 let mut weights = Vec::with_capacity(active_steps_epoch);
-                let training_progress = if epochs > warmup_epochs {
-                    (epoch.saturating_sub(warmup_epochs) as f64)
-                        / ((epochs.saturating_sub(warmup_epochs)).max(1) as f64)
-                } else {
-                    0.0
-                };
-                for layer in &mut self.network {
-                    layer.set_training_progress(training_progress);
-                }
-                let current_gamma = min_snr_gamma.value(training_progress);
-                let current_ce_weight = ce_weight.value(training_progress);
-
                 // Base distribution (schedule/target-aware) + online adaptive reweighting (learned from
                 // data via per-timestep EMA difficulty).
                 let base_weights_full: Vec<f32> =
@@ -4104,8 +4105,8 @@ impl LLM {
                     let sce = crate::loss::symmetric_cross_entropy(
                         &probs_slice.to_owned(),
                         target_ids,
-                        ce_weight * lambda_ce,
-                        ce_weight * lambda_ce,
+                        current_ce_weight * lambda_ce,
+                        current_ce_weight * lambda_ce,
                         1e-4,
                     );
 
@@ -4203,8 +4204,8 @@ impl LLM {
                     let sce_grads_slice = crate::loss::symmetric_cross_entropy_gradients(
                         &probs_slice.to_owned(),
                         target_ids,
-                        ce_weight * lambda_ce,
-                        ce_weight * lambda_ce,
+                        current_ce_weight * lambda_ce,
+                        current_ce_weight * lambda_ce,
                         1e-4,
                     );
                     grads_logits

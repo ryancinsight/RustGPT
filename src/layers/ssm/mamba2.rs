@@ -193,10 +193,7 @@ impl Layer for Mamba2 {
     }
 
     fn set_training_progress(&mut self, progress: f64) {
-        self.moh.training_progress = progress;
-        for head in &mut self.heads {
-            head.set_training_progress(progress);
-        }
+        self.inner.set_training_progress(progress);
     }
 
     fn zero_gradients(&mut self) {

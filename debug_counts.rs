@@ -19,6 +19,7 @@ fn main() {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
+        moh_threshold_modulation: llm::richards::adaptive::AdaptiveScalar::default(),
         temporal_mixing: llm::model_config::TemporalMixingType::Attention,
         use_adaptive_window: false,
         min_window_size: 512,
@@ -27,6 +28,7 @@ fn main() {
         entropy_ema_alpha: 0.2,
         use_advanced_adaptive_residuals: true,
         titan_memory: llm::model_config::TitanMemoryConfig::default(),
+        eprop_adaptor: None,
     };
     let mut tblock = TransformerBlock::new(tcfg.clone());
 

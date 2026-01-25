@@ -13,7 +13,7 @@ pub enum AdaptiveScalar {
     /// Value modulated by a Richards curve based on input signal (e.g., progress t)
     /// val(t) = curve(t)
     Richards {
-        curve: RichardsCurve,
+        curve: Box<RichardsCurve>,
         /// Optional scale factor to apply to curve output (default 1.0)
         output_scale: f32,
     },
@@ -40,7 +40,9 @@ impl AdaptiveScalar {
     /// Create a learnable adaptive scalar initialized with Richards curve defaults
     pub fn learned_curve() -> Self {
         Self::Richards {
-            curve: RichardsCurve::default(), // Default is sigmoid-like
+            curve: Box::new(RichardsCurve::new_learnable(
+                crate::richards::Variant::Sigmoid,
+            )),
             output_scale: 1.0,
         }
     }
