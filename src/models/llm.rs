@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument, warn};
 
 use crate::{
-    MAX_SEQ_LEN, Vocab,
+    Vocab,
     decoding::GreedyDecoder,
     errors::{ModelError, Result},
     layers::transformer::speculative::{SpeculativeMode, SpeculativeSamplingConfig},
@@ -755,6 +755,24 @@ impl LLM {
         self.vocab.decode_tokens_to_string(&output_tokens)
     }
 
+    pub fn max_sequence_len(&self) -> usize {
+        let mut max_len = 0usize;
+        for layer in &self.network {
+            let candidate = match layer {
+                LayerEnum::TransformerBlock(block) => Some(block.max_seq_len()),
+                LayerEnum::DiffusionBlock(block) => Some(block.max_seq_len()),
+                LayerEnum::LRM(lrm) => lrm.max_seq_len(),
+                _ => None,
+            };
+            if let Some(len) = candidate {
+                if len > max_len {
+                    max_len = len;
+                }
+            }
+        }
+        max_len
+    }
+
     #[inline]
     fn forward(&mut self, text: &str) -> Vec<usize> {
         // Tokenize the input text (reuse a scratch Vec to avoid repeated allocations).
@@ -771,24 +789,25 @@ impl LLM {
         }
 
         let input_len = tokenized.len();
+        let max_seq_len = self.max_sequence_len().max(input_len.max(1));
 
         // Pre-allocate to avoid repeated growth reallocations during generation.
-        output_tokens.reserve(MAX_SEQ_LEN.saturating_sub(input_len));
+        output_tokens.reserve(max_seq_len.saturating_sub(input_len));
 
         // Hoist EOS lookup out of the loop.
         let eos_token = self.vocab.encode("</s>");
 
-        // Prevent overflow if input_len >= MAX_SEQ_LEN
-        if input_len >= MAX_SEQ_LEN {
+        // Prevent overflow if input_len >= max_seq_len
+        if input_len >= max_seq_len {
             self.tokenize_scratch = tokenized;
             return output_tokens;
         }
 
-        for _ in 0..(MAX_SEQ_LEN - input_len) {
+        for _ in 0..(max_seq_len - input_len) {
             // let tokenized_clone = tokenized.clone();
 
             // Check if we're approaching the maximum sequence length
-            if output_tokens.len() >= MAX_SEQ_LEN - 1 {
+            if output_tokens.len() >= max_seq_len.saturating_sub(1) {
                 break;
             }
 

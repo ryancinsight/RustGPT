@@ -3,7 +3,7 @@ use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EMBEDDING_DIM, Vocab, adam::Adam, model_config::TitanMemoryConfig, network::Layer, rng::get_rng,
+    Vocab, adam::Adam, model_config::{ModelConfig, TitanMemoryConfig}, network::Layer, rng::get_rng,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -20,23 +20,28 @@ pub struct TokenEmbeddings {
 
 impl Default for TokenEmbeddings {
     fn default() -> Self {
-        Self::new(Vocab::default())
+        let embedding_dim = ModelConfig::default().embedding_dim;
+        Self::new(Vocab::default(), embedding_dim)
     }
 }
 
 impl TokenEmbeddings {
-    pub fn new(vocab: Vocab) -> Self {
-        Self::new_with_titan_memory(vocab, TitanMemoryConfig::default())
+    pub fn new(vocab: Vocab, embedding_dim: usize) -> Self {
+        Self::new_with_titan_memory(vocab, TitanMemoryConfig::default(), embedding_dim)
     }
 
-    pub fn new_with_titan_memory(vocab: Vocab, titan_memory: TitanMemoryConfig) -> Self {
+    pub fn new_with_titan_memory(
+        vocab: Vocab,
+        titan_memory: TitanMemoryConfig,
+        embedding_dim: usize,
+    ) -> Self {
         let vocab_size = vocab.size();
         Self {
-            token_embeddings: Self::init_embeddings(vocab_size, EMBEDDING_DIM),
+            token_embeddings: Self::init_embeddings(vocab_size, embedding_dim),
             cached_token_ids: None,
             cached_input_dim: None,
             titan_memory,
-            token_optimizer: Adam::new((vocab_size, EMBEDDING_DIM)),
+            token_optimizer: Adam::new((vocab_size, embedding_dim)),
         }
     }
 
@@ -414,7 +419,8 @@ mod tests {
             engram_enabled: false,
             ..Default::default()
         };
-        let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, cfg);
+        let embedding_dim = ModelConfig::default().embedding_dim;
+        let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, cfg, embedding_dim);
 
         let ids = vec![0usize, 1, 2, 3, 4, 5];
         let input = make_token_id_input(&ids);
@@ -439,7 +445,8 @@ mod tests {
             engram_num_heads: 3,
             ..Default::default()
         };
-        let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, cfg);
+        let embedding_dim = ModelConfig::default().embedding_dim;
+        let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, cfg, embedding_dim);
 
         let ids = vec![1usize, 2, 3, 1];
         let input = make_token_id_input(&ids);

@@ -1,5 +1,4 @@
 use crate::{
-    EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN,
     cli::Args,
     model_config::{ArchitectureType, AttentionType, ModelConfig, WindowAdaptationStrategy},
 };
@@ -24,8 +23,15 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     let window_adaptation_strategy = WindowAdaptationStrategy::AttentionEntropy;
 
     // Create base configuration
-    let mut config =
-        ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 1, MAX_SEQ_LEN, None, Some(8));
+    let base_config = ModelConfig::default();
+    let mut config = ModelConfig::transformer(
+        base_config.embedding_dim,
+        base_config.hidden_dim,
+        1,
+        base_config.max_seq_len,
+        base_config.hypernetwork_hidden_dim,
+        base_config.num_heads,
+    );
 
     // Apply architecture-specific settings
     config.architecture = architecture;
@@ -109,7 +115,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
         config.moe_router = Some(crate::mixtures::moe::ExpertRouter::LearnedMoE {
             num_experts: 4,
             num_active_experts: 2,
-            expert_hidden_dim: HIDDEN_DIM / 2,
+            expert_hidden_dim: config.hidden_dim / 2,
             load_balance_weight: 0.01,
             sparsity_weight: 0.001,
             diversity_weight: 0.005,

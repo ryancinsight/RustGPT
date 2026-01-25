@@ -449,6 +449,13 @@ impl LRM {
         Self::new(c)
     }
 
+    pub fn max_seq_len(&self) -> Option<usize> {
+        match &self.config.block_config {
+            BlockTypeConfig::Transformer(cfg) => Some(cfg.max_pos),
+            BlockTypeConfig::Diffusion(cfg) => Some(cfg.max_pos),
+        }
+    }
+
     pub fn attention(&self) -> PolyAttentionReadGuard<'_> {
         PolyAttentionReadGuard {
             guard: self.block.read().unwrap(),

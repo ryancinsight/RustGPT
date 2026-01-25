@@ -2,7 +2,6 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 
 use crate::{
-    MAX_SEQ_LEN,
     adam::Adam,
     attention::{head::PolyHead, position::cope::CoPE},
     mixtures::{
@@ -16,11 +15,13 @@ use crate::{
 /// Configuration utilities for PolyAttention initialization and setup
 /// Provides modular functions for initializing different components of attention layers
 /// Initialize polynomial attention parameters (a, b, scale)
-pub fn init_polynomial_params() -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
+pub fn init_polynomial_params(
+    max_seq_len: usize,
+) -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
     let a = Array2::<f32>::from_shape_vec((1, 1), vec![1.0]).unwrap();
     let b = Array2::<f32>::from_shape_vec((1, 1), vec![0.0]).unwrap();
-    let scale =
-        Array2::<f32>::from_shape_vec((1, 1), vec![1.0 / (MAX_SEQ_LEN as f32).sqrt()]).unwrap();
+    let denom = max_seq_len.max(1) as f32;
+    let scale = Array2::<f32>::from_shape_vec((1, 1), vec![1.0 / denom.sqrt()]).unwrap();
 
     let opt_a = Adam::new((1, 1));
     let opt_b = Adam::new((1, 1));
