@@ -416,6 +416,10 @@ impl TransformerBlock {
         }
     }
 
+    pub fn max_seq_len(&self) -> usize {
+        self.config.max_pos.saturating_add(1)
+    }
+
     pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
         &self.activation_similarity_matrix
     }

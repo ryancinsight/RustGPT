@@ -898,6 +898,10 @@ impl DiffusionBlock {
         }
     }
 
+    pub fn max_seq_len(&self) -> usize {
+        self.config.max_pos.saturating_add(1)
+    }
+
     /// Get the cached intermediates
     pub fn get_cache(&self) -> Option<DiffusionCachedIntermediates> {
         self.cached_intermediates.read().unwrap().clone()

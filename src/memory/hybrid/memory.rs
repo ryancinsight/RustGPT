@@ -199,7 +199,11 @@ impl HybridMemory {
 
             let input_norm = x_t.mapv(|x| x * x).sum().sqrt();
 
-            let surprise = if input_norm > 1e-6 {
+            let surprise = if input_norm.is_finite()
+                && engram_norm.is_finite()
+                && titans_norm.is_finite()
+                && input_norm > 1e-6
+            {
                 ((engram_norm - input_norm).abs() + (titans_norm - input_norm).abs()) / 2.0
             } else {
                 0.0

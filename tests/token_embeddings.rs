@@ -11,9 +11,10 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
         engram_enabled: false,
         ..Default::default()
     };
-    let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory);
+    let embedding_dim = llm::model_config::ModelConfig::default().embedding_dim;
+    let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory, embedding_dim);
     // Make embeddings deterministic for assertions.
-    emb.token_embeddings = Array2::from_shape_fn((vocab_size, llm::EMBEDDING_DIM), |(i, j)| {
+    emb.token_embeddings = Array2::from_shape_fn((vocab_size, embedding_dim), |(i, j)| {
         (i * 1000 + j) as f32
     });
 
@@ -25,20 +26,20 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
 
     assert_eq!(out[[0, 0]], 0.0);
     assert_eq!(
-        out[[0, llm::EMBEDDING_DIM - 1]],
-        (llm::EMBEDDING_DIM - 1) as f32
+        out[[0, embedding_dim - 1]],
+        (embedding_dim - 1) as f32
     );
 
     assert_eq!(out[[1, 0]], 0.0);
     assert_eq!(
-        out[[1, llm::EMBEDDING_DIM - 1]],
-        (llm::EMBEDDING_DIM - 1) as f32
+        out[[1, embedding_dim - 1]],
+        (embedding_dim - 1) as f32
     );
 
     assert_eq!(out[[2, 0]], (last * 1000) as f32);
     assert_eq!(
-        out[[2, llm::EMBEDDING_DIM - 1]],
-        (last * 1000 + (llm::EMBEDDING_DIM - 1)) as f32
+        out[[2, embedding_dim - 1]],
+        (last * 1000 + (embedding_dim - 1)) as f32
     );
 }
 
@@ -52,14 +53,15 @@ fn token_embeddings_compute_gradients_accumulates_repeated_tokens() {
         engram_enabled: false,
         ..Default::default()
     };
-    let emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory);
+    let embedding_dim = llm::model_config::ModelConfig::default().embedding_dim;
+    let emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory, embedding_dim);
 
     // token ids: [1, 1, 2]
     let input = Array2::from_shape_vec((1, 3), vec![1.0, 1.0, 2.0]).unwrap();
 
     // grads per position: row0=1, row1=2, row2=3
-    let mut output_grads = Array2::<f32>::zeros((3, llm::EMBEDDING_DIM));
-    for j in 0..llm::EMBEDDING_DIM {
+    let mut output_grads = Array2::<f32>::zeros((3, embedding_dim));
+    for j in 0..embedding_dim {
         output_grads[[0, j]] = 1.0;
         output_grads[[1, j]] = 2.0;
         output_grads[[2, j]] = 3.0;
@@ -73,13 +75,13 @@ fn token_embeddings_compute_gradients_accumulates_repeated_tokens() {
 
     assert_eq!(param_grads.len(), 1);
     let token_grads = &param_grads[0];
-    assert_eq!(token_grads.dim(), (vocab_size, llm::EMBEDDING_DIM));
+    assert_eq!(token_grads.dim(), (vocab_size, embedding_dim));
 
     // token 1 accumulates rows 0 and 1 => 3.0, token 2 accumulates row 2 => 3.0
     assert_eq!(token_grads[[1, 0]], 3.0);
-    assert_eq!(token_grads[[1, llm::EMBEDDING_DIM - 1]], 3.0);
+    assert_eq!(token_grads[[1, embedding_dim - 1]], 3.0);
     assert_eq!(token_grads[[2, 0]], 3.0);
-    assert_eq!(token_grads[[2, llm::EMBEDDING_DIM - 1]], 3.0);
+    assert_eq!(token_grads[[2, embedding_dim - 1]], 3.0);
 
     // token 0 should be untouched.
     assert_eq!(token_grads[[0, 0]], 0.0);

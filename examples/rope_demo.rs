@@ -1,6 +1,4 @@
-use llm::{
-    EMBEDDING_DIM, HIDDEN_DIM, LLM, ModelConfig, Vocab, build_network, print_architecture_summary,
-};
+use llm::{LLM, ModelConfig, Vocab, build_network, print_architecture_summary};
 
 /// Demonstrate the Transformer model architecture available in RustGPT
 ///
@@ -10,8 +8,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("======================================\n");
 
     // Create configuration
-    let config_transformer =
-        ModelConfig::transformer(EMBEDDING_DIM, HIDDEN_DIM, 2, 80, None, Some(8));
+    let base_config = ModelConfig::default();
+    let config_transformer = ModelConfig::transformer(
+        base_config.embedding_dim,
+        base_config.hidden_dim,
+        2,
+        base_config.max_seq_len,
+        base_config.hypernetwork_hidden_dim,
+        base_config.num_heads,
+    );
 
     println!("Configuration:");
     println!("-------------");

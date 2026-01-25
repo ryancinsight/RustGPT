@@ -282,7 +282,8 @@ impl PolyAttention {
         // Initialize all components using configuration utilities
         let heads = init_attention_heads(embed_dim, num_heads);
         let (w_out, opt_w_out) = init_output_projection(embed_dim);
-        let (a, b, scale, opt_a, opt_b, opt_scale) = init_polynomial_params();
+        let max_seq_len = max_pos.saturating_add(1);
+        let (a, b, scale, opt_a, opt_b, opt_scale) = init_polynomial_params(max_seq_len);
         let (w_g, alpha_g, beta_g, opt_w_g, opt_alpha_g, opt_beta_g) =
             init_gating_params(embed_dim, num_heads);
         let cope = init_cope(max_pos, head_dim);

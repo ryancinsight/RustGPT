@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use clap::Parser;
-use llm::{LLM, MAX_SEQ_LEN};
+use llm::LLM;
 
 #[derive(Parser, Debug)]
 #[command(name = "infer")]
@@ -24,7 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut llm = LLM::load_versioned(&args.model)?;
     println!(
         "Loaded model from {} (max seq len: {}).",
-        &args.model, MAX_SEQ_LEN
+        &args.model,
+        llm.max_sequence_len()
     );
     println!("Network: {}", llm.network_description());
     println!("Total parameters: {}", llm.total_parameters());
