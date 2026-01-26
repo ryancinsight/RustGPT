@@ -78,3 +78,7 @@ codegen-units = 1
 
 [profile.bench]
 inherits = "release"
+
+[[bench]]
+name = "inference"
+harness = false
