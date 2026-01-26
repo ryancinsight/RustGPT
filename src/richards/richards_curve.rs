@@ -1118,15 +1118,62 @@ impl RichardsCurve {
     pub fn update_scaling_from_max_abs(&self, max_abs_x: f64) -> Self {
         // Only update if scale and shift are fixed (not learnable)
         if self.scale.is_some() && self.shift.is_some() {
-            let mut updated = self.clone();
-            if max_abs_x > 0.0 {
-                updated.scale = Some((1.0 / max_abs_x).min(0.5));
-                updated.shift = Some(0.0);
+            let (scale, shift) = if max_abs_x > 0.0 {
+                (Some((1.0 / max_abs_x).min(0.5)), Some(0.0))
             } else {
-                updated.scale = Some(1.0);
-                updated.shift = Some(0.0);
+                (Some(1.0), Some(0.0))
+            };
+
+            // Lightweight clone: Copy scalars, skip heavy heap allocations (optimizer, history, etc.)
+            // This is safe because the returned instance is only used for temporary scalar evaluation
+            // in MoHGating, not for training or matrix operations that would need gamma/bias.
+            Self {
+                nu: self.nu,
+                k: self.k,
+                m: self.m,
+                beta: self.beta,
+                temperature: self.temperature,
+                output_gain: self.output_gain,
+                output_bias: self.output_bias,
+                scale, // Updated
+                shift, // Updated
+                birch_exponential_tail: self.birch_exponential_tail,
+                gamma: None,      // Heavy, unused for scalar forward
+                bias: None,       // Heavy, unused for scalar forward
+                poly_power: self.poly_power,
+                poly_coeffs: None, // Heavy, unused for scalar forward (mostly)
+                learned_nu: self.learned_nu,
+                learned_k: self.learned_k,
+                learned_m: self.learned_m,
+                learned_beta: self.learned_beta,
+                learned_temperature: self.learned_temperature,
+                learned_output_gain: self.learned_output_gain,
+                learned_output_bias: self.learned_output_bias,
+                learned_scale: self.learned_scale,
+                learned_shift: self.learned_shift,
+                nu_learnable: self.nu_learnable,
+                k_learnable: self.k_learnable,
+                m_learnable: self.m_learnable,
+                beta_learnable: self.beta_learnable,
+                temperature_learnable: self.temperature_learnable,
+                output_gain_learnable: self.output_gain_learnable,
+                output_bias_learnable: self.output_bias_learnable,
+                scale_learnable: self.scale_learnable,
+                shift_learnable: self.shift_learnable,
+                gamma_learnable: self.gamma_learnable,
+                bias_learnable: self.bias_learnable,
+                variant: self.variant,
+                running_sum: None,    // Unused for scalar forward
+                running_sq_sum: None, // Unused for scalar forward
+                count: None,          // Unused for scalar forward
+                momentum: self.momentum,
+                adaptive_scale: self.adaptive_scale,
+                adaptive_shift: self.adaptive_shift,
+                optimizer: None, // Heavy
+                l2_reg: self.l2_reg,
+                adaptive_lr_scale: self.adaptive_lr_scale,
+                grad_norm_history: Vec::new(), // Heavy
             }
-            updated
         } else {
             self.clone()
         }
