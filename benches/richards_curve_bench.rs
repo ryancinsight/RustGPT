@@ -1,5 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use llm::richards::{RichardsCurve, Variant};
+use ndarray::Array2;
+use rand::Rng;
 
 fn bench_update_scaling(c: &mut Criterion) {
     let mut curve = RichardsCurve::new_learnable(Variant::Sigmoid);
@@ -26,5 +28,22 @@ fn bench_update_scaling(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_update_scaling);
+fn bench_grad_weights_matrix(c: &mut Criterion) {
+    let curve = RichardsCurve::new_learnable(Variant::Sigmoid);
+    let batch_size = 64;
+    let dim = 128;
+
+    // We use a simple RNG for setup
+    let mut rng = rand::rng();
+    let x = Array2::from_shape_fn((batch_size, dim), |(_i, _j)| rng.random::<f64>());
+    let grad = Array2::from_shape_fn((batch_size, dim), |(_i, _j)| rng.random::<f64>());
+
+    c.bench_function("grad_weights_matrix", |b| {
+        b.iter(|| {
+             black_box(curve.grad_weights_matrix(black_box(&x), black_box(&grad)));
+        })
+    });
+}
+
+criterion_group!(benches, bench_update_scaling, bench_grad_weights_matrix);
 criterion_main!(benches);
