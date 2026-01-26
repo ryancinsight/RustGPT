@@ -3,7 +3,10 @@ use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use super::neural::{MemoryWeights, NeuralMemory};
-use crate::{attention::poly_attention::PolyAttention, network::Layer};
+use crate::{
+    attention::poly_attention::{PolyAttention, PolyAttentionCache},
+    network::Layer,
+};
 
 /// Memory As Context (MAC) Architecture
 ///
@@ -35,6 +38,7 @@ pub struct TitansMAC {
 #[derive(Clone, Debug)]
 struct SegmentForwardData {
     seg_out: Array2<f32>,
+    poly_cache: Option<PolyAttentionCache>,
 }
 
 impl TitansMAC {
@@ -65,7 +69,10 @@ impl TitansMAC {
     }
 
     // Helper to retrieve and concat
-    fn process_segment(&mut self, segment: &Array2<f32>) -> Array2<f32> {
+    fn process_segment(
+        &mut self,
+        segment: &Array2<f32>,
+    ) -> (Array2<f32>, Option<PolyAttentionCache>) {
         // 1. Retrieve h_t from Memory using input context (segment) as query.
         let h_t = self.memory.retrieve(segment);
 
@@ -89,6 +96,7 @@ impl TitansMAC {
 
         // 3. Pass to Attention
         let attention_output = self.core.forward(&context_input);
+        let poly_cache = self.core.take_cache();
 
         let segment_output = attention_output
             .slice(s![p_len + s_len..total_len, ..])
@@ -97,7 +105,7 @@ impl TitansMAC {
         // 5. Update Memory using Attention output (segment part)
         self.memory.update(&segment_output);
 
-        segment_output
+        (segment_output, poly_cache)
     }
 }
 
@@ -122,10 +130,13 @@ impl Layer for TitansMAC {
             let end = std::cmp::min(processed + self.segment_len, seq_len);
             let segment = input.slice(s![processed..end, ..]).to_owned();
 
-            let seg_out = self.process_segment(&segment);
+            let (seg_out, poly_cache) = self.process_segment(&segment);
             outputs.push(seg_out.clone());
 
-            forward_data.push(SegmentForwardData { seg_out });
+            forward_data.push(SegmentForwardData {
+                seg_out,
+                poly_cache,
+            });
 
             processed = end;
         }
@@ -489,11 +500,22 @@ impl Layer for TitansMAC {
                 .slice_mut(s![p_len + s_len..total_len, ..])
                 .assign(&d_seg_out_total);
 
-            // We need a Core instance with correct cache.
-            // We can clone `self.core`, run forward baseline to populate cache, then backward.
-            let mut core_clone = self.core.clone();
-            let _ = core_clone.forward_impl_baseline(&data.context, true);
-            let (d_context, core_pg) = core_clone.compute_gradients(&data.context, &d_context_out);
+            // Use cached state if available
+            let poly_cache = if let Some(cached_data) = &self.cached_forward_data {
+                cached_data.get(_seg_idx).and_then(|d| d.poly_cache.as_ref())
+            } else {
+                None
+            };
+
+            let (d_context, core_pg) = if let Some(cache) = poly_cache {
+                self.core
+                    .compute_gradients_with_cache(cache, &d_context_out)
+            } else {
+                // Fallback: clone core and run forward (expensive but correct)
+                let mut core_clone = self.core.clone();
+                let _ = core_clone.forward_impl_baseline(&data.context, true);
+                core_clone.compute_gradients(&data.context, &d_context_out)
+            };
 
             // Add core_pg to accumulators
             if core_param_grads_accum.is_empty() {
