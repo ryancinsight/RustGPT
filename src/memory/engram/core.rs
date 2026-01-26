@@ -131,10 +131,10 @@ impl EngramMemory {
                         .for_each(|a, b| *a += *b);
                 } else {
                     let embedding = self.embedding.lookup(hash_idx);
-                    self.cache.insert(hash_idx, embedding.clone());
                     Zip::from(&mut self.scratch_sum)
                         .and(&embedding)
                         .for_each(|a, b| *a += *b);
+                    self.cache.insert(hash_idx, embedding);
                 }
                 count += 1;
             }
