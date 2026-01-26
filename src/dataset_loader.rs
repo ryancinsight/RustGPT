@@ -45,6 +45,11 @@ impl Dataset {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct TextRow {
+    text: String,
+}
+
 fn get_data_from_json(path: &str) -> Result<Vec<String>> {
     // File size validation
     let metadata = fs::metadata(path).map_err(ModelError::from)?;
@@ -65,6 +70,14 @@ fn get_data_from_json(path: &str) -> Result<Vec<String>> {
     match serde_json::from_reader::<_, Vec<String>>(&mut reader) {
         Ok(strict) => Ok(strict),
         Err(_) => {
+            reader.seek(std::io::SeekFrom::Start(0))?;
+
+            // Optimization: Try to parse as array of objects with "text" field directly
+            // This avoids the overhead of parsing into generic Value enums
+            if let Ok(rows) = serde_json::from_reader::<_, Vec<TextRow>>(&mut reader) {
+                return Ok(rows.into_iter().map(|r| r.text).collect());
+            }
+
             reader.seek(std::io::SeekFrom::Start(0))?;
 
             let parsed = serde_json::from_reader::<_, Vec<serde_json::Value>>(&mut reader);
