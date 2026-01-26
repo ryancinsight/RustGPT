@@ -3801,6 +3801,12 @@ impl LLM {
 
         // Warmup epochs default to 15% of total for stability
         let warmup_epochs = ((epochs as f32) * 0.15).ceil() as usize;
+
+        // Split data into training and validation sets
+        let val_start = (data.len() as f32 * (1.0 - validation_ratio)).floor() as usize;
+        let train_data = &data[..val_start];
+        let val_data = &data[val_start..];
+
         for epoch in 0..epochs {
             let t_epoch_start = std::time::Instant::now();
             // Learning rate warmup + cosine annealing (SGDR)
@@ -3924,7 +3930,7 @@ impl LLM {
             let mut count = 0usize;
             let mut total_grad_norm_sq = 0.0f32;
 
-            for batch_strs in data.chunks(effective_batch_size) {
+            for batch_strs in train_data.chunks(effective_batch_size) {
                 let batch_tokenized: Vec<Vec<usize>> = batch_strs
                     .par_iter()
                     .map(|input| self.tokenize(input))
@@ -4527,14 +4533,11 @@ impl LLM {
                 }
             }
             // Validation split (last 10% examples)
-            let val_start =
-                (data.len() as f32 * (1.0 - validation_ratio)).floor() as usize;
             let mut val_loss_total = 0.0f32;
             let mut val_sce_total = 0.0f32;
             let mut val_mse_total = 0.0f32;
             let mut val_count = 0usize;
 
-            let val_data = &data[val_start..];
             for batch_strs in val_data.chunks(effective_batch_size) {
                 let batch_tokenized: Vec<Vec<usize>> = batch_strs
                     .par_iter()
