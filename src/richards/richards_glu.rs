@@ -106,36 +106,47 @@ impl Layer for RichardsGlu {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        let x1 = self
-            .cached_x1
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| input.dot(&self.w1));
-        let x2 = self
-            .cached_x2
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| input.dot(&self.w2));
-        let value = self
-            .cached_swish
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| self.richards_activation.forward_matrix_f32(&x1));
-        // Compute gate values
-        let gate_sigma = self.gate.forward_const(&x2);
+        let x1_owned;
+        let x1 = if let Some(ref c) = self.cached_x1 {
+            c
+        } else {
+            x1_owned = input.dot(&self.w1);
+            &x1_owned
+        };
 
-        let gated = self
-            .cached_gated
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| &value * &gate_sigma);
+        let x2_owned;
+        let x2 = if let Some(ref c) = self.cached_x2 {
+            c
+        } else {
+            x2_owned = input.dot(&self.w2);
+            &x2_owned
+        };
+
+        let value_owned;
+        let value = if let Some(ref c) = self.cached_swish {
+            c
+        } else {
+            value_owned = self.richards_activation.forward_matrix_f32(x1);
+            &value_owned
+        };
+
+        // Compute gate values
+        let gate_sigma = self.gate.forward_const(x2);
+
+        let gated_owned;
+        let gated = if let Some(ref c) = self.cached_gated {
+            c
+        } else {
+            gated_owned = value * &gate_sigma;
+            &gated_owned
+        };
 
         // Gradients wrt parameters
         let grad_w_out = gated.t().dot(output_grads);
         let grad_gated = output_grads.dot(&self.w_out.t());
 
         let grad_value = &grad_gated * &gate_sigma;
-        let grad_gate_sigma = &grad_gated * &value;
+        let grad_gate_sigma = &grad_gated * value;
 
         // Compute gradients through RichardsActivation / RichardsGate (row by row)
         let mut grad_x1 = Array2::<f32>::zeros(x1.raw_dim());
@@ -200,18 +211,18 @@ impl Layer for RichardsGlu {
 
         // Compute RichardsActivation gradients (value function) in one shot.
         // value(x) = x * curve(x) => dL/d(curve(x)) = x * dL/d(value).
-        let curve_output_grads = &x1 * &grad_value;
+        let curve_output_grads = x1 * &grad_value;
         let value_grads = self
             .richards_activation
             .richards_curve
-            .grad_weights_matrix_f32(&x1, &curve_output_grads);
+            .grad_weights_matrix_f32(x1, &curve_output_grads);
         let mut value_grads_sum = Array2::<f32>::zeros((1, value_grads.len()));
         for (k, &g) in value_grads.iter().enumerate() {
             value_grads_sum[[0, k]] = g as f32;
         }
 
         // Compute RichardsGate gradients using the gate's own gradient computation
-        let (_, gate_param_grads) = self.gate.compute_gradients(&x2, &grad_gate_sigma);
+        let (_, gate_param_grads) = self.gate.compute_gradients(x2, &grad_gate_sigma);
 
         param_grads.push(value_grads_sum);
         param_grads.extend(gate_param_grads);
