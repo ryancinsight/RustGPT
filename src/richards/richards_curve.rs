@@ -1458,6 +1458,8 @@ impl RichardsCurve {
         let scalar_param_count = self.scalar_weights_len();
         let total_elements = (batch_size * embedding_dim) as f64;
 
+        debug_assert!(scalar_param_count <= MAX_SCALAR_PARAMS);
+
         // Parallel accumulation of scalar parameter gradients
         // We iterate over the underlying slices if possible for max speed.
         // Some call sites pass non-contiguous views; handle those without panicking.
@@ -1469,9 +1471,10 @@ impl RichardsCurve {
                     .fold(
                         || vec![0.0f64; scalar_param_count],
                         |mut acc, (&xi, &dy)| {
-                            let param_grads = self.grad_weights_scalar(xi, dy);
+                            let mut buf = [0.0f64; MAX_SCALAR_PARAMS];
+                            self.grad_weights_scalar_into(xi, dy, &mut buf[..scalar_param_count]);
                             for i in 0..scalar_param_count {
-                                acc[i] += param_grads[i];
+                                acc[i] += buf[i];
                             }
                             acc
                         },
@@ -1488,9 +1491,10 @@ impl RichardsCurve {
             } else {
                 let mut acc = vec![0.0f64; scalar_param_count];
                 for (&xi, &dy) in x.iter().zip(output_grads.iter()) {
-                    let param_grads = self.grad_weights_scalar(xi, dy);
+                    let mut buf = [0.0f64; MAX_SCALAR_PARAMS];
+                    self.grad_weights_scalar_into(xi, dy, &mut buf[..scalar_param_count]);
                     for i in 0..scalar_param_count {
-                        acc[i] += param_grads[i];
+                        acc[i] += buf[i];
                     }
                 }
                 acc
