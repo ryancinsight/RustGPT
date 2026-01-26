@@ -31,6 +31,9 @@ impl EngramCache {
     }
 
     pub fn get(&mut self, hash_idx: usize) -> Option<&Array1<f32>> {
+        if self.tier_1_size == 0 && self.tier_2_size == 0 {
+            return None;
+        }
         if self.tier_1.contains_key(&hash_idx) {
             self.tier_1_hits += 1;
             return self.tier_1.get(&hash_idx);
@@ -39,8 +42,16 @@ impl EngramCache {
         self.tier_1_misses += 1;
         if let Some(embedding) = self.tier_2.get(&hash_idx).cloned() {
             self.tier_2_hits += 1;
-            self.tier_1.insert(hash_idx, embedding);
-            return self.tier_1.get(&hash_idx);
+            if self.tier_1_size > 0 {
+                if self.tier_1.len() >= self.tier_1_size {
+                    if let Some(key) = self.tier_1.keys().next().copied() {
+                        self.tier_1.remove(&key);
+                    }
+                }
+                self.tier_1.insert(hash_idx, embedding);
+                return self.tier_1.get(&hash_idx);
+            }
+            return self.tier_2.get(&hash_idx);
         }
 
         self.tier_2_misses += 1;
@@ -48,9 +59,12 @@ impl EngramCache {
     }
 
     pub fn insert(&mut self, hash_idx: usize, embedding: Array1<f32>) {
-        if self.tier_1.len() < self.tier_1_size {
+        if self.tier_1_size == 0 && self.tier_2_size == 0 {
+            return;
+        }
+        if self.tier_1_size > 0 && self.tier_1.len() < self.tier_1_size {
             self.tier_1.insert(hash_idx, embedding.clone());
-        } else {
+        } else if self.tier_2_size > 0 && self.tier_2.len() < self.tier_2_size {
             self.tier_2.insert(hash_idx, embedding.clone());
         }
     }

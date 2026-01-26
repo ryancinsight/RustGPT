@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Zip};
+use ndarray::{Array1, Array2, Axis, Zip};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -178,6 +178,137 @@ impl EngramMemory {
         sum_sq += self.w_gate_k.mapv(|x| x * x).sum();
         sum_sq += self.w_gate_v.mapv(|x| x * x).sum();
         sum_sq.sqrt()
+    }
+
+    pub fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        token_ids: &[usize],
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        let seq_len = input.nrows();
+        assert!(token_ids.len() >= seq_len);
+
+        let mut input_grads = Array2::<f32>::zeros(input.raw_dim());
+        let mut d_embedding = Array2::<f32>::zeros(self.embedding.table.raw_dim());
+        let mut d_w_gate_q = Array2::<f32>::zeros(self.w_gate_q.raw_dim());
+        let mut d_w_gate_k = Array2::<f32>::zeros(self.w_gate_k.raw_dim());
+        let mut d_w_gate_v = Array2::<f32>::zeros(self.w_gate_v.raw_dim());
+
+        let eps = 1e-8_f32;
+        let inv_sqrt_dim = 1.0_f32 / (self.memory_dim as f32).sqrt();
+
+        for t in 0..seq_len {
+            let x_t = input.row(t);
+            let hashes = compute_ngram_hashes(
+                token_ids,
+                t,
+                self.ngram_order,
+                self.num_heads,
+                self.embedding.table.nrows(),
+            );
+
+            let mut scratch_sum = Array1::<f32>::zeros(self.memory_dim);
+            let mut count = 0usize;
+            for &hash_idx in hashes.iter() {
+                let embedding = self.embedding.table.row(hash_idx);
+                Zip::from(&mut scratch_sum)
+                    .and(&embedding)
+                    .for_each(|a, b| *a += *b);
+                count += 1;
+            }
+
+            if count > 0 {
+                let denom = count as f32;
+                scratch_sum.mapv_inplace(|v| v / denom);
+            }
+
+            let q_t = self.w_gate_q.dot(&x_t);
+            let k_t = self.w_gate_k.dot(&scratch_sum);
+            let v_t = self.w_gate_v.dot(&scratch_sum);
+
+            let q_norm = Self::rms_norm(&q_t, eps);
+            let k_norm = Self::rms_norm(&k_t, eps);
+
+            let gate_input = q_norm.dot(&k_norm) * inv_sqrt_dim;
+            let gate_alpha = sigmoid(gate_input);
+
+            let dy_t = output_grads.row(t);
+            let d_gate = dy_t.dot(&v_t);
+            let d_v_t = dy_t.to_owned() * gate_alpha;
+            let d_gate_input = d_gate * gate_alpha * (1.0 - gate_alpha);
+
+            let d_q_norm = k_norm.to_owned() * (d_gate_input * inv_sqrt_dim);
+            let d_k_norm = q_norm.to_owned() * (d_gate_input * inv_sqrt_dim);
+
+            let q_sq = q_t.iter().map(|&v| v * v).sum::<f32>() + eps;
+            let q_norm_denom = q_sq.sqrt();
+            let q_dot = d_q_norm.dot(&q_t);
+            let d_q_t = d_q_norm.mapv(|v| v / q_norm_denom)
+                - q_t.mapv(|v| v * (q_dot / (q_norm_denom * q_norm_denom * q_norm_denom)));
+
+            let k_sq = k_t.iter().map(|&v| v * v).sum::<f32>() + eps;
+            let k_norm_denom = k_sq.sqrt();
+            let k_dot = d_k_norm.dot(&k_t);
+            let d_k_t = d_k_norm.mapv(|v| v / k_norm_denom)
+                - k_t.mapv(|v| v * (k_dot / (k_norm_denom * k_norm_denom * k_norm_denom)));
+
+            d_w_gate_q += &d_q_t
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&x_t.insert_axis(Axis(0)));
+            let d_x_t = self.w_gate_q.t().dot(&d_q_t);
+
+            d_w_gate_k += &d_k_t
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&scratch_sum.clone().insert_axis(Axis(0)));
+            d_w_gate_v += &d_v_t
+                .clone()
+                .insert_axis(Axis(1))
+                .dot(&scratch_sum.clone().insert_axis(Axis(0)));
+
+            let d_scratch_sum = self.w_gate_k.t().dot(&d_k_t) + self.w_gate_v.t().dot(&d_v_t);
+
+            if count > 0 {
+                let scale = 1.0 / (count as f32);
+                for &hash_idx in hashes.iter() {
+                    let mut row = d_embedding.row_mut(hash_idx);
+                    Zip::from(&mut row)
+                        .and(&d_scratch_sum)
+                        .for_each(|a, b| *a += *b * scale);
+                }
+            }
+
+            input_grads.row_mut(t).assign(&d_x_t);
+        }
+
+        (
+            input_grads,
+            vec![d_embedding, d_w_gate_q, d_w_gate_k, d_w_gate_v],
+        )
+    }
+
+    pub fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::errors::Result<()> {
+        if gradients.len() != 4 {
+            return Ok(());
+        }
+
+        self.embedding
+            .table
+            .scaled_add(-learning_rate, &gradients[0]);
+        self.w_gate_q
+            .scaled_add(-learning_rate, &gradients[1]);
+        self.w_gate_k
+            .scaled_add(-learning_rate, &gradients[2]);
+        self.w_gate_v
+            .scaled_add(-learning_rate, &gradients[3]);
+
+        Ok(())
     }
 }
 
