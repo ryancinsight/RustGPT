@@ -9,6 +9,7 @@ use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    adam::Adam,
     errors::Result,
     layers::{
         components::{
@@ -142,6 +143,10 @@ fn default_min_guidance() -> f32 {
 
 fn default_max_guidance() -> f32 {
     10.0
+}
+
+fn default_similarity_context_strength() -> Array2<f32> {
+    Array2::zeros((1, 1))
 }
 
 /// Prediction target for the diffusion model
@@ -720,7 +725,8 @@ impl TimeConditioner {
 
 #[derive(Clone, Debug)]
 pub struct DiffusionCachedIntermediates {
-    pub input: Arc<Array2<f32>>,
+    pub input_original: Arc<Array2<f32>>,
+    pub input_used: Arc<Array2<f32>>,
     pub time_embed: Arc<Array1<f32>>,
     pub gamma_beta: Arc<Array2<f32>>,
     pub norm1_out: Arc<Array2<f32>>,
@@ -745,6 +751,7 @@ pub struct DiffusionParamPartitions {
     pub feedforward: usize,
     pub pre_ffn_norm: usize,
     pub pre_attention_norm: usize,
+    pub similarity_context_strength: usize,
     pub time_conditioner: usize,
     pub time_embedding: usize,
     // Adaptive residual parameter partitions (9 optimizers total)
@@ -766,6 +773,7 @@ impl DiffusionParamPartitions {
             + self.feedforward
             + self.pre_ffn_norm
             + self.pre_attention_norm
+            + self.similarity_context_strength
             + self.time_conditioner
             + self.time_embedding
             + self.adaptive_residual_similarity
@@ -814,6 +822,16 @@ pub struct DiffusionBlock {
     pub param_partitions: RwLock<Option<DiffusionParamPartitions>>,
     #[serde(skip)]
     pub adaptive_residuals: Option<AdaptiveResiduals>,
+    #[serde(skip_serializing, skip_deserializing)]
+    activation_similarity_matrix: Array2<f32>,
+    #[serde(skip_serializing, skip_deserializing)]
+    incoming_similarity_context: Option<Array2<f32>>,
+    #[serde(default = "default_similarity_context_strength")]
+    similarity_context_strength: Array2<f32>,
+    #[serde(skip_serializing, skip_deserializing)]
+    opt_similarity_context_strength: Adam,
+    #[serde(skip_serializing, skip_deserializing)]
+    similarity_update_rate: f32,
     #[serde(skip)]
     film_gamma_beta_tanh_scratch: Vec<f32>,
     #[serde(skip)]
@@ -859,6 +877,8 @@ impl DiffusionBlock {
             None
         };
 
+        let similarity_context_strength = Array2::zeros((1, 1));
+        let opt_similarity_context_strength = Adam::new((1, 1));
         Self {
             config: config.clone(),
             temporal_mixing: layers.temporal_mixing,
@@ -893,6 +913,11 @@ impl DiffusionBlock {
             } else {
                 None
             },
+            activation_similarity_matrix: Array2::zeros((config.embed_dim, config.embed_dim)),
+            incoming_similarity_context: None,
+            similarity_context_strength,
+            opt_similarity_context_strength,
+            similarity_update_rate: 0.01,
             film_gamma_beta_tanh_scratch: Vec::new(),
             titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
@@ -900,6 +925,31 @@ impl DiffusionBlock {
 
     pub fn max_seq_len(&self) -> usize {
         self.config.max_pos.saturating_add(1)
+    }
+
+    pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
+        &self.activation_similarity_matrix
+    }
+
+    pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
+        if let Some(ctx) = context {
+            if ctx.nrows() != self.config.embed_dim || ctx.ncols() != self.config.embed_dim {
+                self.incoming_similarity_context = None;
+                return;
+            }
+
+            if let Some(existing) = self.incoming_similarity_context.as_mut() {
+                if existing.dim() == ctx.dim() {
+                    existing.assign(ctx);
+                } else {
+                    *existing = ctx.clone();
+                }
+            } else {
+                self.incoming_similarity_context = Some(ctx.clone());
+            }
+        } else {
+            self.incoming_similarity_context = None;
+        }
     }
 
     /// Get the cached intermediates
@@ -975,6 +1025,86 @@ impl DiffusionBlock {
 
     pub fn is_discrete_masked(&self) -> bool {
         self.config.discrete_masked
+    }
+
+    #[inline]
+    fn update_activation_similarity_matrix(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
+        let rate = self.similarity_update_rate.clamp(0.0, 1.0);
+        if rate <= 0.0 {
+            return;
+        }
+
+        let seq_len = input.nrows().min(output.nrows());
+        let embed_dim = input
+            .ncols()
+            .min(output.ncols())
+            .min(self.config.embed_dim);
+        if seq_len == 0 || embed_dim == 0 {
+            return;
+        }
+
+        let sample = seq_len.min(32);
+        let step = (seq_len / sample).max(1);
+
+        let mut nx = vec![0.0f64; embed_dim];
+        let mut ny = vec![0.0f64; embed_dim];
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
+            for j in 0..embed_dim {
+                let x = input[[seq_idx, j]];
+                let y = output[[seq_idx, j]];
+                let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                nx[j] += xs * xs;
+                ny[j] += ys * ys;
+            }
+        }
+
+        let tanh = crate::richards::RichardsCurve::tanh(false);
+        for i in 0..embed_dim {
+            for j in 0..embed_dim {
+                let mut dot = 0.0f64;
+                for seq_idx in (0..seq_len).step_by(step).take(sample) {
+                    let x = input[[seq_idx, i]];
+                    let y = output[[seq_idx, j]];
+                    let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                    let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                    dot += xs * ys;
+                }
+                let denom = (nx[i] * ny[j]).sqrt().max(1e-12);
+                let sim = if denom > 0.0 { (dot / denom) as f32 } else { 0.0 };
+                let sim = if sim.is_finite() {
+                    tanh.forward_scalar_f32(sim)
+                } else {
+                    0.0
+                };
+
+                let prev = self.activation_similarity_matrix[[i, j]];
+                self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
+            }
+        }
+    }
+
+    #[inline]
+    fn apply_similarity_context(&self, input: &Array2<f32>, context: &Array2<f32>) -> Array2<f32> {
+        let strength = self.similarity_context_strength[[0, 0]];
+        let strength = if strength.is_finite() { strength } else { 0.0 };
+        if strength == 0.0 {
+            return input.clone();
+        }
+
+        if input.ncols() != context.nrows() || context.nrows() != context.ncols() {
+            return input.clone();
+        }
+
+        let d = input.ncols().max(1) as f32;
+        let k = strength / d;
+        let mut out = input.dot(context);
+        out.zip_mut_with(input, |o, &x| {
+            let ms = if o.is_finite() { *o } else { 0.0 };
+            let xs = if x.is_finite() { x } else { 0.0 };
+            *o = xs + k * ms;
+        });
+        out
     }
 
     pub fn mask_token_id(&self) -> Option<usize> {
@@ -1140,7 +1270,14 @@ impl DiffusionBlock {
                 (x_t.clone(), 0.0, 1.0, false)
             };
 
-        let norm1_out = self.pre_attention_norm.forward(&x_model_in);
+        let input_original = x_model_in;
+        let input_used = if let Some(ctx) = self.incoming_similarity_context.as_ref() {
+            self.apply_similarity_context(&input_original, ctx)
+        } else {
+            input_original.clone()
+        };
+
+        let norm1_out = self.pre_attention_norm.forward(&input_used);
         let norm1_mod = Self::apply_film(&norm1_out, &gamma_attn_vec, &beta_attn_vec);
         let mut attn_out = self
             .temporal_mixing
@@ -1158,12 +1295,13 @@ impl DiffusionBlock {
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
         }
+        self.update_activation_similarity_matrix(&input_used, &attn_out);
         let residual1 = if let Some(ref mut adaptive_residuals) = self.adaptive_residuals {
             // Apply advanced adaptive residuals for first residual connection
-            adaptive_residuals.apply_attention_residual(&x_model_in, &attn_out)
+            adaptive_residuals.apply_attention_residual(&input_used, &attn_out)
         } else {
             // Standard residual connection
-            &x_model_in + &attn_out
+            &input_used + &attn_out
         };
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
         let norm2_mod = Self::apply_film(&norm2_out, &gamma_ffn_vec, &beta_ffn_vec);
@@ -1193,7 +1331,8 @@ impl DiffusionBlock {
         let cached_output = prediction.clone();
 
         *self.cached_intermediates.write().unwrap() = Some(DiffusionCachedIntermediates {
-            input: Arc::new(x_model_in),
+            input_original: Arc::new(input_original),
+            input_used: Arc::new(input_used),
             time_embed: Arc::new(time_embed),
             norm1_out: Arc::new(norm1_out),
             norm1_mod: Arc::new(norm1_mod),
@@ -1689,7 +1828,7 @@ impl Layer for DiffusionBlock {
             + self.temporal_mixing.parameters()
             + self.pre_ffn_norm.parameters()
             + self.feedforward.parameters()
-            + 4
+            + 5
             + self
                 .adaptive_residuals
                 .as_ref()
@@ -1726,7 +1865,8 @@ impl Layer for DiffusionBlock {
         }
         let cache_guard = self.cached_intermediates.read().unwrap();
         if let Some(cache) = &*cache_guard {
-            let input_cache: &Array2<f32> = cache.input.as_ref();
+            let input_original: &Array2<f32> = cache.input_original.as_ref();
+            let input_used: &Array2<f32> = cache.input_used.as_ref();
             let time_embed: &Array1<f32> = cache.time_embed.as_ref();
             let norm1_out: &Array2<f32> = cache.norm1_out.as_ref();
             let norm1_mod: &Array2<f32> = cache.norm1_mod.as_ref();
@@ -1833,11 +1973,44 @@ impl Layer for DiffusionBlock {
 
             let (input_from_norm, pre_attn_param_grads) = self
                 .pre_attention_norm
-                .compute_gradients(input_cache, &norm1_grad);
+                .compute_gradients(input_used, &norm1_grad);
 
-            // The final input gradients are the gradients w.r.t. the transformer input
-            // (combining gradients from residual and attention path)
-            let mut final_input_grads = &residual1_total_grads + &input_from_norm;
+            // Gradients w.r.t. the mixed input used by this block: dX'.
+            let final_input_used_grads = &residual1_total_grads + &input_from_norm;
+
+            let mut similarity_strength_grad = Array2::zeros((1, 1));
+            if let Some(ctx) = self.incoming_similarity_context.as_ref()
+                && ctx.nrows() == self.config.embed_dim
+                && ctx.ncols() == self.config.embed_dim
+            {
+                let d = (self.config.embed_dim.max(1)) as f32;
+                let mixed = input_original.dot(ctx);
+                let mut acc = 0.0f64;
+                for (&g, &m) in final_input_used_grads.iter().zip(mixed.iter()) {
+                    let gs: f64 = if g.is_finite() { g as f64 } else { 0.0 };
+                    let ms: f64 = if m.is_finite() { m as f64 } else { 0.0 };
+                    acc += gs * ms;
+                }
+                similarity_strength_grad[[0, 0]] = (acc as f32) / d;
+            }
+
+            let mut final_input_grads = final_input_used_grads;
+            if let Some(ctx) = self.incoming_similarity_context.as_ref()
+                && ctx.nrows() == self.config.embed_dim
+                && ctx.ncols() == self.config.embed_dim
+            {
+                let d = (self.config.embed_dim.max(1)) as f32;
+                let s = self.similarity_context_strength[[0, 0]];
+                let s = if s.is_finite() { s } else { 0.0 };
+                let k = s / d;
+                if k != 0.0 {
+                    let corr = final_input_grads.dot(&ctx.t());
+                    final_input_grads.zip_mut_with(&corr, |g, &c| {
+                        let cs = if c.is_finite() { c } else { 0.0 };
+                        *g += k * cs;
+                    });
+                }
+            }
 
             if let Some(extra_scale) = input_extra_scale {
                 final_input_grads += &(output_grads * extra_scale);
@@ -1860,6 +2033,7 @@ impl Layer for DiffusionBlock {
             all_param_grads.extend(ffn_param_grads);
             all_param_grads.extend(pre_ffn_param_grads);
             all_param_grads.extend(pre_attn_param_grads);
+            all_param_grads.push(similarity_strength_grad);
 
             let embed = self.config.embed_dim;
             let g_t_attn = gamma_attn_vec.mapv(|x| {
@@ -1907,7 +2081,7 @@ impl Layer for DiffusionBlock {
 
             let adaptive_param_grads = if let Some(residuals) = self.adaptive_residuals.as_ref() {
                 residuals.compute_gradients(
-                    input_cache,
+                    input_used,
                     attn_out,
                     &residual1_total_grads,
                     ffn_out,
@@ -1924,6 +2098,7 @@ impl Layer for DiffusionBlock {
                 feedforward: ffn_grad_count,
                 pre_ffn_norm: pre_ffn_grad_count,
                 pre_attention_norm: pre_attn_grad_count,
+                similarity_context_strength: 1,
                 time_conditioner: 4,
                 time_embedding: 0,
                 adaptive_residual_similarity: 0,
@@ -2028,6 +2203,14 @@ impl Layer for DiffusionBlock {
             let pre_attn_grads = &sanitized[pre_attn_range];
             self.pre_attention_norm
                 .apply_gradients(pre_attn_grads, lr)?;
+        }
+
+        let ctx_range = next_range(partitions.similarity_context_strength);
+        if !ctx_range.is_empty()
+            && let Some(g) = sanitized.get(ctx_range.start)
+        {
+            self.opt_similarity_context_strength
+                .step(&mut self.similarity_context_strength, g, lr);
         }
 
         // Time-conditioner gradients (expect 4 arrays)

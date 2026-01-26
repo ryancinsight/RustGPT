@@ -167,6 +167,10 @@ impl EngramMemory {
         embedding_params + gate_params
     }
 
+    pub fn gradient_count(&self) -> usize {
+        4
+    }
+
     pub fn cache_stats(&self) -> (f32, f32) {
         self.cache.hit_rate()
     }

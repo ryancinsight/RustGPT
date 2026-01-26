@@ -518,8 +518,26 @@ impl LLM {
         let network_len = self.network.len();
         for i in 1..network_len {
             match &mut self.network[i] {
-                LayerEnum::OutputProjection(_) => break, // Stop before output projection
+                LayerEnum::OutputProjection(_) => break,
                 LayerEnum::TransformerBlock(block) => {
+                    block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                    hidden = block.forward(&hidden);
+                    if let Some(existing) = similarity_ctx.as_mut() {
+                        existing.assign(block.activation_similarity_matrix());
+                    } else {
+                        similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                    }
+                }
+                LayerEnum::DiffusionBlock(block) => {
+                    block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                    hidden = block.forward(&hidden);
+                    if let Some(existing) = similarity_ctx.as_mut() {
+                        existing.assign(block.activation_similarity_matrix());
+                    } else {
+                        similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                    }
+                }
+                LayerEnum::LRM(block) => {
                     block.set_incoming_similarity_context(similarity_ctx.as_ref());
                     hidden = block.forward(&hidden);
                     if let Some(existing) = similarity_ctx.as_mut() {
@@ -840,6 +858,26 @@ impl LLM {
             for layer in self.network.iter_mut() {
                 input = match layer {
                     LayerEnum::TransformerBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(&input);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    LayerEnum::DiffusionBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(&input);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    LayerEnum::LRM(block) => {
                         block.set_incoming_similarity_context(similarity_ctx.as_ref());
                         let out = block.forward(&input);
                         if let Some(existing) = similarity_ctx.as_mut() {
@@ -2333,6 +2371,26 @@ impl LLM {
                         }
                         out
                     }
+                    LayerEnum::DiffusionBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(input_ref);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    LayerEnum::LRM(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(input_ref);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
                     _ => {
                         similarity_ctx = None;
                         layer.forward(input_ref)
@@ -2880,6 +2938,26 @@ impl LLM {
                 let input_ref = scratch.layer_inputs.last().unwrap();
                 input = match layer {
                     LayerEnum::TransformerBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(input_ref);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    LayerEnum::DiffusionBlock(block) => {
+                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                        let out = block.forward(input_ref);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(block.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                        }
+                        out
+                    }
+                    LayerEnum::LRM(block) => {
                         block.set_incoming_similarity_context(similarity_ctx.as_ref());
                         let out = block.forward(input_ref);
                         if let Some(existing) = similarity_ctx.as_mut() {
