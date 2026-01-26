@@ -194,6 +194,14 @@ type ThresholdPredictorGrads = (
     Option<Vec<f64>>,
 );
 
+#[derive(Clone, Debug)]
+pub struct PolyAttentionCache {
+    pub cached_input: Array2<f32>,
+    pub cached_thresholds_global: Option<Array2<f32>>,
+    pub cached_soft_top_p_mask: Option<Array2<f32>>,
+    pub last_causal: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyAttention {
     pub embed_dim: usize,
@@ -1526,6 +1534,23 @@ impl PolyAttention {
             .cached_input
             .as_ref()
             .expect("forward must be called before compute_gradients");
+        self.compute_gradients_parallel_from_state(
+            input,
+            self.cached_thresholds_global.as_ref(),
+            self.moh.cached_soft_top_p_mask.as_ref(),
+            self.last_causal,
+            output_grads,
+        )
+    }
+
+    pub fn compute_gradients_parallel_from_state(
+        &self,
+        input: &Array2<f32>,
+        cached_thresholds_global: Option<&Array2<f32>>,
+        cached_soft_top_p_mask: Option<&Array2<f32>>,
+        last_causal: bool,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let (n, _d_model) = (input.nrows(), input.ncols());
         let dk_scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let a = self.a[[0, 0]];
@@ -1573,14 +1598,13 @@ impl PolyAttention {
                 gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 let mut m_col = Array2::<f32>::ones((n, 1));
                 if self.moh.head_selection_config.gating.use_learned_predictor {
-                    let thresholds = self
-                        .cached_thresholds_global
+                    let thresholds = cached_thresholds_global
                         .as_ref()
                         .expect("forward must cache thresholds when learned predictor is enabled");
                     let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
                     m_col.assign(&head_thresholds);
                 } else if self.moh.head_selection_config.gating.use_soft_top_p
-                    && let Some(mask) = &self.moh.cached_soft_top_p_mask
+                    && let Some(mask) = &cached_soft_top_p_mask
                     && mask.nrows() == n
                     && mask.ncols() == self.num_heads
                 {
@@ -1624,7 +1648,7 @@ impl PolyAttention {
                         Some(w) => i.saturating_sub(w - 1),
                         None => 0,
                     };
-                    let j_end = if self.last_causal { i } else { n - 1 };
+                    let j_end = if last_causal { i } else { n - 1 };
                     let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
                     let q_pe_len = max_pos + 1;
                     if q_pe.len() != q_pe_len {
@@ -1903,8 +1927,7 @@ impl PolyAttention {
                 || self.moh.head_selection_config.gating.load_balance_weight > 0.0
                 || self.moh.head_selection_config.gating.sparsity_weight > 0.0)
         {
-            let m_mat = self
-                .cached_thresholds_global
+            let m_mat = cached_thresholds_global
                 .as_ref()
                 .expect("forward must cache thresholds when learned predictor is enabled");
             let mut g_mat = Array2::<f32>::zeros((n, self.num_heads));
@@ -2109,7 +2132,8 @@ impl PolyAttention {
             grad_input_total.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
         }
         (grad_input_total, all_param_grads)
-    }
+        }
+
 
     /// Get parameter information for this PolyAttention layer
     fn get_param_info(&mut self) -> &PolyAttentionParamInfo {
@@ -2345,6 +2369,29 @@ impl PolyAttention {
         } else {
             None
         }
+    }
+
+    pub fn take_cache(&mut self) -> Option<PolyAttentionCache> {
+        Some(PolyAttentionCache {
+            cached_input: self.cached_input.take()?,
+            cached_thresholds_global: self.cached_thresholds_global.take(),
+            cached_soft_top_p_mask: self.moh.cached_soft_top_p_mask.take(),
+            last_causal: self.last_causal,
+        })
+    }
+
+    pub fn compute_gradients_with_cache(
+        &self,
+        cache: &PolyAttentionCache,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        self.compute_gradients_parallel_from_state(
+            &cache.cached_input,
+            cache.cached_thresholds_global.as_ref(),
+            cache.cached_soft_top_p_mask.as_ref(),
+            cache.last_causal,
+            output_grads,
+        )
     }
 }
 
