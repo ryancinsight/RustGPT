@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis};
+use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +61,12 @@ pub struct HybridMemory {
     pub engram_cache_stats: EngramCache,
 
     cumulative_surprise: f32,
+    #[serde(skip)]
+    scratch_input: Array2<f32>,
+    #[serde(skip)]
+    cached_pos_encoding: Option<(usize, Array2<f32>)>,
+    #[serde(skip)]
+    dummy_token_ids: Vec<usize>,
 }
 
 impl HybridMemory {
@@ -112,6 +118,9 @@ impl HybridMemory {
                 config.tier_2_cache_size,
             ),
             cumulative_surprise: 0.0,
+            scratch_input: Array2::zeros((1, config.input_dim)),
+            cached_pos_encoding: None,
+            dummy_token_ids: vec![0; 1],
         }
     }
 
@@ -122,11 +131,9 @@ impl HybridMemory {
         for t in 0..seq_len {
             let x_t = input.row(t);
 
-            let router_out = self.w_router.dot(&x_t.to_owned());
-            let router_logits = Array1::from_vec(router_out.to_vec());
-
-            let engram_gate = Self::sigmoid(router_logits[0]);
-            let titans_gate = Self::sigmoid(router_logits[1]);
+            let router_out = self.w_router.dot(&x_t);
+            let engram_gate = Self::sigmoid(router_out[0]);
+            let titans_gate = Self::sigmoid(router_out[1]);
 
             let total_gate = engram_gate + titans_gate;
 
@@ -186,13 +193,19 @@ impl HybridMemory {
         let seq_len = input.nrows();
         let mut surprise_scores = Vec::with_capacity(seq_len);
 
+        if self.scratch_input.ncols() != self.config.input_dim {
+            self.scratch_input = Array2::zeros((1, self.config.input_dim));
+        }
+
         for t in 0..seq_len {
             let x_t = input.row(t);
 
-            let input_2d = input.row(t).to_owned().insert_axis(Axis(0));
-            let engram_out = self.engram_memory.forward(&input_2d, &vec![0; 32]);
+            self.scratch_input.row_mut(0).assign(&x_t);
+            let engram_out = self
+                .engram_memory
+                .forward(&self.scratch_input, &self.dummy_token_ids);
 
-            let titans_out = self.titans_memory.forward(&input_2d);
+            let titans_out = self.titans_memory.forward(&self.scratch_input);
 
             let engram_norm = engram_out.mapv(|x| x * x).sum().sqrt();
             let titans_norm = titans_out.mapv(|x| x * x).sum().sqrt();
@@ -217,6 +230,20 @@ impl HybridMemory {
         self.last_surprise_scores = surprise_scores.clone();
         surprise_scores
     }
+
+    fn pos_encoding(&mut self, seq_len: usize) -> &Array2<f32> {
+        let rebuild = self
+            .cached_pos_encoding
+            .as_ref()
+            .map(|(len, _)| *len != seq_len)
+            .unwrap_or(true);
+        if rebuild {
+            let encoding = Self::sine_positional_encoding(seq_len, self.config.memory_dim);
+            self.cached_pos_encoding = Some((seq_len, encoding));
+        }
+        &self.cached_pos_encoding.as_ref().unwrap().1
+    }
+
 
     pub fn get_cache_stats(&self) -> (f32, f32, usize, usize) {
         let (tier1_rate, tier2_rate) = self.engram_cache_stats.hit_rate();
@@ -269,24 +296,30 @@ impl Layer for HybridMemory {
             self.adaptive_routing(input)
         };
 
-        let pos_encoding = Self::sine_positional_encoding(seq_len, self.config.memory_dim);
+        if self.scratch_input.ncols() != self.config.input_dim {
+            self.scratch_input = Array2::zeros((1, self.config.input_dim));
+        }
+        let pos_encoding = self.pos_encoding(seq_len).to_owned();
 
         for (t, (engram_gate, titans_gate)) in gates.iter().enumerate().take(seq_len) {
-            let input_t = input.row(t).to_owned().insert_axis(Axis(0));
-            let engram_out = self.engram_memory.forward(&input_t, &vec![0; 32]);
-            let titans_out = self.titans_memory.forward(&input_t);
+            self.scratch_input.row_mut(0).assign(&input.row(t));
+            let engram_out = self
+                .engram_memory
+                .forward(&self.scratch_input, &self.dummy_token_ids);
+            let titans_out = self.titans_memory.forward(&self.scratch_input);
 
-            let engram_proj = self.w_engram_proj.dot(&engram_out.row(0).to_owned());
-            let titans_proj = self.w_titans_proj.dot(&titans_out.row(0).to_owned());
+            let mut engram_proj = self.w_engram_proj.dot(&engram_out.row(0));
+            let mut titans_proj = self.w_titans_proj.dot(&titans_out.row(0));
 
             let pos_enc = pos_encoding.row(t);
 
-            let gated_engram = engram_proj.mapv(|x| x * *engram_gate);
-            let gated_titans = titans_proj.mapv(|x| x * *titans_gate);
+            engram_proj.mapv_inplace(|x| x * *engram_gate);
+            titans_proj.mapv_inplace(|x| x * *titans_gate);
 
-            let combined = &gated_engram + &gated_titans + pos_enc;
+            engram_proj += &titans_proj;
+            engram_proj += &pos_enc;
 
-            output.row_mut(t).assign(&combined);
+            output.row_mut(t).assign(&engram_proj);
         }
 
         output
