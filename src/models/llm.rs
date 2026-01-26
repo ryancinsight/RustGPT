@@ -755,6 +755,15 @@ impl LLM {
         self.vocab.decode_tokens_to_string(&output_tokens)
     }
 
+    #[inline]
+    pub fn predict_with_limit(&mut self, text: &str, max_new_tokens: usize) -> String {
+        let output_tokens = self.forward_with_limit(text, max_new_tokens);
+        if output_tokens.is_empty() {
+            return String::new();
+        }
+        self.vocab.decode_tokens_to_string(&output_tokens)
+    }
+
     pub fn max_sequence_len(&self) -> usize {
         let mut max_len = 0usize;
         for layer in &self.network {
@@ -775,6 +784,11 @@ impl LLM {
 
     #[inline]
     fn forward(&mut self, text: &str) -> Vec<usize> {
+        self.forward_with_limit(text, usize::MAX)
+    }
+
+    #[inline]
+    fn forward_with_limit(&mut self, text: &str, max_new_tokens: usize) -> Vec<usize> {
         // Tokenize the input text (reuse a scratch Vec to avoid repeated allocations).
         // We `take` the buffer out of `self` so we don't hold a mutable borrow of `self` across
         // calls that also require `&mut self`.
@@ -803,7 +817,9 @@ impl LLM {
             return output_tokens;
         }
 
-        for _ in 0..(max_seq_len - input_len) {
+        let available_steps = max_seq_len.saturating_sub(input_len);
+        let generation_steps = available_steps.min(max_new_tokens);
+        for _ in 0..generation_steps {
             // let tokenized_clone = tokenized.clone();
 
             // Check if we're approaching the maximum sequence length

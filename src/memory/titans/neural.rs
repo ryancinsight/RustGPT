@@ -231,7 +231,7 @@ impl NeuralMemory {
         let mut output = Array2::<f32>::zeros((seq_len, self.val_dim));
 
         for t in 0..seq_len {
-            let x_t = input.row(t).to_owned();
+            let x_t = input.row(t);
             let q_t = self.w_q.dot(&x_t);
             let (y_t, _) = Self::mlp_forward(memory, &q_t);
             output.row_mut(t).assign(&y_t);
@@ -247,7 +247,7 @@ impl NeuralMemory {
         let seq_len = input.nrows();
 
         for t in 0..seq_len {
-            let x_t = input.row(t).to_owned();
+            let x_t = input.row(t);
 
             let k_t = self.w_k.dot(&x_t);
             let v_t = self.w_v.dot(&x_t);
@@ -277,7 +277,7 @@ impl NeuralMemory {
         let mut momentums = Vec::with_capacity(seq_len);
 
         for t in 0..seq_len {
-            let x_t = input.row(t).to_owned();
+            let x_t = input.row(t);
 
             let q_t = self.w_q.dot(&x_t);
             let k_t = self.w_k.dot(&x_t);
@@ -372,12 +372,12 @@ impl NeuralMemory {
                 retrieval_memory_snapshot = curr_memory.clone();
             }
 
-            let q_in = queries.row(t).to_owned();
+            let q_in = queries.row(t);
             let q_t = self.w_q.dot(&q_in);
             qs.push(q_t);
             retrieval_memories.push(retrieval_memory_snapshot.clone());
 
-            let u_in = update_inputs.row(t).to_owned();
+            let u_in = update_inputs.row(t);
             let k_t = self.w_k.dot(&u_in);
             let v_t = self.w_v.dot(&u_in);
             let alpha_t = Self::sigmoid(self.w_alpha.dot(&u_in));
@@ -451,7 +451,7 @@ impl Layer for NeuralMemory {
         let mut output = Array2::<f32>::zeros((seq_len, self.val_dim));
 
         for t in 0..seq_len {
-            let x_t = input.row(t).to_owned();
+            let x_t = input.row(t);
 
             let q_t = self.w_q.dot(&x_t);
             let k_t = self.w_k.dot(&x_t);

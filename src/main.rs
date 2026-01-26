@@ -74,11 +74,14 @@ fn main() -> crate::Result<()> {
     println!("Decoder: {}", llm.decoder_description());
     println!("Total parameters: {}", llm.total_parameters());
 
-    // Test prediction before training
     let test_input = "User: How do mountains form?";
+    let preview_max_new_tokens = 64usize;
     println!("\n=== BEFORE TRAINING ===");
     println!("Input: {}", test_input);
-    println!("Output: {}", llm.predict(test_input));
+    println!(
+        "Output: {}",
+        llm.predict_with_limit(test_input, preview_max_new_tokens)
+    );
 
     // Run training pipeline
     llm = run_training_pipeline(&args, &dataset, &vocab, &config, llm)?;
@@ -92,7 +95,7 @@ fn main() -> crate::Result<()> {
     // Test prediction after training
     println!("\n=== AFTER TRAINING ===");
     println!("Input: {}", test_input);
-    let result = llm.predict(test_input);
+    let result = llm.predict_with_limit(test_input, preview_max_new_tokens);
     println!("Output: {}", result);
     println!("======================\n");
 

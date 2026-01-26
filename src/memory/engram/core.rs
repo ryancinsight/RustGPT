@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2, Zip};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +53,8 @@ pub struct EngramMemory {
     pub num_heads: usize,
     pub memory_dim: usize,
     pub input_dim: usize,
+    #[serde(skip)]
+    scratch_sum: Array1<f32>,
 }
 
 impl EngramMemory {
@@ -90,6 +92,7 @@ impl EngramMemory {
             num_heads: DEFAULT_ENGRAM_NUM_HEADS,
             memory_dim,
             input_dim,
+            scratch_sum: Array1::zeros(memory_dim),
         }
     }
 
@@ -104,6 +107,10 @@ impl EngramMemory {
         assert!(token_ids.len() >= seq_len);
         let mut output = Array2::<f32>::zeros((seq_len, self.memory_dim));
 
+        if self.scratch_sum.len() != self.memory_dim {
+            self.scratch_sum = Array1::zeros(self.memory_dim);
+        }
+
         for t in 0..seq_len {
             let x_t = input.row(t);
 
@@ -115,30 +122,31 @@ impl EngramMemory {
                 self.embedding.table.nrows(),
             );
 
-            let mut engram_vectors = Vec::with_capacity(self.num_heads);
+            self.scratch_sum.fill(0.0);
+            let mut count = 0usize;
             for &hash_idx in hashes.iter() {
                 if let Some(cached) = self.cache.get(hash_idx) {
-                    engram_vectors.push(cached.clone());
+                    Zip::from(&mut self.scratch_sum)
+                        .and(cached)
+                        .for_each(|a, b| *a += *b);
                 } else {
                     let embedding = self.embedding.lookup(hash_idx);
                     self.cache.insert(hash_idx, embedding.clone());
-                    engram_vectors.push(embedding);
+                    Zip::from(&mut self.scratch_sum)
+                        .and(&embedding)
+                        .for_each(|a, b| *a += *b);
                 }
+                count += 1;
             }
 
-            let engram_memory = if engram_vectors.is_empty() {
-                Array1::zeros(self.memory_dim)
-            } else {
-                let mut stacked = Array2::zeros((self.num_heads, self.memory_dim));
-                for (i, vec) in engram_vectors.iter().enumerate() {
-                    stacked.row_mut(i).assign(vec);
-                }
-                stacked.mean_axis(Axis(0)).unwrap()
-            };
+            if count > 0 {
+                let denom = count as f32;
+                self.scratch_sum.mapv_inplace(|v| v / denom);
+            }
 
-            let q_t = self.w_gate_q.dot(&x_t.to_owned());
-            let k_t = self.w_gate_k.dot(&engram_memory.to_owned());
-            let v_t = self.w_gate_v.dot(&engram_memory.to_owned());
+            let q_t = self.w_gate_q.dot(&x_t);
+            let k_t = self.w_gate_k.dot(&self.scratch_sum);
+            let v_t = self.w_gate_v.dot(&self.scratch_sum);
 
             let q_norm = Self::rms_norm(&q_t, 1e-8);
             let k_norm = Self::rms_norm(&k_t, 1e-8);

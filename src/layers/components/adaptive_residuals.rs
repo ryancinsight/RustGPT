@@ -20,6 +20,10 @@ pub struct AdaptiveResidualConfig {
     pub residual_stability_threshold: f32,
     /// Maximum sequence length for positional encoding
     pub max_seq_len: usize,
+    pub contrastive_strength: f32,
+    pub contrastive_temperature: f32,
+    pub contrastive_margin: f32,
+    pub contrastive_grad_weight: f32,
 }
 
 impl Default for AdaptiveResidualConfig {
@@ -32,6 +36,10 @@ impl Default for AdaptiveResidualConfig {
             residual_stability_threshold: 3.0,
             // Tests and several call sites assume a 2048-long CoPE table.
             max_seq_len: 2048,
+            contrastive_strength: 0.75,
+            contrastive_temperature: 0.6,
+            contrastive_margin: 0.0,
+            contrastive_grad_weight: 0.01,
         }
     }
 }
@@ -124,6 +132,10 @@ impl AdaptiveResiduals {
             similarity_update_rate: 0.01,
             residual_stability_threshold: 3.0,
             max_seq_len: 2048,
+            contrastive_strength: 0.75,
+            contrastive_temperature: 0.6,
+            contrastive_margin: 0.0,
+            contrastive_grad_weight: 0.01,
         };
         Self::new(config)
     }
@@ -207,8 +219,8 @@ impl AdaptiveResiduals {
         //  - penalize mean absolute off-diagonal similarity (confusions) as "negatives"
         // This makes scaling increase when a channel is distinct, and decrease when it is
         // overly entangled with other channels.
-        let contrast_temperature = 0.6f32;
-        let contrast_alpha = 0.75f32;
+        let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
+        let contrast_alpha = self.config.contrastive_strength;
 
         for channel in 0..embed_dim {
             let mut base_scale = self.attention_residual_scales[[channel, 0]];
@@ -224,21 +236,7 @@ impl AdaptiveResiduals {
                 continue;
             }
 
-            let diag = self.activation_similarity_diag[[channel, 0]];
-            let diag = if diag.is_finite() {
-                diag.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let off_abs_mean = self.activation_similarity_off_abs_mean[[channel, 0]];
-            let off_abs_mean = if off_abs_mean.is_finite() {
-                off_abs_mean.clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let margin = diag - off_abs_mean;
+            let margin = self.contrastive_margin(channel);
             let contrast_factor = 1.0 + contrast_alpha * (margin / contrast_temperature).tanh();
 
             let final_scale =
@@ -289,8 +287,8 @@ impl AdaptiveResiduals {
         // Apply the same channel-contrastive logic as attention residuals: boost channels that
         // are strongly self-aligned and reduce channels that are confusable (high off-diagonal).
         let embed_dim = ffn_out.ncols().min(self.config.embed_dim);
-        let contrast_temperature = 0.6f32;
-        let contrast_alpha = 0.75f32;
+        let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
+        let contrast_alpha = self.config.contrastive_strength;
         self.scratch_channel_scales.resize(embed_dim, 1.0f32);
         self.scratch_channel_scales.fill(1.0f32);
         for channel in 0..embed_dim {
@@ -302,21 +300,7 @@ impl AdaptiveResiduals {
             };
             base_scale = base_scale.clamp(min_scale, threshold);
 
-            let diag = self.activation_similarity_diag[[channel, 0]];
-            let diag = if diag.is_finite() {
-                diag.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let off_abs_mean = self.activation_similarity_off_abs_mean[[channel, 0]];
-            let off_abs_mean = if off_abs_mean.is_finite() {
-                off_abs_mean.clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let margin = diag - off_abs_mean;
+            let margin = self.contrastive_margin(channel);
             let contrast_factor = 1.0 + contrast_alpha * (margin / contrast_temperature).tanh();
             self.scratch_channel_scales[channel] =
                 (base_scale * contrast_factor).clamp(min_scale, threshold);
@@ -699,8 +683,8 @@ impl AdaptiveResiduals {
             // If the supervised signal is exactly zero (can happen in synthetic tests where
             // the target matches output), inject a tiny bounded exploration term so gradient
             // norms don't collapse to 0.
-            let mut g = output_grad_sum;
-            if g.abs() < 1e-12 {
+            let mut g = output_grad_sum + self.contrastive_grad(channel);
+            if g.abs() < 1e-6 {
                 g = 1e-4 * ((channel as f32 + 1.0) * 0.731).sin();
             }
             attention_scale_grads[[channel, 0]] = g;
@@ -720,8 +704,8 @@ impl AdaptiveResiduals {
                 output_grad_sum += ffn_val * res_grad;
             }
 
-            let mut g = output_grad_sum;
-            if g.abs() < 1e-12 {
+            let mut g = output_grad_sum + self.contrastive_grad(channel);
+            if g.abs() < 1e-6 {
                 g = 1e-4 * ((channel as f32 + 1.0) * 0.517).cos();
             }
             ffn_scale_grads[[channel, 0]] = g;
@@ -806,5 +790,37 @@ impl AdaptiveResiduals {
         }
 
         (sum_sq as f32).sqrt()
+    }
+
+    fn contrastive_margin(&self, channel: usize) -> f32 {
+        let diag = self.activation_similarity_diag[[channel, 0]];
+        let diag = if diag.is_finite() {
+            diag.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let off_abs_mean = self.activation_similarity_off_abs_mean[[channel, 0]];
+        let off_abs_mean = if off_abs_mean.is_finite() {
+            off_abs_mean.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        diag - off_abs_mean - self.config.contrastive_margin
+    }
+
+    fn contrastive_grad(&self, channel: usize) -> f32 {
+        let weight = self.config.contrastive_grad_weight;
+        if weight <= 0.0 {
+            return 0.0;
+        }
+        let temp = self.config.contrastive_temperature.max(1e-6);
+        let margin = self.contrastive_margin(channel);
+        if margin.is_finite() {
+            weight * (margin / temp).tanh()
+        } else {
+            0.0
+        }
     }
 }
