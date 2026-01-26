@@ -435,6 +435,10 @@ impl NeuralMemory {
             momentums,
         }
     }
+
+    pub fn gradient_count(&self) -> usize {
+        10
+    }
 }
 
 impl Layer for NeuralMemory {

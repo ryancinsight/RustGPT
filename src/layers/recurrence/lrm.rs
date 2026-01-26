@@ -196,6 +196,20 @@ impl RecursiveBlockVariant {
             _ => tracing::warn!("Mismatched cache type in RecursiveBlockVariant::set_cache"),
         }
     }
+
+    fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
+        match self {
+            Self::Transformer(b) => b.set_incoming_similarity_context(context),
+            Self::Diffusion(b) => b.set_incoming_similarity_context(context),
+        }
+    }
+
+    fn activation_similarity_matrix(&self) -> &Array2<f32> {
+        match self {
+            Self::Transformer(b) => b.activation_similarity_matrix(),
+            Self::Diffusion(b) => b.activation_similarity_matrix(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +237,10 @@ pub struct LRM {
     param_partitions: RwLock<Option<ParamPartitions>>,
     #[serde(skip_serializing, skip_deserializing)]
     cached_mean_input: Option<Array2<f32>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    incoming_similarity_context: Option<Array2<f32>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    activation_similarity_matrix: Array2<f32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -365,6 +383,8 @@ impl LRM {
             recursion_metrics: Vec::new(),
             param_partitions: RwLock::new(None),
             cached_mean_input: None,
+            incoming_similarity_context: None,
+            activation_similarity_matrix: Array2::zeros((config.embed_dim, config.embed_dim)),
         }
     }
 
@@ -492,6 +512,31 @@ impl LRM {
         self.config.max_inference_steps = n;
     }
 
+    pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
+        &self.activation_similarity_matrix
+    }
+
+    pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
+        if let Some(ctx) = context {
+            if ctx.nrows() != self.config.embed_dim || ctx.ncols() != self.config.embed_dim {
+                self.incoming_similarity_context = None;
+                return;
+            }
+
+            if let Some(existing) = self.incoming_similarity_context.as_mut() {
+                if existing.dim() == ctx.dim() {
+                    existing.assign(ctx);
+                } else {
+                    *existing = ctx.clone();
+                }
+            } else {
+                self.incoming_similarity_context = Some(ctx.clone());
+            }
+        } else {
+            self.incoming_similarity_context = None;
+        }
+    }
+
     fn get_max_steps(&self) -> usize {
         if self.is_training {
             self.config.max_supervision_steps
@@ -510,7 +555,15 @@ impl LRM {
 
     pub fn forward_recursive(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
         if self.config.num_recursions == 0 {
-            let out = self.block.write().unwrap().forward_step(input, 0);
+            let mut block_guard = self.block.write().unwrap();
+            block_guard.set_incoming_similarity_context(self.incoming_similarity_context.as_ref());
+            let out = block_guard.forward_step(input, 0);
+            let ctx = block_guard.activation_similarity_matrix().clone();
+            if self.activation_similarity_matrix.dim() == ctx.dim() {
+                self.activation_similarity_matrix.assign(&ctx);
+            } else {
+                self.activation_similarity_matrix = ctx;
+            }
             return Ok(out);
         }
         let mut y = input.clone();
@@ -567,6 +620,7 @@ impl LRM {
         // This is the “permission token” approach: acquire permission once, then
         // operate on data many times.
         let mut block_guard = self.block.write().unwrap();
+        let mut similarity_ctx = self.incoming_similarity_context.clone();
 
         // ACT-style halting state (per token).
         let halting_enabled = self.config.halting.enabled;
@@ -624,6 +678,7 @@ impl LRM {
                     &prev_y_active,
                     &mut z_active,
                     &mut scratch_active,
+                    &mut similarity_ctx,
                     false,
                 );
 
@@ -631,7 +686,18 @@ impl LRM {
                 scratch_active.assign(&prev_y_active);
                 scratch_active += &z_active;
                 Self::sanitize(&mut scratch_active);
+                block_guard.set_incoming_similarity_context(similarity_ctx.as_ref());
                 let new_y_active = block_guard.forward_step(&scratch_active, 0);
+                let ctx = block_guard.activation_similarity_matrix().clone();
+                if let Some(existing) = similarity_ctx.as_mut() {
+                    if existing.dim() == ctx.dim() {
+                        existing.assign(&ctx);
+                    } else {
+                        *existing = ctx;
+                    }
+                } else {
+                    similarity_ctx = Some(ctx);
+                }
 
                 // ACT halting weights for active rows only.
                 let mut w = Array2::<f32>::zeros((bsz, 1));
@@ -729,6 +795,7 @@ impl LRM {
                 prev_y_ref,
                 &mut z,
                 &mut ans_in,
+                &mut similarity_ctx,
                 false,
             );
 
@@ -737,7 +804,18 @@ impl LRM {
             Self::sanitize(&mut ans_in);
 
             // Final answer step.
+            block_guard.set_incoming_similarity_context(similarity_ctx.as_ref());
             let new_y = block_guard.forward_step(&ans_in, 0);
+            let ctx = block_guard.activation_similarity_matrix().clone();
+            if let Some(existing) = similarity_ctx.as_mut() {
+                if existing.dim() == ctx.dim() {
+                    existing.assign(&ctx);
+                } else {
+                    *existing = ctx;
+                }
+            } else {
+                similarity_ctx = Some(ctx);
+            }
             let answer_cache = block_guard.get_cache();
 
             // Optional ACT-style halting weights derived from per-token convergence.
@@ -857,6 +935,13 @@ impl LRM {
             }
         }
 
+        let ctx = block_guard.activation_similarity_matrix().clone();
+        if self.activation_similarity_matrix.dim() == ctx.dim() {
+            self.activation_similarity_matrix.assign(&ctx);
+        } else {
+            self.activation_similarity_matrix = ctx;
+        }
+
         if halting_enabled && self.config.halting.act_weighted_output {
             Ok(y_accum)
         } else {
@@ -899,19 +984,10 @@ impl LRM {
         // read/write permission switching during checkpoint replay.
         let mut block_guard = self.block.write().unwrap();
 
-        // 1) Backward through final answer step.
-        block_guard.set_cache(Some(step_cache.answer_cache.clone()));
-
-        let input_to_block = match &step_cache.answer_cache {
-            CoreCache::Transformer(c) => &c.0,
-            CoreCache::Diffusion(c) => c.input.as_ref(),
-        };
-
-        let (d_ans_in, mut all) = block_guard.compute_gradients(input_to_block, output_grads);
-
-        // 2. Backward through recursions
+        // 1) Backward through recursions
         // Gradient Checkpointing: Re-run forward pass to generate caches
         let mut z_replay = step_cache.initial_z.clone();
+        let mut similarity_ctx = self.incoming_similarity_context.clone();
 
         // Replay the forward recursion to regenerate caches (checkpointing) AND
         // capture the exact per-step adaptive alpha used in the z-update.
@@ -921,7 +997,19 @@ impl LRM {
             &step_cache.y,
             &mut z_replay,
             &mut scratch_combined,
+            &mut similarity_ctx,
         );
+
+        // 2) Backward through final answer step.
+        block_guard.set_incoming_similarity_context(similarity_ctx.as_ref());
+        block_guard.set_cache(Some(step_cache.answer_cache.clone()));
+
+        let input_to_block = match &step_cache.answer_cache {
+            CoreCache::Transformer(c) => &c.0,
+            CoreCache::Diffusion(c) => c.input_used.as_ref(),
+        };
+
+        let (d_ans_in, mut all) = block_guard.compute_gradients(input_to_block, output_grads);
 
         // d_ans_in flows back to y and z.
         // d_y = d_ans_in, d_z = d_ans_in
@@ -936,7 +1024,7 @@ impl LRM {
             block_guard.set_cache(Some(rec.clone()));
             let rec_input = match rec {
                 CoreCache::Transformer(c) => &c.0,
-                CoreCache::Diffusion(c) => c.input.as_ref(),
+                CoreCache::Diffusion(c) => c.input_used.as_ref(),
             };
 
             // Gradient of z update (treat alpha as a detached step-size):
@@ -1166,11 +1254,13 @@ impl LRM {
     ) -> Vec<CoreCache> {
         let mut block_guard = self.block.write().unwrap();
         let mut scratch_combined = Array2::<f32>::zeros(y.raw_dim());
+        let mut similarity_ctx = self.incoming_similarity_context.clone();
         self.run_recursions_with_guard(
             &mut block_guard,
             y,
             z,
             &mut scratch_combined,
+            &mut similarity_ctx,
             capture_caches,
         )
     }
@@ -1181,6 +1271,7 @@ impl LRM {
         y: &Array2<f32>,
         z: &mut Array2<f32>,
         scratch_combined: &mut Array2<f32>,
+        similarity_ctx: &mut Option<Array2<f32>>,
         capture_caches: bool,
     ) -> Vec<CoreCache> {
         let mut caches = Vec::new();
@@ -1192,7 +1283,18 @@ impl LRM {
             scratch_combined.assign(y);
             *scratch_combined += &*z;
             Self::sanitize(scratch_combined);
+            block_guard.set_incoming_similarity_context(similarity_ctx.as_ref());
             let block_out = block_guard.forward_step(scratch_combined, r_step);
+            let ctx = block_guard.activation_similarity_matrix().clone();
+            if let Some(existing) = similarity_ctx.as_mut() {
+                if existing.dim() == ctx.dim() {
+                    existing.assign(&ctx);
+                } else {
+                    *existing = ctx.clone();
+                }
+            } else {
+                *similarity_ctx = Some(ctx.clone());
+            }
 
             if capture_caches && let Some(cache) = block_guard.get_cache() {
                 caches.push(cache);
@@ -1229,6 +1331,7 @@ impl LRM {
         y: &Array2<f32>,
         z: &mut Array2<f32>,
         scratch_combined: &mut Array2<f32>,
+        similarity_ctx: &mut Option<Array2<f32>>,
     ) -> Vec<(CoreCache, f32)> {
         let mut trace = Vec::new();
         if scratch_combined.raw_dim() != y.raw_dim() {
@@ -1239,7 +1342,18 @@ impl LRM {
             scratch_combined.assign(y);
             *scratch_combined += &*z;
             Self::sanitize(scratch_combined);
+            block_guard.set_incoming_similarity_context(similarity_ctx.as_ref());
             let block_out = block_guard.forward_step(scratch_combined, r_step);
+            let ctx = block_guard.activation_similarity_matrix().clone();
+            if let Some(existing) = similarity_ctx.as_mut() {
+                if existing.dim() == ctx.dim() {
+                    existing.assign(&ctx);
+                } else {
+                    *existing = ctx.clone();
+                }
+            } else {
+                *similarity_ctx = Some(ctx.clone());
+            }
 
             let mut new_z = block_out;
             Self::sanitize(&mut new_z);
