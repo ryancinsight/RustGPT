@@ -930,11 +930,6 @@ impl LLM {
         // Set TRM layers to training mode (full supervision steps)
         self.set_trm_training_mode();
 
-        let tokenized_data = data
-            .par_iter()
-            .map(|input| self.tokenize(input))
-            .collect::<Vec<Vec<usize>>>();
-
         // Store previous richards_glu richards weights for delta tracking
         let mut prev_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
 
@@ -977,14 +972,19 @@ impl LLM {
                     layer.set_training_progress(training_progress);
                 }
                 // Process data in batches
-                for batch in tokenized_data.chunks(batch_size.max(1)) {
+                for batch_strs in data.chunks(batch_size.max(1)) {
+                    let batch_tokenized: Vec<Vec<usize>> = batch_strs
+                        .par_iter()
+                        .map(|input| self.tokenize(input))
+                        .collect();
+
                     let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
-                        self.train_batch_profiled(batch, effective_lr, &mut scratch)?;
+                        self.train_batch_profiled(&batch_tokenized, effective_lr, &mut scratch)?;
                     total_loss += batch_loss;
                     total_base_loss += batch_base_loss;
                     total_grad_norm += grad_norm;
                     batch_count += 1;
-                    total_examples += batch.len();
+                    total_examples += batch_tokenized.len();
                     for (i, s) in layer_param_grad_norm_sq.into_iter().enumerate() {
                         if i < per_layer_param_grad_norm_sq.len() {
                             per_layer_param_grad_norm_sq[i] += s;
@@ -1648,11 +1648,6 @@ impl LLM {
     ) -> Result<()> {
         self.set_trm_training_mode();
 
-        let tokenized_data = data
-            .par_iter()
-            .map(|input| self.tokenize(input))
-            .collect::<Vec<Vec<usize>>>();
-
         for epoch in 0..epochs {
             let t_epoch_start = std::time::Instant::now();
             let mut total_loss = 0.0f32;
@@ -1671,9 +1666,14 @@ impl LLM {
                 lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
             };
 
-            for batch in tokenized_data.chunks(batch_size.max(1)) {
+            for batch_strs in data.chunks(batch_size.max(1)) {
+                let batch_tokenized: Vec<Vec<usize>> = batch_strs
+                    .par_iter()
+                    .map(|input| self.tokenize(input))
+                    .collect();
+
                 let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
-                    self.train_batch_eprop_profiled(batch, effective_lr)?;
+                    self.train_batch_eprop_profiled(&batch_tokenized, effective_lr)?;
                 total_loss += batch_loss;
                 total_base_loss += batch_base_loss;
                 total_grad_norm += grad_norm;
@@ -1723,15 +1723,10 @@ impl LLM {
         // Set TRM layers to training mode (full supervision steps)
         self.set_trm_training_mode();
 
-        let tokenized_data = data
-            .par_iter()
-            .map(|input| self.tokenize(input))
-            .collect::<Vec<Vec<usize>>>();
-
         info!(
             "Starting TRM autoencoding pretraining: {} epochs, {} sequences",
             epochs,
-            tokenized_data.len()
+            data.len()
         );
 
         let mut scratch = std::mem::take(&mut self.training_scratch);
@@ -1742,17 +1737,22 @@ impl LLM {
                 let mut total_grad_norm = 0.0;
                 let mut batch_count = 0;
                 // Process data in batches
-                for batch in tokenized_data.chunks(batch_size.max(1)) {
+                for batch_strs in data.chunks(batch_size.max(1)) {
+                    let batch_tokenized: Vec<Vec<usize>> = batch_strs
+                        .par_iter()
+                        .map(|input| self.tokenize(input))
+                        .collect();
+
                     let (batch_loss, batch_base_loss, grad_norm) =
-                        self.train_batch_trm_autoencoding(batch, lr, &mut scratch)?;
+                        self.train_batch_trm_autoencoding(&batch_tokenized, lr, &mut scratch)?;
                     total_loss += batch_loss;
                     total_base_loss += batch_base_loss;
                     total_grad_norm += grad_norm;
                     batch_count += 1;
                 }
 
-                let avg_loss = total_loss / tokenized_data.len() as f32;
-                let avg_base_loss = total_base_loss / tokenized_data.len() as f32;
+                let avg_loss = total_loss / data.len() as f32;
+                let avg_base_loss = total_base_loss / data.len() as f32;
                 let avg_grad_norm = total_grad_norm / batch_count as f32;
 
                 // NFR-5.2: Training divergence detection
@@ -3690,16 +3690,6 @@ impl LLM {
         checkpoint_dir: Option<String>,
         checkpoint_stage: Option<String>,
     ) -> Result<()> {
-        let tokenized_data = data
-            .par_iter()
-            .map(|input| self.tokenize(input))
-            .collect::<Vec<Vec<usize>>>();
-
-        let response_spans: Vec<Option<(usize, usize)>> = tokenized_data
-            .iter()
-            .map(|seq| response_span_from_tokens(&self.vocab, seq))
-            .collect();
-
         let mut diffusion_blocks_idx: Vec<usize> = Vec::new();
         let mut embeddings_idx: Option<usize> = None;
         let mut norm_idx: Option<usize> = None;
@@ -3811,6 +3801,12 @@ impl LLM {
 
         // Warmup epochs default to 15% of total for stability
         let warmup_epochs = ((epochs as f32) * 0.15).ceil() as usize;
+
+        // Split data into training and validation sets
+        let val_start = (data.len() as f32 * (1.0 - validation_ratio)).floor() as usize;
+        let train_data = &data[..val_start];
+        let val_data = &data[val_start..];
+
         for epoch in 0..epochs {
             let t_epoch_start = std::time::Instant::now();
             // Learning rate warmup + cosine annealing (SGDR)
@@ -3934,23 +3930,26 @@ impl LLM {
             let mut count = 0usize;
             let mut total_grad_norm_sq = 0.0f32;
 
-            let mut batch_start = 0usize;
-            while batch_start < tokenized_data.len() {
-                let batch_end = (batch_start + effective_batch_size).min(tokenized_data.len());
+            for batch_strs in train_data.chunks(effective_batch_size) {
+                let batch_tokenized: Vec<Vec<usize>> = batch_strs
+                    .par_iter()
+                    .map(|input| self.tokenize(input))
+                    .collect();
+
+                let batch_response_spans: Vec<Option<(usize, usize)>> = batch_tokenized
+                    .iter()
+                    .map(|seq| response_span_from_tokens(&self.vocab, seq))
+                    .collect();
+
                 self.training_scratch.reset(self.network.len());
                 let mut examples_in_batch = 0usize;
-                for (seq_idx, training_row) in tokenized_data
-                    .iter()
-                    .enumerate()
-                    .take(batch_end)
-                    .skip(batch_start)
-                {
+                for (i, training_row) in batch_tokenized.iter().enumerate() {
                     if training_row.len() < 2 {
                         continue;
                     }
                     examples_in_batch += 1;
 
-                    let response_span = response_spans.get(seq_idx).copied().flatten();
+                    let response_span = batch_response_spans[i];
 
                     let input_ids = &training_row[..training_row.len() - 1];
                     let target_ids = &training_row[1..];
@@ -4456,7 +4455,6 @@ impl LLM {
                     }
                 }
                 self.training_scratch.grads_per_layer = grads_per_layer;
-                batch_start = batch_end;
             }
 
             let avg_loss = if count > 0 {
@@ -4535,18 +4533,27 @@ impl LLM {
                 }
             }
             // Validation split (last 10% examples)
-            let val_start =
-                (tokenized_data.len() as f32 * (1.0 - validation_ratio)).floor() as usize;
             let mut val_loss_total = 0.0f32;
             let mut val_sce_total = 0.0f32;
             let mut val_mse_total = 0.0f32;
             let mut val_count = 0usize;
-            for (seq_idx, training_row) in tokenized_data.iter().enumerate().skip(val_start) {
-                if training_row.len() < 2 {
-                    continue;
-                }
-                let response_span = response_spans.get(seq_idx).copied().flatten();
-                let input_ids = &training_row[..training_row.len() - 1];
+
+            for batch_strs in val_data.chunks(effective_batch_size) {
+                let batch_tokenized: Vec<Vec<usize>> = batch_strs
+                    .par_iter()
+                    .map(|input| self.tokenize(input))
+                    .collect();
+                let batch_response_spans: Vec<Option<(usize, usize)>> = batch_tokenized
+                    .iter()
+                    .map(|seq| response_span_from_tokens(&self.vocab, seq))
+                    .collect();
+
+                for (i, training_row) in batch_tokenized.iter().enumerate() {
+                    if training_row.len() < 2 {
+                        continue;
+                    }
+                    let response_span = batch_response_spans[i];
+                    let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
                 let mut ids_arr = Array2::<f32>::zeros((1, input_ids.len()));
                 for (i, &tid) in input_ids.iter().enumerate() {
@@ -4696,6 +4703,7 @@ impl LLM {
                 val_sce_total += ce;
                 val_mse_total += mse;
                 val_count += 1;
+            }
             }
             let val_loss = if val_count > 0 {
                 val_loss_total / val_count as f32
