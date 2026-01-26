@@ -71,6 +71,10 @@ harness = false
 name = "csv_loading"
 harness = false
 
+[[bench]]
+name = "richards_curve_bench"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
