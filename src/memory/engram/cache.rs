@@ -40,9 +40,14 @@ impl EngramCache {
         }
 
         self.tier_1_misses += 1;
-        if let Some(embedding) = self.tier_2.get(&hash_idx).cloned() {
-            self.tier_2_hits += 1;
-            if self.tier_1_size > 0 {
+        if self.tier_2_size > 0 {
+            if self.tier_1_size == 0 {
+                if let Some(entry) = self.tier_2.get(&hash_idx) {
+                    self.tier_2_hits += 1;
+                    return Some(entry);
+                }
+            } else if let Some(embedding) = self.tier_2.remove(&hash_idx) {
+                self.tier_2_hits += 1;
                 if self.tier_1.len() >= self.tier_1_size {
                     if let Some(key) = self.tier_1.keys().next().copied() {
                         self.tier_1.remove(&key);
@@ -51,7 +56,6 @@ impl EngramCache {
                 self.tier_1.insert(hash_idx, embedding);
                 return self.tier_1.get(&hash_idx);
             }
-            return self.tier_2.get(&hash_idx);
         }
 
         self.tier_2_misses += 1;
@@ -63,9 +67,23 @@ impl EngramCache {
             return;
         }
         if self.tier_1_size > 0 && self.tier_1.len() < self.tier_1_size {
-            self.tier_1.insert(hash_idx, embedding.clone());
-        } else if self.tier_2_size > 0 && self.tier_2.len() < self.tier_2_size {
-            self.tier_2.insert(hash_idx, embedding.clone());
+            self.tier_1.insert(hash_idx, embedding);
+            return;
+        }
+        if self.tier_2_size > 0 {
+            if self.tier_2.len() >= self.tier_2_size {
+                if let Some(key) = self.tier_2.keys().next().copied() {
+                    self.tier_2.remove(&key);
+                }
+            }
+            self.tier_2.insert(hash_idx, embedding);
+            return;
+        }
+        if self.tier_1_size > 0 {
+            if let Some(key) = self.tier_1.keys().next().copied() {
+                self.tier_1.remove(&key);
+            }
+            self.tier_1.insert(hash_idx, embedding);
         }
     }
 
