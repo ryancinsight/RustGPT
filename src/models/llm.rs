@@ -632,10 +632,17 @@ impl LLM {
         t_idx: usize,
     ) -> Array2<f32> {
         let mut hidden = input.clone();
+        let mut similarity_ctx: Option<Array2<f32>> = None;
         for &idx in block_indices {
             if let LayerEnum::DiffusionBlock(block) = &mut self.network[idx] {
                 block.set_timestep(t_idx);
+                block.set_incoming_similarity_context(similarity_ctx.as_ref());
                 hidden = block.forward_with_timestep(&hidden, t_idx);
+                if let Some(existing) = similarity_ctx.as_mut() {
+                    existing.assign(block.activation_similarity_matrix());
+                } else {
+                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                }
             }
         }
         hidden
@@ -5050,9 +5057,16 @@ impl LLM {
                     _ => current_sample.clone(),
                 };
                 let mut hidden = x_t.clone();
+                let mut similarity_ctx: Option<Array2<f32>> = None;
                 for &idx in &diffusion_blocks_idx {
                     if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
+                        b.set_incoming_similarity_context(similarity_ctx.as_ref());
                         hidden = b.forward_with_timestep(&hidden, t_idx);
+                        if let Some(existing) = similarity_ctx.as_mut() {
+                            existing.assign(b.activation_similarity_matrix());
+                        } else {
+                            similarity_ctx = Some(b.activation_similarity_matrix().clone());
+                        }
                     }
                 }
                 for layer in &mut self.network {
@@ -5322,10 +5336,17 @@ impl LLM {
                 _ => continue,
             };
             let mut hidden = x0.clone();
+            let mut similarity_ctx: Option<Array2<f32>> = None;
             for &idx in &diffusion_blocks_idx {
                 if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
                     b.set_timestep(0);
+                    b.set_incoming_similarity_context(similarity_ctx.as_ref());
                     hidden = b.forward_with_timestep(&hidden, 0);
+                    if let Some(existing) = similarity_ctx.as_mut() {
+                        existing.assign(b.activation_similarity_matrix());
+                    } else {
+                        similarity_ctx = Some(b.activation_similarity_matrix().clone());
+                    }
                 }
             }
             if let Some(nidx) = norm_idx
