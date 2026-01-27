@@ -82,6 +82,12 @@ pub struct AdaptiveResiduals {
     #[serde(skip, default)]
     scratch_ny: Vec<f64>,
     #[serde(skip, default)]
+    scratch_mean_x: Vec<f64>,
+    #[serde(skip, default)]
+    scratch_mean_y: Vec<f64>,
+    #[serde(skip, default)]
+    scratch_mean_z: Vec<f64>,
+    #[serde(skip, default)]
     scratch_perf_values: Vec<f64>,
     #[serde(skip, default)]
     scratch_channel_scales: Vec<f32>,
@@ -120,6 +126,9 @@ impl AdaptiveResiduals {
 
             scratch_nx: Vec::new(),
             scratch_ny: Vec::new(),
+            scratch_mean_x: Vec::new(),
+            scratch_mean_y: Vec::new(),
+            scratch_mean_z: Vec::new(),
             scratch_perf_values: Vec::new(),
             scratch_channel_scales: Vec::new(),
         }
@@ -351,6 +360,28 @@ impl AdaptiveResiduals {
         self.scratch_ny.resize(embed_dim, 0.0f64);
         self.scratch_ny.fill(0.0f64);
 
+        self.scratch_mean_x.resize(embed_dim, 0.0f64);
+        self.scratch_mean_x.fill(0.0f64);
+        self.scratch_mean_y.resize(embed_dim, 0.0f64);
+        self.scratch_mean_y.fill(0.0f64);
+        let mut sample_count = 0usize;
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
+            sample_count += 1;
+            for j in 0..embed_dim {
+                let x = input[[seq_idx, j]];
+                let y = output[[seq_idx, j]];
+                let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                self.scratch_mean_x[j] += xs;
+                self.scratch_mean_y[j] += ys;
+            }
+        }
+        let inv = 1.0f64 / (sample_count.max(1) as f64);
+        for j in 0..embed_dim {
+            self.scratch_mean_x[j] *= inv;
+            self.scratch_mean_y[j] *= inv;
+        }
+
         // Compute norms
         for seq_idx in (0..seq_len).step_by(step).take(sample) {
             for j in 0..embed_dim {
@@ -358,8 +389,10 @@ impl AdaptiveResiduals {
                 let y = output[[seq_idx, j]];
                 let xs = if x.is_finite() { x as f64 } else { 0.0 };
                 let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                self.scratch_nx[j] += xs * xs;
-                self.scratch_ny[j] += ys * ys;
+                let xc = xs - self.scratch_mean_x[j];
+                let yc = ys - self.scratch_mean_y[j];
+                self.scratch_nx[j] += xc * xc;
+                self.scratch_ny[j] += yc * yc;
             }
         }
 
@@ -380,7 +413,9 @@ impl AdaptiveResiduals {
                 let y = output[[seq_idx, i]];
                 let xs = if x.is_finite() { x as f64 } else { 0.0 };
                 let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                dot_diag += xs * ys;
+                let xc = xs - self.scratch_mean_x[i];
+                let yc = ys - self.scratch_mean_y[i];
+                dot_diag += xc * yc;
             }
 
             let denom_x = (self.scratch_nx[i] + 1e-6).sqrt();
@@ -407,7 +442,9 @@ impl AdaptiveResiduals {
                     let y = output[[seq_idx, j]];
                     let xs = if x.is_finite() { x as f64 } else { 0.0 };
                     let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                    dot += xs * ys;
+                    let xc = xs - self.scratch_mean_x[i];
+                    let yc = ys - self.scratch_mean_y[j];
+                    dot += xc * yc;
                 }
                 let denom_x = (self.scratch_nx[i] + 1e-6).sqrt();
                 let denom_y = (self.scratch_ny[j] + 1e-6).sqrt();
@@ -600,6 +637,25 @@ impl AdaptiveResiduals {
         let sample = seq_len.min(32);
         let step = (seq_len / sample).max(1);
 
+        self.scratch_mean_z.resize(embed_dim, 0.0f64);
+        self.scratch_mean_z.fill(0.0f64);
+        let mut sample_count = 0usize;
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
+            sample_count += 1;
+            for j in 0..embed_dim {
+                let a = attention_weights[[seq_idx, j]];
+                let f = ffn_weights[[seq_idx, j]];
+                let a = if a.is_finite() { a as f64 } else { 0.0 };
+                let f = if f.is_finite() { f as f64 } else { 0.0 };
+                let v = a + f;
+                self.scratch_mean_z[j] += v;
+            }
+        }
+        let inv = 1.0f64 / (sample_count.max(1) as f64);
+        for j in 0..embed_dim {
+            self.scratch_mean_z[j] *= inv;
+        }
+
         self.scratch_nx.resize(embed_dim, 0.0f64);
         self.scratch_nx.fill(0.0f64);
         let mut dot = vec![0.0f64; embed_dim * embed_dim];
@@ -612,8 +668,9 @@ impl AdaptiveResiduals {
                 let a = if a.is_finite() { a as f64 } else { 0.0 };
                 let f = if f.is_finite() { f as f64 } else { 0.0 };
                 let v = a + f;
-                z[j] = v;
-                self.scratch_nx[j] += v * v;
+                let vc = v - self.scratch_mean_z[j];
+                z[j] = vc;
+                self.scratch_nx[j] += vc * vc;
             }
 
             for i in 0..embed_dim {

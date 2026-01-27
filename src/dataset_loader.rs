@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{BufRead, Seek},
+    path::Path,
 };
 
 use csv::ReaderBuilder;
@@ -25,7 +26,8 @@ impl Dataset {
         type_of_data: DatasetType,
     ) -> Result<Self> {
         let pretraining_data: Vec<String>;
-        let chat_training_data: Vec<String>;
+        let mut chat_training_data: Vec<String>;
+        let is_json = matches!(type_of_data, DatasetType::JSON);
 
         match type_of_data {
             DatasetType::CSV => {
@@ -35,6 +37,19 @@ impl Dataset {
             DatasetType::JSON => {
                 pretraining_data = get_data_from_json(&pretraining_data_path)?;
                 chat_training_data = get_data_from_json(&chat_training_data_path)?;
+            }
+        }
+
+        if is_json {
+            let rust_path = "data/rust_programming_training_data.json";
+            if chat_training_data_path != rust_path && Path::new(rust_path).exists() {
+                let rust_data = get_data_from_json(rust_path)?;
+                chat_training_data.extend(rust_data);
+            }
+            let tool_path = "data/tool_calling_training_data.json";
+            if chat_training_data_path != tool_path && Path::new(tool_path).exists() {
+                let tool_data = get_data_from_json(tool_path)?;
+                chat_training_data.extend(tool_data);
             }
         }
 
