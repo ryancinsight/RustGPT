@@ -41,6 +41,18 @@ type ThresholdParamAndInputGrads = (
     Vec<f64>,
 );
 
+#[derive(Debug, Clone)]
+pub struct ThresholdPredictorCache {
+    pub input: ndarray::Array2<f32>,
+    pub hidden: ndarray::Array2<f32>,
+    pub normalized: ndarray::Array2<f32>,
+    pub activation: ndarray::Array2<f32>,
+    pub activated: ndarray::Array2<f32>,
+    pub output: ndarray::Array2<f32>,
+    pub cond_input: Option<ndarray::Array2<f32>>,
+    pub norm_state: Option<crate::richards::RichardsNorm>,
+}
+
 /// Enhanced threshold predictor inspired by AutoDeco
 ///
 /// This implements a two-layer neural network for threshold prediction with proper
@@ -188,6 +200,61 @@ impl ThresholdPredictor {
         out_sigmoid
     }
 
+    /// Detached prediction that returns cache explicitly without mutating self.
+    /// Used for reproducing forward passes (e.g. in TitansMAC gradient computation) without side effects.
+    pub fn predict_with_condition_detached(
+        &self,
+        input: &ndarray::ArrayView2<f32>,
+        cond: Option<ndarray::ArrayView2<f32>>,
+    ) -> (ndarray::Array2<f32>, ThresholdPredictorCache) {
+        let input_owned = input.to_owned();
+        let hidden_base = input.dot(&self.weights1);
+        let (hidden, cond_input) = if let Some(c) = cond {
+            let c_owned = c.to_owned();
+            (
+                hidden_base + c_owned.dot(&self.cond_w) + &self.bias1,
+                Some(c_owned),
+            )
+        } else {
+            (hidden_base + &self.bias1, None)
+        };
+
+        // Clone norm to capture its state (adjusted params) during forward
+        let mut local_norm = self.norm.clone();
+        // Use forward (mutable on local clone) to update local cache/state
+        let normalized = local_norm.forward(&hidden);
+
+        // Learned Richards activation replacing ReLU
+        let mut activation_output = ndarray::Array2::<f32>::zeros(normalized.raw_dim());
+        self.activation
+            .forward_matrix_f32_into(&normalized, &mut activation_output);
+
+        // Second layer input (previously activated)
+        let activated = activation_output.clone();
+
+        // Second layer: W2 * activated + b2
+        let output = activated.dot(&self.weights2) + &self.bias2;
+
+        // Richards sigmoid activation to get values in [0, 1] range
+        let mut out_sigmoid = ndarray::Array2::<f32>::zeros(output.raw_dim());
+        self.sigmoid
+            .forward_matrix_f32_into(&output, &mut out_sigmoid);
+
+        (
+            out_sigmoid,
+            ThresholdPredictorCache {
+                input: input_owned,
+                hidden,
+                normalized,
+                activation: activation_output,
+                activated,
+                output,
+                cond_input,
+                norm_state: Some(local_norm),
+            },
+        )
+    }
+
     /// Forward pass for auxiliary computation (immutable)
     ///
     /// Returns sigmoid-activated values in [0, 1] range suitable for threshold prediction
@@ -218,10 +285,95 @@ impl ThresholdPredictor {
         self.predict_with_condition(input, None)
     }
 
+    /// Extract current internal cache into a detached cache object
+    pub fn take_cache(&mut self) -> Option<ThresholdPredictorCache> {
+        // We need to capture the state of norm as well.
+        // However, self.norm is not an Option, it stays.
+        // But its state (caches) is inside.
+        // self.norm.cached_adjusted_richards etc are private.
+        // But we can clone `self.norm` which clones its state.
+        let norm_state = Some(self.norm.clone());
+
+        Some(ThresholdPredictorCache {
+            input: self.cached_input.take()?,
+            hidden: self.cached_hidden.take()?,
+            normalized: self.cached_normalized.take()?,
+            activation: self.cached_activation.take()?,
+            activated: self.cached_activated.take()?,
+            output: self.cached_output.take()?,
+            cond_input: self.cached_cond_input.take(),
+            norm_state,
+        })
+    }
+
+    /// Compute gradients using an external cache
+    pub fn compute_gradients_from_cache(
+        &self,
+        cache: &ThresholdPredictorCache,
+        output_grads: &ndarray::Array2<f32>,
+    ) -> ThresholdParamGrads {
+        // Gradient through Richards sigmoid
+        let mut d_output = ndarray::Array2::<f32>::zeros(output_grads.raw_dim());
+        self.sigmoid
+            .backward_matrix_f32_into(&cache.output, output_grads, &mut d_output);
+
+        // Second layer gradients
+        let grad_weights2 = cache.activated.t().dot(&d_output);
+        let grad_bias2 = d_output.sum_axis(ndarray::Axis(0));
+
+        // Gradient w.r.t. activated (before second layer)
+        let d_activated = d_output.dot(&self.weights2.t());
+
+        // Gradient through Richards activation (replacing ReLU)
+        let mut d_normalized = ndarray::Array2::<f32>::zeros(cache.normalized.raw_dim());
+        self.activation.backward_matrix_f32_into(
+            &cache.normalized,
+            &d_activated,
+            &mut d_normalized,
+        );
+
+        // Gradient through Richards normalization
+        // Use the captured norm state if available, otherwise fallback to self.norm
+        // (though if cache came from detached forward, norm_state should be present)
+        let norm_ref = cache.norm_state.as_ref().unwrap_or(&self.norm);
+        let (d_hidden, _) = norm_ref.compute_gradients(&cache.hidden, &d_normalized);
+
+        // First layer gradients
+        let grad_weights1: ndarray::Array2<f32> = cache.input.t().dot(&d_hidden);
+        let grad_bias1 = d_hidden.sum_axis(ndarray::Axis(0));
+        let grad_cond_w = if let Some(cond_in) = &cache.cond_input {
+            Some(cond_in.t().dot(&d_hidden))
+        } else {
+            None
+        };
+
+        // Activation parameter gradients (Richards curve parameters)
+        let activation_grads = self
+            .activation
+            .grad_weights_matrix_f32(&cache.normalized, &d_activated);
+
+        (
+            grad_weights1,
+            grad_bias1,
+            grad_weights2,
+            grad_bias2,
+            grad_cond_w,
+            activation_grads,
+        )
+    }
+
     /// Compute gradients for the two-layer threshold network
     ///
     /// Returns gradients for (weights1, bias1, weights2, bias2, activation_params)
     pub fn compute_gradients(&self, output_grads: &ndarray::Array2<f32>) -> ThresholdParamGrads {
+        // Re-use compute_gradients_from_cache by constructing a temporary cache reference
+        // Note: This requires cloning the cached data into the struct, which is slightly inefficient
+        // compared to direct access, but avoids code duplication.
+        // Given that compute_gradients is usually called once per step, this is acceptable.
+        // OR we can implement a private helper that takes references.
+        // But ThresholdPredictorCache owns the data.
+
+        // Let's rely on the direct implementation for standard path to avoid cloning.
         // Retrieve cached activations
         let cached_input = self
             .cached_input
@@ -476,5 +628,37 @@ mod tests {
 
         // Check activation gradients exist
         assert!(!activation_grads.is_empty());
+    }
+
+    #[test]
+    fn test_threshold_predictor_detached_and_cache() {
+        let predictor = ThresholdPredictor::new(32, 16, 1);
+        let input = Array2::<f32>::from_shape_vec((2, 32), vec![0.1; 64]).unwrap();
+
+        // Detached prediction
+        let (output, cache) = predictor.predict_with_condition_detached(&input.view(), None);
+
+        // Check output range
+        for &val in output.iter() {
+            assert!((0.0..=1.0).contains(&val));
+        }
+
+        // Compute gradients from cache
+        let output_grads = Array2::<f32>::from_elem((2, 1), 1.0);
+        let (grad_w1, grad_b1, grad_w2, grad_b2, _grad_cond_w, activation_grads) =
+            predictor.compute_gradients_from_cache(&cache, &output_grads);
+
+        assert_eq!(grad_w1.shape(), &[32, 16]);
+        assert_eq!(grad_b1.shape(), &[16]);
+        assert_eq!(grad_w2.shape(), &[16, 1]);
+        assert_eq!(grad_b2.shape(), &[1]);
+        assert!(!activation_grads.is_empty());
+
+        // Check take_cache (requires mut predictor and normal predict)
+        let mut predictor_mut = predictor.clone();
+        let _ = predictor_mut.predict(&input.view());
+        let cache_taken = predictor_mut.take_cache().unwrap();
+        // norm_state is stored in take_cache now
+        assert!(cache_taken.norm_state.is_some());
     }
 }
