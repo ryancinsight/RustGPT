@@ -128,6 +128,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
             use_learned_k_adaptation: true,
             shared_experts: vec![],
             shared_expert_scale: 0.0,
+            moh_moe_contrastive_weight: 0.01,
         });
     }
 

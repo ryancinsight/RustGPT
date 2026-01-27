@@ -835,6 +835,14 @@ pub struct DiffusionBlock {
     #[serde(skip)]
     film_gamma_beta_tanh_scratch: Vec<f32>,
     #[serde(skip)]
+    film_gamma_attn_vec: Array2<f32>,
+    #[serde(skip)]
+    film_beta_attn_vec: Array2<f32>,
+    #[serde(skip)]
+    film_gamma_ffn_vec: Array2<f32>,
+    #[serde(skip)]
+    film_beta_ffn_vec: Array2<f32>,
+    #[serde(skip)]
     titan_memory_workspace: TitanMemoryWorkspace,
 }
 
@@ -919,6 +927,10 @@ impl DiffusionBlock {
             opt_similarity_context_strength,
             similarity_update_rate: 0.01,
             film_gamma_beta_tanh_scratch: Vec::new(),
+            film_gamma_attn_vec: Array2::zeros((1, config.embed_dim)),
+            film_beta_attn_vec: Array2::zeros((1, config.embed_dim)),
+            film_gamma_ffn_vec: Array2::zeros((1, config.embed_dim)),
+            film_beta_ffn_vec: Array2::zeros((1, config.embed_dim)),
             titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
@@ -1228,16 +1240,24 @@ impl DiffusionBlock {
 
         let embed = self.config.embed_dim;
         let tanh = crate::richards::RichardsCurve::tanh(false);
-        let mut gamma_attn_vec = Array2::<f32>::zeros((1, embed));
-        let mut beta_attn_vec = Array2::<f32>::zeros((1, embed));
-        let mut gamma_ffn_vec = Array2::<f32>::zeros((1, embed));
-        let mut beta_ffn_vec = Array2::<f32>::zeros((1, embed));
+        if self.film_gamma_attn_vec.raw_dim() != ndarray::Dim([1, embed]) {
+            self.film_gamma_attn_vec = Array2::zeros((1, embed));
+        }
+        if self.film_beta_attn_vec.raw_dim() != ndarray::Dim([1, embed]) {
+            self.film_beta_attn_vec = Array2::zeros((1, embed));
+        }
+        if self.film_gamma_ffn_vec.raw_dim() != ndarray::Dim([1, embed]) {
+            self.film_gamma_ffn_vec = Array2::zeros((1, embed));
+        }
+        if self.film_beta_ffn_vec.raw_dim() != ndarray::Dim([1, embed]) {
+            self.film_beta_ffn_vec = Array2::zeros((1, embed));
+        }
         if let (Some(gb), Some(ga), Some(ba), Some(gf), Some(bf)) = (
             gamma_beta.as_slice(),
-            gamma_attn_vec.as_slice_mut(),
-            beta_attn_vec.as_slice_mut(),
-            gamma_ffn_vec.as_slice_mut(),
-            beta_ffn_vec.as_slice_mut(),
+            self.film_gamma_attn_vec.as_slice_mut(),
+            self.film_beta_attn_vec.as_slice_mut(),
+            self.film_gamma_ffn_vec.as_slice_mut(),
+            self.film_beta_ffn_vec.as_slice_mut(),
         ) {
             self.film_gamma_beta_tanh_scratch.resize(gb.len(), 0.0);
             tanh.forward_into_f32(gb, &mut self.film_gamma_beta_tanh_scratch);
@@ -1255,10 +1275,10 @@ impl DiffusionBlock {
                 let g_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 2 * embed + j]]);
                 let b_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 3 * embed + j]]);
 
-                gamma_attn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_attn;
-                beta_attn_vec[[0, j]] = self.film_scale_beta * b_attn;
-                gamma_ffn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_ffn;
-                beta_ffn_vec[[0, j]] = self.film_scale_beta * b_ffn;
+                self.film_gamma_attn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_attn;
+                self.film_beta_attn_vec[[0, j]] = self.film_scale_beta * b_attn;
+                self.film_gamma_ffn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_ffn;
+                self.film_beta_ffn_vec[[0, j]] = self.film_scale_beta * b_ffn;
             }
         }
 
@@ -1278,7 +1298,8 @@ impl DiffusionBlock {
         };
 
         let norm1_out = self.pre_attention_norm.forward(&input_used);
-        let norm1_mod = Self::apply_film(&norm1_out, &gamma_attn_vec, &beta_attn_vec);
+        let norm1_mod =
+            Self::apply_film(&norm1_out, &self.film_gamma_attn_vec, &self.film_beta_attn_vec);
         let mut attn_out = self
             .temporal_mixing
             .forward_with_causal(&norm1_mod, self.config.causal_attention);
@@ -1296,16 +1317,113 @@ impl DiffusionBlock {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
         }
         self.update_activation_similarity_matrix(&input_used, &attn_out);
+        let head_activity_ratio = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => {
+                if let Some(avg) = attn.last_avg_active_heads {
+                    let denom = attn.num_heads as f32;
+                    let r = avg / denom.max(1.0);
+                    if r.is_finite() {
+                        r.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    1.0
+                }
+            }
+            TemporalMixingLayer::RgLruMoH(rglru) => {
+                if let Some(avg) = rglru.last_avg_active_heads {
+                    let denom = rglru.num_heads as f32;
+                    let r = avg / denom.max(1.0);
+                    if r.is_finite() {
+                        r.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    1.0
+                }
+            }
+            TemporalMixingLayer::MambaMoH(m) => {
+                if let Some(avg) = m.last_avg_active_heads {
+                    let denom = m.num_heads as f32;
+                    let r = avg / denom.max(1.0);
+                    if r.is_finite() {
+                        r.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    1.0
+                }
+            }
+            TemporalMixingLayer::Mamba2MoH(m) => {
+                if let Some(avg) = m.last_avg_active_heads {
+                    let denom = m.num_heads as f32;
+                    let r = avg / denom.max(1.0);
+                    if r.is_finite() {
+                        r.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    1.0
+                }
+            }
+            TemporalMixingLayer::Titans(mac) => {
+                if let Some(avg) = mac.core.last_avg_active_heads {
+                    let denom = mac.core.num_heads as f32;
+                    let r = avg / denom.max(1.0);
+                    if r.is_finite() {
+                        r.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    1.0
+                }
+            }
+            _ => 1.0,
+        };
+        let head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
+            TemporalMixingLayer::MambaMoH(m) => m.last_head_activity_vec.as_deref(),
+            TemporalMixingLayer::Mamba2MoH(m) => m.last_head_activity_vec.as_deref(),
+            TemporalMixingLayer::Titans(mac) => mac.core.last_head_activity_vec.as_deref(),
+            _ => None,
+        };
+        let token_head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::MambaMoH(m) => m.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::Mamba2MoH(m) => m.last_token_head_activity_vec.as_deref(),
+            TemporalMixingLayer::Titans(mac) => mac.core.last_token_head_activity_vec.as_deref(),
+            _ => None,
+        };
         let residual1 = if let Some(ref mut adaptive_residuals) = self.adaptive_residuals {
-            // Apply advanced adaptive residuals for first residual connection
-            adaptive_residuals.apply_attention_residual(&input_used, &attn_out)
+            adaptive_residuals.apply_attention_residual_with_moh(
+                &input_used,
+                &attn_out,
+                Some(head_activity_ratio),
+                head_activity_vec,
+            )
         } else {
-            // Standard residual connection
             &input_used + &attn_out
         };
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
-        let norm2_mod = Self::apply_film(&norm2_out, &gamma_ffn_vec, &beta_ffn_vec);
-        let mut ffn_out = self.feedforward.forward(&norm2_mod);
+        let norm2_mod =
+            Self::apply_film(&norm2_out, &self.film_gamma_ffn_vec, &self.film_beta_ffn_vec);
+        let mut ffn_out = match &mut self.feedforward {
+            FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_mod),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer
+                .forward_with_head_features_and_token_activity(
+                    &norm2_mod,
+                    Some(head_activity_ratio),
+                    head_activity_vec,
+                    token_head_activity_vec,
+                ),
+        };
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut ffn_out, self.dropout_rate);
         }
@@ -1340,10 +1458,10 @@ impl DiffusionBlock {
             norm2_out: Arc::new(norm2_out),
             norm2_mod: Arc::new(norm2_mod),
             h_vec: Arc::new(h_vec),
-            gamma_attn: Arc::new(gamma_attn_vec),
-            beta_attn: Arc::new(beta_attn_vec),
-            gamma_ffn: Arc::new(gamma_ffn_vec),
-            beta_ffn: Arc::new(beta_ffn_vec),
+            gamma_attn: Arc::new(self.film_gamma_attn_vec.clone()),
+            beta_attn: Arc::new(self.film_beta_attn_vec.clone()),
+            gamma_ffn: Arc::new(self.film_gamma_ffn_vec.clone()),
+            beta_ffn: Arc::new(self.film_beta_ffn_vec.clone()),
             gamma_beta: Arc::new(gamma_beta),
             attn_out: Arc::new(attn_out),
             ffn_out: Arc::new(ffn_out),
@@ -1545,8 +1663,11 @@ impl DiffusionBlock {
         conditional_pred: &Array2<f32>,
         guidance_scale: f32,
     ) -> Array2<f32> {
-        let guidance_direction = conditional_pred - unconditional_pred;
-        unconditional_pred + guidance_scale * guidance_direction
+        let mut guided = conditional_pred.clone();
+        guided -= unconditional_pred;
+        guided *= guidance_scale;
+        guided += unconditional_pred;
+        guided
     }
 
     /// Apply adaptive guidance with dynamic scale.

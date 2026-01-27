@@ -123,6 +123,10 @@ pub enum ExpertRouter {
         /// If 0.0 (default), shared experts are disabled.
         #[serde(default)]
         shared_expert_scale: f32,
+
+        /// Weight for MoH–MoE contrastive alignment loss.
+        #[serde(default)]
+        moh_moe_contrastive_weight: f32,
     },
 }
 
@@ -200,6 +204,9 @@ pub struct ExpertRouterConfig {
     pub metrics_avg_routing_prob: Vec<f32>,
     /// Metrics: diversity score (average pairwise expert correlation)
     pub metrics_diversity_score: f32,
+
+    /// Weight for MoH–MoE contrastive alignment loss.
+    pub moh_moe_contrastive_weight: f32,
 }
 
 impl Default for ExpertRouterConfig {
@@ -222,6 +229,7 @@ impl Default for ExpertRouterConfig {
             diversity_weight: 0.005,
             metrics_avg_routing_prob: vec![0.0; 4],
             metrics_diversity_score: 0.0,
+            moh_moe_contrastive_weight: 0.0,
         }
     }
 }
@@ -246,6 +254,7 @@ impl ExpertRouterConfig {
                 use_learned_k_adaptation,
                 shared_experts,
                 shared_expert_scale,
+                moh_moe_contrastive_weight,
             } => Self {
                 gating: GatingConfig::from_strategy(
                     &GatingStrategy::Learned {
@@ -275,6 +284,7 @@ impl ExpertRouterConfig {
                 diversity_weight: *diversity_weight,
                 metrics_avg_routing_prob: vec![0.0; *num_experts],
                 metrics_diversity_score: 0.0,
+                moh_moe_contrastive_weight: *moh_moe_contrastive_weight,
             },
         }
     }
@@ -1252,6 +1262,133 @@ impl MixtureOfExperts {
         }
     }
 
+    fn compute_moh_moe_contrastive_state(&self) -> Option<(f32, Vec<f32>, Vec<f32>, Vec<f32>, f64)>
+    {
+        let weight = if self.config.moh_moe_contrastive_weight.is_finite() {
+            self.config.moh_moe_contrastive_weight.max(0.0)
+        } else {
+            0.0
+        };
+        if weight == 0.0 {
+            return None;
+        }
+
+        let routing = self.cached_routing_probs.as_ref()?;
+        if routing.nrows() == 0 || routing.ncols() == 0 {
+            return None;
+        }
+
+        let head_vec: Vec<f32> = self
+            .router
+            .cached_head_activity_vec
+            .as_ref()
+            .map(|v| v.iter().map(|x| if x.is_finite() { *x } else { 0.0 }).collect())?;
+        if head_vec.is_empty() {
+            return None;
+        }
+
+        let num_experts = self.config.num_experts;
+        if num_experts == 0 || routing.ncols() != num_experts {
+            return None;
+        }
+
+        let w = match self.router.head_to_expert.as_ref() {
+            Some(w) if w.nrows() == head_vec.len() && w.ncols() == num_experts => w,
+            _ => return None,
+        };
+        let mut bias = ndarray::Array1::<f32>::zeros(num_experts);
+        for h in 0..head_vec.len() {
+            let a = head_vec[h];
+            let a = if a.is_finite() { a.max(0.0) } else { 0.0 };
+            if a == 0.0 {
+                continue;
+            }
+            for e in 0..num_experts {
+                bias[e] += a * w[[h, e]];
+            }
+        }
+
+        let mut max_v = f32::NEG_INFINITY;
+        for &v in bias.iter() {
+            if v.is_finite() && v > max_v {
+                max_v = v;
+            }
+        }
+        if !max_v.is_finite() {
+            max_v = 0.0;
+        }
+
+        let mut denom = 0.0f64;
+        for &v in bias.iter() {
+            if v.is_finite() {
+                denom += crate::pade::PadeExp::exp((v - max_v) as f64);
+            }
+        }
+        if denom <= 0.0 || !denom.is_finite() {
+            return None;
+        }
+
+        let mut p_head = vec![0.0f32; num_experts];
+        for (i, &v) in bias.iter().enumerate() {
+            let ex = if v.is_finite() {
+                crate::pade::PadeExp::exp((v - max_v) as f64)
+            } else {
+                0.0
+            };
+            p_head[i] = (ex / denom) as f32;
+        }
+
+        let mut s_routing = vec![0.0f32; num_experts];
+        for e in 0..num_experts {
+            let mut sum = 0.0f64;
+            for t in 0..routing.nrows() {
+                let v = routing[[t, e]];
+                let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+                sum += v as f64;
+            }
+            s_routing[e] = sum as f32;
+        }
+        let mut total = 0.0f64;
+        for &v in &s_routing {
+            total += v as f64;
+        }
+        if total <= 0.0 || !total.is_finite() {
+            return None;
+        }
+
+        let mut p_routing = vec![0.0f32; num_experts];
+        for (i, v) in s_routing.iter().enumerate() {
+            p_routing[i] = (*v as f64 / total) as f32;
+        }
+
+        Some((weight, p_head, p_routing, s_routing, total))
+    }
+
+    fn compute_moh_moe_contrastive_loss(&self) -> f32 {
+        let Some((weight, p_head, p_routing, _s_routing, _total)) =
+            self.compute_moh_moe_contrastive_state()
+        else {
+            return 0.0;
+        };
+
+        let eps = 1e-8f64;
+        let mut kl_pq = 0.0f64;
+        let mut kl_qp = 0.0f64;
+        for i in 0..p_head.len() {
+            let p = (p_head[i] as f64).max(eps);
+            let q = (p_routing[i] as f64).max(eps);
+            kl_pq += p * (p / q).ln();
+            kl_qp += q * (q / p).ln();
+        }
+
+        let loss = kl_pq + kl_qp;
+        if loss.is_finite() {
+            (loss as f32) * weight
+        } else {
+            0.0
+        }
+    }
+
     /// Forward pass: predict routing → all experts process → weighted sum
     pub fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
         self.forward_with_head_activity(input, None)
@@ -1576,6 +1713,8 @@ impl MixtureOfExperts {
         self.cached_active_expert_mask = Some(active_mask);
         self.cached_routing_probs = Some(masked_probs);
 
+        let contrastive = self.compute_moh_moe_contrastive_loss();
+
         let masked_probs = self
             .cached_routing_probs
             .as_ref()
@@ -1592,6 +1731,9 @@ impl MixtureOfExperts {
             self.config.z_loss_weight,
             self.config.diversity_weight,
         );
+        if contrastive.is_finite() {
+            self.cached_aux_loss += contrastive;
+        }
 
         let active_experts: Vec<usize> = self
             .cached_active_expert_mask
@@ -2166,6 +2308,61 @@ impl Layer for MixtureOfExperts {
             1.0
         };
 
+        let (contrastive_grad_s, contrastive_bias_grad) =
+            if let Some((weight, p_head, p_routing, s_routing, total)) =
+                self.compute_moh_moe_contrastive_state()
+            {
+                if p_head.len() == n_exp && p_routing.len() == n_exp && s_routing.len() == n_exp {
+                    let eps = 1e-8f64;
+                    let mut dp_routing = vec![0.0f64; n_exp];
+                    for i in 0..n_exp {
+                        let p = (p_head[i] as f64).max(eps);
+                        let q = (p_routing[i] as f64).max(eps);
+                        dp_routing[i] = (-p / q) + (q / p).ln() + 1.0;
+                    }
+
+                    let mut sum_dp_s = 0.0f64;
+                    for i in 0..n_exp {
+                        sum_dp_s += dp_routing[i] * (s_routing[i] as f64);
+                    }
+                    let denom = total * total;
+                    let mut grad_s = vec![0.0f32; n_exp];
+                    if denom.is_finite() && denom > 0.0 {
+                        for i in 0..n_exp {
+                            let v = (dp_routing[i] * total - sum_dp_s) / denom;
+                            let v = if v.is_finite() {
+                                v * (weight as f64)
+                            } else {
+                                0.0
+                            };
+                            grad_s[i] = v as f32;
+                        }
+                    }
+
+                    let mut dp_head = vec![0.0f64; n_exp];
+                    for i in 0..n_exp {
+                        let p = (p_head[i] as f64).max(eps);
+                        let q = (p_routing[i] as f64).max(eps);
+                        dp_head[i] = (p / q).ln() + 1.0 - (q / p);
+                    }
+                    let mut mean = 0.0f64;
+                    for i in 0..n_exp {
+                        mean += (p_head[i] as f64) * dp_head[i];
+                    }
+                    let mut bias_grad = vec![0.0f32; n_exp];
+                    for i in 0..n_exp {
+                        let v = (p_head[i] as f64) * (dp_head[i] - mean) * (weight as f64);
+                        bias_grad[i] = if v.is_finite() { v as f32 } else { 0.0 };
+                    }
+
+                    (Some(grad_s), Some(bias_grad))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         let mut active_pairs: Vec<(usize, f32, f32)> = Vec::new();
         for token_idx in 0..n_tok {
             let token_output_grad = output_grads.row(token_idx);
@@ -2224,6 +2421,15 @@ impl Layer for MixtureOfExperts {
                     let d_dv = (-2.0 * y) * inv_n_tok / dv_norm;
                     if d_dv.is_finite() {
                         g_aux += dv_w * d_dv;
+                    }
+                }
+
+                if let Some(grad_s) = contrastive_grad_s.as_ref()
+                    && expert_idx < grad_s.len()
+                {
+                    let v = grad_s[expert_idx];
+                    if v.is_finite() {
+                        g_aux += v;
                     }
                 }
 
@@ -2313,6 +2519,20 @@ impl Layer for MixtureOfExperts {
                     }
                     for e in 0..self.config.num_experts {
                         g[[h, e]] = a * grad_bias2[e];
+                    }
+                }
+                if let Some(bias_grad) = contrastive_bias_grad.as_ref()
+                    && bias_grad.len() == self.config.num_experts
+                {
+                    for h in 0..head_activity_vec.len() {
+                        let a = head_activity_vec[h];
+                        let a = if a.is_finite() { a.max(0.0) } else { 0.0 };
+                        if a == 0.0 {
+                            continue;
+                        }
+                        for e in 0..self.config.num_experts {
+                            g[[h, e]] += a * bias_grad[e];
+                        }
                     }
                 }
                 Some(g)
@@ -3125,6 +3345,7 @@ mod tests {
             use_learned_k_adaptation: false,
             shared_experts: vec![],
             shared_expert_scale: 0.0,
+            moh_moe_contrastive_weight: 0.0,
         };
 
         let config = ExpertRouterConfig::from_router(&router);
@@ -3158,6 +3379,83 @@ mod tests {
         let out_high = moe.forward_with_head_activity(&input, Some(0.9));
         assert_eq!(out_low.shape(), input.shape());
         assert_eq!(out_high.shape(), input.shape());
+    }
+
+    #[test]
+    fn test_moh_moe_contrastive_loss_positive() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 2,
+            expert_hidden_dim: 8,
+            diversity_weight: 0.0,
+            moh_moe_contrastive_weight: 1.0,
+            gating: GatingConfig {
+                num_active: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.use_head_conditioning = false;
+        config.use_learned_k_adaptation = false;
+
+        let mut moe = MixtureOfExperts::new(4, 4, config);
+        moe.cached_routing_probs = Some(
+            ndarray::Array2::from_shape_vec((2, 2), vec![0.9, 0.1, 0.8, 0.2]).unwrap(),
+        );
+        moe.router.cached_head_activity_vec =
+            Some(ndarray::Array1::from_vec(vec![1.0, 0.0]));
+        moe.router.head_to_expert = Some(
+            ndarray::Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap(),
+        );
+
+        let loss = moe.compute_moh_moe_contrastive_loss();
+        assert!(loss > 0.0);
+    }
+
+    #[test]
+    fn test_moh_moe_contrastive_gradients_affect_head_to_expert() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 2,
+            expert_hidden_dim: 4,
+            diversity_weight: 0.0,
+            moh_moe_contrastive_weight: 1.0,
+            gating: GatingConfig {
+                num_active: 2,
+                load_balance_weight: 0.0,
+                sparsity_weight: 0.0,
+                complexity_loss_weight: 0.0,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.use_head_conditioning = false;
+        config.use_learned_k_adaptation = false;
+        config.z_loss_weight = 0.0;
+
+        let mut moe = MixtureOfExperts::new(3, 5, config);
+        let input = ndarray::Array2::<f32>::from_shape_vec((2, 3), vec![0.2; 6]).unwrap();
+        let head_activity = vec![1.0f32, 0.0f32];
+        let _out = moe.forward_with_head_features(&input, None, Some(head_activity.as_slice()));
+
+        moe.cached_routing_probs = Some(
+            ndarray::Array2::from_shape_vec((2, 2), vec![0.1, 0.9, 0.2, 0.8]).unwrap(),
+        );
+        moe.router.head_to_expert = Some(
+            ndarray::Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap(),
+        );
+
+        let output_grads = ndarray::Array2::<f32>::zeros(input.raw_dim());
+        let (_grad_input, param_grads) = moe.compute_gradients(&input, &output_grads);
+
+        let mut found = false;
+        for g in param_grads {
+            if g.shape() == [2, 2] && g.iter().any(|v| v.abs() > 1e-8) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
     }
 
     #[test]
