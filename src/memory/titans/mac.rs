@@ -205,6 +205,7 @@ impl Layer for TitansMAC {
             segment: Array2<f32>,
             context: Array2<f32>,
             seg_out: Array2<f32>,
+            poly_cache: Option<PolyAttentionCache>,
             memory_before: MemoryWeights,
             momentum_before: MemoryWeights,
             memory_trace: Vec<MemoryTraceEntry>, // Trace for update loop
@@ -251,20 +252,20 @@ impl Layer for TitansMAC {
             // NOTE: PolyAttention's compute_gradients relies on cached_input from forward pass.
             // In TitansMAC, we process segments independently, so we need to reproduce
             // the attention output for each segment during gradient computation.
-            // Since compute_gradients takes &self (not &mut self), we cannot set cached_input
-            // on self.core. The current workaround clones core and runs forward,
-            // which is expensive but maintains correctness.
+            // Since compute_gradients takes &self (not &mut self), we use forward_detached
+            // to reproduce state without mutating self or cloning the core.
 
-            // Try to use cached forward outputs if available (avoids core.clone())
-            let seg_out = if let Some(cached_data) = &self.cached_forward_data
+            // Try to use cached forward outputs if available
+            let (seg_out, poly_cache) = if let Some(cached_data) = &self.cached_forward_data
                 && forward_data.len() < cached_data.len()
             {
-                cached_data[forward_data.len()].seg_out.clone()
+                let d = &cached_data[forward_data.len()];
+                (d.seg_out.clone(), d.poly_cache.clone())
             } else {
-                // Fallback: clone core and run forward (expensive but correct)
-                let mut core_clone = self.core.clone();
-                let attn_out = core_clone.forward_impl_baseline(&context, true);
-                attn_out.slice(s![p_len + s_len..total_len, ..]).to_owned()
+                // Fallback: use forward_detached (efficient, no clone of weights)
+                let (attn_out, cache) = self.core.forward_detached(&context, true);
+                let seg_out = attn_out.slice(s![p_len + s_len..total_len, ..]).to_owned();
+                (seg_out, Some(cache))
             };
 
             // Update Memory Logic
@@ -317,6 +318,7 @@ impl Layer for TitansMAC {
                 segment,
                 context,
                 seg_out,
+                poly_cache,
                 memory_before,
                 momentum_before,
                 memory_trace,
@@ -500,21 +502,15 @@ impl Layer for TitansMAC {
                 .slice_mut(s![p_len + s_len..total_len, ..])
                 .assign(&d_seg_out_total);
 
-            // Use cached state if available
-            let poly_cache = if let Some(cached_data) = &self.cached_forward_data {
-                cached_data.get(_seg_idx).and_then(|d| d.poly_cache.as_ref())
-            } else {
-                None
-            };
-
-            let (d_context, core_pg) = if let Some(cache) = poly_cache {
+            let (d_context, core_pg) = if let Some(cache) = &data.poly_cache {
                 self.core
                     .compute_gradients_with_cache(cache, &d_context_out)
             } else {
-                // Fallback: clone core and run forward (expensive but correct)
-                let mut core_clone = self.core.clone();
-                let _ = core_clone.forward_impl_baseline(&data.context, true);
-                core_clone.compute_gradients(&data.context, &d_context_out)
+                // Should not happen as we populate poly_cache in the first loop
+                // But as a safety fallback, use forward_detached again
+                let (_, cache) = self.core.forward_detached(&data.context, true);
+                self.core
+                    .compute_gradients_with_cache(&cache, &d_context_out)
             };
 
             // Add core_pg to accumulators
