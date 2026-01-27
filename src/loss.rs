@@ -223,6 +223,122 @@ pub fn residual_decorrelation_gradients(features: &ArrayView2<f32>) -> Array2<f3
     grad
 }
 
+pub fn info_nce_loss_and_grads(
+    anchor: &[f32],
+    positive: &[f32],
+    negatives: &[Vec<f32>],
+    k: usize,
+    temperature: f32,
+) -> (f32, Vec<f32>, Vec<f32>) {
+    let d = anchor.len();
+    if d == 0 || positive.len() != d || k == 0 || negatives.is_empty() {
+        return (0.0, vec![0.0; d], vec![0.0; d]);
+    }
+
+    let tau = temperature.max(1e-6) as f64;
+    let mut na2 = 0.0f64;
+    let mut np2 = 0.0f64;
+    let mut dot_ap = 0.0f64;
+    for j in 0..d {
+        let a = anchor[j];
+        let p = positive[j];
+        let aa = if a.is_finite() { a as f64 } else { 0.0 };
+        let pp = if p.is_finite() { p as f64 } else { 0.0 };
+        na2 += aa * aa;
+        np2 += pp * pp;
+        dot_ap += aa * pp;
+    }
+    let na = na2.sqrt().max(1e-12);
+    let np = np2.sqrt().max(1e-12);
+    let sim_pos = dot_ap / (na * np);
+
+    let mut sims: Vec<(f64, usize, f64, f64)> = Vec::with_capacity(negatives.len());
+    for (idx, neg) in negatives.iter().enumerate() {
+        if neg.len() != d {
+            continue;
+        }
+        let mut dot = 0.0f64;
+        let mut nb2 = 0.0f64;
+        for j in 0..d {
+            let a = anchor[j];
+            let b = neg[j];
+            let aa = if a.is_finite() { a as f64 } else { 0.0 };
+            let bb = if b.is_finite() { b as f64 } else { 0.0 };
+            dot += aa * bb;
+            nb2 += bb * bb;
+        }
+        let nb = nb2.sqrt().max(1e-12);
+        let sim = dot / (na * nb);
+        sims.push((sim, idx, dot, nb));
+    }
+    if sims.is_empty() {
+        return (0.0, vec![0.0; d], vec![0.0; d]);
+    }
+
+    sims.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let take = k.min(sims.len());
+    let mut logits: Vec<f64> = Vec::with_capacity(1 + take);
+    logits.push(sim_pos / tau);
+    for (sim, _, _, _) in sims.iter().take(take) {
+        logits.push(*sim / tau);
+    }
+
+    let max_logit = logits
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut exp_sum = 0.0f64;
+    let mut exp_logits: Vec<f64> = Vec::with_capacity(logits.len());
+    for &l in &logits {
+        let e = (l - max_logit).exp();
+        exp_sum += e;
+        exp_logits.push(e);
+    }
+    let inv_sum = if exp_sum > 0.0 { 1.0 / exp_sum } else { 0.0 };
+    let p_pos = exp_logits[0] * inv_sum;
+    let loss = -(p_pos.max(1e-12)).ln();
+
+    let mut grad_anchor = vec![0.0f32; d];
+    let mut grad_positive = vec![0.0f32; d];
+    let inv_tau = 1.0f64 / tau;
+    let dlogit_pos = p_pos - 1.0;
+
+    for j in 0..d {
+        let a = if anchor[j].is_finite() {
+            anchor[j] as f64
+        } else {
+            0.0
+        };
+        let p = if positive[j].is_finite() {
+            positive[j] as f64
+        } else {
+            0.0
+        };
+        let grad_a = (p / (na * np)) - (sim_pos / (na * na)) * a;
+        let grad_p = (a / (na * np)) - (sim_pos / (np * np)) * p;
+        grad_anchor[j] = (dlogit_pos * inv_tau * grad_a) as f32;
+        grad_positive[j] = (dlogit_pos * inv_tau * grad_p) as f32;
+    }
+
+    for (i, (_, idx, dot, nb)) in sims.iter().take(take).enumerate() {
+        let p_i = exp_logits[1 + i] * inv_sum;
+        let dlogit = p_i;
+        let neg = &negatives[*idx];
+        for j in 0..d {
+            let a = if anchor[j].is_finite() {
+                anchor[j] as f64
+            } else {
+                0.0
+            };
+            let b = if neg[j].is_finite() { neg[j] as f64 } else { 0.0 };
+            let grad_a = (b / (na * nb)) - ((*dot / (na * nb)) / (na * na)) * a;
+            grad_anchor[j] += (dlogit * inv_tau * grad_a) as f32;
+        }
+    }
+
+    (loss as f32, grad_anchor, grad_positive)
+}
+
 /// Hard-negative repulsion loss over a pooled representation.
 ///
 /// This implements a lightweight "learn what it is not" objective without requiring a
@@ -650,5 +766,29 @@ mod tests {
         let fd = (l_pos - l_neg) / (2.0 * h);
         let g = grad[[0, 1]];
         assert!((fd - g).abs() < 1e-3, "fd {} vs grad {}", fd, g);
+    }
+
+    #[test]
+    fn test_info_nce_loss_prefers_positive() {
+        let anchor = [1.0f32, 0.0f32];
+        let positive = [1.0f32, 0.0f32];
+        let negatives = vec![vec![0.0f32, 1.0f32], vec![-1.0f32, 0.0f32]];
+        let (loss, grad_a, grad_p) = info_nce_loss_and_grads(&anchor, &positive, &negatives, 2, 0.1);
+        assert!(loss < 0.01);
+        assert!(grad_a.iter().all(|&v| v.is_finite()));
+        assert!(grad_p.iter().all(|&v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_info_nce_gradients_finite() {
+        let anchor = [1.0f32, 2.0f32];
+        let positive = [2.0f32, 1.0f32];
+        let negatives = vec![vec![-1.0f32, 0.5f32], vec![0.1f32, -0.3f32]];
+        let (_loss, grad_a, grad_p) = info_nce_loss_and_grads(&anchor, &positive, &negatives, 2, 0.5);
+        assert!(grad_a.iter().all(|&v| v.is_finite()));
+        assert!(grad_p.iter().all(|&v| v.is_finite()));
+        let nonzero_a = grad_a.iter().any(|&v| v.abs() > 1e-8);
+        let nonzero_p = grad_p.iter().any(|&v| v.abs() > 1e-8);
+        assert!(nonzero_a || nonzero_p);
     }
 }
