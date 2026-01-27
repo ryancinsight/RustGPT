@@ -1,4 +1,4 @@
-use std::fs;
+use std::{collections::HashMap, fs};
 
 use ndarray::{Array2, Axis, s};
 use rand::Rng;
@@ -21,6 +21,360 @@ use crate::{
 
 impl LayerEnum {
     // Removed downcast helpers for SelfAttention/TRM to simplify to PolyAttention-only
+}
+
+#[derive(Debug, Clone)]
+struct ToolCall {
+    name: String,
+    args: String,
+}
+
+#[derive(Debug)]
+struct ToolRegistry {
+    tools: HashMap<String, ToolDefinition>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolDefinition {
+    handler: fn(&str) -> Result<String>,
+}
+
+impl ToolRegistry {
+    fn with_defaults() -> Self {
+        let mut registry = Self {
+            tools: HashMap::new(),
+        };
+        registry.register("calculator", tool_calculator);
+        registry.register("echo", tool_echo);
+        registry
+    }
+
+    fn register(&mut self, name: &str, handler: fn(&str) -> Result<String>) {
+        self.tools.insert(name.to_string(), ToolDefinition { handler });
+    }
+
+    fn call(&self, name: &str, args: &str) -> Result<String> {
+        let Some(tool) = self.tools.get(name) else {
+            return Err(ModelError::InvalidInput {
+                message: format!("Unknown tool: {}", name),
+            });
+        };
+        (tool.handler)(args)
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CalcToken {
+    Number(f64),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+    Neg,
+}
+
+fn tool_echo(args: &str) -> Result<String> {
+    Ok(args.to_string())
+}
+
+fn tool_calculator(args: &str) -> Result<String> {
+    let value = eval_expression(args)?;
+    Ok(value.to_string())
+}
+
+fn eval_expression(input: &str) -> Result<f64> {
+    let tokens = tokenize_expr(input)?;
+    let rpn = to_rpn(&tokens)?;
+    eval_rpn(&rpn)
+}
+
+fn tokenize_expr(input: &str) -> Result<Vec<CalcToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    let mut prev_op = true;
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch.is_ascii_digit() || ch == '.' {
+            let mut buf = String::new();
+            let mut has_dot = false;
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    buf.push(c);
+                    chars.next();
+                } else if c == '.' && !has_dot {
+                    has_dot = true;
+                    buf.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if let Some(&c) = chars.peek() {
+                if c == 'e' || c == 'E' {
+                    buf.push(c);
+                    chars.next();
+                    if let Some(&sign) = chars.peek() {
+                        if sign == '+' || sign == '-' {
+                            buf.push(sign);
+                            chars.next();
+                        }
+                    }
+                    let mut has_exp_digits = false;
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() {
+                            buf.push(d);
+                            chars.next();
+                            has_exp_digits = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !has_exp_digits {
+                        return Err(ModelError::InvalidInput {
+                            message: "Invalid exponent".to_string(),
+                        });
+                    }
+                }
+            }
+            let value = buf.parse::<f64>().map_err(|e| ModelError::InvalidInput {
+                message: format!("Invalid number: {}", e),
+            })?;
+            tokens.push(CalcToken::Number(value));
+            prev_op = false;
+            continue;
+        }
+        match ch {
+            '+' => {
+                chars.next();
+                if prev_op {
+                    continue;
+                }
+                tokens.push(CalcToken::Plus);
+                prev_op = true;
+            }
+            '-' => {
+                chars.next();
+                if prev_op {
+                    tokens.push(CalcToken::Neg);
+                } else {
+                    tokens.push(CalcToken::Minus);
+                    prev_op = true;
+                }
+            }
+            '*' => {
+                chars.next();
+                tokens.push(CalcToken::Star);
+                prev_op = true;
+            }
+            '/' => {
+                chars.next();
+                tokens.push(CalcToken::Slash);
+                prev_op = true;
+            }
+            '(' => {
+                chars.next();
+                tokens.push(CalcToken::LParen);
+                prev_op = true;
+            }
+            ')' => {
+                chars.next();
+                tokens.push(CalcToken::RParen);
+                prev_op = false;
+            }
+            _ => {
+                return Err(ModelError::InvalidInput {
+                    message: format!("Invalid character: {}", ch),
+                });
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn precedence(tok: CalcToken) -> usize {
+    match tok {
+        CalcToken::Neg => 3,
+        CalcToken::Star | CalcToken::Slash => 2,
+        CalcToken::Plus | CalcToken::Minus => 1,
+        _ => 0,
+    }
+}
+
+fn is_right_assoc(tok: CalcToken) -> bool {
+    matches!(tok, CalcToken::Neg)
+}
+
+fn to_rpn(tokens: &[CalcToken]) -> Result<Vec<CalcToken>> {
+    let mut output = Vec::new();
+    let mut ops: Vec<CalcToken> = Vec::new();
+    for &tok in tokens {
+        match tok {
+            CalcToken::Number(_) => output.push(tok),
+            CalcToken::Plus
+            | CalcToken::Minus
+            | CalcToken::Star
+            | CalcToken::Slash
+            | CalcToken::Neg => {
+                let tok_prec = precedence(tok);
+                while let Some(&top) = ops.last() {
+                    if matches!(top, CalcToken::LParen) {
+                        break;
+                    }
+                    let top_prec = precedence(top);
+                    let should_pop = if is_right_assoc(tok) {
+                        tok_prec < top_prec
+                    } else {
+                        tok_prec <= top_prec
+                    };
+                    if should_pop {
+                        output.push(ops.pop().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                ops.push(tok);
+            }
+            CalcToken::LParen => ops.push(tok),
+            CalcToken::RParen => {
+                let mut found = false;
+                while let Some(top) = ops.pop() {
+                    if matches!(top, CalcToken::LParen) {
+                        found = true;
+                        break;
+                    }
+                    output.push(top);
+                }
+                if !found {
+                    return Err(ModelError::InvalidInput {
+                        message: "Mismatched parentheses".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    while let Some(top) = ops.pop() {
+        if matches!(top, CalcToken::LParen | CalcToken::RParen) {
+            return Err(ModelError::InvalidInput {
+                message: "Mismatched parentheses".to_string(),
+            });
+        }
+        output.push(top);
+    }
+    Ok(output)
+}
+
+fn eval_rpn(tokens: &[CalcToken]) -> Result<f64> {
+    let mut stack: Vec<f64> = Vec::new();
+    for &tok in tokens {
+        match tok {
+            CalcToken::Number(v) => stack.push(v),
+            CalcToken::Neg => {
+                let Some(v) = stack.pop() else {
+                    return Err(ModelError::InvalidInput {
+                        message: "Invalid expression".to_string(),
+                    });
+                };
+                stack.push(-v);
+            }
+            CalcToken::Plus | CalcToken::Minus | CalcToken::Star | CalcToken::Slash => {
+                let Some(b) = stack.pop() else {
+                    return Err(ModelError::InvalidInput {
+                        message: "Invalid expression".to_string(),
+                    });
+                };
+                let Some(a) = stack.pop() else {
+                    return Err(ModelError::InvalidInput {
+                        message: "Invalid expression".to_string(),
+                    });
+                };
+                let v = match tok {
+                    CalcToken::Plus => a + b,
+                    CalcToken::Minus => a - b,
+                    CalcToken::Star => a * b,
+                    CalcToken::Slash => {
+                        if b == 0.0 {
+                            return Err(ModelError::InvalidInput {
+                                message: "Division by zero".to_string(),
+                            });
+                        }
+                        a / b
+                    }
+                    _ => unreachable!(),
+                };
+                stack.push(v);
+            }
+            _ => {
+                return Err(ModelError::InvalidInput {
+                    message: "Invalid expression".to_string(),
+                });
+            }
+        }
+    }
+    if stack.len() != 1 {
+        return Err(ModelError::InvalidInput {
+            message: "Invalid expression".to_string(),
+        });
+    }
+    Ok(stack[0])
+}
+
+fn parse_tool_call(vocab: &Vocab, tokens: &[usize]) -> Result<ToolCall> {
+    let mut parts: Vec<&str> = Vec::new();
+    for &id in tokens {
+        if let Some(tok) = vocab.decode(id) {
+            parts.push(tok);
+        }
+    }
+    let name = parse_tool_name(&parts)?;
+    let args = parse_tool_args(&parts)?;
+    Ok(ToolCall { name, args })
+}
+
+fn parse_tool_name(tokens: &[&str]) -> Result<String> {
+    for (idx, tok) in tokens.iter().enumerate() {
+        if tok.eq_ignore_ascii_case("name") {
+            if let Some(eq_idx) = tokens[idx + 1..].iter().position(|t| *t == "=") {
+                let val_idx = idx + 1 + eq_idx + 1;
+                if let Some(name) = tokens.get(val_idx) {
+                    return Ok(name.to_string());
+                }
+            }
+        }
+    }
+    Err(ModelError::InvalidInput {
+        message: "Missing tool name".to_string(),
+    })
+}
+
+fn parse_tool_args(tokens: &[&str]) -> Result<String> {
+    for (idx, tok) in tokens.iter().enumerate() {
+        if tok.eq_ignore_ascii_case("args") {
+            if let Some(eq_idx) = tokens[idx + 1..].iter().position(|t| *t == "=") {
+                let val_idx = idx + 1 + eq_idx + 1;
+                if val_idx >= tokens.len() {
+                    return Err(ModelError::InvalidInput {
+                        message: "Missing tool args".to_string(),
+                    });
+                }
+                let args = tokens[val_idx..].join(" ");
+                return Ok(args);
+            }
+        }
+    }
+    Err(ModelError::InvalidInput {
+        message: "Missing tool args".to_string(),
+    })
 }
 
 fn response_span_from_tokens(vocab: &Vocab, tokens: &[usize]) -> Option<(usize, usize)> {
@@ -123,6 +477,8 @@ pub struct LLM {
     /// Non-serialized scratch buffers for training to avoid re-allocations.
     #[serde(skip, default)]
     training_scratch: TrainingScratch,
+    #[serde(skip, default)]
+    tool_registry: ToolRegistry,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -242,6 +598,7 @@ impl Default for LLM {
             training_hparams: TrainingHyperParams::default(),
             residual_neg_bank: ResidualNegBank::default(),
             training_scratch: TrainingScratch::default(),
+            tool_registry: ToolRegistry::with_defaults(),
         }
     }
 }
@@ -263,6 +620,7 @@ impl LLM {
             training_hparams: TrainingHyperParams::default(),
             residual_neg_bank: ResidualNegBank::default(),
             training_scratch: TrainingScratch::default(),
+            tool_registry: ToolRegistry::with_defaults(),
         }
     }
 
@@ -304,6 +662,7 @@ impl LLM {
             training_hparams: TrainingHyperParams::default(),
             residual_neg_bank: ResidualNegBank::default(),
             training_scratch: TrainingScratch::default(),
+            tool_registry: ToolRegistry::with_defaults(),
         }
     }
 
@@ -835,6 +1194,10 @@ impl LLM {
 
         // Hoist EOS lookup out of the loop.
         let eos_token = self.vocab.encode("</s>");
+        let tool_call_start = self.vocab.encode("<tool_call>");
+        let tool_call_end = self.vocab.encode("</tool_call>");
+        let tool_result_start = self.vocab.encode("<tool_result>");
+        let tool_result_end = self.vocab.encode("</tool_result>");
 
         // Prevent overflow if input_len >= max_seq_len
         if input_len >= max_seq_len {
@@ -932,6 +1295,43 @@ impl LLM {
 
             output_tokens.push(next_token);
             tokenized.push(next_token);
+
+            if let (Some(start_id), Some(end_id)) = (tool_call_start, tool_call_end) {
+                if next_token == end_id {
+                    let end_pos = output_tokens.len().saturating_sub(1);
+                    if end_pos > 0 {
+                        if let Some(start_pos) =
+                            output_tokens[..end_pos].iter().rposition(|&id| id == start_id)
+                        {
+                            if start_pos < end_pos {
+                                let call_tokens = &output_tokens[start_pos + 1..end_pos];
+                                let tool_result = match parse_tool_call(&self.vocab, call_tokens) {
+                                    Ok(call) => match self.tool_registry.call(&call.name, &call.args)
+                                    {
+                                        Ok(res) => res,
+                                        Err(err) => format!("ToolError: {}", err),
+                                    },
+                                    Err(err) => format!("ToolError: {}", err),
+                                };
+                                let tool_output = if let (Some(rs), Some(re)) =
+                                    (tool_result_start, tool_result_end)
+                                {
+                                    let _ = (rs, re);
+                                    format!(
+                                        "<tool_result> {} </tool_result>",
+                                        tool_result
+                                    )
+                                } else {
+                                    tool_result
+                                };
+                                let tool_tokens = self.vocab.tokenize(&tool_output);
+                                output_tokens.extend(tool_tokens.iter().copied());
+                                tokenized.extend(tool_tokens);
+                            }
+                        }
+                    }
+                }
+            }
 
             if eos_token.is_some_and(|eos| next_token == eos) {
                 break;

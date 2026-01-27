@@ -1,0 +1,22 @@
+[
+    "User: What is 12 * (3 + 4)? Assistant: <tool_call> name = calculator args = 12 * ( 3 + 4 ) </tool_call> <tool_result> 84 </tool_result> 84 </s>",
+    "User: What is 9 / 3 + 2? Assistant: <tool_call> name = calculator args = 9 / 3 + 2 </tool_call> <tool_result> 5 </tool_result> 5 </s>",
+    "User: What is -5 + 18? Assistant: <tool_call> name = calculator args = -5 + 18 </tool_call> <tool_result> 13 </tool_result> 13 </s>",
+    "User: Compute (7 - 2) * (8 + 1). Assistant: <tool_call> name = calculator args = ( 7 - 2 ) * ( 8 + 1 ) </tool_call> <tool_result> 45 </tool_result> 45 </s>",
+    "User: Echo back the phrase Rust GPT. Assistant: <tool_call> name = echo args = Rust GPT </tool_call> <tool_result> Rust GPT </tool_result> Rust GPT </s>",
+    "User: Echo exactly: tool calling ready. Assistant: <tool_call> name = echo args = tool calling ready </tool_call> <tool_result> tool calling ready </tool_result> tool calling ready </s>",
+    "User: What is (15 + 5) / 4? Assistant: <tool_call> name = calculator args = ( 15 + 5 ) / 4 </tool_call> <tool_result> 5 </tool_result> 5 </s>",
+    "User: Calculate 3 * (6 - 2) + 9. Assistant: <tool_call> name = calculator args = 3 * ( 6 - 2 ) + 9 </tool_call> <tool_result> 21 </tool_result> 21 </s>",
+    "User: Compute 100 / (5 * 4). Assistant: <tool_call> name = calculator args = 100 / ( 5 * 4 ) </tool_call> <tool_result> 5 </tool_result> 5 </s>",
+    "User: What is 7 + 8 * 2? Assistant: <tool_call> name = calculator args = 7 + 8 * 2 </tool_call> <tool_result> 23 </tool_result> 23 </s>",
+    "User: Compute (9 - 3) * (2 + 6). Assistant: <tool_call> name = calculator args = ( 9 - 3 ) * ( 2 + 6 ) </tool_call> <tool_result> 48 </tool_result> 48 </s>",
+    "User: What is 64 / 8 + 3? Assistant: <tool_call> name = calculator args = 64 / 8 + 3 </tool_call> <tool_result> 11 </tool_result> 11 </s>",
+    "User: Compute (12 - 5) * (3 + 1). Assistant: <tool_call> name = calculator args = ( 12 - 5 ) * ( 3 + 1 ) </tool_call> <tool_result> 28 </tool_result> 28 </s>",
+    "User: What is 50 - 6 * 4? Assistant: <tool_call> name = calculator args = 50 - 6 * 4 </tool_call> <tool_result> 26 </tool_result> 26 </s>",
+    "User: Evaluate (18 / 3) + (7 - 2). Assistant: <tool_call> name = calculator args = ( 18 / 3 ) + ( 7 - 2 ) </tool_call> <tool_result> 11 </tool_result> 11 </s>",
+    "User: What is 2 * (3 + 4) * (5 - 1)? Assistant: <tool_call> name = calculator args = 2 * ( 3 + 4 ) * ( 5 - 1 ) </tool_call> <tool_result> 56 </tool_result> 56 </s>",
+    "User: Echo: RustGPT tool calling works. Assistant: <tool_call> name = echo args = RustGPT tool calling works </tool_call> <tool_result> RustGPT tool calling works </tool_result> RustGPT tool calling works </s>",
+    "User: Echo back: consistent output formatting. Assistant: <tool_call> name = echo args = consistent output formatting </tool_call> <tool_result> consistent output formatting </tool_result> consistent output formatting </s>",
+    "User: Echo exactly: hello tool pipeline. Assistant: <tool_call> name = echo args = hello tool pipeline </tool_call> <tool_result> hello tool pipeline </tool_result> hello tool pipeline </s>",
+    "User: Echo this phrase: math and tools. Assistant: <tool_call> name = echo args = math and tools </tool_call> <tool_result> math and tools </tool_result> math and tools </s>"
+]

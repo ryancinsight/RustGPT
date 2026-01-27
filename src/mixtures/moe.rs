@@ -51,6 +51,7 @@ type RouterParamGrads = (
 );
 
 type RouterParamShapes<'a> = (&'a [(usize, usize)], &'a [usize], usize, usize, usize);
+type MohMoeContrastiveState = (f32, Vec<f32>, Vec<f32>, Vec<f32>, f64);
 
 /// Strategy for selecting which experts to activate
 ///
@@ -1262,8 +1263,7 @@ impl MixtureOfExperts {
         }
     }
 
-    fn compute_moh_moe_contrastive_state(&self) -> Option<(f32, Vec<f32>, Vec<f32>, Vec<f32>, f64)>
-    {
+    fn compute_moh_moe_contrastive_state(&self) -> Option<MohMoeContrastiveState> {
         let weight = if self.config.moh_moe_contrastive_weight.is_finite() {
             self.config.moh_moe_contrastive_weight.max(0.0)
         } else {

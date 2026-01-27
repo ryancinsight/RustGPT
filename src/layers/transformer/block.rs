@@ -470,6 +470,26 @@ impl TransformerBlock {
         let sample = seq_len.min(32);
         let step = (seq_len / sample).max(1);
 
+        let mut mean_x = vec![0.0f64; embed_dim];
+        let mut mean_y = vec![0.0f64; embed_dim];
+        let mut sample_count = 0usize;
+        for seq_idx in (0..seq_len).step_by(step).take(sample) {
+            sample_count += 1;
+            for j in 0..embed_dim {
+                let x = input[[seq_idx, j]];
+                let y = output[[seq_idx, j]];
+                let xs = if x.is_finite() { x as f64 } else { 0.0 };
+                let ys = if y.is_finite() { y as f64 } else { 0.0 };
+                mean_x[j] += xs;
+                mean_y[j] += ys;
+            }
+        }
+        let inv = 1.0f64 / (sample_count.max(1) as f64);
+        for j in 0..embed_dim {
+            mean_x[j] *= inv;
+            mean_y[j] *= inv;
+        }
+
         let mut nx = vec![0.0f64; embed_dim];
         let mut ny = vec![0.0f64; embed_dim];
         for seq_idx in (0..seq_len).step_by(step).take(sample) {
@@ -478,8 +498,10 @@ impl TransformerBlock {
                 let y = output[[seq_idx, j]];
                 let xs = if x.is_finite() { x as f64 } else { 0.0 };
                 let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                nx[j] += xs * xs;
-                ny[j] += ys * ys;
+                let xc = xs - mean_x[j];
+                let yc = ys - mean_y[j];
+                nx[j] += xc * xc;
+                ny[j] += yc * yc;
             }
         }
 
@@ -492,7 +514,9 @@ impl TransformerBlock {
                     let y = output[[seq_idx, j]];
                     let xs = if x.is_finite() { x as f64 } else { 0.0 };
                     let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                    dot += xs * ys;
+                    let xc = xs - mean_x[i];
+                    let yc = ys - mean_y[j];
+                    dot += xc * yc;
                 }
 
                 let denom = (nx[i] * ny[j]).sqrt();
