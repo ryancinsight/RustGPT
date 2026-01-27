@@ -2864,42 +2864,94 @@ impl LLM {
                     };
                     let w = base_w * (1.0 + difficulty);
                     let hidden_prelogit = &layer_inputs[op_idx];
-                    let rows = hidden_prelogit.nrows().max(1);
+                    let rows = hidden_prelogit.nrows();
                     let cols = hidden_prelogit.ncols();
 
-                    // Mean-pool.
-                    let mut anchor = vec![0.0f32; cols];
+                    let mut anchor_all = vec![0.0f32; cols];
+                    let mut anchor_even = vec![0.0f32; cols];
+                    let mut anchor_odd = vec![0.0f32; cols];
+                    let mut count_even = 0usize;
+                    let mut count_odd = 0usize;
+
                     for i in 0..rows {
+                        let is_even = i % 2 == 0;
+                        if is_even {
+                            count_even += 1;
+                        } else {
+                            count_odd += 1;
+                        }
                         for j in 0..cols {
                             let v = hidden_prelogit[[i, j]];
-                            anchor[j] += if v.is_finite() { v } else { 0.0 };
+                            let v = if v.is_finite() { v } else { 0.0 };
+                            anchor_all[j] += v;
+                            if is_even {
+                                anchor_even[j] += v;
+                            } else {
+                                anchor_odd[j] += v;
+                            }
                         }
                     }
-                    let inv = 1.0f32 / (rows as f32);
-                    for a in &mut anchor {
-                        *a *= inv;
+
+                    let inv_all = 1.0f32 / (rows.max(1) as f32);
+                    for a in &mut anchor_all {
+                        *a *= inv_all;
+                    }
+                    let inv_even = if count_even > 0 {
+                        1.0f32 / (count_even as f32)
+                    } else {
+                        0.0
+                    };
+                    for a in &mut anchor_even {
+                        *a *= inv_even;
+                    }
+                    let inv_odd = if count_odd > 0 {
+                        1.0f32 / (count_odd as f32)
+                    } else {
+                        0.0
+                    };
+                    for a in &mut anchor_odd {
+                        *a *= inv_odd;
                     }
 
                     let (hn_loss, grad_anchor) = crate::loss::hard_negative_repulsion_loss_and_grad(
-                        &anchor,
+                        &anchor_all,
                         self.residual_neg_bank.as_slice(),
                         self.training_hparams.residual_hardneg_k,
                         self.training_hparams.residual_hardneg_margin,
                         self.training_hparams.residual_hardneg_temperature,
                     );
-                    batch_loss += w * hn_loss;
+                    let (nce_loss, grad_even, grad_odd) = if count_even > 0 && count_odd > 0 {
+                        crate::loss::info_nce_loss_and_grads(
+                            &anchor_even,
+                            &anchor_odd,
+                            self.residual_neg_bank.as_slice(),
+                            self.training_hparams.residual_hardneg_k,
+                            self.training_hparams.residual_hardneg_temperature,
+                        )
+                    } else {
+                        (0.0, vec![0.0f32; cols], vec![0.0f32; cols])
+                    };
+                    batch_loss += w * (hn_loss + nce_loss);
 
-                    // Spread pooled grad across tokens.
                     let mut g = Array2::<f32>::zeros(hidden_prelogit.raw_dim());
                     for i in 0..rows {
+                        let is_even = i % 2 == 0;
                         for j in 0..cols {
-                            g[[i, j]] = (grad_anchor[j] * w) * inv;
+                            let mut v = grad_anchor[j] * inv_all;
+                            if count_even > 0 && count_odd > 0 {
+                                if is_even {
+                                    v += grad_even[j] * inv_even;
+                                } else {
+                                    v += grad_odd[j] * inv_odd;
+                                }
+                            }
+                            g[[i, j]] = v * w;
                         }
                     }
 
                     // Update memory bank.
                     self.residual_neg_bank
-                        .push(anchor, self.training_hparams.residual_hardneg_bank_size);
+                        .push(anchor_all, self.training_hparams.residual_hardneg_bank_size);
 
                     Some((op_idx, g))
                 } else {

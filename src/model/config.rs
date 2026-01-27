@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
-    mixtures::{moe::ExpertRouter, moh::HeadSelectionStrategy},
+    mixtures::{moe::ExpertRouter, moe::ExpertRoutingMode, moh::HeadSelectionStrategy},
 };
 
 use crate::richards::adaptive::AdaptiveScalar;
@@ -387,7 +387,24 @@ impl ModelConfig {
             moh_threshold_modulation: AdaptiveScalar::default(),
             attention: AttentionType::SelfAttention,
             temporal_mixing: TemporalMixingType::Attention,
-            moe_router: None, // Default: no MoE (standard feedforward)
+            moe_router: Some(ExpertRouter::LearnedMoE {
+                num_experts: 4,
+                num_active_experts: 2,
+                expert_hidden_dim: hidden_dim / 2,
+                load_balance_weight: 0.01,
+                sparsity_weight: 0.001,
+                diversity_weight: 0.005,
+                routing_mode: ExpertRoutingMode::TokenChoiceTopK,
+                capacity_factor: 0.0,
+                min_expert_capacity: 0,
+                renormalize_after_capacity: true,
+                z_loss_weight: 0.0,
+                use_head_conditioning: true,
+                use_learned_k_adaptation: true,
+                shared_experts: vec![],
+                shared_expert_scale: 0.0,
+                moh_moe_contrastive_weight: 0.01,
+            }),
             titan_memory: TitanMemoryConfig::default(),
             spiking_neuron_model: None,
             trm_use_diffusion: false,

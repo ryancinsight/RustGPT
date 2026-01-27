@@ -1189,6 +1189,12 @@ pub struct MixtureOfExperts {
     cached_weighted_grads: Option<Vec<ndarray::Array2<f32>>>,
 
     #[serde(skip)]
+    cached_active_experts: Option<Vec<usize>>,
+
+    #[serde(skip)]
+    cached_shared_flags: Option<Vec<bool>>,
+
+    #[serde(skip)]
     cached_aux_loss: f32,
 }
 
@@ -1232,6 +1238,8 @@ impl MixtureOfExperts {
             cached_k_features: None,
             cached_k_delta_probs: None,
             cached_weighted_grads: None,
+            cached_active_experts: None,
+            cached_shared_flags: None,
             cached_aux_loss: 0.0,
         }
     }
@@ -1381,7 +1389,34 @@ impl MixtureOfExperts {
             kl_qp += q * (q / p).ln();
         }
 
-        let loss = kl_pq + kl_qp;
+        let mut token_loss_sum = 0.0f64;
+        let mut token_count = 0.0f64;
+        if let Some(routing) = self.cached_routing_probs.as_ref() {
+            if routing.ncols() == p_head.len() && routing.nrows() > 0 {
+                for t in 0..routing.nrows() {
+                    let mut kl_pq_t = 0.0f64;
+                    let mut kl_qp_t = 0.0f64;
+                    for e in 0..p_head.len() {
+                        let p = (p_head[e] as f64).max(eps);
+                        let q = (routing[[t, e]] as f64).max(eps);
+                        kl_pq_t += p * (p / q).ln();
+                        kl_qp_t += q * (q / p).ln();
+                    }
+                    let l = kl_pq_t + kl_qp_t;
+                    if l.is_finite() {
+                        token_loss_sum += l;
+                        token_count += 1.0;
+                    }
+                }
+            }
+        }
+        let token_loss = if token_count > 0.0 {
+            token_loss_sum / token_count
+        } else {
+            0.0
+        };
+
+        let loss = kl_pq + kl_qp + token_loss;
         if loss.is_finite() {
             (loss as f32) * weight
         } else {
@@ -1735,14 +1770,17 @@ impl MixtureOfExperts {
             self.cached_aux_loss += contrastive;
         }
 
-        let active_experts: Vec<usize> = self
+        let mut active_experts = self.cached_active_experts.take().unwrap_or_default();
+        active_experts.clear();
+        let active_mask = self
             .cached_active_expert_mask
             .as_ref()
-            .expect("active expert mask must be cached")
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &a)| if a { Some(i) } else { None })
-            .collect();
+            .expect("active expert mask must be cached");
+        for (i, &a) in active_mask.iter().enumerate() {
+            if a {
+                active_experts.push(i);
+            }
+        }
 
         // Compute only active experts; keep cache length = num_experts.
         // Reuse cached buffers when possible and avoid cloning large expert outputs.
@@ -1759,6 +1797,7 @@ impl MixtureOfExperts {
         for &e in &active_experts {
             expert_outputs[e] = self.experts[e].forward(input);
         }
+        self.cached_active_experts = Some(active_experts);
         self.cached_expert_outputs = Some(expert_outputs);
         let expert_outputs = self
             .cached_expert_outputs
@@ -1855,7 +1894,14 @@ impl Layer for MixtureOfExperts {
         } else {
             0.0
         };
-        let mut shared_flags = vec![false; self.config.num_experts];
+        let mut shared_flags = self.cached_shared_flags.take().unwrap_or_default();
+        if shared_flags.len() != self.config.num_experts {
+            shared_flags = vec![false; self.config.num_experts];
+        } else {
+            for v in shared_flags.iter_mut() {
+                *v = false;
+            }
+        }
         let mut shared_count = 0usize;
         if shared_scale != 0.0 {
             for &idx in &self.config.shared_experts {
@@ -1940,6 +1986,7 @@ impl Layer for MixtureOfExperts {
         }
 
         self.cached_weighted_grads = Some(weighted_buffers);
+        self.cached_shared_flags = Some(shared_flags);
 
         total_grad_input
     }
@@ -2015,41 +2062,7 @@ impl Layer for MixtureOfExperts {
             0.0
         };
 
-        // 1. Route gradients to experts weighted by (post-mask) routing probabilities.
-        // Only build grads for experts that were active for at least one token.
-        let mut expert_output_grads =
-            vec![ndarray::Array2::zeros(output_grads.raw_dim()); self.config.num_experts];
-        for expert_idx in 0..self.config.num_experts {
-            if let Some(m) = active_mask
-                && expert_idx < m.len()
-                && !m[expert_idx]
-            {
-                continue;
-            }
-            let shared_bonus = if expert_idx < shared_flags.len() && shared_flags[expert_idx] {
-                shared_per_expert
-            } else {
-                0.0
-            };
-            for token_idx in 0..output_grads.nrows() {
-                let mut w = cached_routing_probs[[token_idx, expert_idx]];
-                w = if w.is_finite() { w } else { 0.0 };
-                w += shared_bonus;
-                if !w.is_finite() {
-                    w = 0.0;
-                }
-                if w == 0.0 {
-                    continue;
-                }
-
-                let src_row = output_grads.row(token_idx);
-                let mut dst_row = expert_output_grads[expert_idx].row_mut(token_idx);
-                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
-                    let src = if src.is_finite() { src } else { 0.0 };
-                    *dst = src * w;
-                }
-            }
-        }
+        let mut expert_output_grads = ndarray::Array2::zeros(output_grads.raw_dim());
 
         // 2. Compute gradients for each expert
         let mut all_param_grads = Vec::new();
@@ -2077,15 +2090,33 @@ impl Layer for MixtureOfExperts {
                 all_param_grads.extend(zero_expert_grads(expert));
                 continue;
             }
-            let expert_grads = &expert_output_grads[expert_idx];
-            let (expert_input_grad, expert_param_grads) =
-                expert.compute_gradients(cached_input, expert_grads);
-
+            expert_output_grads.fill(0.0);
             let shared_bonus = if expert_idx < shared_flags.len() && shared_flags[expert_idx] {
                 shared_per_expert
             } else {
                 0.0
             };
+            for token_idx in 0..output_grads.nrows() {
+                let mut w = cached_routing_probs[[token_idx, expert_idx]];
+                w = if w.is_finite() { w } else { 0.0 };
+                w += shared_bonus;
+                if !w.is_finite() {
+                    w = 0.0;
+                }
+                if w == 0.0 {
+                    continue;
+                }
+
+                let src_row = output_grads.row(token_idx);
+                let mut dst_row = expert_output_grads.row_mut(token_idx);
+                for (dst, &src) in dst_row.iter_mut().zip(src_row.iter()) {
+                    let src = if src.is_finite() { src } else { 0.0 };
+                    *dst = src * w;
+                }
+            }
+            let expert_grads = &expert_output_grads;
+            let (expert_input_grad, expert_param_grads) =
+                expert.compute_gradients(cached_input, expert_grads);
 
             // Weight input gradients by routing probabilities
             for token_idx in 0..expert_input_grad.nrows() {
@@ -2427,7 +2458,7 @@ impl Layer for MixtureOfExperts {
                 if let Some(grad_s) = contrastive_grad_s.as_ref()
                     && expert_idx < grad_s.len()
                 {
-                    let v = grad_s[expert_idx];
+                    let v = grad_s[expert_idx] * y;
                     if v.is_finite() {
                         g_aux += v;
                     }
@@ -2746,6 +2777,8 @@ impl Layer for MixtureOfExperts {
         self.cached_k_alpha = None;
         self.cached_k_features = None;
         self.cached_k_delta_probs = None;
+        self.cached_active_experts = None;
+        self.cached_shared_flags = None;
     }
 }
 

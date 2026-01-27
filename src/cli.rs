@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 use crate::{
     layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
@@ -173,7 +173,7 @@ pub struct Args {
     /// Enable Mixture-of-Experts (MoE) for feedforward layers
     /// When enabled, replaces standard feedforward layers with sparse MoE layers
     /// Each MoE layer contains multiple expert networks with learned routing
-    #[arg(long)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub moe: bool,
 
     /// Enable/disable learned router temperature for MoE (log-space parameterization).

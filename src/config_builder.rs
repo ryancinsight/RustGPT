@@ -110,7 +110,6 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
         };
     }
 
-    // Enable MoE if requested
     if args.moe {
         config.moe_router = Some(crate::mixtures::moe::ExpertRouter::LearnedMoE {
             num_experts: 4,
@@ -130,6 +129,8 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
             shared_expert_scale: 0.0,
             moh_moe_contrastive_weight: 0.01,
         });
+    } else {
+        config.moe_router = None;
     }
 
     // Enable E-Prop if requested

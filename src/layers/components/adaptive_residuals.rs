@@ -91,6 +91,10 @@ pub struct AdaptiveResiduals {
     scratch_perf_values: Vec<f64>,
     #[serde(skip, default)]
     scratch_channel_scales: Vec<f32>,
+    #[serde(skip, default)]
+    scratch_dot: Vec<f64>,
+    #[serde(skip, default)]
+    scratch_z: Vec<f64>,
 }
 
 impl AdaptiveResiduals {
@@ -131,6 +135,8 @@ impl AdaptiveResiduals {
             scratch_mean_z: Vec::new(),
             scratch_perf_values: Vec::new(),
             scratch_channel_scales: Vec::new(),
+            scratch_dot: Vec::new(),
+            scratch_z: Vec::new(),
         }
     }
 
@@ -172,8 +178,8 @@ impl AdaptiveResiduals {
         let seq_len = input.nrows();
         let embed_dim = input.ncols();
 
-        // Create adaptive scaling based on similarity matrix for contrast enhancement
-        let mut adaptive_scales = Array2::zeros((embed_dim, 1));
+        self.scratch_channel_scales.resize(embed_dim, 1.0f32);
+        self.scratch_channel_scales.fill(1.0f32);
 
         // If there is no head-conditioning signal, use the simplest (and most learnable)
         // per-channel scaling path. This keeps gradients well-aligned with the update rule
@@ -241,7 +247,7 @@ impl AdaptiveResiduals {
             base_scale = base_scale.clamp(min_scale, threshold);
 
             if !enable_contrast_conditioning {
-                adaptive_scales[[channel, 0]] = base_scale;
+                self.scratch_channel_scales[channel] = base_scale;
                 continue;
             }
 
@@ -250,7 +256,7 @@ impl AdaptiveResiduals {
 
             let final_scale =
                 (base_scale * contrast_factor * moh_scale_factor).clamp(min_scale, threshold);
-            adaptive_scales[[channel, 0]] = final_scale;
+            self.scratch_channel_scales[channel] = final_scale;
         }
 
         // Apply position-aware scaling with contrast enhancement
@@ -266,7 +272,11 @@ impl AdaptiveResiduals {
                 } else {
                     0.0
                 };
-                let scale = adaptive_scales[[channel, 0]];
+                let scale = if channel < self.scratch_channel_scales.len() {
+                    self.scratch_channel_scales[channel]
+                } else {
+                    1.0
+                };
 
                 // Apply scaled attention output
                 let scaled_attn = attn_val * scale;
@@ -658,8 +668,9 @@ impl AdaptiveResiduals {
 
         self.scratch_nx.resize(embed_dim, 0.0f64);
         self.scratch_nx.fill(0.0f64);
-        let mut dot = vec![0.0f64; embed_dim * embed_dim];
-        let mut z = vec![0.0f64; embed_dim];
+        self.scratch_dot.resize(embed_dim * embed_dim, 0.0f64);
+        self.scratch_dot.fill(0.0f64);
+        self.scratch_z.resize(embed_dim, 0.0f64);
 
         for seq_idx in (0..seq_len).step_by(step).take(sample) {
             for j in 0..embed_dim {
@@ -669,14 +680,14 @@ impl AdaptiveResiduals {
                 let f = if f.is_finite() { f as f64 } else { 0.0 };
                 let v = a + f;
                 let vc = v - self.scratch_mean_z[j];
-                z[j] = vc;
+                self.scratch_z[j] = vc;
                 self.scratch_nx[j] += vc * vc;
             }
 
             for i in 0..embed_dim {
-                let zi = z[i];
+                let zi = self.scratch_z[i];
                 for j in i..embed_dim {
-                    dot[i * embed_dim + j] += zi * z[j];
+                    self.scratch_dot[i * embed_dim + j] += zi * self.scratch_z[j];
                 }
             }
         }
@@ -688,7 +699,7 @@ impl AdaptiveResiduals {
                 let nj = self.scratch_nx[j].max(0.0);
                 let denom = (ni * nj).sqrt() + eps;
                 let v = if denom > eps {
-                    (dot[i * embed_dim + j] / denom).clamp(-1.0, 1.0)
+                    (self.scratch_dot[i * embed_dim + j] / denom).clamp(-1.0, 1.0)
                 } else {
                     0.0
                 };
@@ -794,7 +805,12 @@ impl AdaptiveResiduals {
 
         // Slightly higher effective LR for residual scales so short synthetic training
         // runs visibly adapt (parameters are still clamped for stability).
-        let scale_lr = (lr * 10.0).min(0.1);
+        let mut adapt = 1.0 + self.similarity_entropy;
+        if !adapt.is_finite() {
+            adapt = 1.0;
+        }
+        let adapt = adapt.clamp(0.5, 1.5);
+        let scale_lr = (lr * 10.0 * adapt).min(0.1);
 
         let clipped_attention = attention_scale_grads.mapv(|g| g.clamp(-grad_clip, grad_clip));
         self.opt_scales_attention.step(
@@ -803,20 +819,15 @@ impl AdaptiveResiduals {
             scale_lr,
         );
 
-        // Ensure scales stay within reasonable bounds to prevent instability
-        for i in 0..self.attention_residual_scales.nrows() {
-            self.attention_residual_scales[[i, 0]] =
-                self.attention_residual_scales[[i, 0]].clamp(0.1, 3.0); // Keep scales between 0.1 and 3.0
-        }
-
         let clipped_ffn = ffn_scale_grads.mapv(|g| g.clamp(-grad_clip, grad_clip));
         self.opt_scales_ffn
             .step(&mut self.ffn_residual_scales, &clipped_ffn, scale_lr);
 
         // Ensure scales stay bounded to prevent instability
+        let max_attention_scale = threshold.min(3.0);
         for i in 0..self.attention_residual_scales.nrows() {
             self.attention_residual_scales[[i, 0]] =
-                self.attention_residual_scales[[i, 0]].clamp(0.1, threshold);
+                self.attention_residual_scales[[i, 0]].clamp(0.1, max_attention_scale);
         }
         for i in 0..self.ffn_residual_scales.nrows() {
             self.ffn_residual_scales[[i, 0]] =
