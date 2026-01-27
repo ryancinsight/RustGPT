@@ -15,13 +15,13 @@ use crate::{
 #[derive(Debug)]
 pub struct ForwardContext<'a> {
     pub input: &'a Array2<f32>,
-    pub heads: &'a mut [PolyHead],
+    pub heads: &'a [PolyHead],
     pub w_out: &'a Array2<f32>,
     pub w_g: &'a Array2<f32>,
     pub alpha_g: &'a Array2<f32>,
     pub beta_g: &'a Array2<f32>,
-    pub gate: &'a mut RichardsGate,
-    pub cope: &'a mut CoPE,
+    pub gate: &'a RichardsGate,
+    pub cope: &'a CoPE,
     pub head_selection_config: &'a mut HeadSelectionConfig,
     pub threshold_predictor: &'a mut Option<ThresholdPredictor>,
     pub embed_dim: usize,
