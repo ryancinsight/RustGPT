@@ -17,6 +17,7 @@ use crate::{
     mixtures::{
         MoHGating,
         moh::{HeadSelectionConfig, HeadSelectionStrategy},
+        threshold::ThresholdPredictorCache,
     },
     richards::AdaptiveScalar,
     model_config::TitanMemoryConfig,
@@ -200,6 +201,7 @@ pub struct PolyAttentionCache {
     pub cached_thresholds_global: Option<Array2<f32>>,
     pub cached_soft_top_p_mask: Option<Array2<f32>>,
     pub last_causal: bool,
+    pub predictor_cache: Option<ThresholdPredictorCache>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -525,6 +527,98 @@ impl PolyAttention {
                 "PolyAttention degree adapted"
             );
         }
+    }
+
+    pub fn forward_detached(
+        &self,
+        input: &Array2<f32>,
+        causal: bool,
+    ) -> (Array2<f32>, PolyAttentionCache) {
+        let mut cached_soft_top_p_mask: Option<Array2<f32>> = None;
+        let mut cached_thresholds_global: Option<Array2<f32>> = None;
+        let mut predictor_cache: Option<ThresholdPredictorCache> = None;
+
+        // Perform detached prediction if predictor is enabled
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+            if let Some(predictor) = self.moh.threshold_predictor.as_ref() {
+                let (t, cache) = predictor.predict_with_condition_detached(
+                    &input.view(),
+                    self.token_latent_features.as_ref().map(|f| f.view()),
+                );
+                // Apply modulation and scaling (logic from compute_poly_attention_forward)
+                let mut t_mod = t;
+                let m = self
+                    .moh
+                    .head_selection_config
+                    .threshold_modulation
+                    .value(self.training_progress);
+                t_mod.mapv_inplace(|v| v * m);
+                let k = self.moh.head_selection_config.gating.num_active as f32;
+                let n = t_mod.nrows();
+                let h = t_mod.ncols();
+                for i in 0..n {
+                    let mut sum = 0.0f32;
+                    for j in 0..h {
+                        sum += t_mod[[i, j]];
+                    }
+                    if sum > 0.0 {
+                        let s = k / sum;
+                        for j in 0..h {
+                            t_mod[[i, j]] *= s;
+                        }
+                    }
+                }
+                cached_thresholds_global = Some(t_mod);
+                predictor_cache = Some(cache);
+            }
+        }
+
+        // We clone head selection config to allow metric updates on the clone (discarded later)
+        let mut local_head_selection_config = self.moh.head_selection_config.clone();
+        let mut none_predictor = None;
+
+        let mut ctx = ForwardContext {
+            input,
+            heads: &self.heads,
+            w_out: &self.w_out,
+            w_g: &self.moh.w_g,
+            alpha_g: &self.moh.alpha_g,
+            beta_g: &self.moh.beta_g,
+            gate: &self.moh.gate,
+            cope: &self.cope,
+            head_selection_config: &mut local_head_selection_config,
+            threshold_predictor: &mut none_predictor, // Predictor handled separately
+            embed_dim: self.embed_dim,
+            num_heads: self.num_heads,
+            head_dim: self.head_dim,
+            p: self.p,
+            a: &self.a,
+            b: &self.b,
+            scale: &self.scale,
+            window_size: self.window_size,
+            cached_soft_top_p_mask: &mut cached_soft_top_p_mask,
+            cached_thresholds_global: &mut cached_thresholds_global,
+            token_threshold_scale: &self.token_threshold_scale,
+            token_latent_features: &self.token_latent_features,
+            eff_skip_threshold: self.eff_skip_threshold,
+            parallel_batch_size: self.parallel_batch_size,
+            parallel_timeout_ms: self.parallel_timeout_ms,
+            training_progress: self.training_progress,
+        };
+
+        let mut result = compute_poly_attention_forward(&mut ctx, causal);
+        self.apply_titan_memory_into(&mut result.output, input);
+
+        (
+            result.output,
+            PolyAttentionCache {
+                cached_input: input.clone(),
+                cached_thresholds_global,
+                cached_soft_top_p_mask,
+                last_causal: causal,
+                predictor_cache,
+            },
+        )
     }
 
     pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
@@ -1535,9 +1629,11 @@ impl PolyAttention {
             .as_ref()
             .expect("forward must be called before compute_gradients");
         self.compute_gradients_parallel_from_state(
+            &self.moh,
             input,
             self.cached_thresholds_global.as_ref(),
             self.moh.cached_soft_top_p_mask.as_ref(),
+            None,
             self.last_causal,
             output_grads,
         )
@@ -1545,9 +1641,11 @@ impl PolyAttention {
 
     pub fn compute_gradients_parallel_from_state(
         &self,
+        moh: &MoHGating,
         input: &Array2<f32>,
         cached_thresholds_global: Option<&Array2<f32>>,
         cached_soft_top_p_mask: Option<&Array2<f32>>,
+        predictor_cache: Option<&ThresholdPredictorCache>,
         last_causal: bool,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
@@ -1558,7 +1656,7 @@ impl PolyAttention {
         let scale = self.scale[[0, 0]];
         let p_i32 = self.p as i32;
         let mut grad_input_total = output_grads.clone();
-        let n_gate_w = self.moh.gate.parameters();
+        let n_gate_w = moh.gate.parameters();
         use rayon::prelude::*;
 
         struct HeadGradients {
@@ -1586,24 +1684,24 @@ impl PolyAttention {
                 let q: Array2<f32> = input.dot(&head.w_q);
                 let k: Array2<f32> = input.dot(&head.w_k);
                 let v: Array2<f32> = input.dot(&head.w_v);
-                let w_g_col = self.moh.w_g.slice(s![.., h_idx..h_idx + 1]);
+                let w_g_col = moh.w_g.slice(s![.., h_idx..h_idx + 1]);
                 let xw_col = input.dot(&w_g_col);
-                let a_h = self.moh.alpha_g[[0, h_idx]];
-                let b_h = self.moh.beta_g[[0, h_idx]];
+                let a_h = moh.alpha_g[[0, h_idx]];
+                let b_h = moh.beta_g[[0, h_idx]];
                 let mut z_col = xw_col.clone();
                 z_col.mapv_inplace(|vv| a_h * vv + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
-                let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
                 let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
                 gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 let mut m_col = Array2::<f32>::ones((n, 1));
-                if self.moh.head_selection_config.gating.use_learned_predictor {
+                if moh.head_selection_config.gating.use_learned_predictor {
                     let thresholds = cached_thresholds_global
                         .as_ref()
                         .expect("forward must cache thresholds when learned predictor is enabled");
                     let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
                     m_col.assign(&head_thresholds);
-                } else if self.moh.head_selection_config.gating.use_soft_top_p
+                } else if moh.head_selection_config.gating.use_soft_top_p
                     && let Some(mask) = &cached_soft_top_p_mask
                     && mask.nrows() == n
                     && mask.ncols() == self.num_heads
@@ -1696,7 +1794,7 @@ impl PolyAttention {
                     let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
 
-                    if self.moh.head_selection_config.gating.training_mode
+                    if moh.head_selection_config.gating.training_mode
                         == crate::mixtures::gating::GatingTrainingMode::Coupled
                     {
                         let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
@@ -1708,7 +1806,7 @@ impl PolyAttention {
                         }
                         grad_alpha_val += grad_g_i * xw_col[[i, 0]];
                         grad_beta_val += grad_g_i;
-                        let wg_col_owned = self.moh.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
+                        let wg_col_owned = moh.w_g.slice(s![.., h_idx..h_idx + 1]).to_owned();
                         let wg_scaled_t = wg_col_owned.t();
                         for d in 0..self.embed_dim {
                             grad_input_contrib[[i, d]] += a_h * wg_scaled_t[[0, d]] * grad_g_i;
@@ -1796,7 +1894,7 @@ impl PolyAttention {
                         }
                     }
 
-                    if self.moh.head_selection_config.gating.training_mode
+                    if moh.head_selection_config.gating.training_mode
                         == crate::mixtures::gating::GatingTrainingMode::Coupled
                         && let Some(threshold_grad_accum) = threshold_accum_local.as_mut()
                     {
@@ -1922,10 +2020,10 @@ impl PolyAttention {
             grad_scale_scalar += head_gradients.grad_scale_scalar;
         }
 
-        if self.moh.head_selection_config.gating.use_learned_predictor
-            && (self.moh.head_selection_config.gating.complexity_loss_weight > 0.0
-                || self.moh.head_selection_config.gating.load_balance_weight > 0.0
-                || self.moh.head_selection_config.gating.sparsity_weight > 0.0)
+        if moh.head_selection_config.gating.use_learned_predictor
+            && (moh.head_selection_config.gating.complexity_loss_weight > 0.0
+                || moh.head_selection_config.gating.load_balance_weight > 0.0
+                || moh.head_selection_config.gating.sparsity_weight > 0.0)
         {
             let m_mat = cached_thresholds_global
                 .as_ref()
@@ -1935,15 +2033,15 @@ impl PolyAttention {
             let mut z_mat = Array2::<f32>::zeros((n, self.num_heads));
             let mut max_abs_vec: Vec<f64> = vec![0.0; self.num_heads];
             for h in 0..self.num_heads {
-                let w_g_col = self.moh.w_g.slice(s![.., h..h + 1]);
+                let w_g_col = moh.w_g.slice(s![.., h..h + 1]);
                 let xw_col = input.dot(&w_g_col);
-                let a_h = self.moh.alpha_g[[0, h]];
-                let b_h = self.moh.beta_g[[0, h]];
+                let a_h = moh.alpha_g[[0, h]];
+                let b_h = moh.beta_g[[0, h]];
                 let mut z_col = xw_col.clone();
                 z_col.mapv_inplace(|v| a_h * v + b_h);
                 let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
                 max_abs_vec[h] = max_abs_z as f64;
-                let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
                 let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
                 gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 for i in 0..n {
@@ -1954,8 +2052,8 @@ impl PolyAttention {
             }
             let inv_n = 1.0f32 / (n as f32);
             let inv_h = 1.0f32 / (self.num_heads as f32);
-            let target_heads = ((self.moh.head_selection_config.min_heads
-                + self.moh.head_selection_config.max_heads) as f32)
+            let target_heads = ((moh.head_selection_config.min_heads
+                + moh.head_selection_config.max_heads) as f32)
                 * 0.5;
             for i in 0..n {
                 let mut s = 0.0f32;
@@ -1964,26 +2062,26 @@ impl PolyAttention {
                 }
                 let mean = s * inv_h;
                 let mut base_d = 0.0f32;
-                if self.moh.head_selection_config.gating.complexity_loss_weight > 0.0 {
-                    base_d += self.moh.head_selection_config.gating.complexity_loss_weight
+                if moh.head_selection_config.gating.complexity_loss_weight > 0.0 {
+                    base_d += moh.head_selection_config.gating.complexity_loss_weight
                         * (s - target_heads)
                         * inv_n;
                 }
-                base_d += self.moh.head_selection_config.gating.sparsity_weight * inv_n * inv_h;
+                base_d += moh.head_selection_config.gating.sparsity_weight * inv_n * inv_h;
                 for h in 0..self.num_heads {
                     let eff_h = eff_mat[[i, h]];
                     let mut d_eff_h = base_d;
-                    if self.moh.head_selection_config.gating.load_balance_weight > 0.0 {
+                    if moh.head_selection_config.gating.load_balance_weight > 0.0 {
                         d_eff_h += 2.0
-                            * self.moh.head_selection_config.gating.load_balance_weight
+                            * moh.head_selection_config.gating.load_balance_weight
                             * inv_n
                             * inv_h
                             * (eff_h - mean);
                     }
                     let d_g_i = d_eff_h * m_mat[[i, h]];
-                    let a_h = self.moh.alpha_g[[0, h]];
+                    let a_h = moh.alpha_g[[0, h]];
                     let z_i = z_mat[[i, h]];
-                    let gate_poly = self.moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
+                    let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
                     let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
                     let grad_g_i = d_g_i * dphi_dz_i;
                     let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
@@ -1994,14 +2092,14 @@ impl PolyAttention {
                         grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i;
                     }
                     let xw_val = if a_h.abs() > 1e-8 {
-                        (z_i - self.moh.beta_g[[0, h]]) / a_h
+                        (z_i - moh.beta_g[[0, h]]) / a_h
                     } else {
                         0.0
                     };
                     grad_alpha_g[[0, h]] += grad_g_i * xw_val;
                     grad_beta_g[[0, h]] += grad_g_i;
                     for d in 0..self.embed_dim {
-                        grad_input_total[[i, d]] += a_h * self.moh.w_g[[d, h]] * grad_g_i;
+                        grad_input_total[[i, d]] += a_h * moh.w_g[[d, h]] * grad_g_i;
                     }
                     if let Some(acc) = threshold_grad_accum.as_mut() {
                         acc[[i, h]] += d_eff_h * g_mat[[i, h]];
@@ -2018,8 +2116,8 @@ impl PolyAttention {
             grad_cond_w_tau,
             grad_activation_tau,
         ): ThresholdPredictorGrads =
-            if self.moh.head_selection_config.gating.use_learned_predictor {
-                let predictor = self.moh.threshold_predictor.as_ref().expect(
+            if moh.head_selection_config.gating.use_learned_predictor {
+                let predictor = moh.threshold_predictor.as_ref().expect(
                     "use_learned_predictor=true requires an initialized threshold_predictor",
                 );
                 let threshold_grad_accum = threshold_grad_accum
@@ -2027,7 +2125,11 @@ impl PolyAttention {
                     .expect("use_learned_predictor=true requires a threshold_grad_accum");
 
                 let (grad_w1, grad_b1_1d, grad_w2, grad_b2_1d, grad_cond_w, grad_activation) =
-                    predictor.compute_gradients(threshold_grad_accum);
+                    if let Some(cache) = predictor_cache {
+                        predictor.compute_gradients_from_cache(cache, threshold_grad_accum)
+                    } else {
+                        predictor.compute_gradients(threshold_grad_accum)
+                    };
                 let grad_b1 = grad_b1_1d
                     .clone()
                     .to_shape((grad_b1_1d.len(), 1))
@@ -2070,7 +2172,7 @@ impl PolyAttention {
         )
         .unwrap();
         all_param_grads.push(grad_gate_poly);
-        if self.moh.head_selection_config.gating.use_learned_predictor {
+        if moh.head_selection_config.gating.use_learned_predictor {
             let predictor_hidden_dim = 128.min(self.embed_dim / 2).max(32);
             match (
                 grad_w_tau,
@@ -2372,11 +2474,18 @@ impl PolyAttention {
     }
 
     pub fn take_cache(&mut self) -> Option<PolyAttentionCache> {
+        let predictor_cache = if let Some(pred) = self.moh.threshold_predictor.as_mut() {
+            pred.take_cache()
+        } else {
+            None
+        };
+
         Some(PolyAttentionCache {
             cached_input: self.cached_input.take()?,
             cached_thresholds_global: self.cached_thresholds_global.take(),
             cached_soft_top_p_mask: self.moh.cached_soft_top_p_mask.take(),
             last_causal: self.last_causal,
+            predictor_cache,
         })
     }
 
@@ -2386,9 +2495,11 @@ impl PolyAttention {
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         self.compute_gradients_parallel_from_state(
+            &self.moh,
             &cache.cached_input,
             cache.cached_thresholds_global.as_ref(),
             cache.cached_soft_top_p_mask.as_ref(),
+            cache.predictor_cache.as_ref(),
             cache.last_causal,
             output_grads,
         )
