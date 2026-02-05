@@ -27,14 +27,6 @@ pub struct TitansMAG {
     cached_swa_output: Option<Array2<f32>>,
 }
 
-// Helpers for NeuralMemory access
-fn mlp_forward(weights: &MemoryWeights, input: &Array1<f32>) -> (Array1<f32>, Array1<f32>) {
-    let z = weights.w1.dot(input) + &weights.b1;
-    let h = z.mapv(|x| x.max(0.0));
-    let y = weights.w2.dot(&h) + &weights.b2;
-    (y, h)
-}
-
 impl TitansMAG {
     pub fn new(swa: SlidingWindowAttention, memory: NeuralMemory, segment_len: usize) -> Self {
         let input_dim = swa.embed_dim;
@@ -78,6 +70,9 @@ impl Layer for TitansMAG {
         self.cached_input = Some(input.clone());
         let seq_len = input.nrows();
         let dim = input.ncols();
+
+        // Reset memory for this sequence (standard layer behavior)
+        self.memory.reset_memory();
 
         // 1. SWA Forward (on full sequence) - cache for use in gradients
         let swa_out = self.swa.forward(input);
@@ -205,7 +200,7 @@ impl Layer for TitansMAG {
 
                 // Retrieval
                 let q_t = self.memory.w_q.dot(&input_t);
-                let (y_mem, _) = mlp_forward(&retrieval_memory_snapshot, &q_t);
+                let (y_mem, _) = NeuralMemory::mlp_forward(&retrieval_memory_snapshot, &q_t);
 
                 // Gating
                 let mut concat = Array1::<f32>::zeros(2 * dim);
@@ -241,7 +236,7 @@ impl Layer for TitansMAG {
                 });
 
                 // Perform Update state tracking locally (needed for next step's trace)
-                let (v_pred, h) = mlp_forward(&curr_memory, &k_t);
+                let (v_pred, h) = NeuralMemory::mlp_forward(&curr_memory, &k_t);
                 let grad_output = &v_pred - &v_t;
 
                 let grad_w2 = grad_output
@@ -648,5 +643,26 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_titans_mag_deterministic_forward() {
+        let input_dim = 4;
+        let window_size = 2;
+        let memory_hidden_dim = 4;
+        let segment_len = 2;
+
+        let swa = SlidingWindowAttention::new(input_dim, window_size);
+        let memory = NeuralMemory::new(input_dim, input_dim, input_dim, memory_hidden_dim);
+
+        let mut mag = TitansMAG::new(swa, memory, segment_len);
+
+        let seq_len = 4;
+        let input = Array2::<f32>::ones((seq_len, input_dim));
+
+        let out1 = mag.forward(&input);
+        let out2 = mag.forward(&input);
+
+        assert_eq!(out1, out2, "Forward pass should be deterministic (memory should be reset)");
     }
 }

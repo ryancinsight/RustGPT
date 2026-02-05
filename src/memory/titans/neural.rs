@@ -164,7 +164,10 @@ impl NeuralMemory {
         ));
     }
 
-    fn mlp_forward(weights: &MemoryWeights, input: &Array1<f32>) -> (Array1<f32>, Array1<f32>) {
+    pub(crate) fn mlp_forward(
+        weights: &MemoryWeights,
+        input: &Array1<f32>,
+    ) -> (Array1<f32>, Array1<f32>) {
         let z = weights.w1.dot(input) + &weights.b1;
         let h = z.mapv(|x| x.max(0.0));
         let y = weights.w2.dot(&h) + &weights.b2;
