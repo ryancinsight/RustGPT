@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use llm::Adam;
+use llm::infrastructure::optimizer::adam::Adam;
 use ndarray::Array2;
 
 #[test]

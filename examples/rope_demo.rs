@@ -1,4 +1,7 @@
-use llm::{LLM, ModelConfig, Vocab, build_network, print_architecture_summary};
+use llm::domain::models::llm::LLM;
+use llm::domain::models::config::ModelConfig;
+use llm::application::encoding::Vocab;
+use llm::domain::models::builder::{build_network, print_architecture_summary};
 
 /// Demonstrate the Transformer model architecture available in RustGPT
 ///

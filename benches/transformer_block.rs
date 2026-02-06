@@ -70,7 +70,7 @@ fn bench_attention_only(c: &mut Criterion) {
     group.throughput(Throughput::Elements(512));
     group.bench_function("attention_forward", |b| {
         b.iter(|| {
-            if let TemporalMixingLayer::Attention(attn) = &mut block.temporal_mixing {
+            if let TemporalMixingLayer::Attention(attn) = block.temporal_mixing_mut() {
                 let _ = attn.forward(&input);
             }
         });

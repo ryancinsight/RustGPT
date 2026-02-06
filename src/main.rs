@@ -1,15 +1,20 @@
 use clap::Parser;
 use llm::{
-    cli::Args,
-    config_builder::build_model_config,
-    dataset_loader::{Dataset, DatasetType},
-    encoding::Vocab,
-    errors::Result,
-    interactive::run_interactive_mode,
-    llm::LLM,
-    model_builder::{build_network, print_architecture_summary},
-    rng::set_seed,
-    training::{configure_speculative_sampling_from_args, run_training_pipeline},
+    presentation::cli::{
+        args::Args,
+        config::build_model_config,
+        interactive::run_interactive_mode,
+    },
+    infrastructure::persistence::dataset::{Dataset, DatasetType},
+    application::{
+        encoding::Vocab,
+        training::pipeline::{configure_speculative_sampling_from_args, run_training_pipeline},
+    },
+    common::{errors::Result, rng::set_seed},
+    domain::models::{
+        llm::LLM,
+        builder::{build_network, print_architecture_summary},
+    },
 };
 
 fn main() -> crate::Result<()> {

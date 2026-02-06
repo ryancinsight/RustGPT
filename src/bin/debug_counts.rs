@@ -1,10 +1,12 @@
-use llm::{
-    Layer,
+use llm::domain::{
+    network::Layer,
     layers::{
         diffusion::{DiffusionBlock, DiffusionBlockConfig},
         transformer::{TransformerBlock, TransformerBlockConfig},
     },
     mixtures::HeadSelectionStrategy,
+    richards::AdaptiveScalar,
+    models::config::{TemporalMixingType, WindowAdaptationStrategy, TitanMemoryConfig},
 };
 use ndarray::Array2;
 
@@ -19,16 +21,16 @@ fn main() {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
-        moh_threshold_modulation: llm::richards::adaptive::AdaptiveScalar::default(),
-        temporal_mixing: llm::model_config::TemporalMixingType::Attention,
+        moh_threshold_modulation: AdaptiveScalar::default(),
+        temporal_mixing: TemporalMixingType::Attention,
         use_adaptive_window: false,
         min_window_size: 512,
         max_window_size: 4096,
         window_adaptation_strategy:
-            llm::model_config::WindowAdaptationStrategy::SequenceLengthBased,
+            WindowAdaptationStrategy::SequenceLengthBased,
         entropy_ema_alpha: 0.2,
         use_advanced_adaptive_residuals: true,
-        titan_memory: llm::model_config::TitanMemoryConfig::default(),
+        titan_memory: TitanMemoryConfig::default(),
         eprop_adaptor: None,
     };
     let mut tblock = TransformerBlock::new(tcfg.clone());

@@ -24,6 +24,7 @@ Phase 3: Verify/docs
 
 ## TransformerBlock Audit/Enhancement Sprint
 - [x] Audit complete, gaps to gap_audit (TB-001..006)
+- [x] PolyAttention Streaming & Long Context Verification
 - [ ] Integrate TransformerWorkspace (TB-001 Major perf)
 - [ ] Prop/unit tests theorems/adaptive/MoE (TB-002/3/4)
 - [ ] Extract WindowAdapter/GradPartitioner traits (TB-005)

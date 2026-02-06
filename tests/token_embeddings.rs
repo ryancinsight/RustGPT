@@ -1,4 +1,7 @@
-use llm::{Vocab, embeddings::TokenEmbeddings, network::Layer};
+use llm::{
+    application::encoding::Vocab,
+    domain::{embeddings::TokenEmbeddings, network::Layer},
+};
 use ndarray::Array2;
 
 #[test]
@@ -6,12 +9,12 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
     let vocab = Vocab::default();
     let vocab_size = vocab.size();
 
-    let titan_memory = llm::model_config::TitanMemoryConfig {
+    let titan_memory = llm::domain::models::config::TitanMemoryConfig {
         enabled: false,
         engram_enabled: false,
         ..Default::default()
     };
-    let embedding_dim = llm::model_config::ModelConfig::default().embedding_dim;
+    let embedding_dim = llm::domain::models::config::ModelConfig::default().embedding_dim;
     let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory, embedding_dim);
     // Make embeddings deterministic for assertions.
     emb.token_embeddings = Array2::from_shape_fn((vocab_size, embedding_dim), |(i, j)| {
@@ -48,12 +51,12 @@ fn token_embeddings_compute_gradients_accumulates_repeated_tokens() {
     let vocab = Vocab::default();
     let vocab_size = vocab.size();
 
-    let titan_memory = llm::model_config::TitanMemoryConfig {
+    let titan_memory = llm::domain::models::config::TitanMemoryConfig {
         enabled: false,
         engram_enabled: false,
         ..Default::default()
     };
-    let embedding_dim = llm::model_config::ModelConfig::default().embedding_dim;
+    let embedding_dim = llm::domain::models::config::ModelConfig::default().embedding_dim;
     let emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory, embedding_dim);
 
     // token ids: [1, 1, 2]

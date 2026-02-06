@@ -1,6 +1,10 @@
 use std::time::Instant;
 
-use llm::{Layer, layers::transformer::TransformerBlock, model_config::ModelConfig};
+use llm::domain::{
+    network::Layer,
+    layers::transformer::TransformerBlock,
+    models::config::ModelConfig,
+};
 use ndarray::Array2;
 
 fn main() {

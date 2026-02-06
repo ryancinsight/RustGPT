@@ -1,4 +1,4 @@
-use llm::{models::titans::memory::NeuralMemory, network::Layer};
+use llm::{domain::models::titans::memory::NeuralMemory, domain::network::Layer};
 use ndarray::Array2;
 use rand::Rng;
 

@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use clap::Parser;
-use llm::LLM;
+use llm::domain::models::llm::LLM;
 
 #[derive(Parser, Debug)]
 #[command(name = "infer")]

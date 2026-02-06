@@ -1,4 +1,4 @@
-use llm::attention::poly_attention::PolyAttention;
+use llm::domain::attention::poly_attention::PolyAttention;
 use ndarray::Array2;
 
 #[test]

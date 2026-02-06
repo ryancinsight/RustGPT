@@ -1,4 +1,5 @@
-use llm::{Layer, llm::LLM};
+use llm::domain::models::llm::LLM;
+use llm::domain::network::Layer;
 
 #[test]
 fn versioned_model_binary_roundtrip_smoke() {
@@ -8,9 +9,9 @@ fn versioned_model_binary_roundtrip_smoke() {
         "rustgpt_versioned_roundtrip_{}_{}.rgpt",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
     ));
     let path_str = path.to_str().expect("temp path should be valid UTF-8");
 
@@ -27,8 +28,8 @@ fn versioned_model_binary_roundtrip_smoke() {
 
     // Pinpoint any layer-level mismatch (helps catch ambiguous serde decoding).
     for (idx, (a, b)) in llm.network.iter().zip(loaded.network.iter()).enumerate() {
-        let a_type = a.layer_type();
-        let b_type = b.layer_type();
+        let a_type: &str = a.layer_type();
+        let b_type: &str = b.layer_type();
         assert_eq!(a_type, b_type, "layer_type mismatch at index {idx}");
 
         let a_params = a.parameters();

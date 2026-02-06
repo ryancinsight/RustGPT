@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use llm::pade::PadeExp;
+use llm::domain::pade::PadeExp;
 
 fn horner(coeffs: &[f64], x: f64) -> f64 {
     coeffs.iter().rev().fold(0.0, |acc, &c| acc.mul_add(x, c))

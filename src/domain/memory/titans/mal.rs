@@ -1,0 +1,69 @@
+use serde::{Deserialize, Serialize};
+
+use super::neural::NeuralMemory;
+use crate::domain::attention::sliding_window_attention::SlidingWindowAttention;
+
+/// Memory As Layer (MAL) Architecture
+///
+/// "Uses the neural Memory As a Layer (MAL) of a deep neural network."
+/// Sequential: Memory -> Attention.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TitansMAL {
+    pub memory: NeuralMemory,
+    pub attention: SlidingWindowAttention,
+}
+
+use ndarray::Array2;
+
+use crate::domain::network::Layer;
+
+impl TitansMAL {
+    pub fn new(
+        input_dim: usize,
+        key_dim: usize,
+        val_dim: usize,
+        memory_hidden_dim: usize,
+        window_size: usize,
+    ) -> Self {
+        Self {
+            memory: NeuralMemory::new(input_dim, key_dim, val_dim, memory_hidden_dim),
+            attention: SlidingWindowAttention::new(val_dim, window_size),
+        }
+    }
+
+    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        let memory_output = self.memory.forward(input);
+        self.attention.forward(&memory_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn test_titans_mal_forward() {
+        let input_dim = 4;
+        let key_dim = 4;
+        let val_dim = 4;
+        let memory_hidden_dim = 8;
+        let window_size = 2;
+
+        let mut mal = TitansMAL::new(
+            input_dim,
+            key_dim,
+            val_dim,
+            memory_hidden_dim,
+            window_size,
+        );
+
+        let seq_len = 5;
+        let input = Array2::<f32>::zeros((seq_len, input_dim));
+
+        // Just verify it runs and returns correct shape
+        let output = mal.forward(&input);
+
+        assert_eq!(output.dim(), (seq_len, val_dim));
+    }
+}
