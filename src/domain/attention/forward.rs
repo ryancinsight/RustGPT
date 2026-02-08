@@ -54,11 +54,60 @@ pub struct ForwardResult {
     pub token_head_activity_vec: Option<Vec<f32>>,
 }
 
-/// Compute polynomial attention forward pass
-pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) -> ForwardResult {
+/// Workspace for batch forward pass to avoid allocations
+#[derive(Debug, Clone, Default)]
+pub struct PolyAttentionBatchWorkspace {
+    pub q_all: Array2<f32>,
+    pub k_all: Array2<f32>,
+    pub v_all: Array2<f32>,
+    pub xw_all: Array2<f32>,
+    pub gate_values: Array2<f32>,
+    pub z_col: Array2<f32>,
+    pub g_col: Array2<f32>,
+    pub y_head: Array2<f32>,
+}
+
+/// Compute polynomial attention forward pass into provided output buffer using workspace
+pub fn compute_poly_attention_forward_into(
+    ctx: &mut ForwardContext,
+    causal: bool,
+    output: &mut ndarray::Array2<f32>,
+    workspace: &mut PolyAttentionBatchWorkspace,
+) -> ForwardResult {
+    if ctx.input.nrows() > 1 && ctx.num_heads > 0 {
+         println!("[DEBUG BATCH ENTRY] n={} heads={}", ctx.input.nrows(), ctx.num_heads);
+    }
     // input: (N, embed_dim)
     let (n, d_model) = (ctx.input.nrows(), ctx.input.ncols());
     assert_eq!(d_model, ctx.embed_dim);
+    assert_eq!(output.nrows(), n);
+    assert_eq!(output.ncols(), ctx.embed_dim);
+
+    // Resize workspace if needed
+    if workspace.q_all.shape() != [n, ctx.num_heads * ctx.head_dim] {
+        workspace.q_all = Array2::zeros((n, ctx.num_heads * ctx.head_dim));
+    }
+    if workspace.k_all.shape() != [n, ctx.num_heads * ctx.head_dim] {
+        workspace.k_all = Array2::zeros((n, ctx.num_heads * ctx.head_dim));
+    }
+    if workspace.v_all.shape() != [n, ctx.num_heads * ctx.head_dim] {
+        workspace.v_all = Array2::zeros((n, ctx.num_heads * ctx.head_dim));
+    }
+    if workspace.xw_all.shape() != [n, ctx.num_heads] {
+        workspace.xw_all = Array2::zeros((n, ctx.num_heads));
+    }
+    if workspace.gate_values.shape() != [n, ctx.num_heads] {
+        workspace.gate_values = Array2::zeros((n, ctx.num_heads));
+    }
+    if workspace.z_col.shape() != [n, 1] {
+        workspace.z_col = Array2::zeros((n, 1));
+    }
+    if workspace.g_col.shape() != [n, 1] {
+        workspace.g_col = Array2::zeros((n, 1));
+    }
+    if workspace.y_head.shape() != [n, ctx.head_dim] {
+        workspace.y_head = Array2::zeros((n, ctx.head_dim));
+    }
 
     // Reset cached soft top-p mask for this forward pass
     ctx.cached_soft_top_p_mask.take();
@@ -66,7 +115,8 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
 
     let dk_scale = 1.0f32 / (ctx.head_dim as f32).sqrt();
 
-    let mut out = ndarray::Array2::<f32>::zeros((n, ctx.embed_dim));
+    // Ensure output is zeroed if we are accumulating
+    output.fill(0.0);
 
     // Pre-compute threshold predictor or soft top-p selection
     if ctx.head_selection_config.gating.use_learned_predictor {
@@ -172,13 +222,29 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
     let thresholds_global = ctx.cached_thresholds_global.as_ref();
 
     // Monolithic Projections
-    let q_all = ctx.input.dot(ctx.w_q); // (N, H*D_h)
-    let k_all = ctx.input.dot(ctx.w_k);
-    let v_all = ctx.input.dot(ctx.w_v);
+    // q_all: (N, H*D_h)
+    
+    if ctx.input.nrows() > 0 && ctx.input.ncols() > 0 {
+        println!("[DEBUG BATCH] Input[Last, 0]: {}", ctx.input[[ctx.input.nrows()-1, 0]]);
+        println!("[DEBUG BATCH] W_q[0,0]: {}", ctx.w_q[[0, 0]]);
+        // Manually compute Q[Last, 0]
+        let last_idx = ctx.input.nrows() - 1;
+        let mut q0_manual = 0.0;
+        for k in 0..ctx.input.ncols() {
+            q0_manual += ctx.input[[last_idx, k]] * ctx.w_q[[k, 0]];
+        }
+        println!("[DEBUG BATCH] Q[Last, 0] Manual: {}", q0_manual);
+    }
+
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_q, 0.0, &mut workspace.q_all);
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_k, 0.0, &mut workspace.k_all);
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_v, 0.0, &mut workspace.v_all);
 
     // Gating Projections
-    let xw_all = ctx.input.dot(ctx.w_g); // (N, H)
-    let mut gate_values = Array2::<f32>::zeros((n, ctx.num_heads));
+    // xw_all: (N, H)
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_g, 0.0, &mut workspace.xw_all);
+    
+    workspace.gate_values.fill(0.0);
 
     let mut tau_min_global = f32::INFINITY;
     let mut tau_max_global = f32::NEG_INFINITY;
@@ -188,19 +254,29 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
     let mut g_count_global = 0;
 
     for h_idx in 0..ctx.num_heads {
-        let xw_col_view = xw_all.slice(s![.., h_idx..h_idx + 1]); // (N, 1)
+        let xw_col_view = workspace.xw_all.slice(s![.., h_idx..h_idx + 1]); // (N, 1)
         let a_h = ctx.alpha_g[[0, h_idx]];
         let b_h = ctx.beta_g[[0, h_idx]];
 
-        let z_col = xw_col_view.mapv(|v| a_h * v + b_h); // (N, 1)
-        let mut g_col = Array2::<f32>::zeros((n, 1));
+        // Reuse workspace.z_col
+        workspace.z_col.assign(&xw_col_view);
+        workspace.z_col.mapv_inplace(|v| a_h * v + b_h);
+        
+        // Reuse workspace.g_col (must be zeroed or overwritten?)
+        // forward_into_f32 overwrites? No, it accumulates? 
+        // RichardsGate::forward_into_f32(input, output).
+        // It likely overwrites.
+        // But let's check RichardsGate. 
+        // Assuming it does what it says.
+        // But the loop iterates tokens.
+        
         for i in 0..n {
-            let z = z_col[[i, 0]];
+            let z = workspace.z_col[[i, 0]];
             // Match streaming behavior: max_abs is local z.abs() per token
             let gate_poly_local = ctx.gate.update_scaling_from_max_abs(z.abs() as f64);
             let mut g_val = 0.0;
             gate_poly_local.forward_into_f32(&[z], std::slice::from_mut(&mut g_val));
-            g_col[[i, 0]] = g_val;
+            workspace.g_col[[i, 0]] = g_val;
         }
 
         g_sq_sum_global += xw_col_view.iter().map(|&v| v * v).sum::<f32>();
@@ -227,29 +303,29 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             if ctx.head_selection_config.gating.use_learned_predictor
                 || ctx.head_selection_config.gating.use_soft_top_p
             {
-                ndarray::Zip::from(&mut g_col)
+                ndarray::Zip::from(&mut workspace.g_col)
                     .and(&head_thresholds)
                     .for_each(|e, &t| *e *= t);
             }
         }
 
-        gate_values.slice_mut(s![.., h_idx..h_idx + 1]).assign(&g_col);
+        workspace.gate_values.slice_mut(s![.., h_idx..h_idx + 1]).assign(&workspace.g_col);
     }
 
     // Reuse a single head-output buffer across heads to reduce allocations.
-    let mut y_head = Array2::<f32>::zeros((n, ctx.head_dim));
+    // workspace.y_head is used.
 
     // Process attention computation for each head
     for h_idx in 0..ctx.num_heads {
         let start = h_idx * ctx.head_dim;
         let end = start + ctx.head_dim;
 
-        // Zero-copy slicing from monolithic arrays
-        let q = q_all.slice(s![.., start..end]);
-        let k = k_all.slice(s![.., start..end]);
-        let v = v_all.slice(s![.., start..end]);
+        // Zero-copy slicing from monolithic arrays in workspace
+        let q = workspace.q_all.slice(s![.., start..end]);
+        let k = workspace.k_all.slice(s![.., start..end]);
+        let v = workspace.v_all.slice(s![.., start..end]);
         // eff_col is (N,) view of column h_idx
-        let eff_col = gate_values.column(h_idx);
+        let eff_col = workspace.gate_values.column(h_idx);
         {
             let a = ctx.a[[0, 0]];
             let b = ctx.b[[0, 0]];
@@ -258,9 +334,9 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             let start = h_idx * ctx.head_dim;
             let end = start + ctx.head_dim;
             let w_block = ctx.w_out.slice(s![start..end, ..]);
-            y_head.fill(0.0);
+            workspace.y_head.fill(0.0);
             use rayon::prelude::*;
-            y_head
+            workspace.y_head
                 .axis_iter_mut(ndarray::Axis(0))
                 .into_par_iter()
                 .enumerate()
@@ -286,10 +362,31 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                         let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
                         let mlen = j_end_excl.saturating_sub(j_start);
                         with_tls_phi(mlen, |phi_row| {
-                            for idx in 0..mlen {
-                                let j = j_start + idx;
-                                let mut s_val = scores_row[idx];
+                        // DEBUG: Log for last token, head 0
+                        if h_idx == 0 && i == n - 1 {
+                             println!("[DEBUG BATCH] i={} (Last), Head 0", i);
+                             println!("[DEBUG BATCH] Q_row: {:?}", q_row_i);
+                             let q_scaled = &q_row_i * dk_scale;
+                             println!("[DEBUG BATCH] Q_scaled: {:?}", q_scaled);
+                             println!("[DEBUG BATCH] K_slice shape: {:?}", k_slice.shape());
+                             // Log first few K values
+                             if k_slice.nrows() > 0 {
+                                 println!("[DEBUG BATCH] K[0]: {:?}", k_slice.row(0));
+                                 println!("[DEBUG BATCH] K[Last]: {:?}", k_slice.row(k_slice.nrows()-1));
+                             }
+                             println!("[DEBUG BATCH] eff_i: {}", eff_i);
+                        }
+
+                        for idx in 0..mlen {
+                            let j = j_start + idx;
+                            let mut s_val = scores_row[idx];
+                            
+                            if h_idx == 0 && i == n - 1 {
                                 let pos = i.saturating_sub(j);
+                                println!("[DEBUG BATCH] Score raw idx {}: {}, Pos: {}", idx, s_val, pos);
+                            }
+
+                            let pos = i.saturating_sub(j);
                                 if pos < q_pe.len() {
                                     s_val += q_pe[pos];
                                 }
@@ -313,9 +410,19 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                                 };
 
                                 phi_row[idx] = scale * (a * sp + b);
+                                if h_idx == 0 && i == n - 1 {
+                                    println!("[DEBUG BATCH] Phi idx {}: {}", idx, phi_row[idx]);
+                                }
                             }
 
                             let v_slice = v.slice(s![j_start..j_end_excl, ..]);
+                            if h_idx == 0 && i == n - 1 {
+                                 if v_slice.nrows() > 0 {
+                                     println!("[DEBUG BATCH] V[0]: {:?}", v_slice.row(0));
+                                     println!("[DEBUG BATCH] V[Last]: {:?}", v_slice.row(v_slice.nrows()-1));
+                                 }
+                            }
+
                             with_tls_acc_f64(ctx.head_dim, |acc| {
                                 acc.fill(0.0);
                                 let eff = eff_i as f64;
@@ -325,6 +432,9 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                                         acc[h] += phi * (v_slice[[idx, h]] as f64);
                                     }
                                 }
+                                if h_idx == 0 && i == n - 1 {
+                                    println!("[DEBUG BATCH] Head Output (Pre-Proj): {:?}", acc);
+                                }
                                 for h in 0..ctx.head_dim {
                                     y_row[h] = acc[h] as f32;
                                 }
@@ -332,15 +442,15 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
                         });
                     });
                 });
-            // Accumulate directly into `out` to avoid allocating an intermediate block.
-            ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 1.0, &mut out);
+            // Accumulate directly into `output` to avoid allocating an intermediate block.
+            ndarray::linalg::general_mat_mul(1.0, &workspace.y_head, &w_block, 1.0, output);
         }
     }
 
     // Update gating metrics with collected gate values
-    if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+    if workspace.gate_values.nrows() > 0 && workspace.gate_values.ncols() > 0 {
         ctx.head_selection_config
-            .update_metrics(&gate_values.view());
+            .update_metrics(&workspace.gate_values.view());
     }
 
     // Update tau metrics from accumulated values
@@ -364,24 +474,24 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         None
     };
 
-    let avg_active_heads = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
+    let avg_active_heads = if workspace.gate_values.nrows() > 0 && workspace.gate_values.ncols() > 0 {
         Some(crate::domain::mixtures::routing::compute_avg_active_components(
-            &gate_values.view(),
+            &workspace.gate_values.view(),
         ))
     } else {
         None
     };
 
     let (head_activity_vec, token_head_activity_vec) =
-        if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
-            let n = gate_values.nrows();
-            let h = gate_values.ncols();
+        if workspace.gate_values.nrows() > 0 && workspace.gate_values.ncols() > 0 {
+            let n = workspace.gate_values.nrows();
+            let h = workspace.gate_values.ncols();
             let mut head_v = vec![0.0f32; h];
             let inv_n = 1.0 / (n as f32);
             for head in 0..h {
                 let mut sum = 0.0f32;
                 for tok in 0..n {
-                    sum += gate_values[[tok, head]];
+                    sum += workspace.gate_values[[tok, head]];
                 }
                 head_v[head] = (sum * inv_n).clamp(0.0, 1.0);
             }
@@ -391,7 +501,7 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
             for tok in 0..n {
                 let mut sum = 0.0f32;
                 for head in 0..h {
-                    sum += gate_values[[tok, head]];
+                    sum += workspace.gate_values[[tok, head]];
                 }
                 tok_v[tok] = (sum * inv_h).clamp(0.0, 1.0);
             }
@@ -402,13 +512,23 @@ pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) ->
         };
 
     ForwardResult {
-        output: out,
+        output: Array2::zeros((0, 0)),
         tau_metrics,
         pred_norm,
         avg_active_heads,
         head_activity_vec,
         token_head_activity_vec,
     }
+}
+
+/// Compute polynomial attention forward pass
+pub fn compute_poly_attention_forward(ctx: &mut ForwardContext, causal: bool) -> ForwardResult {
+    let (n, d_model) = (ctx.input.nrows(), ctx.input.ncols());
+    let mut output = Array2::<f32>::zeros((n, d_model));
+    let mut workspace = PolyAttentionBatchWorkspace::default();
+    let mut res = compute_poly_attention_forward_into(ctx, causal, &mut output, &mut workspace);
+    res.output = output;
+    res
 }
 
 pub fn compute_poly_attention_forward_baseline(
@@ -562,14 +682,26 @@ pub fn compute_poly_attention_forward_baseline(
                                 result
                             };
                             phi_row[idx] = scale * (a * sp + b);
-                            // DEBUG
-                            if i == 17 && h_idx == 0 {
-                                use std::io::Write;
-                                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open("D:\\RustGPT\\debug_direct.txt") {
-                                    writeln!(file, "Batch Step 17 Head 0: Pos {}: Idx {}, Score {}, Phi {}, Val {}, Eff {}", pos, j, s_val, phi_row[idx], v[[j, 0]], eff_i).ok();
-                                    writeln!(file, "Batch Q[0]: {}, K[0]: {}, PE[0]: {}", q_row_i[0], k_slice[[idx, 0]], if pos < q_pe.len() { q_pe[pos] } else { 0.0 }).ok();
-                                } else {
-                                     panic!("Could not open file for batch debug");
+                            
+                            // DEBUG BATCH
+                            if i == n - 1 && h_idx == 0 {
+                                if idx == 0 {
+                                     println!("[DEBUG BATCH] Q_scaled (first 4): {:?}", q_row_i.slice(s![0..4]));
+                                     println!("[DEBUG BATCH] eff_i: {}", eff_i);
+                                }
+                                if idx == 0 { // Context token 0 (Persistent)
+                                    println!("[DEBUG BATCH] Ctx[0] Score (Raw): {}", s_val - if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
+                                    println!("[DEBUG BATCH] Ctx[0] CoPE: {}", if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
+                                    println!("[DEBUG BATCH] Ctx[0] Score (Total): {}", s_val);
+                                    println!("[DEBUG BATCH] Ctx[0] Phi: {}", phi_row[idx]);
+                                    println!("[DEBUG BATCH] Ctx[0] V (first 4): {:?}", v.slice(s![j, 0..4]));
+                                }
+                                if idx == mlen - 1 { // Last token (Input itself)
+                                    println!("[DEBUG BATCH] In Score (Raw): {}", s_val - if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
+                                    println!("[DEBUG BATCH] In CoPE: {}", if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
+                                    println!("[DEBUG BATCH] In Score (Total): {}", s_val);
+                                    println!("[DEBUG BATCH] In Phi: {}", phi_row[idx]);
+                                    println!("[DEBUG BATCH] In V (first 4): {:?}", v.slice(s![j, 0..4]));
                                 }
                             }
                         }
@@ -584,6 +716,11 @@ pub fn compute_poly_attention_forward_baseline(
                                     acc[h] += phi * (v_slice[[idx, h]] as f64);
                                 }
                             }
+                            
+                            if i == n - 1 && h_idx == 0 {
+                                println!("[DEBUG BATCH] Head Output (Pre-Proj, first 4): {:?}", &acc[0..4]);
+                            }
+
                             for h in 0..ctx.head_dim {
                                 y_row[h] = acc[h] as f32;
                             }

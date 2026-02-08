@@ -155,6 +155,108 @@ impl AdaptiveResiduals {
         Self::new(config)
     }
 
+    pub fn apply_attention_residual_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        attn_out: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+        head_activity_ratio: Option<f32>,
+        head_activity_vec: Option<&[f32]>,
+    ) {
+        let embed_dim = input.len();
+
+        self.scratch_channel_scales.resize(embed_dim, 1.0f32);
+        self.scratch_channel_scales.fill(1.0f32);
+
+        // If there is no head-conditioning signal, use the simplest (and most learnable)
+        // per-channel scaling path.
+        let enable_contrast_conditioning =
+            head_activity_ratio.is_some() || head_activity_vec.is_some();
+
+        // Apply MoH conditioning if available.
+        let head_vec_factor = head_activity_vec
+            .and_then(|v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    let mut mean = 0.0f32;
+                    for &x in v {
+                        mean += x.clamp(0.0, 1.0);
+                    }
+                    mean /= v.len() as f32;
+
+                    let mut var = 0.0f32;
+                    for &x in v {
+                        let d = x.clamp(0.0, 1.0) - mean;
+                        var += d * d;
+                    }
+                    var /= v.len() as f32;
+                    let std = var.sqrt();
+
+                    // Map into [0,1] with a conservative blend.
+                    Some((0.5 * mean + 0.5 * std).clamp(0.0, 1.0))
+                }
+            })
+            .unwrap_or(0.0);
+
+        let moh_scale_factor = if enable_contrast_conditioning {
+            let confidence = head_activity_ratio.unwrap_or(0.5).clamp(0.0, 1.0);
+            let difficulty = 1.0 - confidence;
+            // Keep bounded and conservative; scaling is clamped again per-channel below.
+            1.0 + 0.35 * difficulty + 0.15 * head_vec_factor
+        } else {
+            1.0
+        };
+
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+
+        let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
+        let contrast_alpha = self.config.contrastive_strength;
+
+        for channel in 0..embed_dim {
+            let mut base_scale = self.attention_residual_scales[[channel, 0]];
+            base_scale = if base_scale.is_finite() {
+                base_scale
+            } else {
+                1.0
+            };
+            base_scale = base_scale.clamp(min_scale, threshold);
+
+            if !enable_contrast_conditioning {
+                self.scratch_channel_scales[channel] = base_scale;
+                continue;
+            }
+
+            let margin = self.contrastive_margin(channel);
+            let contrast_factor = 1.0 + contrast_alpha * (margin / contrast_temperature).tanh();
+
+            let final_scale =
+                (base_scale * contrast_factor * moh_scale_factor).clamp(min_scale, threshold);
+            self.scratch_channel_scales[channel] = final_scale;
+        }
+
+        // Apply position-aware scaling with contrast enhancement
+        output.zip_mut_with(input, |o, &i| *o = i);
+        
+        for channel in 0..embed_dim {
+            let attn_val = attn_out[channel];
+            let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
+            
+            let scale = if channel < self.scratch_channel_scales.len() {
+                self.scratch_channel_scales[channel]
+            } else {
+                1.0
+            };
+
+            // Apply scaled attention output
+            let scaled_attn = attn_val * scale;
+
+            // Add residual
+            output[channel] += scaled_attn;
+        }
+    }
+
     /// Apply adaptive residual connection after attention with enhanced similarity-based contrast
     pub fn apply_attention_residual(
         &mut self,
@@ -346,6 +448,59 @@ impl AdaptiveResiduals {
         }
 
         output
+    }
+
+    /// Apply adaptive residual connection after feedforward (streaming/zero-alloc version)
+    pub fn apply_ffn_residual_step_into(
+        &mut self,
+        residual1: &ndarray::ArrayView1<f32>,
+        ffn_out: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
+        // Update similarity matrices
+        // Note: We skip update_similarity_matrices in step mode as it requires batch statistics
+        // and streaming updates are handled by the caller/workspace if needed.
+        // For now, we rely on the learned scales and static inference behavior.
+
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+        let ffn_scales = &self.ffn_residual_scales;
+        let embed_dim = ffn_out.len().min(self.config.embed_dim);
+        
+        let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
+        let contrast_alpha = self.config.contrastive_strength;
+
+        self.scratch_channel_scales.resize(embed_dim, 1.0f32);
+        self.scratch_channel_scales.fill(1.0f32);
+
+        for channel in 0..embed_dim {
+            let mut base_scale = ffn_scales[[channel, 0]];
+            base_scale = if base_scale.is_finite() {
+                base_scale
+            } else {
+                1.0
+            };
+            base_scale = base_scale.clamp(min_scale, threshold);
+
+            let margin = self.contrastive_margin(channel);
+            let contrast_factor = 1.0 + contrast_alpha * (margin / contrast_temperature).tanh();
+            self.scratch_channel_scales[channel] =
+                (base_scale * contrast_factor).clamp(min_scale, threshold);
+        }
+
+        // Compute output directly
+        // output = residual1 + ffn_out * scale
+        
+        // Initialize output with residual1
+        output.zip_mut_with(residual1, |o, &r| *o = r);
+        
+        // Add scaled ffn_out
+        for channel in 0..embed_dim {
+            let scale = self.scratch_channel_scales[channel];
+            let v = ffn_out[channel];
+            let v = if v.is_finite() { v } else { 0.0 };
+            output[channel] += v * scale;
+        }
     }
 
     /// Update similarity matrices based on input and output

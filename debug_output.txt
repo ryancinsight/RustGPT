@@ -1,1 +1,759 @@
-error: test failed, to rerun pass `--test streaming_verification`
+Running Batch Forward...
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.54658955
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.12133071
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.1213307, 0.43443784, -0.007843515, 0.22890997], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.06066535, 0.21721892, -0.0039217575, 0.114454985], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.80912787, 0.49484724, 0.69855696, -0.4510574], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.4380882
+[DEBUG BATCH] Score raw idx 0: -0.0029696717, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0011011498
+[DEBUG BATCH] Score raw idx 1: -0.0009471529, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.00047835967
+[DEBUG BATCH] Score raw idx 2: -0.0012123361, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.0003569954
+[DEBUG BATCH] Score raw idx 3: 0.0054424787, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0014308206
+[DEBUG BATCH] Score raw idx 4: -0.000009862013, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.0007755601
+[DEBUG BATCH] Score raw idx 5: 0.102210864, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.011373344
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [-0.1339785, -0.2682369, 0.3210158, 0.30044705], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [-0.0006878055552908276, -0.001339943445414674, 0.0016192835964796031, 0.001507145854187372]
+Batch Step 0:
+  Input: [0.54658955, 0.38251364, 0.367737, 0.98131204, 0.5528273, 0.16087729, 0.25986212, 0.51798576, 0.014659941, 0.086684406, 0.26134104, 0.59351474, 0.2282744, 0.45156687, 0.3152367, 0.5000006], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-8.526775e-5, 1.1666347e-5, 1.7332872e-5, -2.8973434e-5, -5.7590536e-5, -3.0439955e-6, -7.125891e-8, -1.39205185e-5, -4.7175618e-6, 6.791557e-5, 9.025671e-5, 6.2777246e-5, -2.6946036e-5, -3.434519e-5, -3.803446e-5, -4.7757832e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [0.013361444, -0.0060239965, 0.0067924326, 0.014037581, 0.011649824, 0.012229675, 0.015351297, 0.019328369, -0.0035427928, 0.008757235, 0.0076657897, 0.009693716, -0.009816034, 0.010529158, 0.009137639, 0.01307549], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.04373765
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.07441233
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.07441236, 0.042750303, 0.2801096, 0.022646382], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.03720618, 0.021375151, 0.1400548, 0.011323191], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.2736713, 0.54232633, 0.9549726, 0.13181129], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.3493026
+[DEBUG BATCH] Score raw idx 0: -0.00064659433, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0016236312
+[DEBUG BATCH] Score raw idx 1: -0.003616943, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.0012824273
+[DEBUG BATCH] Score raw idx 2: -0.005224412, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.00086835766
+[DEBUG BATCH] Score raw idx 3: 0.0016447929, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.00048249977
+[DEBUG BATCH] Score raw idx 4: -0.000006550949, Pos: 1
+[DEBUG BATCH] Phi idx 4: 0.0001313005
+[DEBUG BATCH] Score raw idx 5: 0.1570156, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.019377114
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.55770266, -0.06758188, -0.23123573, -0.45843232], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.003776281056873609, -0.00046993022025740777, -0.0015580844741596767, -0.0031029629588844154]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.99592036
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.31763893
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.31763896, 0.09484953, 0.25883195, 0.37775534], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.15881948, 0.047424763, 0.12941597, 0.18887767], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [-0.1128425, 0.77247167, 1.1134473, -0.34260365], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.47980675
+[DEBUG BATCH] Score raw idx 0: 0.00070126104, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0031431683
+[DEBUG BATCH] Score raw idx 1: -0.0039566867, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.00051928754
+[DEBUG BATCH] Score raw idx 2: -0.016963225, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.0021477686
+[DEBUG BATCH] Score raw idx 3: 0.009424399, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0012070183
+[DEBUG BATCH] Score raw idx 4: -0.000021447806, Pos: 1
+[DEBUG BATCH] Phi idx 4: 0.0003530919
+[DEBUG BATCH] Score raw idx 5: 0.09810039, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.010872982
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.5035677, -0.15868433, -0.16730474, -0.915278], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.0026185093142006574, -0.0008521909510013915, -0.0008342961947981845, -0.004766894640984482]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.2078616
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.34199277
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.34199283, 0.32234952, -0.15138705, 0.5156458], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.17099641, 0.16117476, -0.075693525, 0.2578229], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [1.2691829, 0.3063061, 0.32675153, -0.2799462], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.39970818
+[DEBUG BATCH] Score raw idx 0: -0.00013799954, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0016840767
+[DEBUG BATCH] Score raw idx 1: 0.0005162236, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.0015929944
+[DEBUG BATCH] Score raw idx 2: -0.011340223, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.0007904645
+[DEBUG BATCH] Score raw idx 3: 0.011473507, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0016547411
+[DEBUG BATCH] Score raw idx 4: 0.00001144611, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.00032872442
+[DEBUG BATCH] Score raw idx 5: 0.169485, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.018981677
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [-0.12716337, -0.2812992, 0.50616497, -0.016502108], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [-0.0009889599490812873, -0.0021380538931434863, 0.003875047047096562, -0.00010926133814917806]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.63958436
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.26268613
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.26268613, 0.17822808, 0.34679854, -0.46994138], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.13134307, 0.08911404, 0.17339927, -0.23497069], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.4335838, 0.09102974, 1.157825, 0.4178608], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.47700787
+[DEBUG BATCH] Score raw idx 0: -0.0029995, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0007733718
+[DEBUG BATCH] Score raw idx 1: -0.005343968, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.0038348027
+[DEBUG BATCH] Score raw idx 2: 0.007284095, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.00058363663
+[DEBUG BATCH] Score raw idx 3: -0.0031348367, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0022716168
+[DEBUG BATCH] Score raw idx 4: 0.00089017174, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.0004843924
+[DEBUG BATCH] Score raw idx 5: 0.16764125, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.022700792
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.15494107, -0.7115799, 0.80493975, -0.47469473], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.0016552122959387428, -0.007743121636291753, 0.00870510594167251, -0.005104606292069622]
+Batch Step 0:
+  Input: [0.63958436, 0.6252922, 0.01660341, 0.13222128, 0.42241794, 0.7609822, 0.6946883, 0.5787833, 0.29765058, 0.9641683, 0.1440816, 0.37547725, 0.61233026, 0.72923106, 0.8159455, 0.051190138], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.0005474368, -0.0028980577, 0.0014680538, -0.0007305162, 0.0006765046, 0.00027383593, -0.00050318596, 0.00033888506, 0.0009774609, -0.0006333285, 0.0026270598, 0.00074500404, -0.0006585918, -0.00012129118, -0.00040410054, -0.0012899032], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [0.0005007349, 0.022037072, -0.021154549, 0.016197834, 0.004812287, 0.011122188, 0.019132761, 0.017874839, -0.0009294762, 0.025458679, 0.0028930597, 0.017246397, -0.0006131418, 0.0083195735, 0.01687001, -0.0015108709], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.39821726
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.01688616
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.01688618, 0.7579433, -0.46540216, 0.23546654], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.00844309, 0.37897164, -0.23270108, 0.11773327], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.95126593, 0.67087036, 0.35895437, -0.6429237], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.59395194
+[DEBUG BATCH] Score raw idx 0: -0.0053855963, Pos: 5
+[DEBUG BATCH] Phi idx 0: -0.001222041
+[DEBUG BATCH] Score raw idx 1: 0.00419734, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.0026134714
+[DEBUG BATCH] Score raw idx 2: 0.011805273, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.0027348357
+[DEBUG BATCH] Score raw idx 3: 0.004344398, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0017513831
+[DEBUG BATCH] Score raw idx 4: -0.00015234572, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.0018690804
+[DEBUG BATCH] Score raw idx 5: 0.1030499, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.010999196
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [-0.027365979, -0.31582072, 0.20362648, -0.483197], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [-0.00023182081585797836, -0.00203277787689241, 0.001348228903402673, -0.003133877742676258]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.8495577
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.14202285
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.14202286, -0.246983, 0.1479732, 0.46492213], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.07101143, -0.1234915, 0.0739866, 0.23246107], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.8655429, 0.282045, 1.6192936, 0.21930224], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.3743765
+[DEBUG BATCH] Score raw idx 0: 0.0038491096, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0024067026
+[DEBUG BATCH] Score raw idx 1: -0.0015014566, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.00075917714
+[DEBUG BATCH] Score raw idx 2: -0.020704955, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.002808352
+[DEBUG BATCH] Score raw idx 3: 0.007983619, Pos: 2
+[DEBUG BATCH] Phi idx 3: -0.0006162843
+[DEBUG BATCH] Score raw idx 4: -0.00036610913, Pos: 1
+[DEBUG BATCH] Phi idx 4: 0.0010877833
+[DEBUG BATCH] Score raw idx 5: 0.19741853, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.023071626
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.061077155, -0.2677402, -0.08604412, -0.018780272], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.000539561121094828, -0.0023189989085624302, -0.0007182852956772089, -0.0001733558567327739]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.54113
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.10220839
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.10220838, -0.043005385, -0.041007556, 0.02268247], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.05110419, -0.021502692, -0.020503778, 0.011341235], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.83495593, 0.47435236, 1.2704967, 0.2438115], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.4488325
+[DEBUG BATCH] Score raw idx 0: 0.00084249035, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.000044713142
+[DEBUG BATCH] Score raw idx 1: 0.00031447102, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.0000094631
+[DEBUG BATCH] Score raw idx 2: -0.0018732867, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.00023344283
+[DEBUG BATCH] Score raw idx 3: 0.0012557755, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.00027064464
+[DEBUG BATCH] Score raw idx 4: 0.00008078199, Pos: 1
+[DEBUG BATCH] Phi idx 4: 0.00010740617
+[DEBUG BATCH] Score raw idx 5: 0.009185036, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.0012242885
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.04249081, -0.4149017, 0.056390107, 0.11542873], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [1.8717375499738566e-5, -0.00023110739257741384, 3.3919180022269524e-5, 7.061697821469558e-5]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.89225847
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.6000604
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.60006046, 0.29737416, 0.1945119, -0.069834895], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.30003023, 0.14868708, 0.09725595, -0.034917448], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.58450496, 1.1244256, 0.52197844, -0.14668648], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.29958385
+[DEBUG BATCH] Score raw idx 0: -0.0016151826, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0019904445
+[DEBUG BATCH] Score raw idx 1: -0.004468608, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.0026059009
+[DEBUG BATCH] Score raw idx 2: -0.0038082153, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.00041424716
+[DEBUG BATCH] Score raw idx 3: 0.0062125903, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.003485141
+[DEBUG BATCH] Score raw idx 4: 0.00051339087, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.0005073404
+[DEBUG BATCH] Score raw idx 5: 0.39844415, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.049956173
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.29530954, -0.68101597, 0.17036653, 0.020321084], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.004391642038487332, -0.010219534935567851, 0.0025629843259867336, 0.00033837161276314585]
+Batch Step 0:
+  Input: [0.89225847, 0.17591763, 0.7887998, 0.8489687, 0.45974064, 0.48023868, 0.6596157, 0.99542147, 0.9171534, 0.87455666, 0.12021494, 0.15845829, 0.9071316, 0.80193853, 0.108983934, 0.3332849], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-0.001024015, -0.0005686997, 0.0016276626, -0.00058579573, 0.00060533494, 0.0004630079, 0.0007848304, 0.0021288837, 0.00043773433, -0.00014011758, 0.0016633032, 0.0004514012, -0.000550273, 0.00013919883, -0.0005913354, -6.21211e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [0.06972274, -0.05227343, -0.035771385, -0.01888074, 0.024901073, 0.041944705, 0.056968912, -0.0021928493, -0.0012662392, -0.01837189, 0.053786464, -0.008120258, 0.030618314, -0.0125100445, 0.011426832, 0.072210364], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.7595654
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.25960967
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.2596096, -0.23307489, 0.63189614, -0.12960835], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.1298048, -0.116537444, 0.31594807, -0.064804174], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [1.0716685, 0.6434972, 0.90362257, -0.28088284], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.3060612
+[DEBUG BATCH] Score raw idx 0: 0.0013141758, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.003121285
+[DEBUG BATCH] Score raw idx 1: -0.007849612, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.003710481
+[DEBUG BATCH] Score raw idx 2: -0.01278536, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.0024730626
+[DEBUG BATCH] Score raw idx 3: 0.0014078903, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.00078212516
+[DEBUG BATCH] Score raw idx 4: -0.00012119979, Pos: 1
+[DEBUG BATCH] Phi idx 4: 0.0008708417
+[DEBUG BATCH] Score raw idx 5: 0.3678164, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.046600677
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.31866336, -0.84078825, -0.04049707, -0.5254317], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.004551493927258696, -0.012021207899692148, -0.0005713531059392145, -0.007489504013765362]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.47026783
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.1489789
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.14897887, 0.2318972, -0.19999482, 0.14235389], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.07448944, 0.1159486, -0.09999741, 0.071176946], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [1.5313249, 0.6747242, 0.53762865, -0.14534914], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.26581264
+[DEBUG BATCH] Score raw idx 0: -0.00090705935, Pos: 5
+[DEBUG BATCH] Phi idx 0: -0.00016252873
+[DEBUG BATCH] Score raw idx 1: 0.0016268551, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.000939804
+[DEBUG BATCH] Score raw idx 2: 0.00080988044, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.00056009716
+[DEBUG BATCH] Score raw idx 3: 0.0037723058, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0010373922
+[DEBUG BATCH] Score raw idx 4: 0.00022676944, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.0005027863
+[DEBUG BATCH] Score raw idx 5: 0.12819389, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.015246472
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.27118844, -0.690575, 0.16852629, -0.17567693], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.001086819210581972, -0.0027970061456298696, 0.0006895102788489291, -0.0007027811489669406]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.510879
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.14026095
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.14026096, 0.58219403, 0.095641844, 0.6857339], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.07013048, 0.29109702, 0.047820922, 0.34286696], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.4588607, 0.848184, 0.14219424, -0.22165087], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.3017092
+[DEBUG BATCH] Score raw idx 0: -0.0030842356, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.003185161
+[DEBUG BATCH] Score raw idx 1: -0.0023381533, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.0016232764
+[DEBUG BATCH] Score raw idx 2: -0.013594514, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.0009821514
+[DEBUG BATCH] Score raw idx 3: 0.012719868, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0013890647
+[DEBUG BATCH] Score raw idx 4: -0.00008406839, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.00060593407
+[DEBUG BATCH] Score raw idx 5: 0.20988703, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.0227293
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.464556, -0.24993083, -0.33162972, -0.600136], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.0031743297879665237, -0.0017158629183326554, -0.0022404024672568064, -0.004118105232921602]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.38827312
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: -0.33825636
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [-0.33825633, -0.17077059, 0.19732124, -0.26039687], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [-0.16912816, -0.08538529, 0.09866062, -0.13019843], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [0.4229491, 0.8313524, 0.94253933, 0.29301926], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.26910877
+[DEBUG BATCH] Score raw idx 0: -0.00056449336, Pos: 5
+[DEBUG BATCH] Phi idx 0: -0.000564119
+[DEBUG BATCH] Score raw idx 1: -0.0012625306, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.00089982245
+[DEBUG BATCH] Score raw idx 2: 0.005724546, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.00028389296
+[DEBUG BATCH] Score raw idx 3: -0.0073620295, Pos: 2
+[DEBUG BATCH] Phi idx 3: -0.0015188865
+[DEBUG BATCH] Score raw idx 4: 0.000018092556, Pos: 1
+[DEBUG BATCH] Phi idx 4: 0.0002647302
+[DEBUG BATCH] Score raw idx 5: -0.08767702, Pos: 0
+[DEBUG BATCH] Phi idx 5: -0.010042359
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.5576763, -0.2812864, -0.14756429, -0.22441413], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [-0.0014912519593566695, 0.0007632420870434527, 0.0003853671998837936, 0.0005918427779434231]
+Batch Step 0:
+  Input: [0.38827312, 0.4836108, 0.70168066, 0.17437512, 0.0055845976, 0.06576198, 0.81403685, 0.52087647, 0.41262674, 0.4418015, 0.2257703, 0.63045585, 0.5631339, 0.5974399, 0.9902722, 0.07452911], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.0006622362, -0.0026094038, -6.954276e-5, -0.0011647358, -8.3805484e-5, -0.00012363317, -0.00018228799, -0.00017572008, 0.0010523803, -0.0017079918, 0.0020741816, 0.00019387927, -0.00078097975, -0.0005682884, -0.00091746385, -0.0020027908], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [0.0030661807, 0.009565571, -0.001319781, 0.013552872, 0.010662316, -0.010112604, 0.016962077, 0.020627817, 1.00284815e-5, 0.0074819475, -0.0046382113, 0.019649114, -0.002178423, 0.006827356, 0.03023123, -0.0023280992], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.56390435
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.6780414
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.67804146, 0.026937123, 0.0181098, -0.12552762], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.33902073, 0.013468562, 0.0090549, -0.06276381], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [1.0591873, 0.010236625, 0.9947999, -0.21947247], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.4384836
+[DEBUG BATCH] Score raw idx 0: 0.0012883584, Pos: 5
+[DEBUG BATCH] Phi idx 0: 0.0009726883
+[DEBUG BATCH] Score raw idx 1: -0.0020750475, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.0022101067
+[DEBUG BATCH] Score raw idx 2: -0.004517333, Pos: 3
+[DEBUG BATCH] Phi idx 2: -0.0006243871
+[DEBUG BATCH] Score raw idx 3: 0.00541136, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0030815399
+[DEBUG BATCH] Score raw idx 4: 0.0005148778, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.00006334362
+[DEBUG BATCH] Score raw idx 5: 0.38200706, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.048587218
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.00025907287, -0.6676658, 0.4568919, 0.6185405], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [-3.4318446200112936e-5, -0.014261078406385314, 0.009746486038972295, 0.013233979811105495]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.080771744
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.48722476
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.48722485, -0.09821006, 0.025898768, -0.42234895], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.24361242, -0.04910503, 0.012949384, -0.21117447], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [1.0204756, 0.4808224, 0.42134726, 0.05551276], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.38616806
+[DEBUG BATCH] Score raw idx 0: 0.0009751108, Pos: 5
+[DEBUG BATCH] Phi idx 0: -0.00035610824
+[DEBUG BATCH] Score raw idx 1: -0.001551196, Pos: 4
+[DEBUG BATCH] Phi idx 1: -0.002821423
+[DEBUG BATCH] Score raw idx 2: 0.00407406, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.0002216731
+[DEBUG BATCH] Score raw idx 3: -0.0011368599, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.0022992964
+[DEBUG BATCH] Score raw idx 4: 0.0006829878, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.000048498383
+[DEBUG BATCH] Score raw idx 5: 0.21872306, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.029481811
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [0.30029902, -0.5076025, 0.41763258, -0.76083], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [0.0033930022294254756, -0.0058065361058450725, 0.004745811216429418, -0.008618454634897991]
+[DEBUG BATCH ENTRY] n=6 heads=4
+[DEBUG BATCH] Input[Last, 0]: 0.8829554
+[DEBUG BATCH] W_q[0,0]: 0.43421444
+[DEBUG BATCH] Q[Last, 0] Manual: 0.55478126
+[DEBUG BATCH] i=5 (Last), Head 0
+[DEBUG BATCH] Q_row: [0.5547813, 0.29682145, -0.885874, -0.041054353], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Q_scaled: [0.27739066, 0.14841072, -0.442937, -0.020527177], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K_slice shape: [6, 4]
+[DEBUG BATCH] K[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] K[Last]: [1.4296126, 0.57561266, 0.868103, -0.10470608], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] eff_i: 0.6644018
+[DEBUG BATCH] Score raw idx 0: 0.00040588173, Pos: 5
+[DEBUG BATCH] Phi idx 0: -0.0033763747
+[DEBUG BATCH] Score raw idx 1: 0.008590952, Pos: 4
+[DEBUG BATCH] Phi idx 1: 0.0021320363
+[DEBUG BATCH] Score raw idx 2: 0.012658092, Pos: 3
+[DEBUG BATCH] Phi idx 2: 0.0026672927
+[DEBUG BATCH] Score raw idx 3: 0.0044247815, Pos: 2
+[DEBUG BATCH] Phi idx 3: 0.002952487
+[DEBUG BATCH] Score raw idx 4: 0.0004997678, Pos: 1
+[DEBUG BATCH] Phi idx 4: -0.0012684101
+[DEBUG BATCH] Score raw idx 5: 0.099622704, Pos: 0
+[DEBUG BATCH] Phi idx 5: 0.012916066
+[DEBUG BATCH] V[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] V[Last]: [-0.03844041, -0.8357564, 0.21681504, -0.2677751], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG BATCH] Head Output (Pre-Proj): [-0.0004294317482440148, -0.007156239525752475, 0.0018614296325625826, -0.0021966043160084876]
+Running Streaming Forward...
+[DEBUG STREAM] Input[0]: 0.54658955
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.12133071
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.060665354, 0.21721885, -0.0039217435, 0.11445498], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [-9.529879e-5, -2.8119224e-5, -5.671547e-5, 1.5769736e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.00296967
+[DEBUG STREAM] eff_h: 0.43808818
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [3.591216e-5, 7.123819e-5, -4.553519e-5, -7.604741e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [-0.13397853, -0.26823696, 0.3210158, 0.30044702], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.10221084
+[DEBUG STREAM] CoPE_in: -0.010512392
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.09169845
+[DEBUG STREAM] Phi_ctx[0]: 0.00048240073
+[DEBUG STREAM] Phi_in: 0.0049825273
+[DEBUG STREAM] Head Output (Pre-Proj): [-0.00068780564, -0.0013399436, 0.0016192835, 0.0015071455], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 0:
+  Input: [0.54658955, 0.38251364, 0.367737, 0.98131204, 0.5528273, 0.16087729, 0.25986212, 0.51798576, 0.014659941, 0.086684406, 0.26134104, 0.59351474, 0.2282744, 0.45156687, 0.3152367, 0.5000006], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-8.526775e-5, 1.1666347e-5, 1.7332872e-5, -2.8973434e-5, -5.7590536e-5, -3.0439955e-6, -7.125891e-8, -1.39205185e-5, -4.7175618e-6, 6.791557e-5, 9.025671e-5, 6.2777246e-5, -2.6946036e-5, -3.434519e-5, -3.803446e-5, -4.7757832e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [0.0031349713, -0.013845963, -0.00044119824, -0.006652426, 0.0002463325, 0.00901675, 0.0101899225, 0.008478732, -0.0030545583, 0.0065697497, 0.002622215, -0.0022306277, -0.0137710795, 0.0019468335, 0.0031866902, 0.0042059016], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.04373765
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.07441233
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.037206165, 0.021375135, 0.1400548, 0.011323173], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [-0.0001159477, -1.6857131e-5, -9.69004e-6, -4.5880828e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.0006465943
+[DEBUG STREAM] eff_h: 0.3493026
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [8.394894e-5, 1.2442867e-5, -2.4886029e-5, -2.0981424e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.5577026, -0.06758188, -0.23123574, -0.45843238], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.15701559
+[DEBUG STREAM] CoPE_in: -0.000772001
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.15624359
+[DEBUG STREAM] Phi_ctx[0]: 0.0005671386
+[DEBUG STREAM] Phi_in: 0.006768476
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0037762807, -0.00046993024, -0.0015580846, -0.0031029633], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.99592036
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.31763893
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.15881947, 0.04742477, 0.12941597, 0.18887767], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [-7.783621e-5, -5.8512454e-5, 0.00010227448, -0.000103489794], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.0007012608
+[DEBUG STREAM] eff_h: 0.47980675
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [0.00012621011, -2.807742e-5, -9.250795e-5, -2.7082619e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.5035677, -0.15868437, -0.16730471, -0.915278], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.09810039
+[DEBUG STREAM] CoPE_in: -0.010435451
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.08766493
+[DEBUG STREAM] Phi_ctx[0]: 0.0015081133
+[DEBUG STREAM] Phi_in: 0.0052169305
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0026185093, -0.00085219124, -0.0008342961, -0.004766895], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.2078616
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.34199277
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.17099638, 0.16117482, -0.075693525, 0.25782287], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [-7.640593e-5, -3.0366346e-5, -0.0001802167, 6.114391e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.00013800093
+[DEBUG STREAM] eff_h: 0.39970818
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-3.447134e-5, 8.4159816e-5, 2.3467514e-5, 5.463921e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [-0.12716335, -0.2812992, 0.506165, -0.016502142], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.169485
+[DEBUG STREAM] CoPE_in: -0.016431866
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.15305313
+[DEBUG STREAM] Phi_ctx[0]: 0.00067313924
+[DEBUG STREAM] Phi_in: 0.0075871316
+[DEBUG STREAM] Head Output (Pre-Proj): [-0.0009889599, -0.0021380538, 0.0038750477, -0.00010926159], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.63958436
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.26268613
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.13134307, 0.089114025, 0.17339928, -0.23497069], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0030414083, -0.00030769006, 0.0010807511, -0.002219704], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.0029995
+[DEBUG STREAM] eff_h: 0.4770079
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0010038196, -0.0014707587, -0.0008815557, 0.0015685702], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.1549411, -0.71158, 0.80493975, -0.47469476], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.16764124
+[DEBUG STREAM] CoPE_in: 0.015410302
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.18305154
+[DEBUG STREAM] Phi_ctx[0]: 0.00036890444
+[DEBUG STREAM] Phi_in: 0.010828457
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0016554047, -0.007743157, 0.0087049175, -0.005104613], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 0:
+  Input: [0.63958436, 0.6252922, 0.01660341, 0.13222128, 0.42241794, 0.7609822, 0.6946883, 0.5787833, 0.29765058, 0.9641683, 0.1440816, 0.37547725, 0.61233026, 0.72923106, 0.8159455, 0.051190138], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.0008853513, -0.0028857698, 0.0018020672, 3.799628e-5, 0.0012629238, 0.0007373946, -0.001186677, -0.0003197745, 8.055243e-6, -0.00065776915, 0.0023122644, 0.0011561706, -0.00044188593, -0.0002422946, -0.0003323831, -0.0009794084], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [-0.011598287, 0.009417663, -0.021394756, 0.012503693, -0.003997461, -0.004098444, 0.005285063, 0.0058023287, -0.006120463, 0.005735456, 0.0001442642, 0.009669323, -0.012236823, -0.005814646, 0.0009119612, -0.0013792196], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.39821726
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.01688616
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.00844308, 0.3789716, -0.23270106, 0.117733285], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.003041633, -0.0003072808, 0.0010810234, -0.0022197764], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.0053855954
+[DEBUG STREAM] eff_h: 0.59395194
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0010036711, -0.0014707529, -0.00088241004, 0.0015683201], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [-0.027365979, -0.31582078, 0.20362651, -0.483197], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.103049874
+[DEBUG STREAM] CoPE_in: -0.014368542
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.08868133
+[DEBUG STREAM] Phi_ctx[0]: -0.0007258336
+[DEBUG STREAM] Phi_in: 0.006532924
+[DEBUG STREAM] Head Output (Pre-Proj): [-0.00023080855, -0.0020327922, 0.0013473842, -0.0031340092], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.8495577
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.14202285
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.071011424, -0.123491496, 0.0739866, 0.23246107], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0030410655, -0.00030823308, 0.0010804631, -0.0022194767], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.0038491094
+[DEBUG STREAM] eff_h: 0.3743765
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0010041357, -0.0014705141, -0.0008812384, 0.0015687069], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.0610772, -0.2677402, -0.0860441, -0.018780261], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.19741856
+[DEBUG STREAM] CoPE_in: -0.011375149
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.18604341
+[DEBUG STREAM] Phi_ctx[0]: 0.0009010129
+[DEBUG STREAM] Phi_in: 0.008637475
+[DEBUG STREAM] Head Output (Pre-Proj): [0.00053919456, -0.0023189804, -0.00071797735, -0.00017330081], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.54113
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.10220839
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.051104195, -0.021502703, -0.020503778, 0.011341214], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0030414169, -0.00030797304, 0.0010808692, -0.0022196537], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.00084249047
+[DEBUG STREAM] eff_h: 0.4488325
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0010039769, -0.0014707262, -0.0008814853, 0.0015686424], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.04249087, -0.4149018, 0.056390107, 0.11542873], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.009185019
+[DEBUG STREAM] CoPE_in: 0.00068536104
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.00987038
+[DEBUG STREAM] Phi_ctx[0]: 0.000020068712
+[DEBUG STREAM] Phi_in: 0.00054950046
+[DEBUG STREAM] Head Output (Pre-Proj): [1.8673118e-5, -0.00023110649, 3.395488e-5, 7.06248e-5], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.89225847
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.6000604
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.3000302, 0.1486871, 0.09725595, -0.034917444], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0022885967, 0.00013255332, 0.00037014412, -0.0009036618], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.001615183
+[DEBUG STREAM] eff_h: 0.29958385
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.00058369077, -0.00035233074, -0.0006264351, 0.00043618865], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.2953095, -0.6810159, 0.17036647, 0.020321127], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.3984441
+[DEBUG STREAM] CoPE_in: 0.0046555614
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.40309966
+[DEBUG STREAM] Phi_ctx[0]: 0.000596305
+[DEBUG STREAM] Phi_in: 0.014966027
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0043917457, -0.010219506, 0.0025628512, 0.0003383325], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 0:
+  Input: [0.89225847, 0.17591763, 0.7887998, 0.8489687, 0.45974064, 0.48023868, 0.6596157, 0.99542147, 0.9171534, 0.87455666, 0.12021494, 0.15845829, 0.9071316, 0.80193853, 0.108983934, 0.3332849], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-0.00020705049, -0.00078281085, 0.0012604841, 0.00024256155, 0.00087660644, 0.0006083352, -0.0003795619, 0.0012075362, -0.00036165424, -0.00028724901, 0.001053789, 0.00057636696, -0.00027037546, -9.124037e-6, 0.00020218041, 0.0004901991], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [0.052602, -0.055951692, -0.051458936, -0.036912717, 0.015346094, 0.032335296, 0.043796655, -0.02263419, -0.018836653, -0.036313083, 0.051534027, -0.0113513665, 0.013096802, -0.028103529, 0.009611797, 0.06667572], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.7595654
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.25960967
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.12980483, -0.116537444, 0.31594813, -0.06480419], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.002288597, 0.0001325542, 0.000370143, -0.0009036643], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.0013141758
+[DEBUG STREAM] eff_h: 0.3060612
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0005836902, -0.00035233053, -0.00062643597, 0.00043618865], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.31866333, -0.8407883, -0.040497005, -0.5254317], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.36781648
+[DEBUG STREAM] CoPE_in: 0.008166958
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.37598345
+[DEBUG STREAM] Phi_ctx[0]: 0.00095530425
+[DEBUG STREAM] Phi_in: 0.0142626595
+[DEBUG STREAM] Head Output (Pre-Proj): [0.004551269, -0.01202123, -0.0005711556, -0.0074894186], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.47026783
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.1489789
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.07448945, 0.11594859, -0.099997476, 0.07117692], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0022885983, 0.00013255328, 0.0003701392, -0.0009036632], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.00090705894
+[DEBUG STREAM] eff_h: 0.26581264
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0005836927, -0.00035232998, -0.0006264343, 0.00043619255], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.27118847, -0.69057506, 0.16852628, -0.17567693], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.12819386
+[DEBUG STREAM] CoPE_in: -0.0052632825
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.12293057
+[DEBUG STREAM] Phi_ctx[0]: -0.000043202188
+[DEBUG STREAM] Phi_in: 0.004052705
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0010869282, -0.0027969985, 0.00068940775, -0.00070282124], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.510879
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.14026095
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.070130475, 0.29109702, 0.04782094, 0.342867], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0022885993, 0.00013255408, 0.00037014342, -0.000903663], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.0030842358
+[DEBUG STREAM] eff_h: 0.30170923
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0005836916, -0.00035233152, -0.0006264349, 0.0004361907], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.464556, -0.24993083, -0.33162966, -0.600136], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.209887
+[DEBUG STREAM] CoPE_in: -0.026605109
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.18328188
+[DEBUG STREAM] Phi_ctx[0]: 0.0009609925
+[DEBUG STREAM] Phi_in: 0.0068576396
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0031744752, -0.0017158539, -0.0022405465, -0.004118158], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.38827312
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: -0.33825636
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [-0.16912818, -0.08538529, 0.09866062, -0.13019842], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0024141285, -0.00048413247, 0.0005633417, -0.002695066], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: -0.0005644935
+[DEBUG STREAM] eff_h: 0.26910883
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0009772166, -0.0017981175, -0.001074203, 0.0023003055], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.5576763, -0.28128636, -0.14756426, -0.22441414], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): -0.08767701
+[DEBUG STREAM] CoPE_in: 0.006710137
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): -0.080966875
+[DEBUG STREAM] Phi_ctx[0]: -0.0001518094
+[DEBUG STREAM] Phi_in: -0.0027024876
+[DEBUG STREAM] Head Output (Pre-Proj): [-0.0014913058, 0.00076323166, 0.00038540177, 0.00059184217], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 0:
+  Input: [0.38827312, 0.4836108, 0.70168066, 0.17437512, 0.0055845976, 0.06576198, 0.81403685, 0.52087647, 0.41262674, 0.4418015, 0.2257703, 0.63045585, 0.5631339, 0.5974399, 0.9902722, 0.07452911], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.001002152, -0.0030630636, 0.00089788286, -0.00056323403, 0.0011380721, 0.00025773596, -0.00080988614, -0.00027581066, 0.00018833872, -0.0014158126, 0.0020803544, 0.0009985899, -0.0011118795, -0.00045193423, -0.0010889105, -0.0013640807], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  Out: [-0.0040091546, -0.00022618845, -0.015230799, 0.009024286, 0.0102048535, -0.01142101, 0.0007212702, 0.009724113, -0.00748163, -0.0017722747, -0.009009711, 0.006983781, -0.012816089, -0.004662438, 0.010797135, -0.0026493846], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.56390435
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.6780414
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.3390207, 0.013468578, 0.009054869, -0.06276381], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0024141285, -0.00048413247, 0.0005633417, -0.002695066], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.0012883579
+[DEBUG STREAM] eff_h: 0.4384836
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0009772166, -0.0017981175, -0.001074203, 0.0023003055], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.00025906414, -0.66766584, 0.45689178, 0.6185406], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.382007
+[DEBUG STREAM] CoPE_in: 0.010028847
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.39203584
+[DEBUG STREAM] Phi_ctx[0]: 0.00042650788
+[DEBUG STREAM] Phi_in: 0.021304699
+[DEBUG STREAM] Head Output (Pre-Proj): [-3.4323115e-5, -0.014261123, 0.009746443, 0.013234041], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.080771744
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.48722476
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.24361238, -0.049105022, 0.012949383, -0.21117447], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0024141285, -0.00048413247, 0.0005633417, -0.002695066], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.00097511057
+[DEBUG STREAM] eff_h: 0.3861681
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0009772166, -0.0017981175, -0.001074203, 0.0023003055], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [0.300299, -0.5076025, 0.41763258, -0.76083], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.21872304
+[DEBUG STREAM] CoPE_in: 0.019036569
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.23775962
+[DEBUG STREAM] Phi_ctx[0]: -0.00013751764
+[DEBUG STREAM] Phi_in: 0.011384935
+[DEBUG STREAM] Head Output (Pre-Proj): [0.0033929923, -0.005806578, 0.0047457763, -0.0086183995], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Input[0]: 0.8829554
+[DEBUG STREAM] W_q[0,0]: 0.43421444
+[DEBUG STREAM] Q[0] Manual: 0.55478126
+[DEBUG STREAM] Head 0 Context Len: 5
+[DEBUG STREAM] Q_scaled: [0.27739063, 0.14841072, -0.44293702, -0.020527162], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[0]: [0.0057758605, -0.018585017, -0.003810544, 0.0061334786], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] K_ctx[Last]: [0.0024141285, -0.00048413247, 0.0005633417, -0.002695066], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_ctx[0]: 0.00040588182
+[DEBUG STREAM] eff_h: 0.6644018
+[DEBUG STREAM] V_ctx[0]: [0.008976142, 0.0008095719, 0.017391408, -0.027327584], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_ctx[Last]: [-0.0009772166, -0.0017981175, -0.001074203, 0.0023003055], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] V_in: [-0.038440432, -0.8357564, 0.21681505, -0.2677751], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+[DEBUG STREAM] Scores_in[0] (Raw): 0.099622585
+[DEBUG STREAM] CoPE_in: 0.004515563
+[DEBUG STREAM] Scores_in[0] (w/ CoPE): 0.10413815
+[DEBUG STREAM] Phi_ctx[0]: -0.0022432695
+[DEBUG STREAM] Phi_in: 0.008581458
+[DEBUG STREAM] Head Output (Pre-Proj): [-0.00042880044, -0.0071561164, 0.0018610203, -0.0021965932], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Max Difference: 0.020690007
+Mean Difference: 0.009722898
+FAILURE: Significant divergence detected.
+Row 0 diff: 0.12360105
+Batch: [0.013361444, -0.0060239965, 0.0067924326, 0.014037581, 0.011649824, 0.012229675, 0.015351297, 0.019328369, -0.0035427928, 0.008757235, 0.0076657897, 0.009693716, -0.009816034, 0.010529158, 0.009137639, 0.01307549], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream: [0.0031349713, -0.013845963, -0.00044119824, -0.006652426, 0.0002463325, 0.00901675, 0.0101899225, 0.008478732, -0.0030545583, 0.0065697497, 0.002622215, -0.0022306277, -0.0137710795, 0.0019468335, 0.0031866902, 0.0042059016], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Row 1 diff: 0.13774984
+Batch: [-0.0049970597, -0.0043773623, -0.0052195834, 0.020653011, -0.01324948, 0.009029007, 0.021803357, 0.011842764, -0.0022876738, 0.016924186, 0.001121012, 0.022868179, -0.016712073, 0.011499443, 0.022629578, 0.0100550875], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream: [-0.00516806, -0.016975638, -0.01793533, 0.009720346, -0.016590461, -0.0015874219, 0.011201776, 0.009907423, -0.011796875, 0.013213985, -0.004608596, 0.0053491984, -0.021832343, 0.00048582355, 0.004419779, 0.0060289446], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Row 2 diff: 0.15399027
+Batch: [0.011062156, 0.00922793, -0.027141334, 0.029888228, 0.02723597, -0.016001921, 0.015223445, -0.0017253347, 0.018407224, 0.013714937, 0.014783622, 0.037455887, -0.024666302, -0.02523192, 0.008324392, 0.016141072], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream: [-0.008153506, -0.00912893, -0.04441096, 0.015179086, 0.026283272, -0.019747512, 0.0130973365, -0.006417629, 0.0058264183, 0.0001139472, 0.013984941, 0.01926154, -0.031438187, -0.036078624, 0.0034447287, 0.010891855], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Row 3 diff: 0.17658116
+Batch: [0.016816942, -0.04824801, 0.0065526143, -0.0021915995, 0.012517913, 0.029631658, 0.04902532, 0.056699146, -0.013355365, 0.022823676, 0.011794031, 0.0058547733, -0.036586493, 0.009825102, 0.005719804, 0.029718501], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream: [0.013364829, -0.061003633, -0.005188059, -0.020866523, -0.006943533, 0.01689184, 0.04053367, 0.03822281, -0.01733749, 0.013295881, 0.00012230128, 0.0013703238, -0.045779325, -0.0017590057, 0.00344056, 0.011652209], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Row 4 diff: 0.15569106
+Batch: [0.0005007349, 0.022037072, -0.021154549, 0.016197834, 0.004812287, 0.011122188, 0.019132761, 0.017874839, -0.0009294762, 0.025458679, 0.0028930597, 0.017246397, -0.0006131418, 0.0083195735, 0.01687001, -0.0015108709], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream: [-0.011598287, 0.009417663, -0.021394756, 0.012503693, -0.003997461, -0.004098444, 0.005285063, 0.0058023287, -0.006120463, 0.005735456, 0.0001442642, 0.009669323, -0.012236823, -0.005814646, 0.0009119612, -0.0013792196], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Row 5 diff: 0.12179515
+Batch: [0.01956387, 0.0043805223, -0.025171462, 0.0036172485, 0.025272012, 0.015484811, 0.021138243, 0.02430967, -0.007483818, 0.00027858326, 0.018998591, -0.004178837, -0.02267727, -0.0029208795, 0.0035098232, 0.026876979], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream: [0.012292794, -0.015721072, -0.031034201, -0.012721021, 0.010508921, 0.01180833, 0.020985613, 0.011761552, -0.015249325, -0.0018725116, 0.011245806, -0.011629056, -0.02351092, -0.009051138, -0.0029766168, 0.024365786], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1

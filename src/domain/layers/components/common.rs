@@ -91,6 +91,36 @@ impl TitanMemoryConfig {
         }
     }
 
+    pub(crate) fn apply_step_into(
+        &self,
+        input: &ndarray::ArrayView1<f32>,
+        out: &mut ndarray::Array1<f32>,
+        workspace: &mut TitanMemoryWorkspace,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let d = input.len();
+        assert_eq!(out.len(), d);
+        assert!(self.scale.is_finite());
+        assert!(self.eta.is_finite());
+        assert!(self.decay.is_finite());
+        assert!(self.eta >= 0.0);
+        assert!(self.decay >= 0.0 && self.decay <= 1.0);
+
+        let retain = 1.0 - self.decay;
+        if workspace.acc.len() != d {
+            workspace.acc.resize(d, 0.0);
+            workspace.acc.fill(0.0);
+        }
+
+        for j in 0..d {
+            let next = retain * workspace.acc[j] + self.eta * input[j];
+            workspace.acc[j] = next;
+            out[j] += self.scale * next;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn input_grads_from_output_grads(&self, output_grads: &Array2<f32>) -> Array2<f32> {
         if !self.enabled {
@@ -169,15 +199,21 @@ impl TemporalMixingLayer {
     ///
     /// Currently only implemented for PolyAttention.
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
+        let mut output = ndarray::Array1::zeros(input.raw_dim());
+        self.forward_step_into(&input.view(), &mut output);
+        output
+    }
+
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
         match self {
-            TemporalMixingLayer::Attention(layer) => layer.forward_step(input),
-            TemporalMixingLayer::RgLru(layer) => layer.forward_step(input),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.forward_step(input),
-            TemporalMixingLayer::Mamba(layer) => layer.forward_step(input),
-            TemporalMixingLayer::MambaMoH(layer) => layer.forward_step(input),
-            TemporalMixingLayer::Mamba2(layer) => layer.forward_step(input),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward_step(input),
-            TemporalMixingLayer::Titans(layer) => layer.forward_step(input),
+            TemporalMixingLayer::Attention(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::RgLru(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::Mamba(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::MambaMoH(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::Mamba2(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward_step_into(input, output),
+            TemporalMixingLayer::Titans(layer) => layer.forward_step_into(input, output),
         }
     }
 
@@ -389,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn common_layers_mamba_uses_moh_by_default() {
+    fn common_layers_mamba_uses_moh_when_moe_enabled() {
         let config = CommonLayerConfig {
             embed_dim: 16,
             hidden_dim: 32,
@@ -397,7 +433,7 @@ mod tests {
             poly_degree: 2,
             max_pos: 32,
             window_size: None,
-            use_moe: false,
+            use_moe: true,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
             moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
@@ -413,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn common_layers_mamba2_uses_moh_by_default() {
+    fn common_layers_mamba2_uses_moh_when_moe_enabled() {
         let config = CommonLayerConfig {
             embed_dim: 16,
             hidden_dim: 32,
@@ -421,7 +457,7 @@ mod tests {
             poly_degree: 2,
             max_pos: 32,
             window_size: None,
-            use_moe: false,
+            use_moe: true,
             moe_config: None,
             head_selection: HeadSelectionStrategy::Fixed { num_active: 2 },
             moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
@@ -478,12 +514,17 @@ mod tests {
         let mut y_fresh = Array2::<f32>::zeros(x.raw_dim());
         cfg.apply_into_out(&mut y_fresh, &x);
 
-        let mut ws = TitanMemoryWorkspace { acc: vec![123.0] };
+        // Initialize workspace with correct size (matching input dimension) and reset it
+        let mut ws = TitanMemoryWorkspace { acc: vec![0.0; x.ncols()] };
+        ws.reset(); // Ensure clean state
         let mut y_ws1 = Array2::<f32>::zeros(x.raw_dim());
         cfg.apply_into_out_with_workspace(&mut y_ws1, &x, &mut ws);
 
+        // For second call, need fresh workspace (batch callers must reset explicitly)
+        let mut ws2 = TitanMemoryWorkspace { acc: vec![0.0; x.ncols()] };
+        ws2.reset();
         let mut y_ws2 = Array2::<f32>::zeros(x.raw_dim());
-        cfg.apply_into_out_with_workspace(&mut y_ws2, &x, &mut ws);
+        cfg.apply_into_out_with_workspace(&mut y_ws2, &x, &mut ws2);
 
         assert_eq!(y_fresh.dim(), y_ws1.dim());
         assert_eq!(y_fresh.dim(), y_ws2.dim());
@@ -554,15 +595,15 @@ impl FeedForwardVariant {
 
     /// Streaming forward step for token-by-token inference.
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
+        let mut output = ndarray::Array1::zeros(input.raw_dim());
+        self.forward_step_into(&input.view(), &mut output);
+        output
+    }
+
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
         match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.forward_step(input),
-            FeedForwardVariant::MixtureOfExperts(layer) => {
-                // Temporary adapter: wrap as batch=1 matrix
-                use ndarray::Axis;
-                let input_mat = input.view().insert_axis(Axis(0));
-                let output_mat = layer.forward(&input_mat.to_owned());
-                output_mat.index_axis(Axis(0), 0).to_owned()
-            }
+            FeedForwardVariant::RichardsGlu(layer) => layer.forward_step_into(input, output),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward_step_into(input, output),
         }
     }
 

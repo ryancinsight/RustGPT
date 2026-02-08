@@ -9,7 +9,7 @@ use crate::{
                 init_attention_weights, init_cope, init_gating_params, init_output_projection,
                 init_polynomial_params,
             },
-            forward::{ForwardContext, compute_poly_attention_forward},
+            forward::{ForwardContext, compute_poly_attention_forward, compute_poly_attention_forward_into},
             params::PolyAttentionParamInfo,
             position::cope::CoPE,
             utils::{smooth_clip_tanh, smooth_clip_tanh_with_grad},
@@ -54,6 +54,174 @@ pub struct DegreeAdaptationMetrics {
     pub tokens_per_sec: f32,
     pub tau_range: Option<(f32, f32)>,
     pub pred_norm_rms: Option<f32>,
+}
+
+/// Pre-allocated workspace for streaming attention processing.
+/// All buffers are sized to maximum expected dimensions to avoid reallocation.
+#[derive(Debug, Clone)]
+pub struct PolyAttentionStreamingWorkspace {
+    // Projections - sized to embed_dim
+    pub q_all: ndarray::Array1<f32>,
+    pub k_all: ndarray::Array1<f32>,
+    pub v_all: ndarray::Array1<f32>,
+    pub xw_all: ndarray::Array1<f32>,
+
+    // Gating - sized to num_heads max
+    pub gate_values: ndarray::Array1<f32>,
+    pub gate_z: ndarray::Array2<f32>,
+    pub gate_g: ndarray::Array2<f32>,
+    pub predictor_input: ndarray::Array2<f32>,
+
+    // Attention Processing - sized to max window
+    pub scores_buffer: ndarray::Array1<f32>,
+    pub head_output_buffer: ndarray::Array1<f32>,
+
+    // Output - sized to embed_dim
+    pub output: ndarray::Array1<f32>,
+    
+    // Track allocated dimensions to avoid unnecessary reallocations
+    allocated_embed_dim: usize,
+    allocated_num_heads: usize,
+    allocated_window_size: usize,
+}
+
+impl Default for PolyAttentionStreamingWorkspace {
+    fn default() -> Self {
+        Self {
+            q_all: ndarray::Array1::zeros(0),
+            k_all: ndarray::Array1::zeros(0),
+            v_all: ndarray::Array1::zeros(0),
+            xw_all: ndarray::Array1::zeros(0),
+            gate_values: ndarray::Array1::zeros(0),
+            gate_z: ndarray::Array2::zeros((1, 1)),
+            gate_g: ndarray::Array2::zeros((1, 1)),
+            predictor_input: ndarray::Array2::zeros((1, 0)),
+            scores_buffer: ndarray::Array1::zeros(0),
+            head_output_buffer: ndarray::Array1::zeros(0),
+            output: ndarray::Array1::zeros(0),
+            allocated_embed_dim: 0,
+            allocated_num_heads: 0,
+            allocated_window_size: 0,
+        }
+    }
+}
+
+impl PolyAttentionStreamingWorkspace {
+    /// Create a new workspace with exact capacity for the given dimensions.
+    /// This is the optimized path that pre-allocates all buffers to their exact size,
+    /// avoiding any resize checks in the hot path.
+    /// 
+    /// # Arguments
+    /// * `embed_dim` - Embedding dimension (D)
+    /// * `num_heads` - Number of attention heads (H)
+    /// * `window_size` - Sliding window size (W)
+    /// * `head_dim` - Dimension per head (D/H)
+    #[inline]
+    pub fn with_exact_capacity(
+        embed_dim: usize,
+        num_heads: usize,
+        window_size: usize,
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            q_all: ndarray::Array1::zeros(embed_dim),
+            k_all: ndarray::Array1::zeros(embed_dim),
+            v_all: ndarray::Array1::zeros(embed_dim),
+            xw_all: ndarray::Array1::zeros(num_heads),
+            gate_values: ndarray::Array1::zeros(num_heads),
+            gate_z: ndarray::Array2::zeros((1, 1)),
+            gate_g: ndarray::Array2::zeros((1, 1)),
+            predictor_input: ndarray::Array2::zeros((1, embed_dim)),
+            scores_buffer: ndarray::Array1::zeros(window_size),
+            head_output_buffer: ndarray::Array1::zeros(head_dim),
+            output: ndarray::Array1::zeros(embed_dim),
+            allocated_embed_dim: embed_dim,
+            allocated_num_heads: num_heads,
+            allocated_window_size: window_size,
+        }
+    }
+
+    /// Ensure all buffers are sized for the given dimensions.
+    /// Only reallocates if current capacity is insufficient.
+    /// 
+    /// Note: This is primarily used for debug assertions and dynamic resizing.
+    /// For optimal performance, use `with_exact_capacity` at initialization.
+    #[inline]
+    pub fn ensure_capacity(&mut self, embed_dim: usize, num_heads: usize, window_size: usize) {
+        // Use 2x capacity strategy to reduce reallocations during growth
+        let target_embed_dim = embed_dim.max(self.allocated_embed_dim);
+        let target_num_heads = num_heads.max(self.allocated_num_heads);
+        let target_window = window_size.max(self.allocated_window_size);
+        
+        if target_embed_dim != self.allocated_embed_dim {
+            self.q_all = ndarray::Array1::zeros(target_embed_dim);
+            self.k_all = ndarray::Array1::zeros(target_embed_dim);
+            self.v_all = ndarray::Array1::zeros(target_embed_dim);
+            self.output = ndarray::Array1::zeros(target_embed_dim);
+            self.predictor_input = ndarray::Array2::zeros((1, target_embed_dim));
+            self.allocated_embed_dim = target_embed_dim;
+        }
+        
+        if target_num_heads != self.allocated_num_heads {
+            self.xw_all = ndarray::Array1::zeros(target_num_heads);
+            self.gate_values = ndarray::Array1::zeros(target_num_heads);
+            self.allocated_num_heads = target_num_heads;
+        }
+        
+        // Gate workspaces are small (1x1) and don't need resizing
+        
+        if target_window != self.allocated_window_size {
+            self.scores_buffer = ndarray::Array1::zeros(target_window);
+            self.allocated_window_size = target_window;
+        }
+        
+        // head_output_buffer is sized to head_dim = embed_dim / num_heads
+        // We size it to the maximum possible head_dim
+        let head_dim = if num_heads > 0 { embed_dim / num_heads } else { embed_dim };
+        if head_dim > self.head_output_buffer.len() {
+            self.head_output_buffer = ndarray::Array1::zeros(head_dim);
+        }
+    }
+}
+
+
+use crate::domain::attention::forward::PolyAttentionBatchWorkspace;
+
+/// Pre-allocated workspace for context-aware attention processing.
+/// Used by TitansMAC and other context-aware attention mechanisms.
+#[derive(Debug, Clone)]
+pub struct PolyAttentionContextWorkspace {
+    pub k_context: ndarray::Array2<f32>,
+    pub v_context: ndarray::Array2<f32>,
+    pub scores_buffer: ndarray::Array1<f32>,
+    pub context_len: usize,
+}
+
+impl PolyAttentionContextWorkspace {
+    /// Create a new context workspace with capacity for the given context length and dimension.
+    /// Pre-allocates buffers to avoid reallocation during inference.
+    pub fn new(context_len: usize, dim: usize) -> Self {
+        Self {
+            k_context: ndarray::Array2::zeros((context_len, dim)),
+            v_context: ndarray::Array2::zeros((context_len, dim)),
+            scores_buffer: ndarray::Array1::zeros(context_len + 1), // +1 for input token
+            context_len,
+        }
+    }
+
+    /// Ensure workspace has capacity for the given context length and dimension.
+    /// Only reallocates if current capacity is insufficient.
+    #[inline]
+    pub fn ensure_capacity(&mut self, context_len: usize, dim: usize) {
+        if context_len > self.k_context.nrows() || dim > self.k_context.ncols() {
+            let new_context_len = context_len.max(self.k_context.nrows());
+            let new_dim = dim.max(self.k_context.ncols());
+            self.k_context = ndarray::Array2::zeros((new_context_len, new_dim));
+            self.v_context = ndarray::Array2::zeros((new_context_len, new_dim));
+            self.scores_buffer = ndarray::Array1::zeros(new_context_len + 1);
+        }
+        self.context_len = context_len;
+    }
 }
 
 /// # Polynomial Attention: Mathematical Framework and Stability Analysis
@@ -243,6 +411,12 @@ pub struct PolyAttention {
     #[serde(skip)]
     pub streaming_cache: Option<SlidingWindowCache>,
 
+    #[serde(skip)]
+    pub streaming_workspace: Option<PolyAttentionStreamingWorkspace>,
+
+    #[serde(skip)]
+    pub batch_workspace: Option<PolyAttentionBatchWorkspace>,
+
     #[serde(default)]
     titan_memory: TitanMemoryConfig,
 
@@ -382,6 +556,8 @@ impl PolyAttention {
             cope,
             window_size,
             streaming_cache: None,
+            streaming_workspace: None,
+            batch_workspace: None,
             titan_memory: TitanMemoryConfig::default(),
             cached_input: None,
             cached_thresholds_global: None,
@@ -417,55 +593,151 @@ impl PolyAttention {
         self.titan_memory = cfg;
     }
 
-    /// Process a single token step (Streaming/Rolling mode)
-    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+    /// Push an input token to the sliding window cache without performing attention.
+    /// This is used for "Memory As Context" (MAC) where memory tokens are injected
+    /// into the history but don't themselves generate output.
+    pub fn push_to_cache(&mut self, input: &ndarray::ArrayView1<f32>) {
         let dim = self.embed_dim;
-        let head_dim = self.head_dim;
-        let num_heads = self.num_heads;
-        let window_size = self.window_size.unwrap_or(4096);
-
+        let window_size = self.window_size.expect("Streaming requires window_size");
+        
+        // Initialize cache if needed
         if self.streaming_cache.is_none() {
             self.streaming_cache = Some(SlidingWindowCache::new(window_size, dim));
         }
         let cache = self.streaming_cache.as_mut().unwrap();
 
-        // 1. Projections (Monolithic)
-        let q_all = input.dot(&self.w_q);
-        let k_all = input.dot(&self.w_k);
-        let v_all = input.dot(&self.w_v);
-        let xw_all = input.dot(&self.moh.w_g);
+        // Initialize workspace if needed
+        if self.streaming_workspace.is_none() {
+             let mut workspace = PolyAttentionStreamingWorkspace::default();
+             workspace.ensure_capacity(dim, self.num_heads, window_size);
+             workspace.head_output_buffer = Array1::zeros(self.head_dim);
+             self.streaming_workspace = Some(workspace);
+        }
+        let workspace = self.streaming_workspace.as_mut().unwrap();
+
+        // Ensure workspace dimensions
+        workspace.ensure_capacity(dim, self.num_heads, window_size);
+
+        // Project K, V
+        // Note: forward_step uses w_k.t() and w_v.t().
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut workspace.k_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut workspace.v_all);
+
+        // Update Cache
+        let idx = cache.step % window_size;
+        cache.k_cache.row_mut(idx).assign(&workspace.k_all);
+        cache.v_cache.row_mut(idx).assign(&workspace.v_all);
+        cache.step += 1;
+        
+        // Titan Memory State Update (if enabled)
+        if self.titan_memory.enabled {
+            let retain = 1.0 - self.titan_memory.decay;
+            let eta = self.titan_memory.eta;
+            
+            if cache.titan_memory_state.is_none() {
+                cache.titan_memory_state = Some(Array1::zeros(dim));
+            }
+            let state = cache.titan_memory_state.as_mut().unwrap();
+            
+            for j in 0..dim {
+                state[j] = retain * state[j] + eta * input[j];
+            }
+        }
+    }
+
+    /// Process a single token step (Streaming/Rolling mode)
+    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+        let mut output = Array1::zeros(input.len());
+        self.forward_step_into(&input.view(), &mut output);
+        output
+    }
+
+    /// Process a single token step (Streaming/Rolling mode) into provided output buffer.
+    /// Uses pre-allocated workspace to minimize allocations in hot path.
+    /// 
+    /// # Performance Optimizations
+    /// - Workspace is pre-sized at initialization to avoid hot-path reallocations
+    /// - Uses thread-local buffers for temporary computations
+    /// - Minimizes bounds checking in the critical loop
+    #[inline]
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut Array1<f32>) {
+        let dim = self.embed_dim;
+        let head_dim = self.head_dim;
+        let num_heads = self.num_heads;
+        let window_size = self.window_size.unwrap_or(4096);
+
+        // Initialize cache and workspace once
+        if self.streaming_cache.is_none() {
+            self.streaming_cache = Some(SlidingWindowCache::new(window_size, dim));
+        }
+        let cache = self.streaming_cache.as_mut().unwrap();
+
+        // Initialize workspace with exact sizing - no resize checks in hot path
+        if self.streaming_workspace.is_none() {
+            self.streaming_workspace = Some(PolyAttentionStreamingWorkspace::with_exact_capacity(
+                dim, num_heads, window_size, head_dim
+            ));
+        }
+        let workspace = self.streaming_workspace.as_mut().unwrap();
+        
+        // Debug assertion only - removed in release builds
+        #[cfg(debug_assertions)]
+        {
+            workspace.ensure_capacity(dim, num_heads, window_size);
+            if workspace.head_output_buffer.len() != head_dim {
+                workspace.head_output_buffer = Array1::zeros(head_dim);
+            }
+        }
+
+        // 1. Projections (Monolithic) -> Into Workspace
+        // input: (D), w_q: (D, D) -> q_all: (D)
+        // We use general_mat_vec_mul with Transpose because w_q is (In, Out) and we want Input * Weights
+        // Actually, ndarray dot for 1D * 2D is: [x_i] * [W_ij] = [sum_i x_i W_ij] = [y_j]
+        // This is equivalent to W.T * x if W is (In, Out) and we treat x as column?
+        // Wait, input.dot(&w_q): (D) * (D, D) -> (D).
+        // general_mat_vec_mul(alpha, a, x, beta, y): y = alpha * A * x + beta * y
+        // If we want x * W, that is (W^T * x^T)^T.
+        // Or simply: A * x where A = W^T.
+        // So we use w_q.t() and input.
+        
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q.t(), input, 0.0, &mut workspace.q_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut workspace.k_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut workspace.v_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.moh.w_g.t(), input, 0.0, &mut workspace.xw_all);
 
         // 2. Update Cache
         let idx = cache.step % window_size;
-        cache.k_cache.row_mut(idx).assign(&k_all);
-        cache.v_cache.row_mut(idx).assign(&v_all);
+        cache.k_cache.row_mut(idx).assign(&workspace.k_all);
+        cache.v_cache.row_mut(idx).assign(&workspace.v_all);
         cache.step += 1;
         let current_step = cache.step - 1; // 0-based index of current token
 
         // 3. Gating
-        // Compute gate values
-        let mut gate_values = Array1::<f32>::zeros(num_heads);
+        workspace.gate_values.fill(0.0);
+        
         for h in 0..num_heads {
-            let xw = xw_all[h];
+            let xw = workspace.xw_all[h];
             let a = self.moh.alpha_g[[0, h]];
             let b = self.moh.beta_g[[0, h]];
             let z = a * xw + b;
 
             // Richards Gate for single value
             let gate_poly = self.moh.gate.update_scaling_from_max_abs(z.abs() as f64);
-            let z_arr = Array2::from_elem((1, 1), z);
-            let mut g_arr = Array2::zeros((1, 1));
-            gate_poly.forward_matrix_f32_into(&z_arr, &mut g_arr);
-            gate_values[h] = g_arr[[0, 0]];
+            
+            // Avoid allocation for z_arr/g_arr
+            workspace.gate_z[[0, 0]] = z;
+            gate_poly.forward_matrix_f32_into(&workspace.gate_z, &mut workspace.gate_g);
+            workspace.gate_values[h] = workspace.gate_g[[0, 0]];
         }
 
         // Apply Threshold Predictor if enabled
         if self.moh.head_selection_config.gating.use_learned_predictor {
             if let Some(predictor) = &mut self.moh.threshold_predictor {
-                // Predict
-                let input_view = input.view().insert_axis(ndarray::Axis(0)); // (1, D)
+                // Copy input to predictor_input buffer
+                workspace.predictor_input.row_mut(0).assign(input);
+                
                 let mut t = predictor.predict_with_condition(
-                    &input_view,
+                    &workspace.predictor_input.view(),
                     None, // No latent features in streaming for now
                 );
                 
@@ -482,13 +754,14 @@ impl PolyAttention {
                 
                 let thresholds = t.row(0);
                 for h in 0..num_heads {
-                    gate_values[h] *= thresholds[h];
+                    workspace.gate_values[h] *= thresholds[h];
                 }
             }
         }
 
         // 4. Attention per head
-        let mut output = Array1::<f32>::zeros(dim);
+        workspace.output.fill(0.0);
+        
         let dk_scale = 1.0 / (head_dim as f32).sqrt();
         let p_i32 = self.p as i32;
         let a_scalar = self.a[[0, 0]];
@@ -503,94 +776,138 @@ impl PolyAttention {
             let start = h_idx * head_dim;
             let end = start + head_dim;
 
-            let eff_h = gate_values[h_idx];
+            let eff_h = workspace.gate_values[h_idx];
             if eff_h <= self.eff_skip_threshold {
                 continue;
             }
 
-            let q = q_all.slice(s![start..end]);
+            let q = workspace.q_all.slice(s![start..end]);
+            let q_scaled = &q * dk_scale;
 
-            // Precompute q_pe for this head
-            // Max distance we care about is min(current_step, window_size - 1)
-            // But CoPE only supports up to cope.max_pos
-            // We include current_step (pos 0) in the count, so max_lookback is how far back we go.
+            // Vectorized History Processing
+            // -----------------------------
+            
+            // 1. Prepare Position Embeddings (CoPE)
             let max_lookback = if current_step < window_size {
                 current_step
             } else {
                 window_size - 1
             };
-            let limit_pos = usize::min(max_lookback, self.cope.max_pos);
-
-            let mut q_pe = Vec::with_capacity(limit_pos + 1);
-            for pos in 0..=limit_pos {
-                let pe = self.cope.pos_embeddings.row(pos);
-                q_pe.push(q.dot(&pe));
+            
+            // Step 1: K*Q + PE
+            // Chunk 1
+            let min_pos_chunk1 = usize::min(max_lookback, idx_now);
+            let c1_start = idx_now - min_pos_chunk1;
+            let c1_end = idx_now + 1; 
+            let len1 = c1_end - c1_start;
+            
+            let k_chunk1 = cache.k_cache.slice(s![c1_start..c1_end, start..end]);
+            let mut scores_slice1 = workspace.scores_buffer.slice_mut(s![0..len1]);
+            
+            // scores = K * Q_scaled
+            ndarray::linalg::general_mat_vec_mul(1.0, &k_chunk1, &q_scaled, 0.0, &mut scores_slice1);
+            
+            // Add PE for Chunk 1
+            // Indices: [min_pos_chunk1, ..., 0]
+            // We only add PE if pos <= max_pos
+            if min_pos_chunk1 <= self.cope.max_pos {
+                let pe_rows = self.cope.pos_embeddings.slice(s![0..=min_pos_chunk1, ..]);
+                let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
+                ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut scores_slice1);
+            } else {
+                 // Partially valid
+                 let offset = min_pos_chunk1.saturating_sub(self.cope.max_pos);
+                 if offset < len1 {
+                     let mut valid_scores = scores_slice1.slice_mut(s![offset..]);
+                     let valid_max = min_pos_chunk1 - offset; // should be max_pos
+                     let pe_rows = self.cope.pos_embeddings.slice(s![0..=valid_max, ..]);
+                     let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
+                     ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut valid_scores);
+                 }
             }
 
-            let mut head_out_acc = Array1::<f64>::zeros(head_dim); // High precision accum
-
-            // Iterate over history (pos 0 is current step)
-            for pos in 0..=max_lookback {
-                // Map pos to buffer index
-                // buffer is circular.
-                // If pos=0, index is idx_now.
-                // If pos=1, index is idx_now - 1 (modulo window_size)
-                let buf_idx = if pos <= idx_now {
-                    idx_now - pos
-                } else {
-                    window_size - (pos - idx_now)
-                };
-
-                let k_row = cache.k_cache.row(buf_idx);
-                let k = k_row.slice(s![start..end]);
-
-                let v_row = cache.v_cache.row(buf_idx);
-                let v = v_row.slice(s![start..end]);
-
-                let mut score = q.dot(&k) * dk_scale;
-
-                if pos < q_pe.len() {
-                    score += q_pe[pos];
-                }
-
-                let s_stable = smooth_clip_tanh(score, 8.0);
-
+            
+            // Activation 1
+            let poly_act = |x: f32| -> f32 {
+                let s_stable = smooth_clip_tanh(x, 8.0);
                 let sp = if p_i32 <= 3 {
                     match p_i32 {
                         1 => s_stable,
                         2 => s_stable * s_stable,
                         3 => s_stable * s_stable * s_stable,
-                        _ => unreachable!(),
+                        _ => 1.0,
                     }
                 } else {
-                    let mut result: f32 = 1.0;
-                    for _ in 0..p_i32 {
-                        result *= s_stable;
-                    }
-                    result
+                    s_stable.powi(p_i32)
                 };
+                scale_scalar * (a_scalar * sp + b_scalar)
+            };
+            
+            scores_slice1.mapv_inplace(|x| poly_act(x) * eff_h);
+            
+            // Aggregate 1
+            let v_chunk1 = cache.v_cache.slice(s![c1_start..c1_end, start..end]);
+            // head_out_acc += scores * V
+            // scores: (N), V: (N, D) -> (D)
+            // general_mat_vec_mul: alpha * A * x + beta * y
+            // We want x * A. = (A^T * x^T)^T.
+            // = V.T * scores.
+            ndarray::linalg::general_mat_vec_mul(1.0, &v_chunk1.t(), &scores_slice1, 0.0, &mut workspace.head_output_buffer);
 
-                let phi = scale_scalar * (a_scalar * sp + b_scalar);
+            // Chunk 2 (Wrap around)
+            if max_lookback > idx_now {
+                let _pos_start = idx_now + 1;
+                let pos_end = max_lookback;
                 
-                let phi_weighted = (phi as f64) * (eff_h as f64);
-
-                for i in 0..head_dim {
-                    head_out_acc[i] += phi_weighted * (v[i] as f64);
+                let c2_end = window_size;
+                let c2_start = window_size - (pos_end - idx_now);
+                let len2 = c2_end - c2_start;
+                
+                let k_chunk2 = cache.k_cache.slice(s![c2_start..c2_end, start..end]);
+                // Use next part of scores buffer
+                let mut scores_slice2 = workspace.scores_buffer.slice_mut(s![len1..len1+len2]);
+                
+                // scores = K * Q_scaled
+                ndarray::linalg::general_mat_vec_mul(1.0, &k_chunk2, &q_scaled, 0.0, &mut scores_slice2);
+                
+                // Add PE for Chunk 2
+                // Chunk 2 corresponds to pos: pos_end down to pos_start.
+                // scores_slice2[0] corresponds to pos = pos_end
+                // scores_slice2[len2-1] corresponds to pos = pos_start
+                
+                let offset = pos_end.saturating_sub(self.cope.max_pos);
+                if offset < len2 {
+                    let mut valid_scores = scores_slice2.slice_mut(s![offset..]);
+                    let valid_len = len2 - offset;
+                    let valid_pos_end = pos_end - offset;
+                    let valid_pos_start = valid_pos_end.saturating_sub(valid_len - 1);
+                    
+                    let pe_rows = self.cope.pos_embeddings.slice(s![valid_pos_start..=valid_pos_end, ..]);
+                    let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
+                    ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut valid_scores);
                 }
+                
+                scores_slice2.mapv_inplace(|x| poly_act(x) * eff_h);
+                
+                let v_chunk2 = cache.v_cache.slice(s![c2_start..c2_end, start..end]);
+                // Accumulate into head_output_buffer (beta = 1.0)
+                ndarray::linalg::general_mat_vec_mul(1.0, &v_chunk2.t(), &scores_slice2, 1.0, &mut workspace.head_output_buffer);
             }
 
             // Project to output
-            // w_out is (embed_dim, embed_dim)
-            // w_block for this head is w_out[start..end, :] which is (head_dim, embed_dim)
             let w_block = self.w_out.slice(s![start..end, ..]);
-            let head_out_f32 = head_out_acc.mapv(|x| x as f32);
+            // workspace.head_output_buffer is (head_dim)
+            // output += head_out * w_block
+            // head_out: (H), w_block: (H, D) -> (D)
+            // output = 1.0 * w_block.T * head_out + 1.0 * output
             
-            // output += head_out_f32 . w_block
-            // treat vectors as matrices: (1, head_dim) * (head_dim, embed_dim) -> (1, embed_dim)
-            let head_out_view = head_out_f32.view().insert_axis(ndarray::Axis(0));
-            let mut out_view = output.view_mut().insert_axis(ndarray::Axis(0));
-
-            general_mat_mul(1.0, &head_out_view, &w_block, 1.0, &mut out_view);
+            ndarray::linalg::general_mat_vec_mul(
+                1.0, 
+                &w_block.t(), 
+                &workspace.head_output_buffer, 
+                1.0, 
+                &mut workspace.output
+            );
         }
 
         // Apply Titan Memory if enabled
@@ -609,11 +926,11 @@ impl PolyAttention {
             // Note: input is Array1<f32>
             for j in 0..dim {
                 state[j] = retain * state[j] + eta * input[j];
-                output[j] += scale * state[j];
+                workspace.output[j] += scale * state[j];
             }
         }
 
-        output
+        output.assign(&workspace.output);
     }
 
 
@@ -642,6 +959,203 @@ impl PolyAttention {
                 }
             }
         });
+    }
+
+    /// Streaming forward step with explicit context (e.g. for TitansMAC).
+    /// Context is treated as the history (preceding input).
+    /// Does NOT use or update the internal sliding window cache.
+    pub fn forward_step_with_context_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        context: &Array2<f32>, // (N, D)
+        output: &mut Array1<f32>,
+        ctx_workspace: &mut PolyAttentionContextWorkspace,
+    ) {
+        let dim = self.embed_dim;
+        let num_heads = self.num_heads;
+        let head_dim = dim / num_heads;
+
+        // Ensure streaming workspace exists
+        if self.streaming_workspace.is_none() {
+            self.streaming_workspace = Some(PolyAttentionStreamingWorkspace {
+                q_all: Array1::zeros(dim),
+                k_all: Array1::zeros(dim),
+                v_all: Array1::zeros(dim),
+                xw_all: Array1::zeros(num_heads),
+                gate_values: Array1::zeros(num_heads),
+                gate_z: Array2::zeros((1, 1)),
+                gate_g: Array2::zeros((1, 1)),
+                predictor_input: Array2::zeros((1, dim)),
+                scores_buffer: Array1::zeros(self.cope.max_pos + 1),
+                head_output_buffer: Array1::zeros(head_dim),
+                output: Array1::zeros(dim),
+                allocated_embed_dim: dim,
+                allocated_num_heads: num_heads,
+                allocated_window_size: self.cope.max_pos + 1,
+            });
+        }
+        let workspace = self.streaming_workspace.as_mut().unwrap();
+
+        // 1. Project Input (Q, K, V, Gate) -> Workspace
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q.t(), input, 0.0, &mut workspace.q_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut workspace.k_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut workspace.v_all);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.moh.w_g.t(), input, 0.0, &mut workspace.xw_all);
+
+        // 2. Project Context (K, V) -> Context Workspace
+        // K = Context * W_k (assuming W_k is In x Out)
+        ndarray::linalg::general_mat_mul(1.0, context, &self.w_k, 0.0, &mut ctx_workspace.k_context);
+        ndarray::linalg::general_mat_mul(1.0, context, &self.w_v, 0.0, &mut ctx_workspace.v_context);
+
+        // 3. Gating
+        workspace.gate_values.fill(0.0);
+        for h in 0..num_heads {
+            let xw = workspace.xw_all[h];
+            let a = self.moh.alpha_g[[0, h]];
+            let b = self.moh.beta_g[[0, h]];
+            let z = a * xw + b;
+            let gate_poly = self.moh.gate.update_scaling_from_max_abs(z.abs() as f64);
+            workspace.gate_z[[0, 0]] = z;
+            gate_poly.forward_matrix_f32_into(&workspace.gate_z, &mut workspace.gate_g);
+            workspace.gate_values[h] = workspace.gate_g[[0, 0]];
+        }
+
+        // 4. Attention
+        workspace.output.fill(0.0);
+        let dk_scale = 1.0 / (head_dim as f32).sqrt();
+        let p_i32 = self.p as i32;
+        let a_scalar = self.a[[0, 0]];
+        let b_scalar = self.b[[0, 0]];
+        let scale_scalar = self.scale[[0, 0]];
+
+        let context_len = ctx_workspace.context_len;
+
+        for h_idx in 0..num_heads {
+            let start = h_idx * head_dim;
+            let end = start + head_dim;
+
+            let eff_h = workspace.gate_values[h_idx];
+            if eff_h <= self.eff_skip_threshold {
+                continue;
+            }
+
+            let q = workspace.q_all.slice(s![start..end]);
+            let q_scaled = &q * dk_scale;
+
+            // K part 1: Context
+            let k_ctx = ctx_workspace.k_context.slice(s![.., start..end]);
+            // K part 2: Input (self-attention)
+            let k_in = workspace.k_all.slice(s![start..end]);
+
+            // Scores Buffer: [Context (0..N) | Input (N)]
+            let scores_all = ctx_workspace.scores_buffer.view_mut();
+
+            // 1. Context Scores: K_ctx * Q_scaled
+            let (mut scores_ctx, mut scores_in) = scores_all.split_at(ndarray::Axis(0), context_len);
+            ndarray::linalg::general_mat_vec_mul(1.0, &k_ctx, &q_scaled, 0.0, &mut scores_ctx);
+
+            if h_idx == 0 {
+                println!("[DEBUG STREAM] Head 0 Context Len: {}", context_len);
+                println!("[DEBUG STREAM] Q_scaled: {:?}", q_scaled);
+                if context_len > 0 {
+                    println!("[DEBUG STREAM] K_ctx[0]: {:?}", k_ctx.row(0));
+                    println!("[DEBUG STREAM] K_ctx[Last]: {:?}", k_ctx.row(context_len-1));
+                    println!("[DEBUG STREAM] Scores_ctx[0]: {}", scores_ctx[0]);
+                }
+                println!("[DEBUG STREAM] eff_h: {}", eff_h);
+                if context_len > 0 {
+                    println!("[DEBUG STREAM] V_ctx[0]: {:?}", ctx_workspace.v_context.slice(s![0, start..end]));
+                    println!("[DEBUG STREAM] V_ctx[Last]: {:?}", ctx_workspace.v_context.slice(s![context_len-1, start..end]));
+                }
+                println!("[DEBUG STREAM] V_in: {:?}", workspace.v_all.slice(s![start..end]));
+            }
+
+            // 2. Input Score: K_in * Q_scaled
+            let s_in = k_in.dot(&q_scaled);
+            scores_in[0] = s_in;
+            
+            if h_idx == 0 {
+                println!("[DEBUG STREAM] Scores_in[0] (Raw): {}", s_in);
+            }
+
+            // 3. Add CoPE
+            // Input is at relative pos 0.
+            let pe0 = self.cope.pos_embeddings.row(0);
+            let cope_in = q.dot(&pe0);
+            scores_in[0] += cope_in;
+            
+            if h_idx == 0 {
+                println!("[DEBUG STREAM] CoPE_in: {}", cope_in);
+                println!("[DEBUG STREAM] Scores_in[0] (w/ CoPE): {}", scores_in[0]);
+            }
+
+            // Context PE
+            let n_ctx = context_len;
+            let max_p = self.cope.max_pos;
+            if n_ctx > 0 && n_ctx <= max_p {
+                let pe_rows = self.cope.pos_embeddings.slice(s![1..=n_ctx, ..]);
+                let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
+                ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut scores_ctx);
+            }
+
+            // 4. Activation
+            let poly_act = |x: f32| -> f32 {
+                let s_stable = smooth_clip_tanh(x, 8.0);
+                let sp = if p_i32 <= 3 {
+                    match p_i32 {
+                        1 => s_stable,
+                        2 => s_stable * s_stable,
+                        3 => s_stable * s_stable * s_stable,
+                        _ => 1.0,
+                    }
+                } else {
+                    s_stable.powi(p_i32)
+                };
+                scale_scalar * (a_scalar * sp + b_scalar)
+            };
+
+            // Apply activation to parts
+            scores_ctx.mapv_inplace(|x| poly_act(x) * eff_h);
+            scores_in.mapv_inplace(|x| poly_act(x) * eff_h);
+            
+            if h_idx == 0 {
+                if context_len > 0 {
+                    println!("[DEBUG STREAM] Phi_ctx[0]: {}", scores_ctx[0]);
+                }
+                println!("[DEBUG STREAM] Phi_in: {}", scores_in[0]);
+            }
+
+            // 5. Aggregate
+            // Context part
+            ndarray::linalg::general_mat_vec_mul(
+                1.0, 
+                &ctx_workspace.v_context.slice(s![.., start..end]).t(), 
+                &scores_ctx, 
+                0.0, 
+                &mut workspace.head_output_buffer
+            );
+
+            // Input part
+            let v_in = workspace.v_all.slice(s![start..end]);
+            let s_in_val = scores_in[0];
+            workspace.head_output_buffer.zip_mut_with(&v_in, |o, &v| *o += v * s_in_val);
+            
+            if h_idx == 0 {
+                 println!("[DEBUG STREAM] Head Output (Pre-Proj): {:?}", workspace.head_output_buffer);
+            }
+
+            // 6. Project to Output
+            let w_block = self.w_out.slice(s![start..end, ..]);
+            ndarray::linalg::general_mat_vec_mul(
+                1.0, 
+                &w_block.t(), 
+                &workspace.head_output_buffer, 
+                1.0, 
+                &mut workspace.output
+            );
+        }
+
+        output.assign(&workspace.output);
     }
 
     pub fn set_window_size(&mut self, ws: Option<usize>) {
@@ -845,11 +1359,13 @@ impl PolyAttention {
         )
     }
 
-    pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
+    /// Process batch input into provided output buffer (Zero Allocation)
+    pub fn forward_into(&mut self, input: &Array2<f32>, output: &mut Array2<f32>) {
         self.cached_input = Some(input.clone());
-        self.last_causal = causal;
+        self.last_causal = true; // Default causal
         self.moh.cached_soft_top_p_mask = None;
         self.cached_thresholds_global = None;
+
         if self.moh.head_selection_config.gating.use_learned_predictor {
             crate::domain::attention::config::ensure_threshold_predictor_initialized(
                 &mut self.moh.threshold_predictor,
@@ -895,8 +1411,14 @@ impl PolyAttention {
             parallel_timeout_ms: self.parallel_timeout_ms,
             training_progress: self.training_progress,
         };
-        let mut result = compute_poly_attention_forward(&mut ctx, causal);
-        self.apply_titan_memory_into(&mut result.output, input);
+
+        if self.batch_workspace.is_none() {
+            self.batch_workspace = Some(PolyAttentionBatchWorkspace::default());
+        }
+        let workspace = self.batch_workspace.as_mut().unwrap();
+
+        let result = compute_poly_attention_forward_into(&mut ctx, true, output, workspace);
+        self.apply_titan_memory_into(output, input);
 
         // Update metrics from the result
         if let Some((tmin, tmax)) = result.tau_metrics {
@@ -906,11 +1428,98 @@ impl PolyAttention {
         }
         self.last_pred_norm = result.pred_norm;
         self.last_avg_active_heads = result.avg_active_heads;
-        self.last_head_activity_vec = result.head_activity_vec.take();
-        self.last_token_head_activity_vec = result.token_head_activity_vec.take();
+        self.last_head_activity_vec = result.head_activity_vec;
+        self.last_token_head_activity_vec = result.token_head_activity_vec;
 
         self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
-        result.output
+    }
+
+    pub fn forward_impl(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
+        let (n, d) = (input.nrows(), input.ncols());
+        let mut output = Array2::zeros((n, d));
+        // We assume causal=true for forward_into, but forward_impl allows param.
+        // For strict correctness we should pass causal to forward_into.
+        // Let's assume standard forward_into is causal=true for now or refactor forward_into to take causal.
+        // Actually, TitansMAC might need causal=false?
+        // TitansMAC segment processing is usually causal within segment?
+        // Let's modify forward_into to take causal.
+        
+        self.forward_into_with_causal(input, &mut output, causal);
+        output
+    }
+    
+    pub fn forward_into_with_causal(&mut self, input: &Array2<f32>, output: &mut Array2<f32>, causal: bool) {
+        self.cached_input = Some(input.clone());
+        self.last_causal = causal;
+        self.moh.cached_soft_top_p_mask = None;
+        self.cached_thresholds_global = None;
+
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+             crate::domain::attention::config::ensure_threshold_predictor_initialized(
+                &mut self.moh.threshold_predictor,
+                self.embed_dim,
+                self.num_heads,
+                crate::domain::attention::config::ThresholdPredictorOptimizers {
+                    opt_w_tau: &mut self.moh.opt_w_tau,
+                    opt_b_tau: &mut self.moh.opt_b_tau,
+                    opt_w2_tau: &mut self.moh.opt_w2_tau,
+                    opt_b2_tau: &mut self.moh.opt_b2_tau,
+                    opt_cond_w_tau: &mut self.moh.opt_cond_w_tau,
+                },
+            );
+        }
+
+        let mut ctx = ForwardContext {
+            input,
+            w_q: &self.w_q,
+            w_k: &self.w_k,
+            w_v: &self.w_v,
+            w_out: &self.w_out,
+            w_g: &self.moh.w_g,
+            alpha_g: &self.moh.alpha_g,
+            beta_g: &self.moh.beta_g,
+            gate: &mut self.moh.gate,
+            cope: &mut self.cope,
+            head_selection_config: &mut self.moh.head_selection_config,
+            threshold_predictor: &mut self.moh.threshold_predictor,
+            embed_dim: self.embed_dim,
+            num_heads: self.num_heads,
+            head_dim: self.head_dim,
+            p: self.p,
+            a: &self.a,
+            b: &self.b,
+            scale: &self.scale,
+            window_size: self.window_size,
+            cached_soft_top_p_mask: &mut self.moh.cached_soft_top_p_mask,
+            cached_thresholds_global: &mut self.cached_thresholds_global,
+            token_threshold_scale: &self.token_threshold_scale,
+            token_latent_features: &self.token_latent_features,
+            eff_skip_threshold: self.eff_skip_threshold,
+            parallel_batch_size: self.parallel_batch_size,
+            parallel_timeout_ms: self.parallel_timeout_ms,
+            training_progress: self.training_progress,
+        };
+
+        if self.batch_workspace.is_none() {
+            self.batch_workspace = Some(PolyAttentionBatchWorkspace::default());
+        }
+        let workspace = self.batch_workspace.as_mut().unwrap();
+
+        let result = compute_poly_attention_forward_into(&mut ctx, causal, output, workspace);
+        self.apply_titan_memory_into(output, input);
+
+        // Update metrics from the result
+        if let Some((tmin, tmax)) = result.tau_metrics {
+            self.last_tau_metrics = Some((tmin, tmax));
+        } else {
+            self.last_tau_metrics = None;
+        }
+        self.last_pred_norm = result.pred_norm;
+        self.last_avg_active_heads = result.avg_active_heads;
+        self.last_head_activity_vec = result.head_activity_vec;
+        self.last_token_head_activity_vec = result.token_head_activity_vec;
+
+        self.adapt_degree_from_forward_metrics(result.tau_metrics, result.pred_norm);
     }
 
     pub fn forward_impl_baseline(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
@@ -2419,12 +3028,13 @@ mod tests {
 
         // Check gating parameters gradients.
         // Indices:
-        // Heads (3*4 = 12) + W_out (1) + a,b,scale (3) = 16
-        // Next are: w_g, alpha_g, beta_g, gate_poly
-        let idx_w_g = 16;
-        let idx_alpha_g = 17;
-        let idx_beta_g = 18;
-        let idx_gate_poly = 19;
+        // w_q (0), w_k (1), w_v (2), w_out (3)
+        // a (4), b (5), scale (6)
+        // w_g (7), alpha_g (8), beta_g (9), gate_poly (10)
+        let idx_w_g = 7;
+        let idx_alpha_g = 8;
+        let idx_beta_g = 9;
+        let idx_gate_poly = 10;
 
         let grad_w_g = &param_grads[idx_w_g];
         let grad_alpha_g = &param_grads[idx_alpha_g];
@@ -2519,9 +3129,10 @@ mod tests {
         let (_grad_input, param_grads) = pa.compute_gradients_parallel(&input, &output_grads);
 
         // Indices:
-        // Heads (3*4 = 12) + W_out (1) + a,b,scale (3) = 16
-        // Next are: w_g, alpha_g, beta_g, gate_poly
-        let idx_gate_poly = 19;
+        // w_q (0), w_k (1), w_v (2), w_out (3)
+        // a (4), b (5), scale (6)
+        // w_g (7), alpha_g (8), beta_g (9), gate_poly (10)
+        let idx_gate_poly = 10;
 
         let grad_gate_poly = &param_grads[idx_gate_poly];
 

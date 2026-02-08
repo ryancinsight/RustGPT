@@ -212,6 +212,11 @@ impl RichardsGate {
         output
     }
 
+    /// Forward pass into a pre-allocated slice (no allocations)
+    pub fn forward_into_f32(&self, input: &[f32], output: &mut [f32]) {
+        self.curve.forward_into_f32(input, output);
+    }
+
     /// Forward pass: compute gating values
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.cached_input = Some(input.clone());

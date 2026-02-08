@@ -8,11 +8,28 @@ use crate::{
     infrastructure::optimizer::adam::Adam,
     common::{errors::Result, rng::get_rng},
     domain::{
-        mixtures::{HeadSelectionStrategy, MoHGating},
+        mixtures::{HeadSelectionStrategy, MoHGating, moh_gating::MoHStreamingWorkspace},
         network::Layer,
         richards::RichardsCurve,
     },
 };
+
+#[derive(Debug, Clone, Default)]
+pub struct RgLruStreamingWorkspace {
+    pub h_prev: Array1<f32>,
+    pub r_pre: Array1<f32>,
+    pub i_pre: Array1<f32>,
+    pub r: Array1<f32>,
+    pub i: Array1<f32>,
+    pub a: Array1<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MoHRgLruStreamingWorkspace {
+    pub moh_workspace: MoHStreamingWorkspace,
+    pub output_buffer: Array1<f32>,
+    pub head_output_buffer: Array1<f32>,
+}
 
 type GatesAndState<'a> = (
     Cow<'a, Array2<f32>>,
@@ -114,7 +131,7 @@ pub struct RgLru {
     cached_hprev: Option<Array2<f32>>, // h_{t-1} per t (hprev[0]=0)
 
     #[serde(skip)]
-    streaming_state: Option<Array1<f32>>,
+    pub streaming_workspace: Option<RgLruStreamingWorkspace>,
 }
 
 /// Multi-head RG-LRU with shared Mixture-of-Heads (MoH) gating.
@@ -145,6 +162,9 @@ pub struct MoHRgLru {
     pub last_head_activity_vec: Option<Vec<f32>>,
     #[serde(skip_serializing, skip_deserializing)]
     pub last_token_head_activity_vec: Option<Vec<f32>>,
+
+    #[serde(skip)]
+    pub streaming_workspace: Option<MoHRgLruStreamingWorkspace>,
 }
 
 impl MoHRgLru {
@@ -192,6 +212,7 @@ impl MoHRgLru {
             last_avg_active_heads: None,
             last_head_activity_vec: None,
             last_token_head_activity_vec: None,
+            streaming_workspace: None,
         }
     }
 
@@ -227,33 +248,63 @@ impl MoHRgLru {
         self.moh.last_max_abs_z.clone()
     }
 
-    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        // 1. Compute MoH gating weights
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut Array1<f32>) {
         let d = input.len();
-        let input_2d = input.to_shape((1, d)).unwrap().to_owned();
-        let eff_weights_2d = self.moh.forward_weights(&input_2d, None, None);
-        let eff_weights = eff_weights_2d.row(0);
-
-        // 2. Split input into heads
+        let num_heads = self.num_heads;
         let head_dim = self.head_dim;
-        let mut output = Array1::<f32>::zeros(d);
 
-        // 3. Process each head
+        // Initialize workspace if needed
+        if self.streaming_workspace.is_none() {
+             self.streaming_workspace = Some(MoHRgLruStreamingWorkspace::default());
+        }
+        let ws = self.streaming_workspace.as_mut().unwrap();
+
+        // Resize buffers if needed
+        if ws.output_buffer.len() != d {
+            ws.output_buffer = Array1::zeros(d);
+        } else {
+            ws.output_buffer.fill(0.0);
+        }
+        
+        if ws.head_output_buffer.len() != head_dim {
+            ws.head_output_buffer = Array1::zeros(head_dim);
+        }
+        
+        if ws.moh_workspace.xw.len() != num_heads {
+            ws.moh_workspace.xw = Array1::zeros(num_heads);
+            ws.moh_workspace.g = Array1::zeros(num_heads);
+            ws.moh_workspace.m = Array1::zeros(num_heads);
+        }
+
+        // 1. Compute MoH gating weights
+        self.moh.forward_weights_into(input, &mut ws.moh_workspace);
+        let eff_weights = &ws.moh_workspace.m;
+
+        // 2. Process heads
         for (h, head) in self.heads.iter_mut().enumerate() {
             let start = h * head_dim;
             let end = start + head_dim;
             if start >= d { break; }
             
-            let head_input = input.slice(s![start..end]).to_owned();
-            let head_out = head.forward_step(&head_input);
+            let head_input = input.slice(s![start..end]);
+            
+            // Forward step into head_output_buffer
+            head.forward_step_into(&head_input, &mut ws.head_output_buffer);
             
             let w = eff_weights[h];
             if w.abs() > 1e-9 {
-                 let mut out_slice = output.slice_mut(s![start..end]);
-                 ndarray::Zip::from(&mut out_slice).and(&head_out).for_each(|o, &v| *o += w * v);
+                 let mut out_slice = ws.output_buffer.slice_mut(s![start..end]);
+                 // Accumulate: out += w * head_out
+                 ndarray::Zip::from(&mut out_slice).and(&ws.head_output_buffer).for_each(|o, &v| *o += w * v);
             }
         }
         
+        output.assign(&ws.output_buffer);
+    }
+
+    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+        let mut output = Array1::zeros(input.len());
+        self.forward_step_into(&input.view(), &mut output);
         output
     }
 }
@@ -293,7 +344,7 @@ impl<'de> Deserialize<'de> for RgLru {
             cached_i: None,
             cached_a: None,
             cached_hprev: None,
-            streaming_state: None,
+            streaming_workspace: None,
         })
     }
 }
@@ -331,7 +382,7 @@ impl RgLru {
             cached_i: None,
             cached_a: None,
             cached_hprev: None,
-            streaming_state: None,
+            streaming_workspace: None,
         }
     }
 
@@ -464,32 +515,62 @@ impl RgLru {
         }
     }
 
-    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        // Ensure state is initialized
-        if self.streaming_state.is_none() {
-            self.streaming_state = Some(Array1::zeros(input.len()));
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut Array1<f32>) {
+        let d = input.len();
+        if self.streaming_workspace.is_none() {
+            self.streaming_workspace = Some(RgLruStreamingWorkspace {
+                h_prev: Array1::zeros(d),
+                r_pre: Array1::zeros(d),
+                i_pre: Array1::zeros(d),
+                r: Array1::zeros(d),
+                i: Array1::zeros(d),
+                a: Array1::zeros(d),
+            });
         }
-        let h_prev = self.streaming_state.as_mut().unwrap();
+        let ws = self.streaming_workspace.as_mut().unwrap();
 
-        // Compute gates
-        let r_pre = input.dot(&self.w_a) + &self.b_a.row(0);
-        let i_pre = input.dot(&self.w_x) + &self.b_x.row(0);
+        // 1. Compute pre-activations
+        // r_pre = input * w_a^T + b_a
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_a.t(), input, 0.0, &mut ws.r_pre);
+        ws.r_pre += &self.b_a.row(0);
 
+        // i_pre = input * w_x^T + b_x
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_x.t(), input, 0.0, &mut ws.i_pre);
+        ws.i_pre += &self.b_x.row(0);
+
+        // 2. Activations
         let sigmoid = RichardsCurve::sigmoid(false);
-        let r = r_pre.mapv(|x| sigmoid.forward_scalar_f32(x));
-        let i = i_pre.mapv(|x| sigmoid.forward_scalar_f32(x));
+        Zip::from(&mut ws.r).and(&ws.r_pre).for_each(|y, &x| *y = sigmoid.forward_scalar_f32(x));
+        Zip::from(&mut ws.i).and(&ws.i_pre).for_each(|y, &x| *y = sigmoid.forward_scalar_f32(x));
 
+        // 3. Compute 'a' (decay)
         let c: f32 = 8.0;
-        let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
-        let a = (&r * &log_base_a * c).mapv(|x| crate::domain::pade::exp(x.clamp(-80.0, 0.0)));
+        let lambda = self.lambda.row(0);
+        Zip::from(&mut ws.a).and(&ws.r).and(&lambda).for_each(|y, &r, &l| {
+            let log_base_a = -crate::domain::soft::softplus(-l);
+            let lt = (c * r * log_base_a).clamp(-80.0, 0.0);
+            *y = crate::domain::pade::exp(lt);
+        });
 
-        // Update state: h_t = a * h_{t-1} + (1 - a) * (i * x)
-        let one_minus_a = 1.0 - &a;
-        let u = &i * input;
-        let h_new = &a * &*h_prev + &one_minus_a * &u;
+        // 4. Update state and output
+        // h_t = a * h_{t-1} + (1 - a) * (i * x)
+        Zip::from(output.view_mut())
+            .and(&mut ws.h_prev)
+            .and(&ws.a)
+            .and(&ws.i)
+            .and(input)
+            .for_each(|out, h, &a, &i, &x| {
+                let u = i * x;
+                let val = a * *h + (1.0 - a) * u;
+                *h = val;
+                *out = val;
+            });
+    }
 
-        h_prev.assign(&h_new);
-        h_new
+    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+        let mut output = Array1::zeros(input.len());
+        self.forward_step_into(&input.view(), &mut output);
+        output
     }
 
     #[inline]

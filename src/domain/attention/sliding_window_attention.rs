@@ -44,6 +44,26 @@ impl SlidingWindowCache {
     }
 }
 
+pub struct SlidingWindowStreamingWorkspace {
+    pub q: Array1<f32>,
+    pub k: Array1<f32>,
+    pub v: Array1<f32>,
+    pub scores: Array1<f32>,
+    pub output: Array1<f32>,
+}
+
+impl SlidingWindowStreamingWorkspace {
+    pub fn new(embed_dim: usize, window_size: usize) -> Self {
+        Self {
+            q: Array1::zeros(embed_dim),
+            k: Array1::zeros(embed_dim),
+            v: Array1::zeros(embed_dim),
+            scores: Array1::zeros(window_size),
+            output: Array1::zeros(embed_dim),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SlidingWindowAttention {
     pub embed_dim: usize,
@@ -125,6 +145,56 @@ impl SlidingWindowAttention {
 
         let output = scores.dot(&v_window);
         output
+    }
+
+    /// Process a single token step using a workspace to minimize allocations.
+    pub fn forward_step_with_workspace(
+        &mut self,
+        input: &Array1<f32>,
+        ws: &mut SlidingWindowStreamingWorkspace,
+    ) -> Array1<f32> {
+        if self.streaming_cache.is_none() {
+            self.streaming_cache = Some(SlidingWindowCache::new(self.window_size, self.embed_dim));
+        }
+        let cache = self.streaming_cache.as_mut().unwrap();
+
+        // 1. Project into workspace
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q.t(), input, 0.0, &mut ws.q);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut ws.k);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut ws.v);
+
+        // 2. Update Cache
+        let idx = cache.step % self.window_size;
+        cache.k_cache.row_mut(idx).assign(&ws.k);
+        cache.v_cache.row_mut(idx).assign(&ws.v);
+        
+        cache.step += 1;
+
+        // 3. Compute Attention
+        let valid_count = if cache.step <= self.window_size {
+            cache.step
+        } else {
+            self.window_size
+        };
+
+        let mut scores_view = ws.scores.slice_mut(s![0..valid_count]);
+        let k_window = cache.k_cache.slice(s![0..valid_count, ..]);
+        
+        // scores = k_window * q
+        ndarray::linalg::general_mat_vec_mul(1.0, &k_window, &ws.q, 0.0, &mut scores_view);
+
+        let scale = (self.embed_dim as f32).sqrt();
+        scores_view.mapv_inplace(|x: f32| (x / scale).exp());
+        let sum_scores = scores_view.sum();
+        if sum_scores > 0.0 {
+            scores_view.mapv_inplace(|x: f32| x / sum_scores);
+        }
+
+        // output = scores * v_window = v_window.t() * scores
+        let v_window = cache.v_cache.slice(s![0..valid_count, ..]);
+        ndarray::linalg::general_mat_vec_mul(1.0, &v_window.t(), &scores_view, 0.0, &mut ws.output);
+
+        ws.output.clone()
     }
 }
 

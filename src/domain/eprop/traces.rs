@@ -4,7 +4,7 @@
 //! eligibility traces with O(N) complexity through rank-one approximation
 //! and exponential smoothing.
 
-use ndarray::Array1;
+use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::eprop::{
@@ -60,7 +60,7 @@ impl MultiScaleTraces {
     pub fn update_all_scales(
         &mut self,
         state: &NeuronState,
-        input: &Array1<f32>,
+        input: ArrayView1<f32>,
     ) -> super::Result<()> {
         self.fast_scale.update(state, input)?;
         self.medium_scale.update(state, input)?;
@@ -101,6 +101,27 @@ impl MultiScaleTraces {
         (weighted_eps_x, weighted_eps_f)
     }
 
+    /// Compute weighted combination of traces into provided buffers (Zero-Allocation)
+    pub fn compute_weighted_traces_into(
+        &self,
+        eps_x_out: Option<&mut Array1<f32>>,
+        eps_f_out: Option<&mut Array1<f32>>,
+    ) {
+        // Combine presynaptic traces
+        if let Some(out) = eps_x_out {
+            out.assign(&(&self.fast_scale.eps_x * self.gradient_weights[0]));
+            out.zip_mut_with(&self.medium_scale.eps_x, |o, &x| *o += x * self.gradient_weights[1]);
+            out.zip_mut_with(&self.slow_scale.eps_x, |o, &x| *o += x * self.gradient_weights[2]);
+        }
+
+        // Combine postsynaptic traces
+        if let Some(out) = eps_f_out {
+            out.assign(&(&self.fast_scale.eps_f * self.gradient_weights[0]));
+            out.zip_mut_with(&self.medium_scale.eps_f, |o, &x| *o += x * self.gradient_weights[1]);
+            out.zip_mut_with(&self.slow_scale.eps_f, |o, &x| *o += x * self.gradient_weights[2]);
+        }
+    }
+
     /// Reset all traces to zero
     pub fn reset(&mut self) {
         self.fast_scale.reset();
@@ -119,7 +140,7 @@ impl SingleScaleTraces {
         }
     }
 
-    fn update(&mut self, state: &NeuronState, input: &Array1<f32>) -> super::Result<()> {
+    fn update(&mut self, state: &NeuronState, input: ArrayView1<f32>) -> super::Result<()> {
         // Update presynaptic trace: ε^x_t = α·ε^x_{t-1} + x_t
         for (dst, &x) in self.eps_x.iter_mut().zip(input.iter()) {
             let prev = *dst;
@@ -324,7 +345,7 @@ impl TraceUpdater {
         &self,
         traces: &mut EligibilityTraces,
         state: &NeuronState,
-        input: &Array1<f32>,
+        input: ArrayView1<f32>,
     ) -> super::Result<()> {
         // Validate dimensions
         if input.len() != traces.eps_x.len() {
@@ -364,7 +385,7 @@ impl TraceUpdater {
     ///
     /// This implements exponential smoothing of the input history,
     /// capturing temporal correlations in the input stream.
-    fn update_presynaptic_trace(&self, traces: &mut EligibilityTraces, input: &Array1<f32>) {
+    fn update_presynaptic_trace(&self, traces: &mut EligibilityTraces, input: ArrayView1<f32>) {
         for (dst, &x) in traces.eps_x.iter_mut().zip(input.iter()) {
             let prev = *dst;
             *dst = prev * self.alpha + x;
@@ -606,13 +627,13 @@ mod tests {
         let mut traces = EligibilityTraces::new(5, 3, false);
         let input = Array1::from_elem(5, 1.0);
 
-        updater.update_presynaptic_trace(&mut traces, &input);
+        updater.update_presynaptic_trace(&mut traces, input.view());
 
         // Trace should accumulate input
         assert!(traces.eps_x.sum() > 0.0);
 
         // Second update
-        updater.update_presynaptic_trace(&mut traces, &input);
+        updater.update_presynaptic_trace(&mut traces, input.view());
 
         // Should accumulate more
         assert!(traces.eps_x.sum() > 1.0);
@@ -652,7 +673,7 @@ mod tests {
 
         let input = Array1::from_elem(5, 0.5);
 
-        let result = updater.update(&mut traces, &state, &input);
+        let result = updater.update(&mut traces, &state, input.view());
         assert!(result.is_ok());
 
         // Both traces should be updated
@@ -724,7 +745,7 @@ mod tests {
         let state = NeuronState::new(3, false, &config);
         let wrong_input = Array1::from_elem(10, 0.5); // Wrong size
 
-        let result = updater.update(&mut traces, &state, &wrong_input);
+        let result = updater.update(&mut traces, &state, wrong_input.view());
         assert!(result.is_err());
     }
 
@@ -737,12 +758,12 @@ mod tests {
 
         // Initial input
         let input = Array1::from_elem(5, 1.0);
-        updater.update_presynaptic_trace(&mut traces, &input);
+        updater.update_presynaptic_trace(&mut traces, input.view());
         let trace_1 = traces.eps_x[0];
 
         // Zero input (decay)
         let zero_input = Array1::zeros(5);
-        updater.update_presynaptic_trace(&mut traces, &zero_input);
+        updater.update_presynaptic_trace(&mut traces, zero_input.view());
         let trace_2 = traces.eps_x[0];
 
         // Should decay by factor α

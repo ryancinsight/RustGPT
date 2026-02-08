@@ -101,8 +101,7 @@ pub enum AttentionType {
 /// Temporal mixing mechanism selection (attention vs recurrent/SSM-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TemporalMixingType {
-    /// Attention-based temporal mixing (default)
-    #[default]
+    /// Attention-based temporal mixing
     Attention,
     /// Recurrent RG-LRU temporal mixing (Hawk/Griffin-style)
     RgLru,
@@ -113,7 +112,10 @@ pub enum TemporalMixingType {
     /// Mamba-2 style selective SSM (reference implementation)
     Mamba2,
 
-    /// Titans MAC (Memory As Context)
+    /// Titans MAC (Memory As Context) - uses PolyAttention + NeuralMemory + Engram
+    /// This is the default as it combines the best of attention-based mixing
+    /// with persistent memory and n-gram caching for long-context modeling.
+    #[default]
     Titans,
 }
 
@@ -386,7 +388,7 @@ impl ModelConfig {
             },
             moh_threshold_modulation: AdaptiveScalar::default(),
             attention: AttentionType::SelfAttention,
-            temporal_mixing: TemporalMixingType::Attention,
+            temporal_mixing: TemporalMixingType::Titans,
             moe_router: Some(ExpertRouter::LearnedMoE {
                 num_experts: 4,
                 num_active_experts: 2,

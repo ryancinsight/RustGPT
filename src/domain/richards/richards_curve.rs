@@ -1535,6 +1535,7 @@ impl RichardsCurve {
         }
     }
 
+
     pub fn forward_matrix_f32_with_overrides_into(
         &self,
         x: &Array2<f32>,

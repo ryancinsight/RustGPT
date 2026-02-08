@@ -29,6 +29,9 @@ pub struct RichardsGlu {
     pub richards_activation: RichardsActivation,
     // [MOD] Learned RichardsGate for gating
     pub gate: RichardsGate,
+    /// Workspace for streaming inference
+    #[serde(skip)]
+    pub streaming_workspace: Option<RichardsGluStreamingWorkspace>,
 }
 
 impl RichardsGlu {
@@ -57,7 +60,72 @@ impl RichardsGlu {
             cached_gated: None,
             richards_activation: RichardsActivation::new_learnable(Variant::None),
             gate: RichardsGate::new(),
+            streaming_workspace: None,
         }
+    }
+
+    /// Streaming forward step with pre-allocated output buffer (zero-allocation)
+    pub fn forward_step_into(
+        &mut self, 
+        input: &ndarray::ArrayView1<f32>, 
+        output: &mut ndarray::Array1<f32>,
+    ) {
+        // Initialize workspace if needed
+        if self.streaming_workspace.is_none() {
+             let d_hidden = self.w1.ncols();
+             self.streaming_workspace = Some(RichardsGluStreamingWorkspace {
+                 x1: ndarray::Array1::zeros(d_hidden),
+                 x2: ndarray::Array1::zeros(d_hidden),
+                 value: ndarray::Array1::zeros(d_hidden),
+                 gate_sigma: ndarray::Array1::zeros(d_hidden),
+                 gated: ndarray::Array1::zeros(d_hidden),
+             });
+        }
+        let ws = self.streaming_workspace.as_mut().unwrap();
+
+        // Ensure workspace dimensions
+        if ws.x1.len() != self.w1.ncols() {
+            let d_hidden = self.w1.ncols();
+            ws.x1 = ndarray::Array1::zeros(d_hidden);
+            ws.x2 = ndarray::Array1::zeros(d_hidden);
+            ws.value = ndarray::Array1::zeros(d_hidden);
+            ws.gate_sigma = ndarray::Array1::zeros(d_hidden);
+            ws.gated = ndarray::Array1::zeros(d_hidden);
+        }
+
+        // x1 = input * W1
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w1.t(), input, 0.0, &mut ws.x1);
+        // x2 = input * W2
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w2.t(), input, 0.0, &mut ws.x2);
+
+        // Apply Richards activation
+        if let (Some(x1_slice), Some(value_slice)) = (ws.x1.as_slice(), ws.value.as_slice_mut()) {
+            self.richards_activation.forward_into_f32(x1_slice, value_slice);
+        } else {
+             // Fallback
+             ws.value.assign(&self.richards_activation.forward_matrix_f32(&ws.x1.view().insert_axis(ndarray::Axis(0)).to_owned()).row(0));
+        }
+
+        // Apply Richards gate
+        if let (Some(x2_slice), Some(gate_slice)) = (ws.x2.as_slice(), ws.gate_sigma.as_slice_mut()) {
+            self.gate.forward_into_f32(x2_slice, gate_slice);
+        } else {
+             // Fallback
+             ws.gate_sigma.assign(&self.gate.forward_const(&ws.x2.view().insert_axis(ndarray::Axis(0)).to_owned()).row(0));
+        }
+
+        // Gating: value * gate
+        ndarray::Zip::from(&mut ws.gated)
+            .and(&ws.value)
+            .and(&ws.gate_sigma)
+            .for_each(|g, &v, &s| *g = v * s);
+
+        // Output = gated * W_out + input
+        // gated: (H,), W_out: (H, D)
+        // output = input (residual)
+        output.assign(input);
+        // output += gated * W_out
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_out.t(), &ws.gated, 1.0, output);
     }
 
     /// Streaming forward step for token-by-token inference.
@@ -66,34 +134,19 @@ impl RichardsGlu {
     /// It uses zero-copy views to reuse the optimized matrix implementations of the
     /// underlying components.
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
-        use ndarray::Axis;
-
-        let x1 = input.dot(&self.w1);
-        let x2 = input.dot(&self.w2);
-
-        // Create 2D views for compatibility with matrix-based subcomponents
-        let x1_mat = x1.view().insert_axis(Axis(0));
-        let x2_mat = x2.view().insert_axis(Axis(0));
-
-        // RichardsActivation (returns Array2)
-        // We need owned arrays for the subcomponents
-        let value_mat = self.richards_activation.forward_matrix_f32(&x1_mat.to_owned());
-        // RichardsGate (returns Array2)
-        let gate_sigma_mat = self.gate.forward(&x2_mat.to_owned());
-
-        // Extract rows back to 1D (views or owned as needed)
-        // Note: forward_matrix_f32 returns owned Array2, so we can take views.
-        let value = value_mat.index_axis(Axis(0), 0);
-        let gate_sigma = gate_sigma_mat.index_axis(Axis(0), 0);
-
-        // Element-wise gating (ArrayView1 * ArrayView1 -> Array1)
-        let gated = &value * &gate_sigma;
-
-        // Final projection and residual
-        let output = gated.dot(&self.w_out) + input;
-
+        let mut output = ndarray::Array1::zeros(input.raw_dim());
+        self.forward_step_into(&input.view(), &mut output);
         output
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RichardsGluStreamingWorkspace {
+    pub x1: ndarray::Array1<f32>,
+    pub x2: ndarray::Array1<f32>,
+    pub value: ndarray::Array1<f32>,
+    pub gate_sigma: ndarray::Array1<f32>,
+    pub gated: ndarray::Array1<f32>,
 }
 
 impl Layer for RichardsGlu {

@@ -12,7 +12,7 @@ use crate::{
         EPropError, Result,
         adaptive_softmax::AdaptiveSoftmax,
         config::{EPropConfig, NeuronModel},
-        neuron::{NeuronDynamics, NeuronState},
+        neuron::{NeuronDynamics, NeuronState, NeuronWorkspace},
         traces::{EligibilityTraces, TraceUpdater},
         utils::{fill_active_spike_indices, outer_product_into, sparse_matvec_add_into},
     },
@@ -101,6 +101,9 @@ pub struct EPropTrainer {
     /// Current neuron state
     state: NeuronState,
 
+    /// Workspace for zero-allocation neuron dynamics
+    neuron_workspace: NeuronWorkspace,
+
     /// Eligibility traces
     traces: EligibilityTraces,
 
@@ -125,6 +128,7 @@ impl EPropTrainer {
     /// Weights are initialized using Xavier/Glorot initialization scaled by
     /// config.init_scale for stability.
     pub fn new(config: EPropConfig) -> Result<Self> {
+        let neuron_workspace = NeuronWorkspace::new(config.num_neurons);
         config.validate()?;
 
         use rand_distr::{Distribution, Normal};
@@ -202,6 +206,7 @@ impl EPropTrainer {
             dynamics,
             trace_updater,
             state,
+            neuron_workspace,
             traces,
             input_current_buf: Array1::zeros(num_neurons),
             learning_signal_buf: Array1::zeros(num_neurons),
@@ -270,14 +275,14 @@ impl EPropTrainer {
 
         let t_dyn = profile.then(std::time::Instant::now);
         self.dynamics
-            .update(&mut self.state, &self.input_current_buf, loss_gradient)?;
+            .update(&mut self.state, &self.input_current_buf.view(), loss_gradient, &mut self.neuron_workspace)?;
         let dyn_us = t_dyn.map(|t| t.elapsed().as_micros());
 
         self.maybe_truncate_traces();
 
         let t_tr = profile.then(std::time::Instant::now);
         self.trace_updater
-            .update(&mut self.traces, &self.state, input)?;
+            .update(&mut self.traces, &self.state, input.view())?;
         let tr_us = t_tr.map(|t| t.elapsed().as_micros());
 
         self.traces.step();

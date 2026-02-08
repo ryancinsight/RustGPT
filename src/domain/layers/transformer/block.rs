@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
                     TitanMemoryWorkspace, apply_adaptive_gradients,
                 },
             },
-            transformer::components::eprop_adaptor::{EPropAdaptor, EPropAdaptorConfig},
+            transformer::components::eprop_adaptor::{EPropAdaptor, EPropAdaptorConfig, EPropAdaptorStreamingWorkspace},
         },
         mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
         models::config::{ModelConfig, TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy},
@@ -33,6 +33,20 @@ use crate::{
 
 fn default_similarity_context_strength() -> Array2<f32> {
     Array2::zeros((1, 1))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TransformerBlockStreamingWorkspace {
+    pub norm1_out: Array1<f32>,
+    pub mix_out: Array1<f32>,
+    pub norm2_out: Array1<f32>,
+    pub ffn_out: Array1<f32>,
+    pub residual: Array1<f32>,
+    pub input_used: Array1<f32>,
+    
+    // E-Prop buffers
+    pub eprop_out: Array1<f32>,
+    pub eprop_workspace: EPropAdaptorStreamingWorkspace,
 }
 
 /// Cached transformer block intermediates to improve readability
@@ -120,6 +134,9 @@ pub struct TransformerBlock {
 
     #[serde(skip_serializing, skip_deserializing)]
     titan_memory_workspace: TitanMemoryWorkspace,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    streaming_workspace: Option<TransformerBlockStreamingWorkspace>,
 }
 
 impl Clone for TransformerBlock {
@@ -141,6 +158,7 @@ impl Clone for TransformerBlock {
             adaptive_residuals: self.adaptive_residuals.clone(),
             eprop_adaptor: self.eprop_adaptor.clone(),
             titan_memory_workspace: self.titan_memory_workspace.clone(),
+            streaming_workspace: self.streaming_workspace.clone(),
         }
     }
 }
@@ -258,6 +276,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             },
             eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
+            streaming_workspace: None,
         })
     }
 }
@@ -441,6 +460,7 @@ impl TransformerBlock {
             },
             eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
+            streaming_workspace: None,
         }
     }
 
@@ -529,7 +549,7 @@ impl TransformerBlock {
     }
 
     #[inline]
-    fn update_activation_similarity_matrix(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
+    fn update_activation_similarity_matrix(&mut self, input: &ndarray::ArrayView2<f32>, output: &ndarray::ArrayView2<f32>) {
         // Match the adaptive_residuals representation update: channel-to-channel cosine similarity
         // across (sampled) sequence positions, bounded smoothly into [-1, 1], EMA updated.
         let rate = self.similarity_update_rate.clamp(0.0, 1.0);
@@ -615,38 +635,214 @@ impl TransformerBlock {
 
     /// Apply similarity context to input (single step)
     #[inline]
-    fn apply_similarity_context_step(
+    fn apply_similarity_context_step_into(
         &self,
-        input: &ndarray::Array1<f32>,
+        input: &ndarray::ArrayView1<f32>,
         context: &Array2<f32>,
-    ) -> ndarray::Array1<f32> {
+        output: &mut ndarray::Array1<f32>,
+    ) {
         let strength = self.similarity_context_strength[[0, 0]];
         let strength = if strength.is_finite() { strength } else { 0.0 };
+        
         if strength == 0.0 {
-            return input.clone();
+            output.assign(input);
+            return;
         }
 
         let embed_dim = input.len();
         if embed_dim != context.nrows() || context.nrows() != context.ncols() {
-            return input.clone();
+            output.assign(input);
+            return;
         }
 
         let d = embed_dim.max(1) as f32;
         let k = strength / d;
 
         // input (D) dot context (D, D) -> (D)
-        let mut out = input.dot(context);
-
-        // Element-wise add: out = input + k * out
-        out.zip_mut_with(input, |o, &x| {
-            let ms = if o.is_finite() { *o } else { 0.0 };
-            let xs = if x.is_finite() { x } else { 0.0 };
-            *o = xs + k * ms;
-        });
-        out
+        // output = input + k * (input * context)
+        // Use general_mat_vec_mul: y = alpha * A * x + beta * y
+        // We want y = 1.0 * input + k * (context^T * input)
+        // Step 1: y = k * context^T * input
+        ndarray::linalg::general_mat_vec_mul(k, &context.t(), input, 0.0, output);
+        // Step 2: y += input
+        output.zip_mut_with(input, |o, &i| *o += i);
     }
 
-    /// Streaming forward step for token-by-token inference.
+    /// Streaming forward step for token-by-token inference (Zero-Allocation).
+    pub fn forward_step_into(
+        &mut self, 
+        input: &ndarray::ArrayView1<f32>, 
+        output: &mut ndarray::Array1<f32>
+    ) {
+        self.forward_step_into_with_overrides(input, output, None, None, None);
+    }
+
+    pub fn forward_step_into_with_overrides(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+        norm1_overrides: Option<(Option<f64>, Option<f64>, Option<f64>)>,
+        norm2_overrides: Option<(Option<f64>, Option<f64>, Option<f64>)>,
+        moh_overrides: Option<Vec<f64>>,
+    ) {
+        // Initialize workspace if needed
+        if self.streaming_workspace.is_none() {
+            let dim = self.config.embed_dim;
+            self.streaming_workspace = Some(TransformerBlockStreamingWorkspace {
+                norm1_out: Array1::zeros(dim),
+                mix_out: Array1::zeros(dim),
+                norm2_out: Array1::zeros(dim),
+                ffn_out: Array1::zeros(dim),
+                residual: Array1::zeros(dim),
+                input_used: Array1::zeros(dim),
+                eprop_out: Array1::zeros(dim),
+                eprop_workspace: crate::domain::layers::transformer::components::eprop_adaptor::EPropAdaptorStreamingWorkspace {
+                    neuron_workspace: crate::domain::eprop::neuron::NeuronWorkspace::new(dim),
+                    eps_f_workspace: Array1::zeros(dim),
+                },
+            });
+        }
+        let mut workspace = self.streaming_workspace.take().unwrap();
+
+        // Apply incoming similarity context if present
+        if let Some(ctx) = self.incoming_similarity_context.as_ref() {
+            self.apply_similarity_context_step_into(input, ctx, &mut workspace.input_used);
+        } else {
+            workspace.input_used.assign(input);
+        }
+        let input_used_view = workspace.input_used.view();
+
+        // 1. Pre-Attention Norm
+        self.pre_attention_norm.normalize_step_into(
+            &input_used_view,
+            &mut workspace.norm1_out,
+            norm1_overrides,
+        );
+        let norm1_out_view = workspace.norm1_out.view();
+
+        // 2. Temporal Mixing
+        // Apply overrides if available
+        if let Some(overrides) = moh_overrides {
+            match &mut self.temporal_mixing {
+                TemporalMixingLayer::RgLruMoH(rglru) => rglru.set_verification_overrides(Some(overrides)),
+                TemporalMixingLayer::MambaMoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
+                TemporalMixingLayer::Mamba2MoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
+                _ => {}
+            }
+        }
+
+        self.temporal_mixing.forward_step_into(&norm1_out_view, &mut workspace.mix_out);
+        
+        // Titan Memory Integration
+        if !matches!(
+            self.temporal_mixing,
+            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
+        ) {
+            let _mix_out_processed = workspace.mix_out.clone(); // Temporary clone for logic flow, optimized below
+            // Actually, we can do in-place update if Titan allows.
+            // Titan: apply_step_into(input, out, workspace)
+            // It adds to `out`.
+            // We want `mix_out = mix_out + titan(norm1_out)`?
+            // Original code:
+            // apply_into_out_with_workspace(&mut mix_out, &norm1_out, ...)
+            // Yes, it accumulates into mix_out.
+            
+            self.config.titan_memory.apply_step_into(
+                &norm1_out_view,
+                &mut workspace.mix_out,
+                &mut self.titan_memory_workspace,
+            );
+        }
+        let mix_out_view = workspace.mix_out.view();
+
+        // Update activation similarity matrix
+        // We need 2D views for the current update method.
+        // Optimization: implement update_activation_similarity_matrix_step
+        // For now, use existing with view insert.
+        let input_used_2d = input_used_view.insert_axis(ndarray::Axis(0));
+        let mix_out_2d = mix_out_view.insert_axis(ndarray::Axis(0));
+        
+        self.update_activation_similarity_matrix(&input_used_2d, &mix_out_2d);
+        
+        // Head activity ratio logic...
+        let head_activity_ratio = match &self.temporal_mixing {
+             TemporalMixingLayer::Attention(attn) => {
+                if let Some(avg) = attn.last_avg_active_heads {
+                    let denom = (self.config.num_heads.max(1)) as f32;
+                    let r = avg / denom;
+                    if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
+                } else { 1.0 }
+            }
+            TemporalMixingLayer::RgLruMoH(rglru) => {
+                if let Some(avg) = rglru.last_avg_active_heads {
+                    let denom = (self.config.num_heads.max(1)) as f32;
+                    let r = avg / denom;
+                    if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
+                } else { 1.0 }
+            }
+             _ => 1.0
+        };
+
+        let head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
+            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
+            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
+            _ => None,
+        };
+
+        // Adaptive Residuals
+        let alpha = 1.0;
+        if let Some(ar) = &mut self.adaptive_residuals {
+             ar.apply_attention_residual_step_into(
+                 &input_used_view,
+                 &mix_out_view,
+                 &mut workspace.residual,
+                 Some(head_activity_ratio),
+                 head_activity_vec,
+             );
+        } else {
+             // workspace.residual = input + alpha * mix_out
+             workspace.residual.assign(&input_used_view);
+             workspace.residual.zip_mut_with(&workspace.mix_out, |r, &m| *r += alpha * m);
+        }
+        let residual_view = workspace.residual.view();
+
+        // 3. Pre-FFN Norm
+        self.pre_ffn_norm.normalize_step_into(
+            &residual_view,
+            &mut workspace.norm2_out,
+            norm2_overrides,
+        );
+        let norm2_out_view = workspace.norm2_out.view();
+
+        // 4. Feedforward
+        self.feedforward.forward_step_into(&norm2_out_view, &mut workspace.ffn_out);
+        
+        // Final Residual: output = residual + ffn_out
+        if let Some(ref mut residuals) = self.adaptive_residuals {
+            residuals.apply_ffn_residual_step_into(
+                &residual_view,
+                &workspace.ffn_out.view(),
+                output,
+            );
+        } else {
+            output.assign(&residual_view);
+            output.zip_mut_with(&workspace.ffn_out, |o, &f| *o += f);
+        }
+
+        // E-Prop Adaptor
+        if let Some(ref mut adaptor) = self.eprop_adaptor {
+             // TODO: Make EProp zero-alloc. For now, we adapt.
+             let out_2d = output.view().insert_axis(ndarray::Axis(0)).to_owned();
+             if let Ok(adaptation) = adaptor.forward(&out_2d) {
+                 let adapt_1d = adaptation.index_axis(ndarray::Axis(0), 0);
+                 *output += &adapt_1d;
+             }
+        }
+
+        self.streaming_workspace = Some(workspace);
+    }
+
+    /// Apply similarity context to input (single step)
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
         self.forward_step_with_overrides(input, None, None, None)
     }
@@ -658,145 +854,9 @@ impl TransformerBlock {
         norm2_overrides: Option<(Option<f64>, Option<f64>, Option<f64>)>,
         moh_overrides: Option<Vec<f64>>,
     ) -> ndarray::Array1<f32> {
-        // Apply incoming similarity context if present
-        let input_used = if let Some(ctx) = self.incoming_similarity_context.as_ref() {
-            self.apply_similarity_context_step(input, ctx)
-        } else {
-            input.to_owned()
-        };
-
-        // 1. Pre-Attention Norm
-        // Reshape to (1, D) for RichardsNorm (which expects Array2)
-        let norm1_in = input_used.view().insert_axis(ndarray::Axis(0));
-        
-        let (n1_temp, n1_m, n1_beta) = norm1_overrides.unwrap_or((None, None, None));
-        let norm1_out_2d = self.pre_attention_norm.normalize_with_overrides(
-            &norm1_in.to_owned(),
-            n1_temp,
-            n1_m,
-            n1_beta
-        );
-        let norm1_out = norm1_out_2d.index_axis(ndarray::Axis(0), 0).to_owned();
-
-        // 2. Temporal Mixing
-        // Apply overrides if available
-        if let Some(overrides) = moh_overrides {
-            match &mut self.temporal_mixing {
-                TemporalMixingLayer::RgLruMoH(rglru) => rglru.set_verification_overrides(Some(overrides)),
-                TemporalMixingLayer::MambaMoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
-                _ => {}
-            }
-        }
-
-        let mix_out = self.temporal_mixing.forward_step(&norm1_out);
-
-        // Titan Memory Integration
-        let mut mix_out_processed = mix_out.clone();
-        if !matches!(
-            self.temporal_mixing,
-            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
-        ) {
-            let mut mix_out_2d_arr = mix_out_processed
-                .view()
-                .insert_axis(ndarray::Axis(0))
-                .to_owned();
-            let norm1_out_2d_ref = norm1_out.view().insert_axis(ndarray::Axis(0)).to_owned();
-            
-            self.config.titan_memory.apply_into_out_with_workspace(
-                &mut mix_out_2d_arr,
-                &norm1_out_2d_ref,
-                &mut self.titan_memory_workspace,
-            );
-            mix_out_processed = mix_out_2d_arr
-                .index_axis(ndarray::Axis(0), 0)
-                .to_owned();
-        }
-
-        // Update activation similarity matrix
-        let input_used_2d = input_used.view().insert_axis(ndarray::Axis(0)).to_owned();
-        let mix_out_2d = mix_out_processed
-            .view()
-            .insert_axis(ndarray::Axis(0))
-            .to_owned();
-        self.update_activation_similarity_matrix(&input_used_2d, &mix_out_2d);
-
-        // Head activity ratio
-        let head_activity_ratio = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => {
-                if let Some(avg) = attn.last_avg_active_heads {
-                    let denom = (self.config.num_heads.max(1)) as f32;
-                    let r = avg / denom;
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            TemporalMixingLayer::RgLruMoH(rglru) => {
-                if let Some(avg) = rglru.last_avg_active_heads {
-                    let denom = (self.config.num_heads.max(1)) as f32;
-                    let r = avg / denom;
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            _ => 1.0,
-        };
-
-        let head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
-            _ => None,
-        };
-
-        // 3. Residual 1 (Adaptive)
-        let residual1 = if let Some(ref mut residuals) = self.adaptive_residuals {
-             let res_out_2d = residuals.apply_attention_residual_with_moh(
-                 &input_used_2d,
-                 &mix_out_2d,
-                 Some(head_activity_ratio),
-                 head_activity_vec,
-             );
-             res_out_2d.index_axis(ndarray::Axis(0), 0).to_owned()
-        } else {
-             &mix_out_processed + &input_used
-        };
-
-        // 4. Pre-FFN Norm
-        let norm2_in = residual1.view().insert_axis(ndarray::Axis(0));
-        
-        let (n2_temp, n2_m, n2_beta) = norm2_overrides.unwrap_or((None, None, None));
-        let norm2_out_2d = self.pre_ffn_norm.normalize_with_overrides(
-            &norm2_in.to_owned(),
-            n2_temp,
-            n2_m,
-            n2_beta
-        );
-        let norm2_out = norm2_out_2d.index_axis(ndarray::Axis(0), 0).to_owned();
-
-        // 5. FeedForward
-        let ffn_out = self.feedforward.forward_step(&norm2_out);
-
-        // 6. Residual 2
-        let mut output = &ffn_out + &residual1;
-
-        // E-Prop Adaptor
-        if let Some(ref mut adaptor) = self.eprop_adaptor {
-             let out_2d = output.view().insert_axis(ndarray::Axis(0));
-             if let Ok(adaptation) = adaptor.forward(&out_2d.to_owned()) {
-                 let adapt_1d = adaptation.index_axis(ndarray::Axis(0), 0);
-                 output += &adapt_1d;
-             }
-        }
-
+        let dim = input.len();
+        let mut output = ndarray::Array1::<f32>::zeros(dim);
+        self.forward_step_into_with_overrides(&input.view(), &mut output, norm1_overrides, norm2_overrides, moh_overrides);
         output
     }
 
@@ -1037,7 +1097,7 @@ impl Layer for TransformerBlock {
         }
 
         // Update per-layer similarity representation matrix (input→mix-output channel similarity).
-        self.update_activation_similarity_matrix(input_used_arc.as_ref(), &mix_out);
+        self.update_activation_similarity_matrix(&input_used_arc.as_ref().view(), &mix_out.view());
 
         // Head activity ratio from MoH (avg active heads / num_heads).
         let head_activity_ratio = match &self.temporal_mixing {

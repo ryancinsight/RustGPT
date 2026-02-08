@@ -5,5 +5,6 @@ pub mod memory;
 pub mod params;
 pub mod poly_attention;
 pub mod position;
+pub mod ring_attention;
 pub mod sliding_window_attention;
 pub mod utils;

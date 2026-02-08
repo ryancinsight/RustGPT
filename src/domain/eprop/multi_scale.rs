@@ -92,11 +92,44 @@ impl MultiScaleTraces {
         }
     }
 
+    /// Compute weighted trace combination into provided buffers (Zero-Allocation)
+    ///
+    /// Combines traces from all scales using current weights:
+    /// out = w_fast * trace_fast + w_medium * trace_medium + w_slow * trace_slow
+    pub fn compute_weighted_traces_into(
+        &self,
+        out_eps_x: Option<&mut Array1<f32>>,
+        out_eps_f: Option<&mut Array1<f32>>,
+    ) {
+        let weights = self.get_current_weights();
+        let (w_f, w_m, w_s) = (weights.fast, weights.medium, weights.slow);
+
+        if let Some(out) = out_eps_f {
+            ndarray::Zip::from(out)
+                .and(&self.fast.eps_f)
+                .and(&self.medium.eps_f)
+                .and(&self.slow.eps_f)
+                .for_each(|o, &f, &m, &s| {
+                    *o = f * w_f + m * w_m + s * w_s;
+                });
+        }
+        
+        if let Some(out) = out_eps_x {
+             ndarray::Zip::from(out)
+                .and(&self.fast.eps_x)
+                .and(&self.medium.eps_x)
+                .and(&self.slow.eps_x)
+                .for_each(|o, &f, &m, &s| {
+                    *o = f * w_f + m * w_m + s * w_s;
+                });
+        }
+    }
+
     /// Update all trace scales with current state and input
     pub fn update(
         &mut self,
         state: &NeuronState,
-        input: &Array1<f32>,
+        input: &ndarray::ArrayView1<f32>,
         fast_updater: &TraceUpdater,
         medium_updater: &TraceUpdater,
         slow_updater: &TraceUpdater,
@@ -318,7 +351,7 @@ impl MultiScaleUpdater {
         &mut self,
         traces: &mut MultiScaleTraces,
         state: &NeuronState,
-        input: &Array1<f32>,
+        input: &ndarray::ArrayView1<f32>,
         learning_signal: &Array1<f32>,
     ) -> super::Result<(Array1<f32>, Array1<f32>)> {
         // Update all traces

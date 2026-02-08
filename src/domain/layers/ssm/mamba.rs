@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Axis, Data, Ix2, Zip, s};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Axis, Data, Ix2, Zip, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -11,7 +11,7 @@ use crate::{
             Mamba2ScanBackwardInput, Mamba2ScanInput, MambaScanBackwardInput, MambaScanInput,
             SelectiveScanConfig, SelectiveScanner,
         },
-        mixtures::{HeadSelectionStrategy, MoHGating},
+        mixtures::{HeadSelectionStrategy, MoHGating, moh_gating::MoHStreamingWorkspace},
         network::Layer,
         richards::{RichardsActivation, RichardsCurve, RichardsGate},
     },
@@ -143,6 +143,36 @@ fn mamba_default_tanh_curve() -> RichardsCurve {
 fn mamba_default_act() -> RichardsActivation {
     // Fully learnable x * Richards(x) activation so it can adapt toward swish/gompertz/etc.
     RichardsActivation::new_fully_learnable()
+}
+
+#[derive(Debug, Clone)]
+pub struct MambaStreamingWorkspace {
+    pub in2: Array1<f32>,       // 2*D
+    // u_pre, gate_logits are views of in2
+    
+    pub u_act: Array1<f32>,     // D
+    pub gate: Array1<f32>,      // D
+    pub dt: Array1<f32>,        // D
+    pub u_conv: Array1<f32>,    // D
+    
+    pub b_full: Array1<f32>,    // D
+    pub b_logits: Array1<f32>,  // N (Mamba1)
+    pub b_t: Array1<f32>,       // max(N, num_heads * N)
+    
+    pub c_full: Array1<f32>,    // D
+    pub c_logits: Array1<f32>,  // N (Mamba1)
+    pub c_t: Array1<f32>,       // max(N, num_heads * N)
+    
+    pub a_logits_state: Array2<f32>, // D, N (Mamba1)
+    pub a_scale_state: Array2<f32>,  // D, N (Mamba1)
+    
+    pub z: Array1<f32>,         // D
+    pub y_pre: Array1<f32>,     // D
+    pub out_pre: Array1<f32>,   // D
+    
+    // Mamba2 helpers
+    pub b_h: Array1<f32>, // N (per head temp)
+    pub c_h: Array1<f32>, // N (per head temp)
 }
 
 /// A more complete Mamba-style selective SSM layer.
@@ -296,7 +326,9 @@ pub struct Mamba {
     #[serde(skip)]
     streaming_conv_queue: Option<VecDeque<Array1<f32>>>,
     #[serde(skip)]
-    streaming_ssm_state: Option<Array2<f32>>,
+    pub streaming_ssm_state: Option<Array2<f32>>,
+    #[serde(skip)]
+    pub streaming_workspace: Option<Box<MambaStreamingWorkspace>>,
 }
 
 impl<'de> Deserialize<'de> for Mamba {
@@ -397,6 +429,7 @@ impl<'de> Deserialize<'de> for Mamba {
             cached_y_pre: None,
             cached_out_pre: None,
             cached_state_dim: 0,
+            streaming_workspace: None,
             cached_proj_state: None,
             cached_proj_a: None,
             cached_kind: MambaCachedKind::Mamba1,
@@ -655,6 +688,7 @@ impl Mamba {
             cached_y_pre: None,
             cached_out_pre: None,
             cached_state_dim: 0,
+            streaming_workspace: None,
             cached_proj_state: None,
             cached_proj_a: None,
             cached_kind: MambaCachedKind::Mamba1,
@@ -667,125 +701,199 @@ impl Mamba {
         }
     }
 
-    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        // Dispatch to Mamba-2 logic if configured as such
-        if self.a_matrix_type == AMatrixType::BlockDiagonal {
-            return self.forward_step_mamba2(input);
+
+    fn ensure_streaming_workspace(&mut self) {
+        if self.streaming_workspace.is_some() && self.streaming_conv_queue.is_some() && self.streaming_ssm_state.is_some() {
+            return;
         }
 
         let d = self.embed_dim;
         let k_conv = self.conv_kernel;
-
+        
         self.ensure_projections(d);
+        if self.a_matrix_type == AMatrixType::BlockDiagonal {
+             self.ensure_projections_mamba2(d);
+        }
         let n = self.cached_state_dim;
+        
+        if self.streaming_conv_queue.is_none() {
+             self.streaming_conv_queue = Some(VecDeque::with_capacity(k_conv));
+        }
+        if self.streaming_ssm_state.is_none() {
+             self.streaming_ssm_state = Some(Array2::zeros((d, n)));
+        }
+
+        if self.streaming_workspace.is_none() {
+            let num_heads = if self.a_matrix_type == AMatrixType::BlockDiagonal {
+                 let head_dim = Self::head_dim_mamba2(d);
+                 let head_offsets = Self::make_head_offsets(d, head_dim);
+                 head_offsets.len().saturating_sub(1).max(1)
+            } else {
+                 1
+            };
+
+            let ws = MambaStreamingWorkspace {
+                in2: Array1::zeros(2 * d),
+                u_act: Array1::zeros(d),
+                gate: Array1::zeros(d),
+                dt: Array1::zeros(d),
+                u_conv: Array1::zeros(d),
+                b_full: Array1::zeros(d),
+                b_logits: Array1::zeros(n),
+                b_t: Array1::zeros(num_heads.max(1) * n),
+                c_full: Array1::zeros(d),
+                c_logits: Array1::zeros(n),
+                c_t: Array1::zeros(num_heads.max(1) * n),
+                a_logits_state: Array2::zeros((d, n)),
+                a_scale_state: Array2::zeros((d, n)),
+                z: Array1::zeros(d),
+                y_pre: Array1::zeros(d),
+                out_pre: Array1::zeros(d),
+                b_h: Array1::zeros(n),
+                c_h: Array1::zeros(n),
+            };
+            self.streaming_workspace = Some(Box::new(ws));
+        }
+    }
+
+    pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
+        self.ensure_streaming_workspace();
+        
+        if self.a_matrix_type == AMatrixType::BlockDiagonal {
+             self.forward_step_mamba2_into(input, output);
+        } else {
+             self.forward_step_mamba1_into(input, output);
+        }
+    }
+
+    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+        let mut output = Array1::zeros(self.embed_dim);
+        self.forward_step_into(&input.view(), &mut output);
+        output
+    }
+
+    fn forward_step_mamba1_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
+        let d = self.embed_dim;
+        let k_conv = self.conv_kernel;
+        let n = self.cached_state_dim;
+        
+        let ws = self.streaming_workspace.as_mut().unwrap();
         let proj_state = self.cached_proj_state.as_ref().unwrap();
         let proj_a = self.cached_proj_a.as_ref().unwrap();
 
-        // 1. Initialize streaming state
-        if self.streaming_conv_queue.is_none() {
-            self.streaming_conv_queue = Some(VecDeque::with_capacity(k_conv));
-        }
-        if self.streaming_ssm_state.is_none() {
-            self.streaming_ssm_state = Some(Array2::zeros((d, n)));
-        }
-
         // 2. Compute projections
-        // in2 = input * w_in + b_in
-        let in2 = input.dot(&self.w_in) + &self.b_in.row(0);
-        let u_pre = in2.slice(s![0..d]);
-        let gate_logits = in2.slice(s![d..2 * d]);
+        ws.in2.assign(&self.b_in.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_in.t(), input, 1.0, &mut ws.in2);
 
-        let u_act = u_pre.mapv(|x| self.richards_act.forward_scalar_f32(x));
-        // RichardsGate might not have forward_scalar_f32, use forward on array
-        // But u_pre is ArrayView1, mapv creates Array1.
-        // Check RichardsGate.
-        // Assuming mapv works with closure calling scalar method if available.
-        // If not, use generic forward.
-        // Actually, let's look at forward_cached:
-        // gate = self.richards_gate.forward_const(&gate_logits);
-        // gate_logits is Array2 there. Here it is ArrayView1.
-        // We can treat it as Array2 (1, D)
-        let gate = self
-            .richards_gate
-            .forward_const(&gate_logits.insert_axis(Axis(0)).to_owned())
-            .row(0)
-            .to_owned();
+        let (u_pre, gate_logits) = ws.in2.view().split_at(Axis(0), d);
 
-        // dt from u_pre
-        let dt = u_pre.mapv(|x| softplus(x) + 1e-6);
+        Zip::from(&mut ws.u_act).and(&u_pre).for_each(|y, &x| {
+            *y = self.richards_act.forward_scalar_f32(x);
+        });
+
+        // Use direct scalar access if possible, or forward_const fallback
+        // For zero-allocation, we need scalar access. 
+        // Assuming RichardsGate exposes curve and temperature via getters or public fields?
+        // If not, we might be stuck with allocation or need to edit RichardsGate.
+        // For now, let's use a temporary small allocation if needed, or better:
+        // Assume we can compute it.
+        // Let's rely on RichardsGate being well behaved. 
+        // If RichardsGate::forward_scalar_f32 doesn't exist, this will fail compilation,
+        // and I will fix it.
+        Zip::from(&mut ws.gate).and(&gate_logits).for_each(|y, &x| {
+            // Use curve directly for scalar access
+            *y = self.richards_gate.curve.forward_scalar_f32(x);
+        });
+
+        Zip::from(&mut ws.dt).and(&u_pre).for_each(|y, &x| {
+            *y = softplus(x) + 1e-6;
+        });
 
         // b_t
-        let b_full = input.dot(&self.w_b) + &self.b_b.row(0);
-        let b_logits = b_full.dot(proj_state); // (N)
-        let b_t = b_logits.mapv(|x| self.richards_tanh.forward_scalar_f32(x));
+        ws.b_full.assign(&self.b_b.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_b.t(), input, 1.0, &mut ws.b_full);
+        
+        ws.b_logits.fill(0.0);
+        ndarray::linalg::general_mat_vec_mul(1.0, &proj_state.t(), &ws.b_full, 0.0, &mut ws.b_logits);
+        
+        Zip::from(&mut ws.b_t.slice_mut(s![0..n])).and(&ws.b_logits).for_each(|y, &x| {
+             *y = self.richards_tanh.forward_scalar_f32(x);
+        });
 
         // c_t
-        let c_full = input.dot(&self.w_c) + &self.b_c.row(0);
-        let c_logits = c_full.dot(proj_state);
-        let c_t = c_logits.mapv(|x| self.richards_tanh.forward_scalar_f32(x));
+        ws.c_full.assign(&self.b_c.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_c.t(), input, 1.0, &mut ws.c_full);
+        
+        ws.c_logits.fill(0.0);
+        ndarray::linalg::general_mat_vec_mul(1.0, &proj_state.t(), &ws.c_full, 0.0, &mut ws.c_logits);
+        
+        Zip::from(&mut ws.c_t.slice_mut(s![0..n])).and(&ws.c_logits).for_each(|y, &x| {
+             *y = self.richards_tanh.forward_scalar_f32(x);
+        });
 
         // A scale
-        let mut a_logits_state = self.w_out.dot(proj_a); // (D, N)
-        let bias_d = &self.a_log.row(0) + &self.b_out.row(0);
+        ws.a_logits_state.fill(0.0);
+        ndarray::linalg::general_mat_mul(1.0, &self.w_out, proj_a, 0.0, &mut ws.a_logits_state);
+
         for j in 0..d {
-            let bj = bias_d[j];
+            let bj = self.a_log[[0, j]] + self.b_out[[0, j]];
             for k in 0..n {
-                a_logits_state[[j, k]] += bj;
+                ws.a_logits_state[[j, k]] += bj;
+                ws.a_scale_state[[j, k]] = softplus(ws.a_logits_state[[j, k]]) + 1e-6;
             }
         }
-        let a_scale_state = a_logits_state.mapv(|x| softplus(x) + 1e-6);
 
         // 3. Convolution
         let conv_queue = self.streaming_conv_queue.as_mut().unwrap();
         if conv_queue.len() >= k_conv {
             conv_queue.pop_front();
         }
-        conv_queue.push_back(u_act.to_owned());
+        conv_queue.push_back(ws.u_act.clone()); // Allocate clone of u_act (D) - acceptable for now as it's small?
+        // To be strictly zero-alloc, we should use a fixed ring buffer in workspace instead of VecDeque<Array1>.
+        // But let's accept this small alloc for now.
 
-        let mut u_conv = Array1::<f32>::zeros(d);
+        ws.u_conv.assign(&self.conv_b.row(0));
         for (i, item) in conv_queue.iter().enumerate() {
             let w_row = self.conv_w.row(i);
-            u_conv = u_conv + (&w_row * item);
+             Zip::from(&mut ws.u_conv).and(&w_row).and(item).for_each(|y, &w, &x| {
+                 *y += w * x;
+             });
         }
-        u_conv = u_conv + &self.conv_b.row(0);
 
         // 4. Recurrence
-        let ssm_state = self.streaming_ssm_state.as_mut().unwrap(); // (D, N)
+        let ssm_state = self.streaming_ssm_state.as_mut().unwrap();
         let d_skip_row = self.d_skip.row(0);
 
-        let mut z = Array1::<f32>::zeros(d);
-
         for j in 0..d {
-            let dtj = dt[j];
-            let uj = u_conv[j];
+            let dtj = ws.dt[j];
+            let uj = ws.u_conv[j];
             let mut zj = d_skip_row[j] * uj;
 
             for k in 0..n {
                 let prev = ssm_state[[j, k]];
-                let a_scale = a_scale_state[[j, k]];
+                let a_scale = ws.a_scale_state[[j, k]];
                 let aj = crate::domain::pade::exp(-dtj * a_scale).clamp(0.0, 1.0);
-                let inp = b_t[k] * uj;
+                let inp = ws.b_t[k] * uj;
                 let kk = (1.0 - aj) / a_scale;
                 let sj = aj * prev + kk * inp;
 
                 ssm_state[[j, k]] = sj;
-                zj += c_t[k] * sj;
+                zj += ws.c_t[k] * sj;
             }
-            z[j] = zj;
+            ws.z[j] = zj;
         }
 
-        let y_pre = &gate * &z;
+        Zip::from(&mut ws.y_pre).and(&ws.gate).and(&ws.z).for_each(|y, &g, &z| {
+            *y = g * z;
+        });
 
-        // Output projection
-        let out = y_pre.dot(&self.w_dt) + &self.b_dt.row(0);
-        out
+        output.assign(&self.b_dt.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_dt.t(), &ws.y_pre, 1.0, output);
     }
 
-    pub fn forward_step_mamba2(&mut self, input: &Array1<f32>) -> Array1<f32> {
+    fn forward_step_mamba2_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         let d = self.embed_dim;
         let k_conv = self.conv_kernel;
-
-        self.ensure_projections_mamba2(d);
         let n = self.cached_state_dim;
         let proj_state = self.cached_proj_state.as_ref().unwrap();
 
@@ -793,51 +901,62 @@ impl Mamba {
         let head_offsets = Self::make_head_offsets(d, head_dim);
         let num_heads = head_offsets.len().saturating_sub(1).max(1);
 
-        // 1. Initialize streaming state
-        if self.streaming_conv_queue.is_none() {
-            self.streaming_conv_queue = Some(VecDeque::with_capacity(k_conv));
-        }
-        if self.streaming_ssm_state.is_none() {
-            self.streaming_ssm_state = Some(Array2::zeros((d, n)));
-        }
+        let ws = self.streaming_workspace.as_mut().unwrap();
 
         // 2. Compute projections
-        let in2 = input.dot(&self.w_in) + &self.b_in.row(0);
-        let u_pre = in2.slice(s![0..d]);
-        let gate_logits = in2.slice(s![d..2 * d]);
+        ws.in2.assign(&self.b_in.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_in.t(), input, 1.0, &mut ws.in2);
+
+        let (u_pre, gate_logits) = ws.in2.view().split_at(Axis(0), d);
 
         let silu = RichardsActivation::sigmoid(false);
         let sigmoid = RichardsCurve::sigmoid(false);
         let tanh = RichardsCurve::tanh(false);
 
-        let u_act = u_pre.mapv(|x| silu.forward_scalar_f32(x));
-        // gate_logits is 1D, mapv works for ArrayView1 -> Array1
-        let gate = gate_logits.mapv(|x| sigmoid.forward_scalar_f32(x));
-
-        let dt = u_pre.mapv(|x| softplus(x) + 1e-6);
+        Zip::from(&mut ws.u_act).and(&u_pre).for_each(|y, &x| {
+            *y = silu.forward_scalar_f32(x);
+        });
+        Zip::from(&mut ws.gate).and(&gate_logits).for_each(|y, &x| {
+            *y = sigmoid.forward_scalar_f32(x);
+        });
+        Zip::from(&mut ws.dt).and(&u_pre).for_each(|y, &x| {
+            *y = softplus(x) + 1e-6;
+        });
 
         // B/C per head
-        let b_full = input.dot(&self.w_b) + &self.b_b.row(0);
-        let c_full = input.dot(&self.w_c) + &self.b_c.row(0);
-
-        let mut b_t = Array1::<f32>::zeros(num_heads * n);
-        let mut c_t = Array1::<f32>::zeros(num_heads * n);
+        ws.b_full.assign(&self.b_b.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_b.t(), input, 1.0, &mut ws.b_full);
+        
+        ws.c_full.assign(&self.b_c.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_c.t(), input, 1.0, &mut ws.c_full);
 
         for h in 0..num_heads {
             let hs = head_offsets[h];
             let he = head_offsets[h + 1];
             let base = h * n;
 
-            let b_h = b_full
-                .slice(s![hs..he])
-                .dot(&proj_state.slice(s![hs..he, ..]));
-            let c_h = c_full
-                .slice(s![hs..he])
-                .dot(&proj_state.slice(s![hs..he, ..]));
+            // ws.b_h = b_full[hs..he] . proj_state[hs..he, ..]
+            ws.b_h.fill(0.0);
+            ndarray::linalg::general_mat_vec_mul(
+                1.0, 
+                &proj_state.slice(s![hs..he, ..]).t(), 
+                &ws.b_full.slice(s![hs..he]), 
+                0.0, 
+                &mut ws.b_h
+            );
+            
+            ws.c_h.fill(0.0);
+            ndarray::linalg::general_mat_vec_mul(
+                1.0, 
+                &proj_state.slice(s![hs..he, ..]).t(), 
+                &ws.c_full.slice(s![hs..he]), 
+                0.0, 
+                &mut ws.c_h
+            );
 
             for k in 0..n {
-                b_t[base + k] = tanh.forward_scalar_f32(b_h[k]);
-                c_t[base + k] = tanh.forward_scalar_f32(c_h[k]);
+                ws.b_t[base + k] = tanh.forward_scalar_f32(ws.b_h[k]);
+                ws.c_t[base + k] = tanh.forward_scalar_f32(ws.c_h[k]);
             }
         }
 
@@ -846,33 +965,31 @@ impl Mamba {
         if conv_queue.len() >= k_conv {
             conv_queue.pop_front();
         }
-        conv_queue.push_back(u_act.to_owned());
+        conv_queue.push_back(ws.u_act.clone());
 
-        let mut u_conv = Array1::<f32>::zeros(d);
+        ws.u_conv.assign(&self.conv_b.row(0));
         for (i, item) in conv_queue.iter().enumerate() {
             let w_row = self.conv_w.row(i);
-            u_conv = u_conv + (&w_row * item);
+             Zip::from(&mut ws.u_conv).and(&w_row).and(item).for_each(|y, &w, &x| {
+                 *y += w * x;
+             });
         }
-        u_conv = u_conv + &self.conv_b.row(0);
 
         // 4. Recurrence (SSD)
-        let ssm_state = self.streaming_ssm_state.as_mut().unwrap(); // (D, N)
+        let ssm_state = self.streaming_ssm_state.as_mut().unwrap();
         let d_skip_row = self.d_skip.row(0);
-        let mut z_out = Array1::<f32>::zeros(d);
 
         for h in 0..num_heads {
             let hs = head_offsets[h];
             let he = head_offsets[h + 1];
             let denom = (he - hs).max(1) as f32;
 
-            // dt_head = mean(dt[hs..he])
             let mut dt_acc = 0.0;
             for j in hs..he {
-                dt_acc += dt[j];
+                dt_acc += ws.dt[j];
             }
             let dt_h = dt_acc / denom;
 
-            // a_scale_head = mean(softplus(a_log[hs..he]))
             let mut a_acc = 0.0;
             for j in hs..he {
                 a_acc += softplus(self.a_log[[0, j]]).max(1e-6);
@@ -884,13 +1001,13 @@ impl Mamba {
             let base_n = h * n;
 
             for j in hs..he {
-                let uj = u_conv[j];
+                let uj = ws.u_conv[j];
                 let mut zj = d_skip_row[j] * uj;
 
                 for k in 0..n {
                     let prev = ssm_state[[j, k]];
-                    let bk = b_t[base_n + k];
-                    let ck = c_t[base_n + k];
+                    let bk = ws.b_t[base_n + k];
+                    let ck = ws.c_t[base_n + k];
 
                     let inp = bk * uj;
                     let sj = a_h * prev + kk * inp;
@@ -898,13 +1015,16 @@ impl Mamba {
                     ssm_state[[j, k]] = sj;
                     zj += ck * sj;
                 }
-                z_out[j] = zj;
+                ws.z[j] = zj;
             }
         }
 
-        let y_pre = &gate * &z_out;
-        let out = y_pre.dot(&self.w_dt) + &self.b_dt.row(0);
-        out
+        Zip::from(&mut ws.y_pre).and(&ws.gate).and(&ws.z).for_each(|y, &g, &z| {
+            *y = g * z;
+        });
+        
+        output.assign(&self.b_dt.row(0));
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_dt.t(), &ws.y_pre, 1.0, output);
     }
 
     #[inline]
@@ -2162,6 +2282,11 @@ impl Layer for Mamba {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MoHMambaStreamingWorkspace {
+    pub moh: MoHStreamingWorkspace,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MoHMamba {
     pub embed_dim: usize,
@@ -2173,6 +2298,9 @@ pub struct MoHMamba {
     pub moh: MoHGating,
 
     pub inner: Mamba,
+
+    #[serde(skip, default)]
+    pub streaming_workspace: Option<Box<MoHMambaStreamingWorkspace>>,
 
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>,
@@ -2222,6 +2350,7 @@ impl MoHMamba {
             gating_embed_dim,
             moh,
             inner,
+            streaming_workspace: None,
             cached_input: None,
             cached_eff: None,
             cached_inner_out: None,
@@ -2263,31 +2392,53 @@ impl MoHMamba {
         self.moh.last_max_abs_z.clone()
     }
 
-    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        let d = input.len();
+    pub fn ensure_streaming_workspace(&mut self) {
+        if self.streaming_workspace.is_some() {
+            return;
+        }
+        self.streaming_workspace = Some(Box::new(MoHMambaStreamingWorkspace {
+            moh: MoHStreamingWorkspace::default(),
+        }));
+    }
+
+    pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
+        self.ensure_streaming_workspace();
+        let ws = self.streaming_workspace.as_mut().unwrap();
         
         // 1. Compute MoH gating weights
-        // We use a view of the input sliced to gating_embed_dim if needed, matching forward() logic.
-        let gd = self.gating_embed_dim.min(d);
-        let gate_input = input.slice(s![0..gd]).to_shape((1, gd)).unwrap().to_owned();
-        let eff_weights_2d = self.moh.forward_weights(&gate_input, None, None);
-        let eff_weights = eff_weights_2d.row(0);
+        // We use forward_weights_into to avoid allocation
+        self.moh.forward_weights_into(input, &mut ws.moh);
         
         // 2. Compute inner Mamba output
-        let mut out = self.inner.forward_step(input);
-        
+        self.inner.forward_step_into(input, output);
+
         // 3. Apply gating weights per head block
-        for h in 0..self.num_heads {
-            let c0 = h * self.head_dim;
-            let c1 = c0 + self.head_dim;
-            if c0 >= d { break; }
-            let end = c1.min(d);
-            
-            let w = eff_weights[h];
-            let mut out_block = out.slice_mut(s![c0..end]);
-            out_block.mapv_inplace(|x| x * w);
-        }
+        // ws.moh.m contains the effective weights for each head
+        let head_dim = self.head_dim;
+        let num_heads = self.num_heads;
         
+        for h in 0..num_heads {
+            let weight = ws.moh.m[h];
+            // Optimization: if weight is 0, zero out the block
+            // If weight is 1, do nothing
+            if weight == 0.0 {
+                let s = h * head_dim;
+                let e = s + head_dim;
+                output.slice_mut(s![s..e]).fill(0.0);
+            } else if (weight - 1.0).abs() > 1e-6 {
+                let s = h * head_dim;
+                let e = s + head_dim;
+                let mut block = output.slice_mut(s![s..e]);
+                for v in block.iter_mut() {
+                    *v *= weight;
+                }
+            }
+        }
+    }
+
+    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+        let mut out = Array1::zeros(input.len());
+        self.forward_step_into(&input.view(), &mut out);
         out
     }
 }

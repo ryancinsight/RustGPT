@@ -603,6 +603,14 @@ struct RouterParamInfo {
     total_params: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExpertSelectorWorkspace {
+    pub hidden: ndarray::Array1<f32>,
+    pub normalized: ndarray::Array1<f32>,
+    pub activated: ndarray::Array1<f32>,
+    pub logits: ndarray::Array1<f32>,
+}
+
 /// Enhanced expert selector inspired by AutoDeco
 ///
 /// This implements a two-layer neural network for expert routing with proper
@@ -655,9 +663,80 @@ pub struct ExpertSelector {
     /// Cached per-head activity vector used for conditioning during the last predict.
     #[serde(skip)]
     cached_head_activity_vec: Option<ndarray::Array1<f32>>,
+
+    /// Workspace for streaming inference
+    #[serde(skip)]
+    pub streaming_workspace: Option<ExpertSelectorWorkspace>,
 }
 
 impl ExpertSelector {
+    /// Compute logits for a single token step without allocation
+    pub fn predict_step_logits_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
+        // Initialize workspace if needed
+        if self.streaming_workspace.is_none() {
+            let hidden_dim = self.bias1.len();
+            let num_experts = self.bias2.len();
+            self.streaming_workspace = Some(ExpertSelectorWorkspace {
+                hidden: ndarray::Array1::zeros(hidden_dim),
+                normalized: ndarray::Array1::zeros(hidden_dim),
+                activated: ndarray::Array1::zeros(hidden_dim),
+                logits: ndarray::Array1::zeros(num_experts),
+            });
+        }
+        let workspace = self.streaming_workspace.as_mut().unwrap();
+
+        // 1. Layer 1: h = xW1 + b1
+        // input: (D,), W1: (D, H), b1: (H,)
+        // ndarray dot: vector dot matrix -> vector
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &self.weights1.t(),
+            input,
+            0.0,
+            &mut workspace.hidden,
+        );
+        workspace.hidden += &self.bias1;
+
+        // 2. Norm
+        if let (Some(h_slice), Some(norm_slice)) = (
+            workspace.hidden.as_slice(),
+            workspace.normalized.as_slice_mut(),
+        ) {
+            self.norm.normalize_into_f32(h_slice, norm_slice);
+        } else {
+             // Fallback
+             self.norm.normalize_step_into(&workspace.hidden.view(), &mut workspace.normalized, None);
+        }
+
+        // 3. Activation
+        if let (Some(n_slice), Some(act_slice)) = (
+            workspace.normalized.as_slice(),
+            workspace.activated.as_slice_mut(),
+        ) {
+            self.activation.forward_into_f32(n_slice, act_slice);
+        } else {
+             // Fallback: unwrap because workspaces should be contiguous
+             self.activation.forward_into_f32(
+                 workspace.normalized.as_slice().unwrap(),
+                 workspace.activated.as_slice_mut().unwrap()
+             );
+        }
+
+        // 4. Layer 2: logits = h_act W2 + b2
+        // h_act: (H,), W2: (H, E), b2: (E,)
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &self.weights2.t(),
+            &workspace.activated,
+            0.0,
+            output,
+        );
+        *output += &self.bias2;
+    }
     /// Create a new expert selector with AutoDeco-inspired architecture
     pub fn new(embed_dim: usize, router_hidden_dim: usize, num_experts: usize) -> Self {
         use rand::Rng;
@@ -701,6 +780,7 @@ impl ExpertSelector {
             cached_logits: None,
             cached_output: None,
             cached_head_activity_vec: None,
+            streaming_workspace: None,
         }
     }
 
@@ -820,6 +900,25 @@ impl ExpertSelector {
         self.cached_output = Some(output.clone());
 
         output
+    }
+
+    /// Streaming forward pass returning logits (pre-softmax)
+    pub fn predict_step_logits(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
+        let mut logits = ndarray::Array1::<f32>::zeros(self.bias2.len());
+        self.predict_step_logits_into(&input.view(), &mut logits);
+        logits
+    }
+
+
+    /// Predict routing probabilities for a single token (step mode)
+    pub fn predict_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
+        let logits = self.predict_step_logits(input);
+
+        // Softmax
+        let logits_mat = logits.view().insert_axis(ndarray::Axis(0));
+        let probs_mat = self.softmax.forward_immutable(&logits_mat);
+
+        probs_mat.index_axis(ndarray::Axis(0), 0).to_owned()
     }
 
     /// Forward pass for auxiliary computation (immutable)
@@ -1053,6 +1152,16 @@ struct ExpertParamInfo {
 }
 
 impl RichardsExpert {
+    /// Streaming forward step for token-by-token inference
+    pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
+        self.glu.forward_step(input)
+    }
+
+    /// Streaming forward step with pre-allocated output buffer (zero-allocation)
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
+        self.glu.forward_step_into(input, output);
+    }
+
     /// Create a new expert with specified dimensions
     pub fn new(embedding_dim: usize, expert_hidden_dim: usize) -> Self {
         Self {
@@ -1146,6 +1255,16 @@ impl Layer for RichardsExpert {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MoeStreamingWorkspace {
+    pub logits: ndarray::Array1<f32>,
+    pub top_k_indices: Vec<usize>,
+    pub top_k_scores: Vec<f32>,
+    pub expert_output_acc: ndarray::Array1<f32>,
+    pub expert_output_buffer: ndarray::Array1<f32>,
+    pub best_buffer: Vec<(f32, usize)>,
+}
+
 /// Mixture of Experts layer combining routing and expert execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixtureOfExperts {
@@ -1198,6 +1317,10 @@ pub struct MixtureOfExperts {
 
     #[serde(skip)]
     cached_aux_loss: f32,
+
+    /// Workspace for streaming inference
+    #[serde(skip)]
+    pub streaming_workspace: Option<MoeStreamingWorkspace>,
 }
 
 impl MixtureOfExperts {
@@ -1243,6 +1366,7 @@ impl MixtureOfExperts {
             cached_active_experts: None,
             cached_shared_flags: None,
             cached_aux_loss: 0.0,
+            streaming_workspace: None,
         }
     }
 
@@ -1429,6 +1553,111 @@ impl MixtureOfExperts {
     /// Forward pass: predict routing → all experts process → weighted sum
     pub fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
         self.forward_with_head_activity(input, None)
+    }
+
+    /// Streaming forward step for token-by-token inference
+    pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
+        let mut output = ndarray::Array1::zeros(input.raw_dim());
+        self.forward_step_into(&input.view(), &mut output);
+        output
+    }
+
+    /// Streaming forward step with pre-allocated output buffer (zero-allocation)
+    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
+        // Initialize workspace if needed
+        if self.streaming_workspace.is_none() {
+            let num_experts = self.config.num_experts;
+            let embed_dim = input.len();
+            self.streaming_workspace = Some(MoeStreamingWorkspace {
+                logits: ndarray::Array1::zeros(num_experts),
+                top_k_indices: Vec::with_capacity(num_experts),
+                top_k_scores: Vec::with_capacity(num_experts),
+                expert_output_acc: ndarray::Array1::zeros(embed_dim),
+                expert_output_buffer: ndarray::Array1::zeros(embed_dim),
+                best_buffer: Vec::with_capacity(num_experts),
+            });
+        }
+        
+        let workspace = self.streaming_workspace.as_mut().unwrap();
+        
+        // Ensure dimensions
+        if workspace.logits.len() != self.config.num_experts {
+            workspace.logits = ndarray::Array1::zeros(self.config.num_experts);
+        }
+        if workspace.expert_output_buffer.len() != input.len() {
+            workspace.expert_output_buffer = ndarray::Array1::zeros(input.len());
+        }
+
+        // 1. Get routing logits
+        self.router.predict_step_logits_into(input, &mut workspace.logits);
+
+        // 2. Select top-k experts (Masked Softmax)
+        let num_experts = workspace.logits.len();
+        let k = self.config.gating.num_active.clamp(1, num_experts);
+
+        // Sort logits to find top-k using buffer
+        workspace.best_buffer.clear();
+        for (idx, &val) in workspace.logits.iter().enumerate() {
+            let score = if val.is_finite() {
+                val
+            } else {
+                f32::NEG_INFINITY
+            };
+            workspace.best_buffer.push((score, idx));
+        }
+        workspace.best_buffer.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Take top k
+        let top_k_entries = &workspace.best_buffer[..k];
+
+        // Compute softmax over top-k
+        let max_val = top_k_entries
+            .iter()
+            .map(|(s, _)| *s)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let mut sum_exp = 0.0;
+        workspace.top_k_indices.clear();
+        workspace.top_k_scores.clear();
+        
+        for (score, idx) in top_k_entries {
+            if score.is_finite() {
+                let e = crate::domain::pade::PadeExp::exp((*score - max_val) as f64);
+                sum_exp += e;
+                workspace.top_k_scores.push(e as f32);
+                workspace.top_k_indices.push(*idx);
+            } else {
+                workspace.top_k_scores.push(0.0);
+                workspace.top_k_indices.push(*idx);
+            }
+        }
+        
+        // Normalize probabilities
+        let inv_sum = if sum_exp > 0.0 {
+            1.0 / sum_exp
+        } else {
+            0.0
+        };
+
+        // 3. Aggregate expert outputs
+        output.fill(0.0);
+        
+        for (i, &expert_idx) in workspace.top_k_indices.iter().enumerate() {
+            let prob = (workspace.top_k_scores[i] as f64 * inv_sum) as f32;
+            if prob <= 0.0 {
+                continue;
+            }
+            
+            // Expert forward step (zero-alloc)
+            self.experts[expert_idx].forward_step_into(input, &mut workspace.expert_output_buffer);
+            
+            // Accumulate: acc += prob * expert_out
+             ndarray::Zip::from(&mut *output)
+                .and(&workspace.expert_output_buffer)
+                .for_each(|acc, &val| {
+                    *acc += prob * val;
+                });
+        }
     }
 
     /// Forward pass with optional Mixture-of-Heads activity signal.

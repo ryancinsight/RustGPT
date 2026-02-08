@@ -7,6 +7,34 @@ use crate::domain::network::Layer;
 
 pub type TitansMemory = NeuralMemory;
 
+#[derive(Debug, Clone, Default)]
+pub struct NeuralMemoryStreamingWorkspace {
+    // For retrieve
+    pub q: Array1<f32>,
+    pub z_ret: Array1<f32>,
+    pub h_ret: Array1<f32>,
+    pub y_ret: Array1<f32>,
+
+    // For update
+    pub k: Array1<f32>,
+    pub v: Array1<f32>,
+    
+    // For update_memory_step internal
+    pub z_upd: Array1<f32>,
+    pub h_upd: Array1<f32>,
+    pub v_pred: Array1<f32>,
+    pub grad_output: Array1<f32>,
+    
+    pub grad_w2: Array2<f32>,
+    pub grad_b2: Array1<f32>,
+    
+    pub grad_h: Array1<f32>,
+    pub grad_z: Array1<f32>,
+    
+    pub grad_w1: Array2<f32>,
+    pub grad_b1: Array1<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryWeights {
     pub w1: Array2<f32>,
@@ -218,6 +246,11 @@ impl NeuralMemory {
         let memory_mut = self.curr_memory.as_mut().unwrap();
         memory_mut.scale(1.0 - alpha);
         memory_mut.add(momentum);
+
+        if cfg!(debug_assertions) {
+             println!("Batch Update: k[0]={:.6} alpha={:.6} theta={:.6} Grad_w1_sum={:.6} M_w1_sum={:.6} Mem_w1_sum={:.6}", 
+                k[0], alpha, theta, grad_w1.sum(), self.momentum.as_ref().unwrap().w1.sum(), self.curr_memory.as_ref().unwrap().w1.sum());
+        }
     }
 
     fn sigmoid(x: f32) -> f32 {
@@ -241,10 +274,44 @@ impl NeuralMemory {
 
     /// Retrieve memory for a single step (query input -> memory output)
     pub fn retrieve_step(&self, input: &Array1<f32>) -> Array1<f32> {
+        let mut out = Array1::zeros(self.val_dim);
+        let mut ws = NeuralMemoryStreamingWorkspace {
+            q: Array1::zeros(self.key_dim),
+            z_ret: Array1::zeros(self.memory_hidden_dim),
+            h_ret: Array1::zeros(self.memory_hidden_dim),
+            y_ret: Array1::zeros(self.val_dim),
+            ..Default::default()
+        };
+        self.retrieve_step_into(&input.view(), &mut out, &mut ws);
+        out
+    }
+
+    /// Retrieve memory for a single step into output buffer (zero allocation)
+    pub fn retrieve_step_into(
+        &self, 
+        input: &ndarray::ArrayView1<f32>, 
+        output: &mut Array1<f32>,
+        ws: &mut NeuralMemoryStreamingWorkspace
+    ) {
         let memory = self.curr_memory.as_ref().unwrap_or(&self.init_memory);
-        let q = self.w_q.dot(input);
-        let (y, _) = Self::mlp_forward(memory, &q);
-        y
+        
+        // q = W_q * input
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q, input, 0.0, &mut ws.q);
+        
+        // MLP Forward with workspace
+        // z = W1 * q + b1
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
+        ws.z_ret += &memory.b1;
+        
+        // h = ReLU(z)
+        ws.h_ret.assign(&ws.z_ret);
+        ws.h_ret.mapv_inplace(|x| x.max(0.0));
+        
+        // y = W2 * h + b2
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
+        ws.y_ret += &memory.b2;
+        
+        output.assign(&ws.y_ret);
     }
 
     pub fn update(&mut self, input: &Array2<f32>) {
@@ -282,6 +349,116 @@ impl NeuralMemory {
         let theta = Self::sigmoid(self.w_theta.dot(input));
 
         self.update_memory_step(&k, &v, alpha, eta, theta);
+    }
+
+    pub fn update_step_with_workspace(
+        &mut self, 
+        input: &ndarray::ArrayView1<f32>, 
+        ws: &mut NeuralMemoryStreamingWorkspace
+    ) {
+        if self.curr_memory.is_none() {
+            self.reset_memory();
+        }
+
+        // k = W_k * input
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k, input, 0.0, &mut ws.k);
+        
+        // v = W_v * input
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v, input, 0.0, &mut ws.v);
+
+        let alpha = Self::sigmoid(self.w_alpha.dot(input));
+        let eta = Self::sigmoid(self.w_eta.dot(input));
+        let theta = Self::sigmoid(self.w_theta.dot(input));
+
+        self.update_memory_step_with_workspace(alpha, eta, theta, ws);
+    }
+
+    pub fn update_memory_step_with_workspace(
+        &mut self,
+        alpha: f32,
+        eta: f32,
+        theta: f32,
+        ws: &mut NeuralMemoryStreamingWorkspace,
+    ) {
+        if self.curr_memory.is_none() {
+            self.reset_memory();
+        }
+
+        let memory = self.curr_memory.as_ref().unwrap();
+
+        // z = W1 * k + b1
+        // k is already in ws.k from update_step_with_workspace
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.k, 0.0, &mut ws.z_upd);
+        ws.z_upd += &memory.b1;
+
+        // h = ReLU(z)
+        ws.h_upd.assign(&ws.z_upd);
+        ws.h_upd.mapv_inplace(|x| x.max(0.0));
+
+        // v_pred = W2 * h + b2
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_upd, 0.0, &mut ws.v_pred);
+        ws.v_pred += &memory.b2;
+
+        // grad_output = v_pred - v
+        // v is in ws.v
+        ws.grad_output.assign(&ws.v_pred);
+        ws.grad_output -= &ws.v;
+
+        // grad_w2 = grad_output * h^T (Outer Product)
+        // (V, 1) * (1, H) -> (V, H)
+        ndarray::linalg::general_mat_mul(
+            1.0,
+            &ws.grad_output.view().insert_axis(Axis(1)),
+            &ws.h_upd.view().insert_axis(Axis(0)),
+            0.0,
+            &mut ws.grad_w2
+        );
+
+        // grad_b2 = grad_output
+        ws.grad_b2.assign(&ws.grad_output);
+
+        // grad_h = W2^T * grad_output
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2.t(), &ws.grad_output, 0.0, &mut ws.grad_h);
+
+        // grad_z = grad_h * step(z)
+        ws.grad_z.assign(&ws.grad_h);
+        ndarray::Zip::from(&mut ws.grad_z)
+            .and(&ws.z_upd)
+            .for_each(|gz, &z| {
+                if z <= 0.0 { *gz = 0.0; }
+            });
+
+        // grad_w1 = grad_z * k^T (Outer Product)
+        // (H, 1) * (1, K) -> (H, K)
+        ndarray::linalg::general_mat_mul(
+            1.0,
+            &ws.grad_z.view().insert_axis(Axis(1)),
+            &ws.k.view().insert_axis(Axis(0)),
+            0.0,
+            &mut ws.grad_w1
+        );
+
+        // grad_b1 = grad_z
+        ws.grad_b1.assign(&ws.grad_z);
+
+        // Update Momentum
+        let momentum = self.momentum.as_mut().unwrap();
+        momentum.scale(eta);
+
+        momentum.w1.scaled_add(-theta, &ws.grad_w1);
+        momentum.b1.scaled_add(-theta, &ws.grad_b1);
+        momentum.w2.scaled_add(-theta, &ws.grad_w2);
+        momentum.b2.scaled_add(-theta, &ws.grad_b2);
+
+        // Update Memory
+        let memory_mut = self.curr_memory.as_mut().unwrap();
+        memory_mut.scale(1.0 - alpha);
+        memory_mut.add(momentum);
+
+        if cfg!(debug_assertions) {
+             println!("Stream Update: k[0]={:.6} alpha={:.6} theta={:.6} Grad_w1_sum={:.6} M_w1_sum={:.6} Mem_w1_sum={:.6}", 
+                ws.k[0], alpha, theta, ws.grad_w1.sum(), self.momentum.as_ref().unwrap().w1.sum(), self.curr_memory.as_ref().unwrap().w1.sum());
+        }
     }
 
     fn forward_with_trace(&self, input: &Array2<f32>) -> (Array2<f32>, ForwardTrace) {
@@ -367,6 +544,48 @@ impl NeuralMemory {
                 momentums,
             },
         )
+    }
+
+    /// Process a single time step using a workspace to minimize allocations.
+    pub fn forward_step_with_workspace(
+        &mut self,
+        input: &Array1<f32>,
+        ws: &mut NeuralMemoryStreamingWorkspace,
+    ) -> Array1<f32> {
+        if self.curr_memory.is_none() {
+            self.reset_memory();
+        }
+
+        // 1. Projections into workspace
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q, input, 0.0, &mut ws.q);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k, input, 0.0, &mut ws.k);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v, input, 0.0, &mut ws.v);
+
+        let alpha = Self::sigmoid(self.w_alpha.dot(input));
+        let eta = Self::sigmoid(self.w_eta.dot(input));
+        let theta = Self::sigmoid(self.w_theta.dot(input));
+
+        // 2. Retrieve from current memory
+        let memory = self.curr_memory.as_ref().expect("Memory not initialized");
+
+        // z = W1 * q + b1
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
+        ws.z_ret += &memory.b1;
+
+        // h = ReLU(z)
+        ws.h_ret.assign(&ws.z_ret);
+        ws.h_ret.mapv_inplace(|x| x.max(0.0));
+
+        // y = W2 * h + b2
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
+        ws.y_ret += &memory.b2;
+
+        let output = ws.y_ret.clone();
+
+        // 3. Update memory
+        self.update_memory_step_with_workspace(alpha, eta, theta, ws);
+
+        output
     }
 
     /// Process a single time step, updating memory and returning prediction.
@@ -496,6 +715,93 @@ impl NeuralMemory {
         }
     }
 
+    pub fn forward_optimized(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        if self.curr_memory.is_none() {
+            self.reset_memory();
+        }
+
+        let seq_len = input.nrows();
+        
+        // 1. Vectorized Projections
+        // (T, In) x (In, K)^T -> (T, K)
+        let q_all = input.dot(&self.w_q.t());
+        let k_all = input.dot(&self.w_k.t());
+        let v_all = input.dot(&self.w_v.t());
+        
+        let mut alpha_all = input.dot(&self.w_alpha); // (T)
+        let mut eta_all = input.dot(&self.w_eta);     // (T)
+        let mut theta_all = input.dot(&self.w_theta); // (T)
+        
+        // Apply sigmoid activation
+        alpha_all.mapv_inplace(Self::sigmoid);
+        eta_all.mapv_inplace(Self::sigmoid);
+        theta_all.mapv_inplace(Self::sigmoid);
+
+        let mut output = Array2::<f32>::zeros((seq_len, self.val_dim));
+        
+        // Workspace for inner loop to avoid allocations
+        let mut ws = NeuralMemoryStreamingWorkspace {
+            q: Array1::zeros(self.key_dim),
+            z_ret: Array1::zeros(self.memory_hidden_dim),
+            h_ret: Array1::zeros(self.memory_hidden_dim),
+            y_ret: Array1::zeros(self.val_dim),
+            
+            k: Array1::zeros(self.key_dim),
+            v: Array1::zeros(self.val_dim), // v dim is val_dim!
+            
+            z_upd: Array1::zeros(self.memory_hidden_dim),
+            h_upd: Array1::zeros(self.memory_hidden_dim),
+            v_pred: Array1::zeros(self.val_dim),
+            grad_output: Array1::zeros(self.val_dim),
+            
+            grad_w2: Array2::zeros((self.val_dim, self.memory_hidden_dim)),
+            grad_b2: Array1::zeros(self.val_dim),
+            
+            grad_h: Array1::zeros(self.memory_hidden_dim),
+            grad_z: Array1::zeros(self.memory_hidden_dim),
+            
+            grad_w1: Array2::zeros((self.memory_hidden_dim, self.key_dim)),
+            grad_b1: Array1::zeros(self.memory_hidden_dim),
+        };
+
+        // 2. Sequential Memory Update
+        for t in 0..seq_len {
+            // Retrieve inputs from pre-calculated arrays
+            ws.q.assign(&q_all.row(t));
+            
+            // Retrieve: y = Memory(q)
+            let memory = self.curr_memory.as_ref().unwrap();
+            
+            // MLP Forward (Retrieve)
+            // z = W1 * q + b1
+            ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
+            ws.z_ret += &memory.b1;
+            
+            // h = ReLU(z)
+            ws.h_ret.assign(&ws.z_ret);
+            ws.h_ret.mapv_inplace(|x| x.max(0.0));
+            
+            // y = W2 * h + b2
+            ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
+            ws.y_ret += &memory.b2;
+            
+            // Store output
+            output.row_mut(t).assign(&ws.y_ret);
+            
+            // Update: Memory.update(k, v, alpha, eta, theta)
+            ws.k.assign(&k_all.row(t));
+            ws.v.assign(&v_all.row(t));
+            
+            let alpha = alpha_all[t];
+            let eta = eta_all[t];
+            let theta = theta_all[t];
+            
+            self.update_memory_step_with_workspace(alpha, eta, theta, &mut ws);
+        }
+        
+        output
+    }
+
     pub fn gradient_count(&self) -> usize {
         10
     }
@@ -507,31 +813,7 @@ impl Layer for NeuralMemory {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        if self.curr_memory.is_none() {
-            self.reset_memory();
-        }
-
-        let seq_len = input.nrows();
-        let mut output = Array2::<f32>::zeros((seq_len, self.val_dim));
-
-        for t in 0..seq_len {
-            let x_t = input.row(t);
-
-            let q_t = self.w_q.dot(&x_t);
-            let k_t = self.w_k.dot(&x_t);
-            let v_t = self.w_v.dot(&x_t);
-
-            let alpha_t = Self::sigmoid(self.w_alpha.dot(&x_t));
-            let eta_t = Self::sigmoid(self.w_eta.dot(&x_t));
-            let theta_t = Self::sigmoid(self.w_theta.dot(&x_t));
-
-            let (y_t, _) = Self::mlp_forward(self.curr_memory.as_ref().unwrap(), &q_t);
-            output.row_mut(t).assign(&y_t);
-
-            self.update_memory_step(&k_t, &v_t, alpha_t, eta_t, theta_t);
-        }
-
-        output
+        self.forward_optimized(input)
     }
 
     fn backward(&mut self, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {

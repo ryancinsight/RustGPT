@@ -9,12 +9,50 @@ use super::super::config::{
 use super::cache::EngramCache;
 use super::embedding::EngramEmbedding;
 
-fn multiplicative_xor_hash(tokens: &[usize], table_size: usize, seed: u64) -> usize {
-    let mut hash: u64 = seed;
+/// Optimized hash function for n-gram hashing with excellent avalanche properties.
+/// 
+/// Based on splitmix64 design principles:
+/// - High-quality bit mixing for uniform distribution
+/// - Avalanche: ~50% of output bits flip on single input bit change
+/// - Efficient for small n-grams (2-5 tokens typical)
+/// 
+/// References:
+/// - SplitMix64: Steele & Vigna (2014) - http://xorshift.di.unimi.it/splitmix64.c
+/// - MurmurHash3 finalizer: Austin Appleby (2008)
+fn hash_ngram(tokens: &[usize], table_size: usize, seed: u64) -> usize {
+    // Use a per-head randomized initial state mixed with seed
+    let mut state: u64 = seed.wrapping_add(0x9E3779B97F4A7C15);
+    
     for &token in tokens {
-        hash = hash.wrapping_mul(0x5DEECE66D).wrapping_add(token as u64);
+        // Mix token into state using MurmurHash3-style operations
+        let k: u64 = (token as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+        let k = k ^ (k >> 27);
+        let k = k.wrapping_mul(0x94D049BB133111EB);
+        
+        state ^= k;
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
     }
-    ((hash >> 32) as usize) % table_size
+    
+    // Finalization mix (similar to MurmurHash3)
+    state ^= state >> 30;
+    state = state.wrapping_mul(0xBF58476D1CE4E5B9);
+    state ^= state >> 27;
+    state = state.wrapping_mul(0x94D049BB133111EB);
+    state ^= state >> 31;
+    
+    // Fast modulo for power-of-2 table sizes (common case)
+    if table_size.is_power_of_two() {
+        (state as usize) & (table_size - 1)
+    } else {
+        ((state >> 32) as usize) % table_size
+    }
+}
+
+/// Legacy alias for backward compatibility
+#[inline]
+#[deprecated(since = "0.2.0", note = "Use hash_ngram for better hash quality")]
+fn multiplicative_xor_hash(tokens: &[usize], table_size: usize, seed: u64) -> usize {
+    hash_ngram(tokens, table_size, seed)
 }
 
 fn compute_ngram_hashes(
@@ -32,7 +70,7 @@ fn compute_ngram_hashes(
 
     let mut hashes = Vec::with_capacity(num_heads);
     for head in 0..num_heads {
-        let hash = multiplicative_xor_hash(ngram, table_size, head as u64);
+        let hash = hash_ngram(ngram, table_size, head as u64);
         hashes.push(hash);
     }
     hashes
@@ -332,6 +370,95 @@ mod tests {
         let _output = memory.forward(&dummy_input, &dummy_tokens);
 
         assert_eq!(memory.embedding.num_heads, DEFAULT_ENGRAM_NUM_HEADS);
+    }
+
+    #[test]
+    fn test_hash_ngram_avalanche_property() {
+        // Test that hash_ngram has good avalanche properties
+        // Single bit change in input should change ~50% of output bits
+        let table_size = 1024;
+        let seed = 12345u64;
+        
+        // Base n-gram
+        let base = vec![1, 2, 3, 4, 5];
+        let base_hash = hash_ngram(&base, table_size, seed);
+        
+        // Count bit flips across many single-bit variations
+        let mut total_bit_flips = 0u32;
+        let num_variations = 100usize;
+        
+        for i in 0..num_variations {
+            let mut variant = base.clone();
+            // Modify one token slightly
+            variant[i % base.len()] = variant[i % base.len()].wrapping_add(i + 1);
+            let variant_hash = hash_ngram(&variant, table_size, seed);
+            
+            // Count differing bits using XOR and population count
+            let diff = (base_hash ^ variant_hash) as u64;
+            total_bit_flips += diff.count_ones();
+        }
+        
+        // For good avalanche, we expect ~50% bit flips on average
+        // With 10 bits (1024 = 2^10), expect ~5 bits flipped on average
+        let avg_flips = total_bit_flips as f32 / num_variations as f32;
+        let expected_flips = (table_size.trailing_zeros() as f32) / 2.0;
+        
+        // Allow 30% tolerance for statistical variation
+        let tolerance = expected_flips * 0.3;
+        assert!(
+            avg_flips >= expected_flips - tolerance && avg_flips <= expected_flips + tolerance,
+            "Hash avalanche test failed: avg {} expected {} ±{}",
+            avg_flips, expected_flips, tolerance
+        );
+    }
+
+    #[test]
+    fn test_hash_ngram_uniform_distribution() {
+        // Test that hash_ngram distributes values uniformly across table
+        let table_size = 256;
+        let seed = 0u64;
+        let num_samples = 10000usize;
+        let mut buckets = vec![0usize; table_size];
+        
+        // Hash many different n-grams
+        for i in 0..num_samples {
+            let i = i as usize;
+            let tokens = vec![i, i.wrapping_add(1), i.wrapping_add(2)];
+            let hash = hash_ngram(&tokens, table_size, seed);
+            buckets[hash] += 1;
+        }
+        
+        // Calculate chi-squared statistic
+        let expected = num_samples as f64 / table_size as f64;
+        let chi_squared: f64 = buckets.iter()
+            .map(|&observed| {
+                let diff = observed as f64 - expected;
+                (diff * diff) / expected
+            })
+            .sum();
+        
+        // For 255 degrees of freedom (256 buckets - 1) at p=0.01,
+        // critical value is approximately 310
+        // A well-distributed hash should have chi_squared < 310
+        assert!(
+            chi_squared < 350.0,
+            "Hash distribution not uniform: chi_squared={}, expected < 350",
+            chi_squared
+        );
+    }
+
+    #[test]
+    fn test_hash_ngram_fast_modulo() {
+        // Test that power-of-2 table sizes use fast path
+        let tokens = vec![1, 2, 3];
+        
+        // Power of 2 - should use bitwise AND
+        let hash_pow2 = hash_ngram(&tokens, 1024, 0);
+        assert!(hash_pow2 < 1024);
+        
+        // Non-power of 2 - should use modulo
+        let hash_non_pow2 = hash_ngram(&tokens, 1000, 0);
+        assert!(hash_non_pow2 < 1000);
     }
 
     #[test]

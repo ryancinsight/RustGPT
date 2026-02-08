@@ -6,14 +6,21 @@
 //! It maintains neuron state and eligibility traces, processing inputs sequentially
 //! to update internal dynamics and generate adaptation signals.
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::eprop::{
     config::NeuronConfig,
-    neuron::{NeuronDynamics, NeuronState},
+    neuron::{NeuronDynamics, NeuronState, NeuronWorkspace},
     traces::EligibilityTraces,
 };
+
+/// Workspace for zero-allocation streaming inference in E-Prop Adaptor
+#[derive(Debug, Default, Clone)]
+pub struct EPropAdaptorStreamingWorkspace {
+    pub neuron_workspace: crate::domain::eprop::neuron::NeuronWorkspace,
+    pub eps_f_workspace: Array1<f32>,
+}
 
 /// Configuration for the E-Prop Adaptor
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,6 +109,82 @@ impl EPropAdaptor {
         }
     }
 
+    /// Process a single step for streaming inference (Zero-Allocation)
+    pub fn forward_step_into(
+        &mut self,
+        input: &ArrayView1<f32>,
+        output: &mut ArrayViewMut1<f32>,
+        workspace: &mut EPropAdaptorStreamingWorkspace,
+    ) -> crate::common::errors::Result<()> {
+        // Initialize dynamics if needed
+        if self.dynamics.is_none() {
+            self.dynamics = Some(NeuronDynamics::new(self.config.neuron_config.clone()));
+        }
+        let dynamics = self.dynamics.as_ref().unwrap();
+
+        // Initialize state if needed
+        if self.neuron_state.voltage.len() != self.config.dim {
+             self.neuron_state = NeuronState::new(
+                self.config.dim,
+                self.config.neuron_config.is_alif(),
+                &self.config.neuron_config,
+            );
+            
+             self.traces = EligibilityTraces::new(
+                self.config.dim,
+                self.config.dim,
+                self.config.neuron_config.is_alif(),
+            );
+
+            if self.config.use_multi_scale {
+                self.traces.multi_scale_traces = Some(crate::domain::eprop::traces::MultiScaleTraces::new(
+                    self.config.dim,
+                    self.config.dim,
+                    [0.8, 0.95, 0.99],
+                ));
+            }
+        }
+
+        // 1. Update neuron dynamics
+        dynamics
+            .update(&mut self.neuron_state, input, None, &mut workspace.neuron_workspace)
+            .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
+
+        // 2. Update eligibility traces
+        if let Some(multi_scale) = &mut self.traces.multi_scale_traces {
+            multi_scale
+                .update_all_scales(&self.neuron_state, *input)
+                .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
+        }
+
+        // 3. Compute adaptation signal
+        use ndarray::Zip;
+
+        if let Some(multi_scale) = &self.traces.multi_scale_traces {
+             // Ensure workspace capacity
+             if workspace.eps_f_workspace.len() != self.config.dim {
+                 workspace.eps_f_workspace = Array1::zeros(self.config.dim);
+             }
+
+             // Compute weighted eps_f into workspace
+             multi_scale.compute_weighted_traces_into(None, Some(&mut workspace.eps_f_workspace));
+             
+             // adaptation = eps_f * learned_weights
+             Zip::from(output)
+                .and(&workspace.eps_f_workspace)
+                .and(&self.adaptation_weights)
+                .for_each(|o, &e, &w| *o = e * w);
+        } else {
+             // Fallback: adaptation = spikes * learned_weights
+             Zip::from(output)
+                .and(&self.neuron_state.spikes) // Note: using spikes directly, not filtered_spikes, matching forward() logic
+                .and(&self.adaptation_weights)
+                .for_each(|o, &s, &w| *o = s * w);
+        }
+
+        Ok(())
+    }
+
     /// Process a sequence of inputs and return the adaptation signal
     ///
     /// # Arguments
@@ -152,6 +235,7 @@ impl EPropAdaptor {
         let mut trace_cache = Array2::zeros((seq_len, dim));
 
         let dynamics = self.dynamics.as_ref().unwrap();
+        let mut neuron_workspace = NeuronWorkspace::new(self.config.dim);
 
         // Process sequence step-by-step
         for t in 0..seq_len {
@@ -160,13 +244,13 @@ impl EPropAdaptor {
             // 1. Update neuron dynamics
             // We treat the input as the current injection
             dynamics
-                .update(&mut self.neuron_state, &input_t, None)
+                .update(&mut self.neuron_state, &input_t.view(), None, &mut neuron_workspace)
                 .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
 
             // 2. Update eligibility traces
             if let Some(multi_scale) = &mut self.traces.multi_scale_traces {
                 multi_scale
-                    .update_all_scales(&self.neuron_state, &input_t)
+                    .update_all_scales(&self.neuron_state, input_t.view())
                     .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
             }
 

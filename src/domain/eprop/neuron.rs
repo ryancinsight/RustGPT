@@ -7,12 +7,33 @@
 //! Both models support forward computation with surrogate gradients for
 //! biologically plausible online learning.
 
-use ndarray::Array1;
+use ndarray::{Array1, Zip};
 
 // use crate::domain::eprop::adaptive_surrogate::{AdaptiveSurrogate, SurrogatePerformance,
 // ActivityStats};
 use crate::domain::eprop::adaptive_surrogate::SurrogatePerformance;
 use crate::domain::eprop::config::{NeuronConfig, NeuronModel};
+
+/// Workspace for zero-allocation neuron dynamics
+#[derive(Debug, Clone, Default)]
+pub struct NeuronWorkspace {
+    /// Buffer for adaptive threshold computation
+    pub threshold: Array1<f32>,
+}
+
+impl NeuronWorkspace {
+    pub fn new(num_neurons: usize) -> Self {
+        Self {
+            threshold: Array1::zeros(num_neurons),
+        }
+    }
+
+    pub fn ensure_capacity(&mut self, num_neurons: usize) {
+        if self.threshold.len() != num_neurons {
+            self.threshold = Array1::zeros(num_neurons);
+        }
+    }
+}
 
 /// Neuron state for LIF/ALIF dynamics
 ///
@@ -121,14 +142,16 @@ impl NeuronDynamics {
     /// * `state` - Current neuron state (will be modified)
     /// * `input_current` - Total input current I_t (recurrent + feedforward)
     /// * `loss_gradient` - Optional loss gradient for adaptive surrogate updates
+    /// * `workspace` - Workspace for zero-allocation computation
     ///
     /// # Returns
     /// Ok(()) on success, Err if dimensions mismatch
     pub fn update(
         &self,
         state: &mut NeuronState,
-        input_current: &Array1<f32>,
+        input_current: &ndarray::ArrayView1<f32>,
         loss_gradient: Option<&Array1<f32>>,
+        workspace: &mut NeuronWorkspace,
     ) -> super::Result<()> {
         let n = state.num_neurons();
 
@@ -138,73 +161,89 @@ impl NeuronDynamics {
                 actual: input_current.len(),
             });
         }
+        
+        workspace.ensure_capacity(n);
 
-        // Compute adaptive threshold
-        let threshold = self.compute_threshold(state)?;
+        // Compute adaptive threshold into workspace
+        self.compute_threshold_into(state, &mut workspace.threshold)?;
 
         // Update membrane potential: v_{t+1} = α·v_t + I_t
-        let mut next_voltage = &state.voltage * self.config.alpha + input_current;
+        // In-place update: state.voltage = state.voltage * alpha + input
+        use ndarray::Zip;
+        Zip::from(&mut state.voltage)
+            .and(input_current)
+            .for_each(|v, &i| *v = *v * self.config.alpha + i);
 
         // Generate spikes and compute surrogate derivatives using adaptive system
-        let (spikes, surrogate_deriv) = if self.config.use_adaptive_surrogate {
-            self.compute_adaptive_spikes(&next_voltage, &threshold, &mut *state)?
+        if self.config.use_adaptive_surrogate {
+            self.compute_adaptive_spikes_into(&workspace.threshold, state)?;
         } else {
-            self.compute_spikes(&next_voltage, &threshold)
-        };
-
-        // Apply spike reset: v -= A_t for neurons that spiked
-        for i in 0..n {
-            if spikes[i] > 0.5 {
-                next_voltage[i] -= threshold[i];
-            }
+            self.compute_spikes_into(&workspace.threshold, state);
         }
 
+        // Apply spike reset: v -= A_t for neurons that spiked
+        // In-place update
+        Zip::from(&mut state.voltage)
+            .and(&state.spikes)
+            .and(&workspace.threshold)
+            .for_each(|v, &s, &th| {
+                if s > 0.5 {
+                    *v -= th;
+                }
+            });
+
         // Update filtered spikes: z̄_t = α·z̄_{t-1} + z_t
-        state.filtered_spikes = &state.filtered_spikes * self.config.alpha + &spikes;
+        // In-place update
+        Zip::from(&mut state.filtered_spikes)
+            .and(&state.spikes)
+            .for_each(|z_bar, &z| *z_bar = *z_bar * self.config.alpha + z);
 
         // Update adaptation (ALIF only): a_{t+1} = ρ·a_t + z_t
         if let Some(ref mut adaptation) = state.adaptation {
-            *adaptation = &*adaptation * self.config.rho + &spikes;
+            Zip::from(adaptation)
+                .and(&state.spikes)
+                .for_each(|a, &z| *a = *a * self.config.rho + z);
         }
 
         // Update adaptive surrogate performance if enabled
-        if self.config.use_adaptive_surrogate
-            && let Some(ref mut performance) = state.performance
-        {
-            let current_loss = if let Some(loss_grad) = loss_gradient {
-                loss_grad.mapv(|x| x * x).sum().sqrt()
-            } else {
-                state.spikes.mapv(|x| x * x).sum()
-            };
+        if self.config.use_adaptive_surrogate {
+             // Note: let-chains are not yet stable in all contexts, simplifying
+             if let Some(ref mut performance) = state.performance {
+                let current_loss = if let Some(loss_grad) = loss_gradient {
+                    loss_grad.mapv(|x| x * x).sum().sqrt()
+                } else {
+                    state.spikes.mapv(|x| x * x).sum()
+                };
 
-            if let Some(loss_grad) = loss_gradient {
-                let _ = performance.update_with_gradient(loss_grad, &surrogate_deriv, current_loss);
-            }
+                if let Some(loss_grad) = loss_gradient {
+                    let _ = performance.update_with_gradient(loss_grad, &state.surrogate_deriv, current_loss);
+                }
 
-            if performance.should_adapt() {
-                performance.adapt();
-            }
+                if performance.should_adapt() {
+                    performance.adapt();
+                }
+             }
         }
-
-        // Update state
-        state.voltage = next_voltage;
-        state.spikes = spikes;
-        state.surrogate_deriv = surrogate_deriv;
 
         Ok(())
     }
 
-    /// Compute adaptive threshold A_t
-    ///
-    /// For LIF: A_t = v_th
-    /// For ALIF: A_t = v_th + β·a_t
-    fn compute_threshold(&self, state: &NeuronState) -> super::Result<Array1<f32>> {
+    /// Compute adaptive threshold A_t into workspace
+    fn compute_threshold_into(&self, state: &NeuronState, threshold: &mut Array1<f32>) -> super::Result<()> {
         let n = state.num_neurons();
-        let mut threshold = Array1::from_elem(n, self.config.v_threshold);
+        if threshold.len() != n {
+             // Should have been ensured by caller
+             *threshold = Array1::from_elem(n, self.config.v_threshold);
+        } else {
+             threshold.fill(self.config.v_threshold);
+        }
 
         if self.config.model == NeuronModel::ALIF {
             if let Some(ref adaptation) = state.adaptation {
-                threshold += &(adaptation * self.config.beta);
+                // threshold += adaptation * beta
+                Zip::from(threshold)
+                    .and(adaptation)
+                    .for_each(|th, &a| *th += a * self.config.beta);
             } else {
                 return Err(super::EPropError::InvalidDynamics(
                     "ALIF model requires adaptation state".to_string(),
@@ -212,89 +251,85 @@ impl NeuronDynamics {
             }
         }
 
-        Ok(threshold)
+        Ok(())
     }
 
     /// Compute spikes and surrogate derivatives using adaptive system
-    ///
-    /// Uses the adaptive surrogate gradient system to dynamically select
-    /// the optimal surrogate function based on current neuron activity.
-    fn compute_adaptive_spikes(
+    fn compute_adaptive_spikes_into(
         &self,
-        voltage: &Array1<f32>,
         threshold: &Array1<f32>,
         state: &mut NeuronState,
-    ) -> super::Result<(Array1<f32>, Array1<f32>)> {
-        let n = voltage.len();
-        let mut spikes = Array1::zeros(n);
-        let mut surrogate_deriv = Array1::zeros(n);
-
+    ) -> super::Result<()> {
+        let n = state.voltage.len();
+        
         // Get the adaptive surrogate instance
-        let perf = state
-            .performance
-            .as_mut()
-            .ok_or(super::EPropError::InvalidDynamics(
+        // Need to extract performance first to avoid borrowing conflict if possible
+        // But state.spikes is needed.
+        // We can't hold `state.performance` mutable borrow while reading `state.spikes`
+        // So we might need to be careful.
+        
+        let adaptive = if let Some(ref mut perf) = state.performance {
+             // We need to clone adaptive to use it, or design this better.
+             // For now, let's clone the surrogate which should be cheap (just params)
+             perf.get_current_surrogate()
+        } else {
+             return Err(super::EPropError::InvalidDynamics(
                 "Adaptive surrogate performance tracking not initialized".to_string(),
-            ))?;
-        let adaptive = perf.get_current_surrogate();
+            ));
+        };
 
         // Create activity statistics for adaptation
-        let activity_stats = adaptive.create_activity_stats(voltage, threshold, &state.spikes);
+        let activity_stats = adaptive.create_activity_stats(&state.voltage, threshold, &state.spikes);
 
         // Update the adaptive surrogate with current activity
-        perf.update_with_activity(adaptive.clone(), &activity_stats)?;
+        if let Some(ref mut perf) = state.performance {
+            perf.update_with_activity(adaptive.clone(), &activity_stats)?;
+        }
 
         // Get the updated surrogate for computation
-        let adaptive = perf.get_current_surrogate();
+        let adaptive = if let Some(ref mut perf) = state.performance {
+             perf.get_current_surrogate()
+        } else {
+             unreachable!()
+        };
 
         // Compute spikes using Heaviside step function (binary output)
         for i in 0..n {
-            let delta = voltage[i] - threshold[i];
-            spikes[i] = if delta >= 0.0 { 1.0 } else { 0.0 };
+            let delta = state.voltage[i] - threshold[i];
+            state.spikes[i] = if delta >= 0.0 { 1.0 } else { 0.0 };
         }
 
         // Compute surrogate derivatives using current adaptive function
         for i in 0..n {
-            let delta = voltage[i] - threshold[i];
-            surrogate_deriv[i] = adaptive.derivative(delta);
+            let delta = state.voltage[i] - threshold[i];
+            state.surrogate_deriv[i] = adaptive.derivative(delta);
         }
 
-        Ok((spikes, surrogate_deriv))
+        Ok(())
     }
 
     /// Compute spikes and surrogate derivatives (legacy static method)
-    ///
-    /// Spike: z_t = H(v_t - A_t)  where H is Heaviside step function
-    ///
-    /// Surrogate derivative (piecewise linear):
-    /// ψ(v) = (1/(γ_pd·v_th)) · max(0, 1 - |v - A|/v_th)
-    ///
-    /// This provides a smooth approximation for gradient flow.
-    fn compute_spikes(
+    fn compute_spikes_into(
         &self,
-        voltage: &Array1<f32>,
         threshold: &Array1<f32>,
-    ) -> (Array1<f32>, Array1<f32>) {
-        let n = voltage.len();
-        let mut spikes = Array1::zeros(n);
-        let mut surrogate_deriv = Array1::zeros(n);
+        state: &mut NeuronState,
+    ) {
+        let n = state.voltage.len();
 
         for i in 0..n {
-            let delta = voltage[i] - threshold[i];
+            let delta = state.voltage[i] - threshold[i];
 
             // Heaviside step function
-            spikes[i] = if delta >= 0.0 { 1.0 } else { 0.0 };
+            state.spikes[i] = if delta >= 0.0 { 1.0 } else { 0.0 };
 
             // Surrogate derivative: piecewise linear approximation
             let abs_delta = delta.abs() / self.config.v_threshold;
-            surrogate_deriv[i] = if abs_delta < 1.0 {
+            state.surrogate_deriv[i] = if abs_delta < 1.0 {
                 (1.0 - abs_delta) / (self.config.gamma_pd * self.config.v_threshold)
             } else {
                 0.0
             };
         }
-
-        (spikes, surrogate_deriv)
     }
 
     // /// Update adaptive surrogate performance metrics
@@ -375,8 +410,9 @@ mod tests {
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, false, &config);
         let input = Array1::from_elem(5, 0.1); // Weak input
+        let mut workspace = NeuronWorkspace::new(5);
 
-        let result = dynamics.update(&mut state, &input, None);
+        let result = dynamics.update(&mut state, &input.view(), None, &mut workspace);
         assert!(result.is_ok());
 
         // With weak input, should not spike
@@ -394,8 +430,9 @@ mod tests {
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, false, &config);
         let input = Array1::from_elem(5, 5.0); // Strong input
+        let mut workspace = NeuronWorkspace::new(5);
 
-        let result = dynamics.update(&mut state, &input, None);
+        let result = dynamics.update(&mut state, &input.view(), None, &mut workspace);
         assert!(result.is_ok());
 
         // With strong input, should spike
@@ -411,9 +448,10 @@ mod tests {
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, true, &config);
         let input = Array1::from_elem(5, 5.0); // Strong input to cause spikes
+        let mut workspace = NeuronWorkspace::new(5);
 
         // First update
-        let _ = dynamics.update(&mut state, &input, None);
+        let _ = dynamics.update(&mut state, &input.view(), None, &mut workspace);
         let first_spikes = state.spikes.clone();
 
         // If there were spikes, adaptation should increase
@@ -421,7 +459,7 @@ mod tests {
             let adaptation_1 = state.adaptation.as_ref().unwrap().clone();
 
             // Second update with same input
-            let _ = dynamics.update(&mut state, &input, None);
+            let _ = dynamics.update(&mut state, &input.view(), None, &mut workspace);
             let adaptation_2 = state.adaptation.as_ref().unwrap().clone();
 
             // Adaptation should have accumulated
@@ -436,10 +474,11 @@ mod tests {
 
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, false, &config);
+        let mut workspace = NeuronWorkspace::new(5);
 
         // Input near threshold should give non-zero surrogate derivative
         let input = Array1::from_elem(5, 0.9); // Just below threshold
-        let _ = dynamics.update(&mut state, &input, None);
+        let _ = dynamics.update(&mut state, &input.view(), None, &mut workspace);
 
         // Surrogate derivative should be non-zero near threshold
         let surr_sum: f32 = state.surrogate_deriv.sum();
@@ -453,10 +492,11 @@ mod tests {
 
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(1, false, &config);
+        let mut workspace = NeuronWorkspace::new(1);
 
         // Strong input to cause spike
         let input = Array1::from_elem(1, 10.0);
-        let _ = dynamics.update(&mut state, &input, None);
+        let _ = dynamics.update(&mut state, &input.view(), None, &mut workspace);
 
         // If spiked, voltage should have been reset
         if state.spikes[0] > 0.5 {
@@ -471,10 +511,11 @@ mod tests {
 
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, false, &config);
+        let mut workspace = NeuronWorkspace::new(5);
 
         // Generate some spikes
         let input = Array1::from_elem(5, 5.0);
-        let _ = dynamics.update(&mut state, &input, None);
+        let _ = dynamics.update(&mut state, &input.view(), None, &mut workspace);
 
         let spikes_1 = state.spikes.clone();
         let filtered_1 = state.filtered_spikes.clone();
@@ -501,8 +542,9 @@ mod tests {
         let config = NeuronConfig::default();
         let mut state = NeuronState::new(5, false, &config);
         let input = Array1::from_elem(10, 1.0); // Wrong size
+        let mut workspace = NeuronWorkspace::new(5);
 
-        let result = dynamics.update(&mut state, &input, None);
+        let result = dynamics.update(&mut state, &input.view(), None, &mut workspace);
         assert!(result.is_err());
     }
 }
