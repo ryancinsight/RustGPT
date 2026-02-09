@@ -206,13 +206,6 @@ impl TitansMAC {
             &mut workspace.poly_context_workspace
         );
 
-        if cfg!(debug_assertions) && workspace.buffer_idx == 0 {
-             println!("Stream Step 0:");
-             println!("  Input: {:?}", input);
-             println!("  h_t: {:?}", workspace.h_t);
-             println!("  Out: {:?}", output);
-        }
-
         // 4. Buffer output for Segment-based Memory Update
         workspace.update_buffer.row_mut(workspace.buffer_idx).assign(&output.view());
         workspace.buffer_idx += 1;

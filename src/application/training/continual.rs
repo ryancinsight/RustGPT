@@ -22,6 +22,7 @@
 use std::collections::VecDeque;
 
 use ndarray::{Array1, Array2, Axis};
+use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::{
