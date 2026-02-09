@@ -2,12 +2,10 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 
 use crate::{
-    infrastructure::optimizer::adam::Adam,
+    common::rng::get_rng,
     domain::{
         attention::position::{
-            cope::CoPE, 
-            optimized_cope::OptimizedCoPE,
-            window_aware_cope::WindowAwareCoPE,
+            optimized_cope::OptimizedCoPE, unified::UnifiedCoPE, window_aware_cope::WindowAwareCoPE,
         },
         mixtures::{
             moh::{HeadSelectionConfig, HeadSelectionStrategy},
@@ -15,7 +13,7 @@ use crate::{
         },
         richards::{RichardsCurve, Variant},
     },
-    common::rng::get_rng,
+    infrastructure::optimizer::adam::Adam,
 };
 
 /// Configuration utilities for PolyAttention initialization and setup
@@ -87,8 +85,8 @@ impl CoPEType {
 }
 
 /// Initialize CoPE positional embeddings
-pub fn init_cope(max_pos: usize, head_dim: usize) -> CoPE {
-    CoPE::new(max_pos, head_dim)
+pub fn init_cope(max_pos: usize, head_dim: usize) -> UnifiedCoPE {
+    UnifiedCoPE::new(max_pos, head_dim)
 }
 
 /// Initialize OptimizedCoPE (unified default with gating + factorization + log1p)
@@ -205,14 +203,7 @@ pub fn configure_head_selection(
 pub fn init_attention_weights(
     embed_dim: usize,
     num_heads: usize,
-) -> (
-    Array2<f32>,
-    Array2<f32>,
-    Array2<f32>,
-    Adam,
-    Adam,
-    Adam,
-) {
+) -> (Array2<f32>, Array2<f32>, Array2<f32>, Adam, Adam, Adam) {
     let head_dim = embed_dim / num_heads;
     let total_head_dim = num_heads * head_dim;
     let mut rng = get_rng();
@@ -224,15 +215,12 @@ pub fn init_attention_weights(
     let normal_qk = Normal::new(0.0, std_qk).unwrap();
     let normal_v = Normal::new(0.0, std_v).unwrap();
 
-    let w_q = Array2::<f32>::from_shape_fn((embed_dim, total_head_dim), |_| {
-        normal_qk.sample(&mut rng)
-    });
-    let w_k = Array2::<f32>::from_shape_fn((embed_dim, total_head_dim), |_| {
-        normal_qk.sample(&mut rng)
-    });
-    let w_v = Array2::<f32>::from_shape_fn((embed_dim, total_head_dim), |_| {
-        normal_v.sample(&mut rng)
-    });
+    let w_q =
+        Array2::<f32>::from_shape_fn((embed_dim, total_head_dim), |_| normal_qk.sample(&mut rng));
+    let w_k =
+        Array2::<f32>::from_shape_fn((embed_dim, total_head_dim), |_| normal_qk.sample(&mut rng));
+    let w_v =
+        Array2::<f32>::from_shape_fn((embed_dim, total_head_dim), |_| normal_v.sample(&mut rng));
 
     let opt_w_q = Adam::new((embed_dim, total_head_dim));
     let opt_w_k = Adam::new((embed_dim, total_head_dim));

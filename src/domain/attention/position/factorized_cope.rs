@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{infrastructure::optimizer::adam::Adam, common::rng::get_rng};
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Factorized Contextual Position Embeddings (FactorizedCoPE)
 ///
@@ -53,10 +53,10 @@ impl FactorizedCoPE {
     pub fn new(max_pos: usize, embed_dim: usize, rank: usize) -> Self {
         let mut rng = get_rng();
         let normal = Normal::new(0.0, 0.02 / (rank as f32).sqrt()).unwrap();
-        
+
         let up_proj = Array2::from_shape_fn((max_pos + 1, rank), |_| normal.sample(&mut rng));
         let opt_up_proj = Adam::new((max_pos + 1, rank));
-        
+
         let down_proj = Array2::from_shape_fn((rank, embed_dim), |_| normal.sample(&mut rng));
         let opt_down_proj = Adam::new((rank, embed_dim));
 
@@ -120,11 +120,11 @@ impl FactorizedCoPE {
         // For large positive x: log(1 + exp(x)) ≈ x
         // For large negative x: log(1 + exp(x)) ≈ exp(x) (very small)
         if x > 20.0 {
-            x  // exp(x) dominates, log(1 + exp(x)) ≈ x
+            x // exp(x) dominates, log(1 + exp(x)) ≈ x
         } else if x < -20.0 {
-            x.exp()  // exp(x) is very small, log(1 + exp(x)) ≈ exp(x)
+            x.exp() // exp(x) is very small, log(1 + exp(x)) ≈ exp(x)
         } else {
-            (1.0 + x.exp()).ln()  // Standard computation
+            (1.0 + x.exp()).ln() // Standard computation
         }
     }
 
@@ -139,7 +139,13 @@ impl FactorizedCoPE {
         let up_row = self.up_proj.row(pos);
         let mut embedding = Array1::zeros(self.embed_dim);
         // U[pos] (1,r) @ V.T (embed_dim, r).T = U[pos] @ V.T = (1, embed_dim)
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj.t(), &up_row.to_owned(), 0.0, &mut embedding);
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &self.down_proj.t(),
+            &up_row.to_owned(),
+            0.0,
+            &mut embedding,
+        );
         Some(embedding)
     }
 
@@ -158,7 +164,7 @@ impl FactorizedCoPE {
     /// Apply gradients
     pub fn apply_gradients(
         &mut self,
-        grads: &(Array2<f32>, Array2<f32>),  // (up_grad, down_grad)
+        grads: &(Array2<f32>, Array2<f32>), // (up_grad, down_grad)
         lr: f32,
     ) {
         self.opt_up_proj.step(&mut self.up_proj, &grads.0, lr);
@@ -196,10 +202,10 @@ mod tests {
     fn test_factorized_cope_contribution() {
         let fc = FactorizedCoPE::new(128, 64, 16);
         let q = Array1::from_elem(64, 0.5);
-        
+
         let contrib0 = fc.factorized_cope_contribution(&q.view(), 0);
         let contrib100 = fc.factorized_cope_contribution(&q.view(), 100);
-        
+
         assert!(contrib0.is_finite());
         assert!(contrib100.is_finite());
     }
@@ -208,7 +214,7 @@ mod tests {
     fn test_compression_ratio() {
         let fc = FactorizedCoPE::new(512, 128, 32);
         let ratio = fc.compression_ratio();
-        
+
         // Full: 513 * 128 = 65664
         // Factored: 513*32 + 32*128 = 16416 + 4096 = 20512
         // Ratio: 65664 / 20512 ≈ 3.2
@@ -218,15 +224,19 @@ mod tests {
     #[test]
     fn test_log1p_stability() {
         let fc = FactorizedCoPE::with_temperature(64, 32, 8, 1.0);
-        
+
         // Test numerical stability for extreme values
         let large_pos = fc.log1p_exp(100.0);
         let large_neg = fc.log1p_exp(-100.0);
-        
+
         // log(1 + exp(100)) ≈ 100
         assert!(large_pos.is_finite());
-        assert!((large_pos - 100.0).abs() < 1e-10, "Expected ~100, got {}", large_pos);
-        
+        assert!(
+            (large_pos - 100.0).abs() < 1e-10,
+            "Expected ~100, got {}",
+            large_pos
+        );
+
         // log(1 + exp(-100)) ≈ exp(-100) (very small but finite)
         assert!(large_neg.is_finite());
         assert!(large_neg > 0.0);
@@ -237,7 +247,7 @@ mod tests {
     fn test_embedding_reconstruction() {
         let fc = FactorizedCoPE::new(64, 32, 8);
         let emb = fc.get_embedding(0);
-        
+
         assert!(emb.is_some());
         let emb = emb.unwrap();
         assert_eq!(emb.len(), 32);

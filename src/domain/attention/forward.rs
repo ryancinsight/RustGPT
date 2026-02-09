@@ -3,7 +3,7 @@ use ndarray::{Array2, s};
 use crate::domain::{
     attention::{
         memory::{with_tls_acc_f64, with_tls_phi, with_tls_qpe},
-        position::cope::CoPE,
+        position::unified::UnifiedCoPE,
         utils::{smooth_clip_tanh, smooth_saturate_01},
     },
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
@@ -22,7 +22,7 @@ pub struct ForwardContext<'a> {
     pub alpha_g: &'a Array2<f32>,
     pub beta_g: &'a Array2<f32>,
     pub gate: &'a RichardsGate,
-    pub cope: &'a CoPE,
+    pub cope: &'a UnifiedCoPE,
     pub head_selection_config: &'a mut HeadSelectionConfig,
     pub threshold_predictor: &'a mut Option<ThresholdPredictor>,
     pub embed_dim: usize,

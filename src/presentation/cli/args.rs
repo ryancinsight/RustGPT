@@ -294,6 +294,34 @@ pub struct Args {
     /// Maximum number of pooled residual vectors stored in the hard-negative memory bank.
     #[arg(long, default_value_t = 512)]
     pub residual_hardneg_bank_size: usize,
+
+    /// Enable continual learning during inference (online learning from user feedback)
+    #[arg(long, default_value_t = false)]
+    pub continual_learning: bool,
+
+    /// User ID for continual learning personalization
+    #[arg(long)]
+    pub user_id: Option<String>,
+
+    /// Learning rate for online updates during continual learning (typically smaller than training LR)
+    #[arg(long, default_value_t = 1e-5)]
+    pub online_learning_rate: f32,
+
+    /// EWC (Elastic Weight Consolidation) regularization strength for continual learning (0 to disable)
+    #[arg(long, default_value_t = 100.0)]
+    pub ewc_lambda: f32,
+
+    /// Maximum number of past interactions to store per user for continual learning
+    #[arg(long, default_value_t = 1000)]
+    pub max_user_memory_size: usize,
+
+    /// Number of replay samples to use for each continual learning update
+    #[arg(long, default_value_t = 32)]
+    pub replay_buffer_size: usize,
+
+    /// Path to save/load user memories for continual learning
+    #[arg(long)]
+    pub user_memories_path: Option<String>,
 }
 
 /// CLI representation of temporal mixing types

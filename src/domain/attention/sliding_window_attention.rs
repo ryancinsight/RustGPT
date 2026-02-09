@@ -1,6 +1,6 @@
 use std::ops::AddAssign;
 
-use ndarray::{Array1, Array2, Axis, s, Zip};
+use ndarray::{Array1, Array2, Axis, Zip, s};
 use rand::distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
@@ -141,7 +141,7 @@ impl SlidingWindowAttention {
             streaming_cache: None,
         }
     }
-    
+
     /// Process a single token step (Streaming/Rolling mode)
     pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
         if self.streaming_cache.is_none() {
@@ -160,14 +160,14 @@ impl SlidingWindowAttention {
         let idx = cache.step % self.window_size;
         cache.k_cache.row_mut(idx).assign(&k);
         cache.v_cache.row_mut(idx).assign(&v);
-        
+
         cache.step += 1;
 
         // 3. Compute Attention
         // Since there are no positional embeddings, order in the buffer doesn't matter
         // for the weighted sum (permutation invariant).
         // We just need to take the valid entries.
-        
+
         let valid_rows = if cache.step <= self.window_size {
             // Cache not full yet
             s![0..cache.step, ..]
@@ -178,7 +178,7 @@ impl SlidingWindowAttention {
 
         let k_window = cache.k_cache.slice(valid_rows);
         let v_window = cache.v_cache.slice(valid_rows);
-        
+
         let scale = (self.embed_dim as f32).sqrt();
         let mut scores = k_window.dot(&q); // (current_len,)
 
@@ -214,7 +214,7 @@ impl SlidingWindowAttention {
         let idx = cache.step % self.window_size;
         cache.k_cache.row_mut(idx).assign(&ws.k);
         cache.v_cache.row_mut(idx).assign(&ws.v);
-        
+
         cache.step += 1;
 
         // 3. Compute Attention
@@ -226,7 +226,7 @@ impl SlidingWindowAttention {
 
         let mut scores_view = ws.scores.slice_mut(s![0..valid_count]);
         let k_window = cache.k_cache.slice(s![0..valid_count, ..]);
-        
+
         // scores = k_window * q
         ndarray::linalg::general_mat_vec_mul(1.0, &k_window, &ws.q, 0.0, &mut scores_view);
 
@@ -285,19 +285,21 @@ impl Layer for SlidingWindowAttention {
             .par_for_each(|t, mut out_row, mut score_row| {
                 let start = t.saturating_sub(window_size - 1);
                 let current_window_len = t - start + 1;
-                
+
                 let window_k = k_view.slice(s![start..=t, ..]);
                 let window_v = v_view.slice(s![start..=t, ..]);
 
                 let mut scores = q_view.row(t).dot(&window_k.t());
-                
+
                 scores.mapv_inplace(|x| (x / scale).exp());
                 let sum_scores = scores.sum();
                 if sum_scores > 0.0 {
                     scores.mapv_inplace(|x| x / sum_scores);
                 }
-                
-                score_row.slice_mut(s![..current_window_len]).assign(&scores);
+
+                score_row
+                    .slice_mut(s![..current_window_len])
+                    .assign(&scores);
 
                 let weighted_v = scores.dot(&window_v);
                 out_row.assign(&weighted_v);
@@ -347,7 +349,7 @@ impl Layer for SlidingWindowAttention {
 
             let row_view = cache.attention_scores.row(t);
             let scores_t = row_view.slice(s![..current_window_len]);
-            
+
             let window_v_t = cache.v.slice(s![start..=t, ..]);
             let window_k_t = cache.k.slice(s![start..=t, ..]);
             let q_t = cache.q.row(t);

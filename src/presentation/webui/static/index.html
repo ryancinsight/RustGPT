@@ -3,480 +3,185 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RustGPT Web Interface</title>
+    <title>RustGPT</title>
     <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
-            color: #e0e0e0;
-        }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        header {
-            text-align: center;
-            padding: 40px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            margin-bottom: 40px;
-        }
-
-        h1 {
-            font-size: 2.5rem;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin-bottom: 10px;
-        }
-
-        .subtitle {
-            color: #888;
-            font-size: 1.1rem;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 40px;
-        }
-
-        .card {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 12px;
-            padding: 24px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-
-        .card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-        }
-
-        .card h2 {
-            color: #667eea;
-            margin-bottom: 12px;
-            font-size: 1.25rem;
-        }
-
-        .card p {
-            color: #aaa;
-            line-height: 1.6;
-            margin-bottom: 16px;
-        }
-
-        .btn {
-            display: inline-block;
-            padding: 10px 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            text-decoration: none;
-            border-radius: 6px;
-            border: none;
-            cursor: pointer;
-            font-size: 14px;
-            transition: opacity 0.2s;
-        }
-
-        .btn:hover {
-            opacity: 0.9;
-        }
-
-        .btn-secondary {
-            background: rgba(255, 255, 255, 0.1);
-            margin-left: 10px;
-        }
-
-        .chat-container {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            overflow: hidden;
-        }
-
-        .chat-header {
-            padding: 16px 24px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .chat-messages {
-            height: 400px;
-            overflow-y: auto;
-            padding: 20px;
-        }
-
-        .message {
-            margin-bottom: 16px;
-            padding: 12px 16px;
-            border-radius: 12px;
-            max-width: 80%;
-        }
-
-        .message.user {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            margin-left: auto;
-        }
-
-        .message.assistant {
-            background: rgba(255, 255, 255, 0.1);
-        }
-
-        .chat-input {
-            padding: 16px 24px;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-            display: flex;
-            gap: 12px;
-        }
-
-        .chat-input input {
-            flex: 1;
-            padding: 12px 16px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 8px;
-            color: #e0e0e0;
-            font-size: 14px;
-        }
-
-        .chat-input input::placeholder {
-            color: #666;
-        }
-
-        .status {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-
-        .status.online {
-            background: #4ade80;
-        }
-
-        .status.offline {
-            background: #ef4444;
-        }
-
-        .api-section {
-            margin-top: 40px;
-            padding: 24px;
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .api-section h3 {
-            color: #667eea;
-            margin-bottom: 16px;
-        }
-
-        .endpoint {
-            background: rgba(0, 0, 0, 0.3);
-            padding: 12px 16px;
-            border-radius: 8px;
-            margin-bottom: 12px;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-        }
-
-        .endpoint .method {
-            color: #4ade80;
-            font-weight: bold;
-        }
-
-        .endpoint .path {
-            color: #e0e0e0;
-        }
-
-        footer {
-            text-align: center;
-            padding: 40px 0;
-            color: #666;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-            margin-top: 40px;
-        }
-
-        @media (max-width: 768px) {
-            h1 {
-                font-size: 1.75rem;
-            }
-
-            .grid {
-                grid-template-columns: 1fr;
-            }
-
-            .chat-messages {
-                height: 300px;
-            }
-        }
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f0f;color:#ececec;height:100vh;display:flex;overflow:hidden}
+        .sidebar{width:260px;background:#171717;border-right:1px solid #2a2a2a;display:flex;flex-direction:column;flex-shrink:0}
+        .sidebar-header{padding:12px;border-bottom:1px solid #2a2a2a}
+        .new-chat-btn{width:100%;padding:12px 16px;background:transparent;border:1px solid #2a2a2a;border-radius:8px;color:#ececec;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all 0.2s}
+        .new-chat-btn:hover{background:#2a2a2a;border-color:#3a3a3a}
+        .new-chat-btn:active{transform:scale(0.98)}
+        .chat-history{flex:1;overflow-y:auto;padding:8px}
+        .chat-history-title{font-size:12px;font-weight:500;color:#8e8e8e;padding:8px 12px;text-transform:uppercase;letter-spacing:0.5px;display:flex;justify-content:space-between;align-items:center}
+        .chat-history-title .refresh-btn{background:none;border:none;color:#8e8e8e;cursor:pointer;padding:4px;border-radius:4px}
+        .chat-history-title .refresh-btn:hover{background:#2a2a2a;color:#ececec}
+        .chat-history-item{padding:10px 12px;border-radius:8px;cursor:pointer;font-size:14px;color:#b4b4b4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px;display:flex;align-items:center;gap:8px;transition:all 0.2s}
+        .chat-history-item:hover{background:#2a2a2a}
+        .chat-history-item.active{background:#2a2a2a;color:#ececec}
+        .chat-history-item .delete-btn{opacity:0;margin-left:auto;background:none;border:none;color:#ef4444;cursor:pointer;padding:4px;border-radius:4px;transition:all 0.2s}
+        .chat-history-item:hover .delete-btn{opacity:1}
+        .chat-history-item .delete-btn:hover{background:#3a1f1f}
+        .sidebar-footer{padding:12px;border-top:1px solid #2a2a2a}
+        .settings-btn{width:100%;padding:10px 12px;background:transparent;border:none;border-radius:8px;color:#b4b4b4;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all 0.2s}
+        .settings-btn:hover{background:#2a2a2a}
+        .main{flex:1;display:flex;flex-direction:column;min-width:0}
+        .main-header{padding:12px 20px;border-bottom:1px solid #2a2a2a;display:flex;justify-content:space-between;align-items:center;background:#0f0f0f;gap:16px}
+        .model-selector{flex:1;display:flex;align-items:center;gap:8px;padding:8px 12px;background:#2a2a2a;border-radius:8px;cursor:pointer;font-size:14px;position:relative;max-width:300px;transition:all 0.2s}
+        .model-selector:hover{background:#3a3a3a}
+        .model-dropdown{display:none;position:absolute;top:100%;left:0;min-width:220px;background:#2a2a2a;border-radius:8px;margin-top:4px;max-height:300px;overflow-y:auto;z-index:100;box-shadow:0 4px 20px rgba(0,0,0,0.4);border:1px solid #3a3a3a}
+        .model-dropdown.show{display:block}
+        .model-option{padding:12px 16px;cursor:pointer;border-bottom:1px solid #3a3a3a;transition:all 0.2s}
+        .model-option:last-child{border-bottom:none}
+        .model-option:hover{background:#3a3a3a}
+        .model-option.selected{background:#3a3a3a;color:#10a37f}
+        .model-option .model-size{font-size:11px;color:#8e8e8e;margin-top:4px}
+        .model-option .model-loaded{font-size:11px;color:#10a37f;margin-top:2px}
+        .status-indicator{display:flex;align-items:center;gap:8px;font-size:13px;color:#b4b4b4}
+        .status-dot{width:8px;height:8px;border-radius:50%;background:#4ade80;transition:all 0.3s}
+        .status-dot.offline{background:#ef4444}
+        .status-dot.loading{background:#f59e0b}
+        .status-dot.saving{background:#3b82f6}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+        .typing-indicator{display:flex;gap:4px;padding:8px 0}
+        .typing-indicator span{width:8px;height:8px;background:#6b6b6b;border-radius:50%;animation:typing 1.4s infinite ease-in-out}
+        .typing-indicator span:nth-child(2){animation-delay:0.2s}
+        .typing-indicator span:nth-child(3){animation-delay:0.4s}
+        @keyframes typing{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-8px)}}
+        .empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#6b6b6b;text-align:center;padding:40px}
+        .empty-state svg{width:48px;height:48px;margin-bottom:16px;opacity:0.5}
+        .empty-state h2{font-size:20px;font-weight:500;margin-bottom:12px;color:#ececec}
+        .empty-state p{font-size:14px;max-width:400px;line-height:1.5}
+        .empty-state .shortcut{background:#2a2a2a;padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px}
+        .message{max-width:768px;margin:0 auto;padding:16px 20px;display:flex;gap:16px;animation:fadeIn 0.3s ease}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        .message-avatar{width:28px;height:28px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:500;flex-shrink:0}
+        .message.user .message-avatar{background:#5436da}
+        .message.assistant .message-avatar{background:#10a37f}
+        .message-content{flex:1;line-height:1.6;font-size:15px;padding-top:2px}
+        .message.user{background:transparent}
+        .message.assistant{background:#171717;border-top:1px solid #2a2a2a;border-bottom:1px solid #2a2a2a}
+        .message-content pre{background:#1a1a1a;border-radius:8px;padding:16px;overflow-x:auto;margin:12px 0;font-family:'SF Mono',Monaco,monospace;font-size:13px;position:relative;border:1px solid #2a2a2a}
+        .message-content code{background:#2a2a2a;padding:2px 6px;border-radius:4px;font-size:13px}
+        .message-content pre code{background:none;padding:0}
+        .copy-code{position:absolute;top:8px;right:8px;padding:4px 8px;background:#3a3a3a;border:none;border-radius:4px;color:#b4b4b4;font-size:11px;cursor:pointer;opacity:0;transition:all 0.2s}
+        .message-content pre:hover .copy-code{opacity:1}
+        .copy-code:hover{background:#4a4a4a;color:#ececec}
+        .input-container{padding:20px;background:#0f0f0f;border-top:1px solid #2a2a2a}
+        .input-wrapper{max-width:768px;margin:0 auto}
+        .chat-input-area{background:#2a2a2a;border-radius:12px;padding:12px 16px;display:flex;align-items:flex-end;gap:12px;border:1px solid transparent;transition:all 0.2s}
+        .chat-input-area:focus-within{border-color:#565869;background:#1a1a1a}
+        .chat-input{flex:1;background:transparent;border:none;color:#ececec;font-size:15px;resize:none;max-height:200px;line-height:1.5;outline:none;font-family:inherit;min-height:24px}
+        .chat-input::placeholder{color:#6b6b6b}
+        .send-btn{width:36px;height:36px;background:#19c37d;border:none;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.2s}
+        .send-btn:hover{background:#1a7f4e;transform:scale(1.05)}
+        .send-btn:disabled{background:#3a3a3a;cursor:not-allowed;transform:none}
+        .send-btn:disabled:hover{background:#3a3a3a}
+        .send-btn svg{width:18px;height:18px;color:#fff}
+        .input-hint{text-align:center;font-size:12px;color:#6b6b6b;margin-top:8px}
+        .error-message{background:#3a1f1f;border:1px solid #5c2a2a;border-radius:8px;padding:12px 16px;margin:8px 0;color:#ff6b6b;display:flex;align-items:center;gap:8px}
+        .error-message svg{width:16px;height:16px;flex-shrink:0}
+        .retry-btn{background:#5c2a2a;border:none;border-radius:4px;padding:6px 12px;color:#ff6b6b;cursor:pointer;margin-left:auto;font-size:12px;transition:all 0.2s}
+        .retry-btn:hover{background:#7a3a3a}
+        .clear-btn{background:none;border:none;color:#8e8e8e;cursor:pointer;font-size:12px;padding:4px 8px;border-radius:4px;transition:all 0.2s}
+        .clear-btn:hover{background:#2a2a2a;color:#ececec}
+        .toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#2a2a2a;color:#ececec;padding:8px 16px;border-radius:8px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.3);opacity:0;transition:all 0.3s;z-index:1000}
+        .toast.show{opacity:1}
+        .toast.success{border-left:3px solid #10a37f}
+        .toast.error{border-left:3px solid #ef4444}
+        .loading-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;visibility:hidden;transition:all 0.3s}
+        .loading-overlay.show{opacity:1;visibility:visible}
+        .loading-spinner{width:40px;height:40px;border:3px solid #3a3a3a;border-top-color:#19c37f;border-radius:50%;animation:spin 1s linear infinite}
+        ::-webkit-scrollbar{width:8px}
+        ::-webkit-scrollbar-track{background:transparent}
+        ::-webkit-scrollbar-thumb{background:#3a3a3a;border-radius:4px}
+        ::-webkit-scrollbar-thumb:hover{background:#4a4a4a}
+        @media(max-width:768px){.sidebar{display:none}.message{padding:12px 16px}.model-selector{max-width:none}}
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🦀 RustGPT Web Interface</h1>
-            <p class="subtitle">Web UI for interacting with trained language models</p>
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <button class="new-chat-btn" onclick="newChat()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New chat
+            </button>
+        </div>
+        <div class="chat-history" id="chatHistory"><div class="chat-history-title">Conversations<button class="refresh-btn" onclick="loadConversations(event)" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button></div></div>
+        <div class="sidebar-footer">
+            <button class="settings-btn" onclick="openSettings()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Settings
+            </button>
+        </div>
+    </aside>
+    <main class="main">
+        <header class="main-header">
+            <div class="model-selector" id="modelSelector" onclick="toggleModelDropdown()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;color:#10a37f"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                <span class="model-name" id="currentModel">Loading...</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;color:#8e8e8e"><polyline points="6 9 12 15 18 9"/></svg>
+                <div class="model-dropdown" id="modelDropdown"></div>
+            </div>
+            <div class="status-indicator">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Connecting...</span>
+            </div>
         </header>
-
-        <div class="grid">
-            <div class="card">
-                <h2>🤖 Chat Completion</h2>
-                <p>Interact with your trained models using the OpenAI-compatible chat completion API. Supports streaming responses and conversation history.</p>
-                <button class="btn" onclick="focusChat()">Start Chatting</button>
-            </div>
-
-            <div class="card">
-                <h2>📦 Model Management</h2>
-                <p>Load, unload, and manage your trained models. View model information, configuration, and performance metrics.</p>
-                <button class="btn" onclick="loadModel()">Load Model</button>
-                <button class="btn btn-secondary" onclick="listModels()">List Models</button>
-            </div>
-
-            <div class="card">
-                <h2>📊 Server Status</h2>
-                <p>Monitor server health, request statistics, and performance metrics in real-time.</p>
-                <button class="btn" onclick="checkStatus()">Check Status</button>
-            </div>
-
-            <div class="card">
-                <h2>💬 Conversations</h2>
-                <p>View and manage conversation history. Export conversations or delete old ones.</p>
-                <button class="btn" onclick="listConversations()">View Conversations</button>
-            </div>
-        </div>
-
-        <div class="chat-container" id="chatContainer">
-            <div class="chat-header">
-                <div>
-                    <span class="status online" id="statusIndicator"></span>
-                    <span id="modelName">No model loaded</span>
-                </div>
-                <button class="btn btn-secondary" onclick="clearChat()">Clear</button>
-            </div>
+        <div class="chat-container">
             <div class="chat-messages" id="chatMessages">
-                <div class="message assistant">
-                    <strong>Assistant:</strong> Welcome to RustGPT! Load a model to start chatting.
+                <div class="empty-state" id="emptyState">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                    <h2>Welcome to RustGPT</h2>
+                    <p>Select a model and start chatting.<br>Your conversations are automatically saved.<br><br>Use <span class="shortcut">Shift + Enter</span> for new lines</p>
                 </div>
             </div>
-            <div class="chat-input">
-                <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
-                <button class="btn" onclick="sendMessage()">Send</button>
+        </div>
+        <div class="input-container">
+            <div class="input-wrapper">
+                <div class="chat-input-area">
+                    <textarea class="chat-input" id="messageInput" placeholder="Message RustGPT..." rows="1" onkeydown="handleKeyDown(event)" oninput="autoResize(this)"></textarea>
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                    </button>
+                </div>
+                <p class="input-hint">RustGPT can make mistakes. Consider checking important information. <button class="clear-btn" onclick="clearChat()">Clear chat</button></p>
             </div>
         </div>
-
-        <div class="api-section">
-            <h3>📡 Available Endpoints</h3>
-            <div class="endpoint">
-                <span class="method">POST</span>
-                <span class="path">/v1/chat/completions</span> - Chat completion with streaming support
-            </div>
-            <div class="endpoint">
-                <span class="method">POST</span>
-                <span class="path">/v1/completions</span> - Text completion (legacy)
-            </div>
-            <div class="endpoint">
-                <span class="method">GET</span>
-                <span class="path">/v1/models</span> - List available models
-            </div>
-            <div class="endpoint">
-                <span class="method">POST</span>
-                <span class="path">/v1/models/load</span> - Load a model
-            </div>
-            <div class="endpoint">
-                <span class="method">GET</span>
-                <span class="path">/v1/status</span> - Server status and statistics
-            </div>
-            <div class="endpoint">
-                <span class="method">GET</span>
-                <span class="path">/health</span> - Health check
-            </div>
-        </div>
-
-        <footer>
-            <p>RustGPT Web UI &copy; 2024 | Built with Rust & Axum</p>
-        </footer>
+    </main>
+    <div class="toast" id="toast"></div>
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-spinner"></div>
     </div>
-
     <script>
-        let currentModel = null;
-        let conversationId = generateId();
-
-        function generateId() {
-            return 'conv-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-        }
-
-        function focusChat() {
-            document.getElementById('messageInput').focus();
-        }
-
-        function clearChat() {
-            document.getElementById('chatMessages').innerHTML = `
-                <div class="message assistant">
-                    <strong>Assistant:</strong> Chat cleared. How can I help you?
-                </div>
-            `;
-        }
-
-        function handleKeyPress(event) {
-            if (event.key === 'Enter') {
-                sendMessage();
-            }
-        }
-
-        async function sendMessage() {
-            const input = document.getElementById('messageInput');
-            const message = input.value.trim();
-            if (!message) return;
-
-            if (!currentModel) {
-                alert('Please load a model first using the "Load Model" button.');
-                return;
-            }
-
-            // Add user message
-            addMessage('user', message);
-            input.value = '';
-
-            try {
-                const response = await fetch('/v1/chat/completions', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: currentModel,
-                        messages: [{ role: 'user', content: message }],
-                        conversation_id: conversationId,
-                        max_tokens: 256,
-                        temperature: 0.7
-                    })
-                });
-
-                if (!response.ok) {
-                    throw new Error('Failed to get response');
-                }
-
-                const data = await response.json();
-                if (data.choices && data.choices[0]) {
-                    addMessage('assistant', data.choices[0].message.content);
-                }
-            } catch (error) {
-                addMessage('assistant', 'Error: ' + error.message);
-            }
-        }
-
-        function addMessage(role, content) {
-            const messagesDiv = document.getElementById('chatMessages');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'message ' + role;
-            messageDiv.innerHTML = `<strong>${role === 'user' ? 'You' : 'Assistant'}:</strong> ${escapeHtml(content)}`;
-            messagesDiv.appendChild(messageDiv);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        async function loadModel() {
-            const modelName = prompt('Enter model name to load:');
-            if (!modelName) return;
-
-            try {
-                const response = await fetch('/v1/models/load', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: modelName })
-                });
-
-                if (!response.ok) {
-                    throw new Error('Failed to load model');
-                }
-
-                const data = await response.json();
-                currentModel = modelName;
-                document.getElementById('modelName').textContent = modelName;
-                document.getElementById('statusIndicator').className = 'status online';
-                addMessage('assistant', `Model "${modelName}" loaded successfully!`);
-            } catch (error) {
-                alert('Error loading model: ' + error.message);
-            }
-        }
-
-        async function listModels() {
-            try {
-                const response = await fetch('/v1/models');
-                if (!response.ok) throw new Error('Failed to fetch models');
-                const data = await response.json();
-                alert('Available models: ' + (data.data.length > 0 
-                    ? data.data.map(m => m.id).join(', ') 
-                    : 'No models found'));
-            } catch (error) {
-                alert('Error: ' + error.message);
-            }
-        }
-
-        async function checkStatus() {
-            try {
-                const response = await fetch('/v1/status');
-                if (!response.ok) throw new Error('Failed to fetch status');
-                const data = await response.json();
-                alert(`Server Status: ${data.status}\n` +
-                      `Version: ${data.version}\n` +
-                      `Uptime: ${data.uptime_seconds}s\n` +
-                      `Total Requests: ${data.stats.total_requests}\n` +
-                      `Success Rate: ${data.stats.success_rate.toFixed(2)}%`);
-            } catch (error) {
-                alert('Error: ' + error.message);
-            }
-        }
-
-        async function listConversations() {
-            try {
-                const response = await fetch('/v1/conversations');
-                if (!response.ok) throw new Error('Failed to fetch conversations');
-                const data = await response.json();
-                alert(`Total conversations: ${data.total}\n` +
-                      (data.data.length > 0 
-                        ? data.data.map(c => `${c.id} (${c.message_count} messages)`).join('\n')
-                        : 'No conversations'));
-            } catch (error) {
-                alert('Error: ' + error.message);
-            }
-        }
-
-        // Check server health on load
-        async function checkHealth() {
-            try {
-                const response = await fetch('/health');
-                if (response.ok) {
-                    document.getElementById('statusIndicator').className = 'status online';
-                } else {
-                    document.getElementById('statusIndicator').className = 'status offline';
-                }
-            } catch (error) {
-                document.getElementById('statusIndicator').className = 'status offline';
-            }
-        }
-
-        checkHealth();
-        setInterval(checkHealth, 30000); // Check every 30 seconds
+        let currentModel='RustGPT',conversationId=generateId(),conversations=[],messages=[],isLoading=false,modelList=[],savedSettings={temperature:0.7,maxTokens:1024};
+        function generateId(){return'conv-'+Date.now()+'-'+Math.random().toString(36).substr(2,9)}
+        function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
+        function formatMessage(t){let f=escapeHtml(t);f=f.replace(/```([\w]*)(?:\n|$)([\s\S]*?)```/g,'<pre><code>$2</code><button class="copy-code" onclick="copyCode(this)">Copy</button></pre>');f=f.replace(/`([^`]+)`/g,'<code>$1</code>');f=f.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');f=f.replace(/\n/g,'<br>');return f}
+        function autoResize(t){t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px';document.getElementById('sendBtn').disabled=!t.value.trim()}
+        function copyCode(b){const c=b.previousElementSibling.textContent;navigator.clipboard.writeText(c).then(()=>{b.textContent='Copied!';setTimeout(()=>b.textContent='Copy',2000)})}
+        function scrollToBottom(){const m=document.getElementById('chatMessages');setTimeout(()=>m.scrollTop=m.scrollHeight,100)}
+        function showToast(t,s='success'){const o=document.getElementById('toast');o.textContent=t;o.className='toast '+s+' show';setTimeout(()=>o.classList.remove('show'),3000)}
+        function showLoading(){document.getElementById('loadingOverlay').classList.add('show')}
+        function hideLoading(){document.getElementById('loadingOverlay').classList.remove('show')}
+        function toggleModelDropdown(){const d=document.getElementById('modelDropdown');d.classList.toggle('show');if(d.children.length===0)loadModels()}
+        function selectModel(n){currentModel=n;document.getElementById('currentModel').textContent=n;document.getElementById('modelDropdown').classList.remove('show');localStorage.setItem('selectedModel',n);updateModelOptions();showToast('Model: '+n)}
+        function updateModelOptions(){document.querySelectorAll('.model-option').forEach(o=>{o.classList.toggle('selected',o.dataset.name===currentModel)})}
+        function handleKeyDown(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}}
+        function setStatus(s,t){const d=document.getElementById('statusDot'),x=document.getElementById('statusText');d.className='status-dot '+s;x.textContent=t}
+        async function loadModels(){setStatus('loading','Loading models...');try{const r=await fetch('/v1/models'),d=await r.json(),m=document.getElementById('modelDropdown');m.innerHTML='';modelList=d.data||[];if(modelList.length){modelList.forEach(x=>{const o=document.createElement('div');o.className='model-option';o.dataset.name=x.name;o.innerHTML='<div>'+x.name+'</div><div class="model-size">'+(x.size_human||'Unknown size')+'</div>'+(x.is_loaded?'<div class="model-loaded">✓ Loaded</div>':'');o.onclick=()=>selectModel(x.name);if(x.name===currentModel)o.classList.add('selected');m.appendChild(o)});if(!modelList.find(x=>x.name===currentModel)&&modelList[0])selectModel(modelList[0].name);setStatus('online','Online')}else{m.innerHTML='<div class="model-option">No models found</div>';setStatus('offline','No models')}}catch(e){m.innerHTML='<div class="model-option" onclick="loadModels()">Error loading - Click to retry</div>';setStatus('offline','Connection error');showToast('Failed to load models','error')}finally{hideLoading()}}
+        async function loadConversations(e){if(e)e.stopPropagation();showLoading();try{const r=await fetch('/v1/conversations'),d=await r.json(),h=document.getElementById('chatHistory');h.innerHTML='<div class="chat-history-title">Conversations<button class="refresh-btn" onclick="loadConversations(event)" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button></div>';if(d.data&&d.data.length){conversations=d.data.sort((a,b)=>new Date(b.last_activity)-new Date(a.last_activity));conversations.forEach(c=>{const i=document.createElement('div');i.className='chat-history-item';i.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>'+(c.model?`${c.model}: `:'')+escapeHtml(c.id.substr(0,18));i.onclick=()=>loadConversation(c.id);if(c.id===conversationId)i.classList.add('active');h.appendChild(i)});if(!conversations.find(c=>c.id===conversationId)&&conversations[0]){conversationId=conversations[0].id;loadConversation(conversationId)}}showToast(`Loaded ${d.data?.length||0} conversations`)}catch(e){console.error('Failed to load conversations',e);showToast('Failed to load conversations','error')}finally{hideLoading()}}
+        async function loadConversation(id){showLoading();try{const r=await fetch('/v1/conversations/'+encodeURIComponent(id));if(!r.ok)throw new Error('Conversation not found');const d=await r.json();conversationId=id;messages=d.messages.map(m=>({role:m.role,content:m.content}));document.getElementById('chatMessages').innerHTML='';if(messages.length){messages.forEach(m=>addMessage(m.role,m.content));scrollToBottom()}else{document.getElementById('chatMessages').innerHTML='<div class="empty-state" id="emptyState"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg><h2>'+escapeHtml(id.substr(0,20))+'...</h2><p>Start a new conversation</p></div>'}document.querySelectorAll('.chat-history-item').forEach(i=>{i.classList.toggle('active',i.textContent.includes(id.substr(0,20)))});if(d.model)currentModel=d.model;document.getElementById('currentModel').textContent=currentModel;updateModelOptions();showToast('Conversation loaded')}catch(e){showToast('Failed to load conversation','error')}finally{hideLoading()}}
+        async function sendMessage(){if(isLoading)return;const i=document.getElementById('messageInput'),t=i.value.trim();if(!t)return;isLoading=true;i.value='';i.style.height='auto';i.disabled=true;document.getElementById('sendBtn').disabled=true;setStatus('loading','Generating...');const e=document.getElementById('emptyState');if(e)e.remove();messages.push({role:'user',content:t});addMessage('user',t);const l=addLoading();scrollToBottom();try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:currentModel,messages:messages.map(m=>({role:m.role,content:m.content})),conversation_id:conversationId,max_tokens:savedSettings.maxTokens,temperature:savedSettings.temperature,stream:false})});if(!r.ok){const e=await r.json();throw new Error(e.error?.message||'HTTP '+r.status)}const d=await r.json();l.remove();if(d.choices&&d.choices[0]){const c=d.choices[0].message.content;messages.push({role:'assistant',content:c});addMessage('assistant',c);showToast('Response received')}else{throw new Error('Invalid response format')}}catch(err){l.remove();addError(err.message);showToast(err.message,'error')}finally{isLoading=false;i.disabled=false;i.focus();document.getElementById('sendBtn').disabled=!i.value.trim();setStatus('online','Online');scrollToBottom();saveConversation();loadConversations()}}
+        function addMessage(r,c){const m=document.createElement('div');m.className='message '+r;m.innerHTML='<div class="message-avatar">'+(r==='user'?'You':'AI')+'</div><div class="message-content">'+formatMessage(c)+'</div>';document.getElementById('chatMessages').appendChild(m);return m}
+        function addLoading(){const m=document.createElement('div');m.className='message assistant';m.id='loading';m.innerHTML='<div class="message-avatar">AI</div><div class="message-content"><div class="typing-indicator"><span></span><span></span><span></span></div></div>';document.getElementById('chatMessages').appendChild(m);return m}
+        function addError(e){const m=document.createElement('div');m.className='message assistant';m.innerHTML='<div class="message-avatar">AI</div><div class="message-content"><div class="error-message"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'+escapeHtml(e)+'<button class="retry-btn" onclick="retryMessage()">Retry</button></div></div>';document.getElementById('chatMessages').appendChild(m);scrollToBottom()}
+        function retryMessage(){const l=document.querySelector('.error-message');if(l)l.closest('.message').remove();isLoading=false;const i=document.getElementById('messageInput');i.disabled=false;i.focus();document.getElementById('sendBtn').disabled=!i.value.trim();sendMessage()}
+        function newChat(){conversationId=generateId();messages=[];document.getElementById('chatMessages').innerHTML='<div class="empty-state" id="emptyState"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg><h2>New Conversation</h2><p>Start chatting with RustGPT</p></div>';document.querySelectorAll('.chat-history-item').forEach(i=>i.classList.remove('active'));loadConversations();showToast('New conversation started')}
+        function clearChat(){if(messages.length&&!confirm('Clear this conversation?'))return;conversationId=generateId();messages=[];document.getElementById('chatMessages').innerHTML='<div class="empty-state" id="emptyState"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg><h2>Cleared</h2><p>Start a new conversation</p></div>';showToast('Chat cleared')}
+        async function saveConversation(){if(messages.length>0){localStorage.setItem('conv-'+conversationId,JSON.stringify({id:conversationId,messages:messages,model:currentModel,timestamp:Date.now()}));setStatus('saving','Saving...');setTimeout(()=>setStatus('online','Online'),500)}}
+        function openSettings(){const s=prompt('Settings (enter as: temperature,max_tokens):\n\nExample: 0.7,1024',localStorage.getItem('settings')||'0.7,1024');if(s){const[t,m]=s.split(',').map(x=>parseFloat(x.trim()));if(!isNaN(t)&&t>0&&t<=2){savedSettings.temperature=t;localStorage.setItem('temperature',t);showToast('Temperature set to '+t)}if(!isNaN(m)&&m>0&&m<=8192){savedSettings.maxTokens=m;localStorage.setItem('maxTokens',m);showToast('Max tokens set to '+m)}}}
+        document.addEventListener('click',e=>{if(!e.target.closest('.model-selector'))document.getElementById('modelDropdown').classList.remove('show')});
+        window.onload=()=>{const s=localStorage.getItem('selectedModel');if(s)currentModel=s;const t=localStorage.getItem('temperature');if(t)savedSettings.temperature=parseFloat(t);const m=localStorage.getItem('maxTokens');if(m)savedSettings.maxTokens=parseInt(m);document.getElementById('currentModel').textContent=currentModel;loadModels();loadConversations();document.getElementById('messageInput').focus()};
     </script>
 </body>
 </html>

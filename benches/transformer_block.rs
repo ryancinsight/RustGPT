@@ -1,11 +1,11 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llm::{
-    Layer,
-    layers::{
+    domain::layers::{
         components::common::TemporalMixingLayer,
         transformer::{TransformerBlock, TransformerBlockConfig},
     },
-    model_config::{ModelConfig, TemporalMixingType},
+    domain::models::config::{ModelConfig, TemporalMixingType},
+    domain::network::Layer,
 };
 use ndarray::Array2;
 
@@ -27,18 +27,19 @@ fn bench_transformer_block_forward(c: &mut Criterion) {
             window_size: Some(seq_len),
             use_moe: false,
             moe_config: None,
-            head_selection: llm::mixtures::HeadSelectionStrategy::Fixed {
+            head_selection: llm::domain::mixtures::HeadSelectionStrategy::Fixed {
                 num_active: num_heads,
             },
-            moh_threshold_modulation: llm::richards::adaptive::AdaptiveScalar::default(),
+            moh_threshold_modulation: llm::domain::richards::adaptive::AdaptiveScalar::default(),
             temporal_mixing: TemporalMixingType::Attention,
             use_adaptive_window: false,
             min_window_size: seq_len,
             max_window_size: seq_len,
-            window_adaptation_strategy: llm::model_config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                llm::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: true,
-            titan_memory: llm::model_config::TitanMemoryConfig::default(),
+            titan_memory: llm::domain::models::config::TitanMemoryConfig::default(),
             eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(tcfg);

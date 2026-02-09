@@ -219,6 +219,7 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 #[derive(Debug)]
 struct WavHeader {
     audio_format: u16,
+    #[allow(dead_code)]
     num_channels: u16,
     sample_rate: u32,
     bits_per_sample: u16,

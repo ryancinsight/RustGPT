@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{infrastructure::optimizer::adam::Adam, common::rng::get_rng};
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Optimized Contextual Position Embeddings (OptimizedCoPE)
 ///
@@ -92,7 +92,12 @@ impl OptimizedCoPE {
     }
 
     /// Create with custom temperature
-    pub fn with_temperature(max_pos: usize, embed_dim: usize, rank: usize, temperature: f32) -> Self {
+    pub fn with_temperature(
+        max_pos: usize,
+        embed_dim: usize,
+        rank: usize,
+        temperature: f32,
+    ) -> Self {
         let mut instance = Self::new(max_pos, embed_dim, rank);
         instance.temperature = temperature;
         instance
@@ -161,9 +166,9 @@ impl OptimizedCoPE {
     #[inline]
     fn log1p_exp(&self, x: f32) -> f32 {
         if x > 20.0 {
-            x  // Approximation for large positive
+            x // Approximation for large positive
         } else if x < -20.0 {
-            x.exp()  // Approximation for large negative (very small)
+            x.exp() // Approximation for large negative (very small)
         } else {
             (1.0 + x.exp()).ln()
         }
@@ -195,7 +200,13 @@ impl OptimizedCoPE {
         }
         let up_row = self.up_proj.row(pos);
         let mut embedding = Array1::zeros(self.embed_dim);
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj.t(), &up_row.to_owned(), 0.0, &mut embedding);
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &self.down_proj.t(),
+            &up_row.to_owned(),
+            0.0,
+            &mut embedding,
+        );
         Some(embedding)
     }
 

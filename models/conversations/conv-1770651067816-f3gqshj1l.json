@@ -1,0 +1,23 @@
+{
+  "id": "conv-1770651067816-f3gqshj1l",
+  "created_at": "2026-02-09T15:31:23.868161700Z",
+  "last_activity": "2026-02-09T15:31:40.729923Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello\\",
+      "timestamp": "2026-02-09T15:31:23.868174100Z"
+    },
+    {
+      "role": "user",
+      "content": "hello\\",
+      "timestamp": "2026-02-09T15:31:40.729919400Z"
+    }
+  ],
+  "model_name": "rustgpt"
+}      "content": "hello",
+      "timestamp": "2026-02-09T15:31:40.729941700Z"
+    }
+  ],
+  "model_name": "rustgpt"
+}

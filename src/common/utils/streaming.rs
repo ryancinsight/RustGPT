@@ -52,13 +52,13 @@ impl Default for StreamingConfig {
 pub trait StreamingWorkspace: Clone + Send {
     /// Reset all buffers to initial state.
     fn reset(&mut self);
-    
+
     /// Get the configuration for this workspace.
     fn config(&self) -> &StreamingConfig;
-    
+
     /// Estimate memory usage in bytes.
     fn memory_usage(&self) -> usize;
-    
+
     /// Check if workspace is initialized for the given dimensions.
     fn is_compatible(&self, config: &StreamingConfig) -> bool;
 }
@@ -88,19 +88,19 @@ impl GenericStreamingWorkspace {
             config,
         }
     }
-    
+
     /// Get mutable access to the IO buffer.
     #[inline]
     pub fn io(&mut self) -> &mut Array1<f32> {
         &mut self.io_buffer
     }
-    
+
     /// Get mutable access to the temp buffer.
     #[inline]
     pub fn temp(&mut self) -> &mut Array1<f32> {
         &mut self.temp_buffer
     }
-    
+
     /// Get mutable access to the matrix buffer.
     #[inline]
     pub fn matrix(&mut self) -> &mut Array2<f32> {
@@ -115,12 +115,12 @@ impl StreamingWorkspace for GenericStreamingWorkspace {
         self.temp_buffer.fill(0.0);
         self.matrix_buffer.fill(0.0);
     }
-    
+
     #[inline]
     fn config(&self) -> &StreamingConfig {
         &self.config
     }
-    
+
     #[inline]
     fn memory_usage(&self) -> usize {
         let d = self.config.embed_dim;
@@ -129,11 +129,10 @@ impl StreamingWorkspace for GenericStreamingWorkspace {
         // matrix_buffer: d * d * 4 bytes
         (d * 2 + d * d) * 4
     }
-    
+
     #[inline]
     fn is_compatible(&self, config: &StreamingConfig) -> bool {
-        self.config.embed_dim >= config.embed_dim
-            && self.config.max_seq_len >= config.max_seq_len
+        self.config.embed_dim >= config.embed_dim && self.config.max_seq_len >= config.max_seq_len
     }
 }
 
@@ -164,7 +163,7 @@ impl WorkspaceManager {
         let mut generic_small = Vec::with_capacity(4);
         let mut generic_medium = Vec::with_capacity(2);
         let mut generic_large = Vec::with_capacity(1);
-        
+
         // Pre-allocate workspaces for common sizes
         for _ in 0..4 {
             generic_small.push(GenericStreamingWorkspace::new(StreamingConfig {
@@ -172,19 +171,19 @@ impl WorkspaceManager {
                 ..Default::default()
             }));
         }
-        
+
         for _ in 0..2 {
             generic_medium.push(GenericStreamingWorkspace::new(StreamingConfig {
                 embed_dim: 512,
                 ..Default::default()
             }));
         }
-        
+
         generic_large.push(GenericStreamingWorkspace::new(StreamingConfig {
             embed_dim: 2048,
             ..Default::default()
         }));
-        
+
         Self {
             generic_small,
             generic_medium,
@@ -193,12 +192,12 @@ impl WorkspaceManager {
             allocations_performed: 0,
         }
     }
-    
+
     /// Acquire a workspace suitable for the given embed dimension.
     #[inline]
     pub fn acquire(&mut self, embed_dim: usize) -> &mut GenericStreamingWorkspace {
         self.allocations_avoided += 1;
-        
+
         if embed_dim <= 128 {
             let idx = self.allocations_avoided % self.generic_small.len();
             &mut self.generic_small[idx]
@@ -210,7 +209,7 @@ impl WorkspaceManager {
             &mut self.generic_large[idx]
         }
     }
-    
+
     /// Get statistics about workspace usage.
     pub fn stats(&self) -> WorkspaceManagerStats {
         WorkspaceManagerStats {
@@ -221,7 +220,7 @@ impl WorkspaceManager {
             allocations_performed: self.allocations_performed,
         }
     }
-    
+
     /// Reset all workspaces.
     pub fn reset_all(&mut self) {
         for ws in &mut self.generic_small {
@@ -250,11 +249,11 @@ pub struct WorkspaceManagerStats {
 #[inline]
 pub fn with_workspace_manager<R>(f: impl FnOnce(&mut WorkspaceManager) -> R) -> R {
     use std::cell::RefCell;
-    
+
     thread_local! {
         static MANAGER: RefCell<WorkspaceManager> = RefCell::new(WorkspaceManager::new());
     }
-    
+
     MANAGER.with(|m| {
         let mut m = m.borrow_mut();
         f(&mut m)
@@ -264,7 +263,7 @@ pub fn with_workspace_manager<R>(f: impl FnOnce(&mut WorkspaceManager) -> R) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_generic_workspace_creation() {
         let config = StreamingConfig {
@@ -272,12 +271,12 @@ mod tests {
             ..Default::default()
         };
         let ws = GenericStreamingWorkspace::new(config);
-        
+
         assert_eq!(ws.io_buffer.len(), 256);
         assert_eq!(ws.temp_buffer.len(), 256);
         assert_eq!(ws.matrix_buffer.dim(), (256, 256));
     }
-    
+
     #[test]
     fn test_generic_workspace_reset() {
         let config = StreamingConfig {
@@ -285,47 +284,47 @@ mod tests {
             ..Default::default()
         };
         let mut ws = GenericStreamingWorkspace::new(config);
-        
+
         ws.io_buffer.fill(1.0);
         ws.temp_buffer.fill(2.0);
         ws.matrix_buffer.fill(3.0);
-        
+
         ws.reset();
-        
+
         assert!(ws.io_buffer.iter().all(|&x| x == 0.0));
         assert!(ws.temp_buffer.iter().all(|&x| x == 0.0));
         assert!(ws.matrix_buffer.iter().all(|&x| x == 0.0));
     }
-    
+
     #[test]
     fn test_workspace_manager_acquire() {
         let mut manager = WorkspaceManager::new();
-        
+
         let ws = manager.acquire(64);
         assert!(ws.io_buffer.len() >= 64);
-        
+
         let ws = manager.acquire(256);
         assert!(ws.io_buffer.len() >= 256);
-        
+
         let ws = manager.acquire(1024);
         assert!(ws.io_buffer.len() >= 1024);
     }
-    
+
     #[test]
     fn test_workspace_manager_stats() {
         let mut manager = WorkspaceManager::new();
-        
+
         let _ = manager.acquire(64);
         let _ = manager.acquire(128);
         let _ = manager.acquire(512);
-        
+
         let stats = manager.stats();
         assert_eq!(stats.small_available, 4);
         assert_eq!(stats.medium_available, 2);
         assert_eq!(stats.large_available, 1);
         assert_eq!(stats.allocations_avoided, 3);
     }
-    
+
     #[test]
     fn test_streaming_workspace_trait() {
         let config = StreamingConfig {
@@ -334,17 +333,17 @@ mod tests {
             ..Default::default()
         };
         let ws = GenericStreamingWorkspace::new(config);
-        
+
         assert_eq!(ws.config().embed_dim, 128);
         assert!(ws.memory_usage() > 0);
-        
+
         let compatible_config = StreamingConfig {
             embed_dim: 64,
             max_seq_len: 256,
             ..Default::default()
         };
         assert!(ws.is_compatible(&compatible_config));
-        
+
         let incompatible_config = StreamingConfig {
             embed_dim: 256,
             max_seq_len: 1024,
@@ -352,7 +351,7 @@ mod tests {
         };
         assert!(!ws.is_compatible(&incompatible_config));
     }
-    
+
     #[test]
     fn test_tls_workspace_manager() {
         let result = with_workspace_manager(|m| {

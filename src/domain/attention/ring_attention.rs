@@ -142,22 +142,31 @@ impl RingBlock {
 
     /// Append tokens to this block.
     /// Returns the number of tokens successfully appended.
-    pub fn append(&mut self, k_new: &ArrayView2<f32>, v_new: &ArrayView2<f32>, global_pos: usize) -> usize {
+    pub fn append(
+        &mut self,
+        k_new: &ArrayView2<f32>,
+        v_new: &ArrayView2<f32>,
+        global_pos: usize,
+    ) -> usize {
         let available = self.k.nrows() - self.valid_len;
         let to_append = k_new.nrows().min(available).min(v_new.nrows());
-        
+
         if to_append > 0 {
             let start = self.valid_len;
             let end = start + to_append;
-            self.k.slice_mut(s![start..end, ..]).assign(&k_new.slice(s![..to_append, ..]));
-            self.v.slice_mut(s![start..end, ..]).assign(&v_new.slice(s![..to_append, ..]));
-            
+            self.k
+                .slice_mut(s![start..end, ..])
+                .assign(&k_new.slice(s![..to_append, ..]));
+            self.v
+                .slice_mut(s![start..end, ..])
+                .assign(&v_new.slice(s![..to_append, ..]));
+
             if self.valid_len == 0 {
                 self.global_pos = global_pos;
             }
             self.valid_len += to_append;
         }
-        
+
         to_append
     }
 
@@ -189,11 +198,11 @@ impl RingBuffer {
     /// Create a new ring buffer with the given configuration.
     pub fn new(config: RingAttentionConfig) -> Self {
         config.validate().expect("Invalid RingAttentionConfig");
-        
+
         let blocks: Vec<RingBlock> = (0..config.num_blocks)
             .map(|_| RingBlock::new(config.block_size, config.embed_dim))
             .collect();
-        
+
         Self {
             config,
             blocks,
@@ -227,30 +236,30 @@ impl RingBuffer {
     }
 
     /// Append key-value pairs to the ring buffer.
-    /// 
+    ///
     /// This implements the circular write pattern where new tokens overwrite
     /// the oldest tokens when the buffer is full.
     pub fn append_kv(&mut self, k: &Array2<f32>, v: &Array2<f32>) {
         assert_eq!(k.shape(), v.shape(), "K and V must have same shape");
         assert_eq!(k.ncols(), self.config.embed_dim, "K dimension mismatch");
-        
+
         let mut offset = 0usize;
-        
+
         while offset < k.nrows() {
             let block = &mut self.blocks[self.write_pos];
-            
+
             if block.is_full() {
                 // Move to next block and reset it
                 self.write_pos = (self.write_pos + 1) % self.config.num_blocks;
                 self.blocks[self.write_pos].reset();
                 continue;
             }
-            
+
             let k_slice = k.slice(s![offset.., ..]);
             let v_slice = v.slice(s![offset.., ..]);
-            
+
             let appended = block.append(&k_slice, &v_slice, self.total_tokens);
-            
+
             if appended == 0 {
                 // Block is full, move to next
                 self.write_pos = (self.write_pos + 1) % self.config.num_blocks;
@@ -271,7 +280,7 @@ impl RingBuffer {
             // Buffer not full yet, start from beginning
             0
         };
-        
+
         (0..self.config.num_blocks).map(move |i| {
             let idx = (start + i) % self.config.num_blocks;
             &self.blocks[idx]
@@ -279,7 +288,7 @@ impl RingBuffer {
     }
 
     /// Get blocks that are relevant for a query at the given position.
-    /// 
+    ///
     /// For causal attention, this returns all blocks up to the query position.
     pub fn get_relevant_blocks(&self, query_global_pos: usize) -> Vec<&RingBlock> {
         self.iter_blocks()
@@ -292,7 +301,7 @@ impl RingBuffer {
 }
 
 /// Online softmax accumulator for stable attention computation.
-/// 
+///
 /// Implements the online softmax algorithm from Milakov & Gimelshein (2018)
 /// to compute attention in a numerically stable manner without materializing
 /// the full attention matrix.
@@ -320,31 +329,31 @@ impl OnlineSoftmaxAccumulator {
     }
 
     /// Process a new block of attention scores and values.
-    /// 
+    ///
     /// This implements the online softmax update:
     /// - Track running maximum for numerical stability
     /// - Update exponential sum with correction factor
     /// - Accumulate weighted values
-    pub fn process_block(
-        &mut self,
-        scores: &ArrayView1<f32>,
-        values: &ArrayView2<f32>,
-    ) {
+    pub fn process_block(&mut self, scores: &ArrayView1<f32>, values: &ArrayView2<f32>) {
         assert_eq!(scores.len(), values.nrows(), "Score/value count mismatch");
-        assert_eq!(values.ncols(), self.output.len(), "Output dimension mismatch");
-        
+        assert_eq!(
+            values.ncols(),
+            self.output.len(),
+            "Output dimension mismatch"
+        );
+
         if scores.is_empty() {
             return;
         }
-        
+
         // Find max score in this block
         let block_max = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        
+
         if self.blocks_processed == 0 {
             // First block - initialize
             self.max_score = block_max;
             self.sum_exp = 0.0;
-            
+
             for (i, &score) in scores.iter().enumerate() {
                 let exp_val = (score - self.max_score).exp();
                 self.sum_exp += exp_val;
@@ -357,11 +366,11 @@ impl OnlineSoftmaxAccumulator {
             let new_max = self.max_score.max(block_max);
             let correction_old = (self.max_score - new_max).exp();
             let correction_new = (block_max - new_max).exp();
-            
+
             // Scale existing output
             self.output *= correction_old;
             self.sum_exp *= correction_old;
-            
+
             // Add new contributions
             for (i, &score) in scores.iter().enumerate() {
                 let exp_val = (score - new_max).exp() * correction_new;
@@ -370,10 +379,10 @@ impl OnlineSoftmaxAccumulator {
                     self.output[j] += exp_val * values[[i, j]];
                 }
             }
-            
+
             self.max_score = new_max;
         }
-        
+
         self.blocks_processed += 1;
     }
 
@@ -419,7 +428,7 @@ impl RingAttentionStreamingWorkspace {
             kv_2d: Array2::zeros((1, dim)),
         }
     }
-    
+
     /// Reset all buffers.
     #[inline]
     pub fn reset(&mut self) {
@@ -460,13 +469,13 @@ impl RingAttention {
     /// Create a new Ring Attention processor.
     pub fn new(config: RingAttentionConfig) -> Self {
         use rand_distr::{Distribution, Normal};
-        
+
         config.validate().expect("Invalid RingAttentionConfig");
         let head_dim = config.embed_dim / config.num_heads;
-        
+
         let mut rng = rand::rng();
         let normal = Normal::new(0.0, (head_dim as f32).powf(-0.5)).unwrap();
-        
+
         // Initialize weights with Xavier/Glorot initialization
         let w_q = Array2::from_shape_fn((config.embed_dim, config.embed_dim), |_| {
             normal.sample(&mut rng)
@@ -480,7 +489,7 @@ impl RingAttention {
         let w_out = Array2::from_shape_fn((config.embed_dim, config.embed_dim), |_| {
             normal.sample(&mut rng)
         });
-        
+
         Self {
             config,
             ring_buffer: RingBuffer::new(config),
@@ -503,7 +512,7 @@ impl RingAttention {
             ws.reset();
         }
     }
-    
+
     /// Ensure streaming workspace is initialized.
     #[inline]
     fn ensure_streaming_workspace(&mut self) {
@@ -518,56 +527,56 @@ impl RingAttention {
     #[inline]
     pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         self.ensure_streaming_workspace();
-        
+
         // Cache values needed for score computation to avoid borrow conflict
         let scale_factor = self.scale_factor;
         let poly_a = self.poly_a;
         let poly_b = self.poly_b;
         let poly_scale = self.poly_scale;
         let poly_degree = self.config.polynomial_degree;
-        
+
         let dim = self.config.embed_dim;
         let num_heads = self.config.num_heads;
         let head_dim = dim / num_heads;
-        
+
         // Project input to Q, K, V using workspace buffers
         {
             let ws = self.streaming_workspace.as_mut().unwrap();
             ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q.t(), input, 0.0, &mut ws.q);
             ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut ws.k);
             ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut ws.v);
-            
+
             // Append K, V to ring buffer using workspace 2D buffer
             ws.kv_2d.row_mut(0).assign(&ws.k);
             let k_copy = ws.kv_2d.clone();
             ws.kv_2d.row_mut(0).assign(&ws.v);
             self.ring_buffer.append_kv(&k_copy, &ws.kv_2d);
         }
-        
+
         // Clear output
         output.fill(0.0);
-        
+
         let global_pos = self.ring_buffer.len();
-        
+
         // Get workspace reference for the main computation
         let ws = self.streaming_workspace.as_mut().unwrap();
-        
+
         for h in 0..num_heads {
             let start = h * head_dim;
             let end = start + head_dim;
-            
+
             let q_h = ws.q.slice(s![start..end]);
-            
+
             // Accumulate attention across ring blocks
             let mut accumulator = OnlineSoftmaxAccumulator::new(head_dim);
-            
+
             for block in self.ring_buffer.get_relevant_blocks(global_pos) {
                 let k_block = block.k_view();
                 let v_block = block.v_view();
-                
+
                 // Compute scores for this block using cached parameters
                 let block_len = k_block.nrows().min(ws.scores.len());
-                
+
                 for i in 0..block_len {
                     let k_h = k_block.slice(s![i, start..end]);
                     // Inline score computation to avoid borrowing self
@@ -585,15 +594,15 @@ impl RingAttention {
                     };
                     ws.scores[i] = poly_scale * (poly_a * sp + poly_b);
                 }
-                
+
                 // Process block
                 let v_h = v_block.slice(s![..block_len, start..end]);
                 accumulator.process_block(&ws.scores.slice(s![..block_len]).view(), &v_h);
             }
-            
+
             // Get output for this head
             let head_output = accumulator.finalize();
-            
+
             // Project to output
             let w_out_h = self.w_out.slice(s![start..end, ..]);
             for j in 0..dim {
@@ -611,51 +620,51 @@ impl RingAttention {
         let dim = self.config.embed_dim;
         let num_heads = self.config.num_heads;
         let head_dim = dim / num_heads;
-        
+
         // Project input to Q, K, V
         let q = input.dot(&self.w_q.t());
         let k = input.dot(&self.w_k.t());
         let v = input.dot(&self.w_v.t());
-        
+
         // Append K, V to ring buffer
         let k_2d = k.clone().insert_axis(Axis(0));
         let v_2d = v.clone().insert_axis(Axis(0));
         self.ring_buffer.append_kv(&k_2d, &v_2d);
-        
+
         // Process each head
         let mut output = Array1::zeros(dim);
         let global_pos = self.ring_buffer.len();
-        
+
         for h in 0..num_heads {
             let start = h * head_dim;
             let end = start + head_dim;
-            
+
             let q_h = q.slice(s![start..end]);
-            
+
             // Accumulate attention across ring blocks
             let mut accumulator = OnlineSoftmaxAccumulator::new(head_dim);
-            
+
             for block in self.ring_buffer.get_relevant_blocks(global_pos) {
                 let k_block = block.k_view();
                 let v_block = block.v_view();
-                
+
                 // Compute scores for this block
                 let block_len = k_block.nrows();
                 let mut scores = Array1::zeros(block_len);
-                
+
                 for i in 0..block_len {
                     let k_h = k_block.slice(s![i, start..end]);
                     scores[i] = self.compute_score(&q_h, &k_h);
                 }
-                
+
                 // Process block
                 let v_h = v_block.slice(s![.., start..end]);
                 accumulator.process_block(&scores.view(), &v_h);
             }
-            
+
             // Get output for this head
             let head_output = accumulator.finalize();
-            
+
             // Project to output
             let w_out_h = self.w_out.slice(s![start..end, ..]);
             for j in 0..dim {
@@ -664,18 +673,18 @@ impl RingAttention {
                 }
             }
         }
-        
+
         output
     }
 
     /// Compute polynomial attention score.
     fn compute_score(&self, q: &ArrayView1<f32>, k: &ArrayView1<f32>) -> f32 {
         let dot = q.dot(k) * self.scale_factor;
-        
+
         // Apply polynomial transformation
         let p = self.config.polynomial_degree as i32;
         let s_stable = Self::smooth_clip(dot, 8.0);
-        
+
         let sp = if p <= 3 {
             match p {
                 1 => s_stable,
@@ -686,7 +695,7 @@ impl RingAttention {
         } else {
             s_stable.powi(p)
         };
-        
+
         self.poly_scale * (self.poly_a * sp + self.poly_b)
     }
 
@@ -729,14 +738,14 @@ mod tests {
     #[test]
     fn test_ring_block_append() {
         let mut block = RingBlock::new(4, 8);
-        
+
         let k = Array2::zeros((2, 8));
         let v = Array2::zeros((2, 8));
-        
+
         let appended = block.append(&k.view(), &v.view(), 0);
         assert_eq!(appended, 2);
         assert_eq!(block.valid_len, 2);
-        
+
         // Try to append more than capacity
         let k2 = Array2::zeros((10, 8));
         let v2 = Array2::zeros((10, 8));
@@ -755,20 +764,20 @@ mod tests {
             polynomial_degree: 3,
             use_online_softmax: true,
         };
-        
+
         let mut buffer = RingBuffer::new(config);
-        
+
         // Fill buffer
         for i in 0..10 {
             let k = Array2::from_elem((1, 4), i as f32);
             let v = Array2::from_elem((1, 4), i as f32);
             buffer.append_kv(&k, &v);
         }
-        
+
         // Buffer should have wrapped around
         assert_eq!(buffer.len(), 10);
         assert_eq!(buffer.capacity(), 6);
-        
+
         // Should have 3 blocks with valid data
         let valid_blocks: Vec<_> = buffer.iter_blocks().filter(|b| b.valid_len > 0).collect();
         assert_eq!(valid_blocks.len(), 3);
@@ -777,27 +786,27 @@ mod tests {
     #[test]
     fn test_online_softmax() {
         let mut acc = OnlineSoftmaxAccumulator::new(4);
-        
+
         // First block
         let scores1 = Array1::from_vec(vec![1.0, 2.0, 3.0]);
-        let values1 = Array2::from_shape_vec((3, 4), vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-        ]).unwrap();
+        let values1 = Array2::from_shape_vec(
+            (3, 4),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        )
+        .unwrap();
         acc.process_block(&scores1.view(), &values1.view());
-        
+
         // Second block
         let scores2 = Array1::from_vec(vec![2.0, 3.0, 4.0]);
-        let values2 = Array2::from_shape_vec((3, 4), vec![
-            0.0, 0.0, 0.0, 1.0,
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-        ]).unwrap();
+        let values2 = Array2::from_shape_vec(
+            (3, 4),
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        )
+        .unwrap();
         acc.process_block(&scores2.view(), &values2.view());
-        
+
         let output = acc.finalize();
-        
+
         // Check that output is properly normalized
         // With scores [1,2,3,2,3,4], the max is 4
         // Softmax should weight the higher scores more
@@ -815,9 +824,9 @@ mod tests {
             polynomial_degree: 3,
             use_online_softmax: true,
         };
-        
+
         let mut ring_attn = RingAttention::new(config);
-        
+
         // Process several tokens
         for _ in 0..20 {
             let input = Array1::zeros(16);
@@ -825,7 +834,7 @@ mod tests {
             assert_eq!(output.len(), 16);
             assert!(output.iter().all(|&x| x.is_finite()));
         }
-        
+
         let stats = ring_attn.stats();
         assert_eq!(stats.total_tokens, 20);
         assert_eq!(stats.capacity, 16);
@@ -836,13 +845,13 @@ mod tests {
     fn test_config_validation() {
         let valid_config = RingAttentionConfig::default();
         assert!(valid_config.validate().is_ok());
-        
+
         let invalid_config = RingAttentionConfig {
             block_size: 0,
             ..Default::default()
         };
         assert!(invalid_config.validate().is_err());
-        
+
         let invalid_config2 = RingAttentionConfig {
             embed_dim: 128,
             num_heads: 3, // Not divisible
@@ -850,7 +859,7 @@ mod tests {
         };
         assert!(invalid_config2.validate().is_err());
     }
-    
+
     #[test]
     fn test_ring_attention_forward_step_into() {
         let config = RingAttentionConfig {
@@ -861,10 +870,10 @@ mod tests {
             polynomial_degree: 3,
             use_online_softmax: true,
         };
-        
+
         let mut ring_attn = RingAttention::new(config);
         let mut output = Array1::zeros(16);
-        
+
         // Process several tokens using zero-allocation path
         for _ in 0..10 {
             let input = Array1::zeros(16);
@@ -872,11 +881,11 @@ mod tests {
             assert_eq!(output.len(), 16);
             assert!(output.iter().all(|&x| x.is_finite()));
         }
-        
+
         let stats = ring_attn.stats();
         assert_eq!(stats.total_tokens, 10);
     }
-    
+
     #[test]
     fn test_ring_attention_forward_step_into_vs_forward_step() {
         let config = RingAttentionConfig {
@@ -887,17 +896,17 @@ mod tests {
             polynomial_degree: 3,
             use_online_softmax: true,
         };
-        
+
         // Test forward_step_into
         let mut ring_attn1 = RingAttention::new(config.clone());
         let mut output1 = Array1::zeros(16);
         let input = Array1::zeros(16);
         ring_attn1.forward_step_into(&input.view(), &mut output1);
-        
+
         // Test forward_step
         let mut ring_attn2 = RingAttention::new(config);
         let output2 = ring_attn2.forward_step(&input.view());
-        
+
         // Both should produce finite outputs of the same shape
         assert_eq!(output1.len(), output2.len());
         assert!(output1.iter().all(|&x| x.is_finite()));

@@ -1,8 +1,8 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use llm::models::llm::LLM;
-use llm::Vocab;
-use llm::model_config::ModelConfig;
-use llm::model_builder::build_network;
+use criterion::{Criterion, criterion_group, criterion_main};
+use llm::application::encoding::vocab::Vocab;
+use llm::domain::models::builder::build_network;
+use llm::domain::models::config::ModelConfig;
+use llm::domain::models::llm::LLM;
 
 fn bench_generation(c: &mut Criterion) {
     let mut config = ModelConfig::default();

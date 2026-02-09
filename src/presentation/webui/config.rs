@@ -52,6 +52,10 @@ pub struct WebUiConfig {
     #[serde(default = "default_model_dir")]
     pub model_dir: String,
 
+    /// Data directory for conversations and other data
+    #[serde(default = "default_data_dir")]
+    pub data_dir: Option<String>,
+
     /// Enable authentication
     #[serde(default = "default_auth_enabled")]
     pub auth_enabled: bool,
@@ -75,6 +79,7 @@ impl Default for WebUiConfig {
             websocket_enabled: default_websocket_enabled(),
             max_connections: default_max_connections(),
             model_dir: default_model_dir(),
+            data_dir: default_data_dir(),
             auth_enabled: default_auth_enabled(),
             api_key: None,
         }
@@ -133,6 +138,12 @@ impl WebUiConfig {
         self
     }
 
+    /// Builder method: set data directory
+    pub fn with_data_dir(mut self, dir: impl Into<String>) -> Self {
+        self.data_dir = Some(dir.into());
+        self
+    }
+
     /// Builder method: enable authentication
     pub fn with_auth(mut self, enabled: bool, api_key: Option<String>) -> Self {
         self.auth_enabled = enabled;
@@ -184,6 +195,10 @@ fn default_max_connections() -> usize {
 
 fn default_model_dir() -> String {
     "models".to_string()
+}
+
+fn default_data_dir() -> Option<String> {
+    None
 }
 
 fn default_auth_enabled() -> bool {

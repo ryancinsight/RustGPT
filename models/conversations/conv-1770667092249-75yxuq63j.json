@@ -1,0 +1,78 @@
+{
+  "id": "conv-1770667092249-75yxuq63j",
+  "created_at": "2026-02-09T19:58:20.061553700Z",
+  "last_activity": "2026-02-09T19:59:02.119291Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-09T19:58:20.061568600Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Hello ! Assistant : Hello ! Assistant : Hello ! How can I help you today ? to help </s>",
+      "timestamp": "2026-02-09T19:58:20.454662600Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-09T19:58:39.846739100Z"
+    },
+    {
+      "role": "user",
+      "content": "what is today",
+      "timestamp": "2026-02-09T19:58:39.846755100Z"
+    },
+    {
+      "role": "assistant",
+      "content": "You ' re having a string ( ) </s>",
+      "timestamp": "2026-02-09T19:58:40.217499800Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-09T19:58:52.784079100Z"
+    },
+    {
+      "role": "user",
+      "content": "what is today",
+      "timestamp": "2026-02-09T19:58:52.784098900Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me the future",
+      "timestamp": "2026-02-09T19:58:52.784122600Z"
+    },
+    {
+      "role": "assistant",
+      "content": "get APIs </s>",
+      "timestamp": "2026-02-09T19:58:52.961806100Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-09T19:59:01.679513700Z"
+    },
+    {
+      "role": "user",
+      "content": "what is today",
+      "timestamp": "2026-02-09T19:59:01.679544100Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me the future",
+      "timestamp": "2026-02-09T19:59:01.679568600Z"
+    },
+    {
+      "role": "user",
+      "content": "why",
+      "timestamp": "2026-02-09T19:59:01.679575100Z"
+    },
+    {
+      "role": "assistant",
+      "content": "get The great day . </s>",
+      "timestamp": "2026-02-09T19:59:02.119275800Z"
+    }
+  ],
+  "model_name": "rustgpt"
+}

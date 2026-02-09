@@ -51,6 +51,7 @@ fn hash_ngram(tokens: &[usize], table_size: usize, seed: u64) -> usize {
 /// Legacy alias for backward compatibility
 #[inline]
 #[deprecated(since = "0.2.0", note = "Use hash_ngram for better hash quality")]
+#[allow(dead_code)]
 fn multiplicative_xor_hash(tokens: &[usize], table_size: usize, seed: u64) -> usize {
     hash_ngram(tokens, table_size, seed)
 }

@@ -2,7 +2,7 @@ use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{infrastructure::optimizer::adam::Adam, common::rng::get_rng};
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyHead {

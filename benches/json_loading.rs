@@ -1,6 +1,6 @@
-use std::io::Write;
 use criterion::{Criterion, criterion_group, criterion_main};
-use llm::{Dataset, DatasetType};
+use llm::infrastructure::persistence::dataset::{Dataset, DatasetType};
+use std::io::Write;
 use tempfile::NamedTempFile;
 
 fn create_json_file(rows: usize) -> NamedTempFile {
@@ -11,7 +11,10 @@ fn create_json_file(rows: usize) -> NamedTempFile {
             write!(file, ",").unwrap();
         }
         // Create a reasonably long string to simulate real data
-        let text = format!("This is row number {} with some dummy text to make it longer. It needs to be long enough to make memory allocation significant.", i);
+        let text = format!(
+            "This is row number {} with some dummy text to make it longer. It needs to be long enough to make memory allocation significant.",
+            i
+        );
         serde_json::to_writer(&file, &serde_json::json!({"text": text})).unwrap();
     }
     write!(file, "]").unwrap();

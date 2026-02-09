@@ -1,15 +1,17 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use llm::{
-    Layer,
-    layers::{
+    domain::layers::{
         diffusion::{
             DiffusionBlock, DiffusionBlockConfig, DiffusionPredictionTarget, DiffusionSampler,
             EDM_SIGMA_DATA_DEFAULT, NoiseSchedule,
         },
         transformer::{TransformerBlock, TransformerBlockConfig},
     },
-    mixtures::HeadSelectionStrategy,
-    model_config::{DiffusionTimestepStrategy, TemporalMixingType, WindowAdaptationStrategy},
+    domain::mixtures::HeadSelectionStrategy,
+    domain::models::config::{
+        DiffusionTimestepStrategy, TemporalMixingType, WindowAdaptationStrategy,
+    },
+    domain::network::Layer,
 };
 use ndarray::Array2;
 
@@ -25,7 +27,7 @@ fn bench_forward(c: &mut Criterion) {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 8 },
-        titan_memory: llm::model_config::TitanMemoryConfig::default(),
+        titan_memory: llm::domain::models::config::TitanMemoryConfig::default(),
         time_embed_dim: 128 * 4,
         num_timesteps: 1000,
         noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
@@ -77,7 +79,7 @@ fn bench_forward_vs_transformer(c: &mut Criterion) {
         head_selection: HeadSelectionStrategy::Fixed {
             num_active: num_heads,
         },
-        titan_memory: llm::model_config::TitanMemoryConfig::default(),
+        titan_memory: llm::domain::models::config::TitanMemoryConfig::default(),
         time_embed_dim: embed_dim * 4,
         num_timesteps: 1000,
         noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
@@ -112,7 +114,7 @@ fn bench_forward_vs_transformer(c: &mut Criterion) {
         head_selection: HeadSelectionStrategy::Fixed {
             num_active: num_heads,
         },
-        moh_threshold_modulation: llm::richards::adaptive::AdaptiveScalar::default(),
+        moh_threshold_modulation: llm::domain::richards::adaptive::AdaptiveScalar::default(),
         temporal_mixing: TemporalMixingType::Attention,
         use_adaptive_window: false,
         min_window_size: 16,
@@ -174,7 +176,7 @@ fn bench_sample(c: &mut Criterion) {
         use_moe: false,
         moe_config: None,
         head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
-        titan_memory: llm::model_config::TitanMemoryConfig::default(),
+        titan_memory: llm::domain::models::config::TitanMemoryConfig::default(),
         time_embed_dim: 64 * 4,
         num_timesteps: 200,
         noise_schedule: NoiseSchedule::Cosine { s: 0.008 },

@@ -4,6 +4,7 @@ pub mod memory_pool;
 pub mod numeric;
 pub mod ring_buffer;
 pub mod streaming;
+pub mod unified_pool;
 pub mod workspace_pool;
 
 pub use memory_pool::*;

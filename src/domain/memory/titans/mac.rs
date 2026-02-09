@@ -93,6 +93,16 @@ impl TitansMAC {
         // 1. Retrieve h_t from Memory using input context (segment) as query.
         let h_t = self.memory.retrieve(segment);
 
+        if cfg!(debug_assertions) {
+             for i in 0..segment.nrows() {
+                  if i == segment.nrows() - 1 {
+                       println!("Batch Step {} (Last):", i);
+                       println!("  Retrieve Input (segment row): {:?}", segment.row(i));
+                       println!("  h_t: {:?}", h_t.row(i));
+                  }
+             }
+        }
+
         // 2. Process token-by-token to ensure correct causality (context = P + h_t[i])
         let p_len = self.persistent_len;
         let s_len = segment.nrows();
@@ -115,6 +125,14 @@ impl TitansMAC {
 
             // Forward detached (causal=true ensures C attends to A, B, C)
             let (attn_out, cache) = self.core.forward_detached(&input_seq, true);
+
+            if cfg!(debug_assertions) {
+                 println!("Batch Step {}:", i);
+                 println!("  Input: {:?}", current_seg);
+                 println!("  h_t: {:?}", current_h_t);
+                 // Check context slice
+                 // input_seq row p_len is h_t
+            }
 
             // Extract output for segment[i] (last row)
             let out_i = attn_out.row(total_len - 1).to_owned();
@@ -178,7 +196,7 @@ impl TitansMAC {
                 poly_context_workspace: PolyAttentionContextWorkspace::new(context_len, d),
                 update_buffer: Array2::zeros((self.segment_len, d)),
                 segment_input_buffer: Array2::zeros((self.segment_len, d)),
-                buffer_idx: 0,
+                buffer_idx: 0
             });
         }
         
@@ -186,6 +204,12 @@ impl TitansMAC {
 
         // 1. Retrieve h_t from Memory using input as query
         self.memory.retrieve_step_into(input, &mut workspace.h_t, &mut workspace.neural_memory_workspace);
+
+        if cfg!(debug_assertions) {
+             println!("Stream Step {}:", workspace.buffer_idx);
+             println!("  Input: {:?}", input);
+             println!("  h_t: {:?}", workspace.h_t);
+        }
 
         // 2. Construct Context [Persistent | h_t]
         // Copy persistent memory

@@ -11,7 +11,7 @@ use crate::{
             },
             forward::{ForwardContext, compute_poly_attention_forward, compute_poly_attention_forward_into},
             params::PolyAttentionParamInfo,
-            position::cope::CoPE,
+            position::unified::{UnifiedCoPE, UnifiedCoPEGradients},
             utils::{smooth_clip_tanh, smooth_clip_tanh_with_grad},
             sliding_window_attention::SlidingWindowCache,
         },
@@ -186,6 +186,8 @@ impl PolyAttentionStreamingWorkspace {
 
 
 use crate::domain::attention::forward::PolyAttentionBatchWorkspace;
+
+
 
 /// Pre-allocated workspace for context-aware attention processing.
 /// Used by TitansMAC and other context-aware attention mechanisms.
@@ -406,7 +408,7 @@ pub struct PolyAttention {
     pub moh: MoHGating,
 
     // CoPE integration and sliding window
-    cope: CoPE,
+    cope: UnifiedCoPE,
     window_size: Option<usize>,
 
     #[serde(skip)]
@@ -724,7 +726,7 @@ impl PolyAttention {
         w_v: &Array2<f32>,
         w_out: &Array2<f32>,
         moh: &mut MoHGating,
-        cope: &CoPE,
+        cope: &UnifiedCoPE,
         a: f32,
         b: f32,
         scale: f32,
@@ -1639,11 +1641,13 @@ impl PolyAttention {
         if self.moh.head_selection_config.gating.use_learned_predictor {
             expected += 6;
         } // weights1, bias1, weights2, bias2, cond_w, activation_params
-        expected += 1; // CoPE parameters
-        if param_grads.len() != expected {
+        
+        // CoPE contributes variable number of gradients depending on configuration
+        // So we just ensure we have at least the base parameters
+        if param_grads.len() < expected {
             return Err(crate::common::errors::ModelError::GradientError {
                 message: format!(
-                    "PolyAttention expected {} grad arrays, got {}",
+                    "PolyAttention expected at least {} grad arrays, got {}",
                     expected,
                     param_grads.len()
                 ),
@@ -1736,7 +1740,7 @@ impl PolyAttention {
             }
             idx += 6; // weights1, bias1, weights2, bias2, cond_w, activation_params
         }
-        self.cope.apply_gradients(&param_grads[idx], lr);
+        self.cope.apply_gradients_from_slice(&param_grads[idx..], lr);
         Ok(())
     }
 
@@ -1791,22 +1795,22 @@ impl PolyAttention {
         use rayon::prelude::*;
 
         struct HeadGradients {
-            d_w_q_block: Array2<f32>,
-            d_w_k_block: Array2<f32>,
-            d_w_v_block: Array2<f32>,
-            grad_w_out_block: Array2<f32>,
-            grad_input_contrib: Array2<f32>,
-            grad_a_scalar: f32,
-            grad_b_scalar: f32,
-            grad_scale_scalar: f32,
-            grad_w_g_col: Array2<f32>,
-            grad_alpha_val: f32,
-            grad_beta_val: f32,
-            grad_gate_poly_vec: Vec<f64>,
-            threshold_accum_local: Option<Array2<f32>>,
-            grad_p_local: Array2<f32>,
-            anomaly: bool,
-        }
+    d_w_q_block: Array2<f32>,
+    d_w_k_block: Array2<f32>,
+    d_w_v_block: Array2<f32>,
+    grad_w_out_block: Array2<f32>,
+    grad_input_contrib: Array2<f32>,
+    grad_a_scalar: f32,
+    grad_b_scalar: f32,
+    grad_scale_scalar: f32,
+    grad_w_g_col: Array2<f32>,
+    grad_alpha_val: f32,
+    grad_beta_val: f32,
+    grad_gate_poly_vec: Vec<f64>,
+    threshold_accum_local: Option<Array2<f32>>,
+    grad_cope: UnifiedCoPEGradients,
+    anomaly: bool,
+}
 
         // Monolithic forward projections for gradient computation
         let q_all = input.dot(&self.w_q);
@@ -1864,8 +1868,7 @@ impl PolyAttention {
                 let mut grad_q: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
                 let mut grad_k: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
                 let mut grad_v: Array2<f32> = Array2::<f32>::zeros((n, self.head_dim));
-                let mut grad_p_local: Array2<f32> =
-                    Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
+                let mut grad_cope = self.cope.init_gradients();
                 
                 // Vectorized accumulations
                 let mut y_gated_col = Array2::<f32>::zeros((n, self.head_dim));
@@ -1884,7 +1887,6 @@ impl PolyAttention {
                         None
                     };
                 let mut anomaly = false;
-                let mut q_pe: Vec<f32> = Vec::new();
 
                 for i in 0..n {
                     // Optimized: Use precomputed gradient for this head
@@ -1897,22 +1899,11 @@ impl PolyAttention {
                     };
                     let j_end = if last_causal { i } else { n - 1 };
                     let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
-                    let q_pe_len = max_pos + 1;
-                    if q_pe.len() != q_pe_len {
-                        q_pe.resize(q_pe_len, 0.0);
-                    } else {
-                        q_pe.fill(0.0);
-                    }
-                    for (pos, qpe) in q_pe.iter_mut().enumerate() {
-                        *qpe = q.row(i).dot(&self.cope.pos_embeddings.row(pos));
-                    }
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        let pos = i.saturating_sub(j);
-                        if pos < q_pe.len() {
-                            s += q_pe[pos];
-                        }
+                        let cope_contrib = self.cope.get_contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
+                        s += cope_contrib;
 
                         // Match the forward path: smoothly clip extreme scores before
                         // polynomial evaluation.
@@ -1971,10 +1962,9 @@ impl PolyAttention {
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        let pos = i.saturating_sub(j);
-                        if pos < q_pe.len() {
-                            s += q_pe[pos];
-                        }
+                        let cope_contrib = self.cope.get_contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
+                        s += cope_contrib;
+
                         let (s_stable, ds_stable_ds) = smooth_clip_tanh_with_grad(s, 8.0);
                         let sp = if p_i32 <= 3 {
                             match p_i32 {
@@ -2035,12 +2025,13 @@ impl PolyAttention {
                             grad_q[[i, h]] += grad_q_val;
                             grad_k[[j, h]] += grad_k_val;
                         }
-                        let pos = i.saturating_sub(j);
-                        if pos < q_pe.len() {
-                            for h in 0..self.head_dim {
-                                grad_q[[i, h]] += d_s_ij * self.cope.pos_embeddings[[pos, h]];
-                                grad_p_local[[pos, h]] += d_s_ij * q[[i, h]];
-                            }
+                        
+                        let (dq_cope, dk_cope) = self.cope.backward(
+                            &q.row(i), &k.row(j), i, j, Some(&input.view()), d_s_ij, &mut grad_cope,
+                        );
+                        for h in 0..self.head_dim {
+                            grad_q[[i, h]] += dq_cope[h];
+                            grad_k[[j, h]] += dk_cope[h];
                         }
                     }
 
@@ -2052,10 +2043,8 @@ impl PolyAttention {
                         for j in j_start..=j_end {
                             let base = q.row(i).dot(&k.row(j)) * dk_scale;
                             let mut s = base;
-                            let pos = i.saturating_sub(j);
-                            if pos < q_pe.len() {
-                                s += q_pe[pos];
-                            }
+                            let cope_contrib = self.cope.get_contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
+                            s += cope_contrib;
                             let s_stable = smooth_clip_tanh(s, 8.0);
                             let sp = if p_i32 <= 3 {
                                 match p_i32 {
@@ -2149,7 +2138,7 @@ impl PolyAttention {
                     grad_beta_val,
                     grad_gate_poly_vec,
                     threshold_accum_local,
-                    grad_p_local,
+                    grad_cope,
                     anomaly,
                 }
             })
@@ -2167,8 +2156,7 @@ impl PolyAttention {
         let mut grad_b_scalar: f32 = 0.0;
         let mut grad_scale_scalar: f32 = 0.0;
         let mut grad_gate_poly_vec_acc = vec![0.0f64; n_gate_w];
-        let mut grad_cope_pos =
-            Array2::<f32>::zeros((self.cope.max_pos + 1, self.cope.pos_embeddings.ncols()));
+        let mut grad_cope_total = self.cope.init_gradients();
         let mut threshold_grad_accum =
             if self.moh.head_selection_config.gating.use_learned_predictor {
                 Some(Array2::<f32>::zeros((n, self.num_heads)))
@@ -2202,7 +2190,7 @@ impl PolyAttention {
                 let mut acc_col = acc.slice_mut(s![.., h_idx..h_idx + 1]);
                 acc_col += &local;
             }
-            grad_cope_pos += &head_gradients.grad_p_local;
+            grad_cope_total.accumulate(&head_gradients.grad_cope);
             if head_gradients.anomaly {
                 gradient_anomaly_detected = true;
             }
@@ -2398,7 +2386,7 @@ impl PolyAttention {
                 }
             }
         }
-        all_param_grads.push(grad_cope_pos);
+        all_param_grads.extend(grad_cope_total.to_vec());
 
         if self.titan_memory.enabled {
             assert!(self.titan_memory.scale.is_finite());

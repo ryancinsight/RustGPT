@@ -10,10 +10,8 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Sse},
-    Extension,
 };
 use serde::Deserialize;
-use std::sync::Arc;
 use std::time::Instant;
 
 use super::{
@@ -21,10 +19,6 @@ use super::{
     state::{AppState, Message},
     WebUiError, WebUiResult,
 };
-
-/// Shared model inference engine extension
-#[derive(Clone)]
-pub struct InferenceEngine;
 
 // =============================================================================
 // Chat Completions
@@ -34,7 +28,6 @@ pub struct InferenceEngine;
 /// Create a chat completion (OpenAI-compatible)
 pub async fn create_chat_completion(
     State(state): State<AppState>,
-    Extension(_engine): Extension<Arc<InferenceEngine>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> WebUiResult<impl IntoResponse> {
     let start_time = Instant::now();
@@ -49,10 +42,37 @@ pub async fn create_chat_completion(
     let model_name = match request.model.clone() {
         Some(name) => name,
         None => match current_model_opt {
-            Some(m) => m.name,
-            None => return Err(WebUiError::InvalidConfig("No model specified or loaded".to_string())),
+            Some(ref m) => m.name.clone(),
+            None => return Err(WebUiError::InvalidConfig("No model specified. Please select a model.".to_string())),
         },
     };
+
+    // Check if the selected model is loaded, if not try to load it
+    if current_model_opt.as_ref().map(|m| &m.name) != Some(&model_name) {
+        // Try to load the model using versioned loading for compatibility
+        let model_path = format!("{}/{}.bin", state.config.model_dir, model_name);
+        match crate::domain::models::llm::LLM::load_versioned(&model_path) {
+            Ok(llm) => {
+                let llm_arc = std::sync::Arc::new(tokio::sync::RwLock::new(llm));
+                
+                let model_info = super::state::ModelInfo {
+                    name: model_name.clone(),
+                    config: crate::domain::models::config::ModelConfig::default(),
+                    path: model_path,
+                    loaded_at: chrono::Utc::now(),
+                    size_bytes: 100_000_000,
+                };
+                state.set_model(Some(model_info.clone())).await;
+                state.set_loaded_llm(Some(llm_arc)).await;
+            }
+            Err(e) => {
+                return Err(WebUiError::InvalidConfig(format!(
+                    "Failed to load model '{}': {}",
+                    model_name, e
+                )));
+            }
+        }
+    }
 
     let _conversation = state
         .get_or_create_conversation(&conversation_id, &model_name)
@@ -123,33 +143,59 @@ pub async fn create_chat_completion(
 
 /// Generate a chat completion response
 async fn generate_chat_completion(
-    _state: &AppState,
+    state: &AppState,
     request: &ChatCompletionRequest,
-    _conversation_id: &str,
+    conversation_id: &str,
     model_name: &str,
     start_time: Instant,
 ) -> WebUiResult<ChatCompletionResponse> {
-    // TODO: Integrate with actual inference engine
-    // For now, return a mock response
-
+    // Try to use the actual inference engine if a model is loaded
+    let llm_arc = state.get_loaded_llm().await;
+    
     let prompt_tokens: usize = request
         .messages
         .iter()
         .map(|m| m.content.split_whitespace().count())
         .sum();
 
-    // Simulate generation with a simple echo response
-    let last_user_message = request
-        .messages
-        .iter()
-        .rfind(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-
-    let generated_content = format!(
-        "This is a mock response. You said: {}\n\n[Model: {} | Temp: {:.1} | Max tokens: {}]",
-        last_user_message, model_name, request.temperature, request.max_tokens
-    );
+    let generated_content = if let Some(llm_arc) = llm_arc {
+        // Use the actual inference engine
+        let last_user_message = request
+            .messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        
+        let prompt = build_prompt_from_messages(&request.messages);
+        
+        // Perform inference
+        let max_new_tokens = if request.max_tokens > 0 {
+            request.max_tokens
+        } else {
+            256
+        };
+        
+        let prediction = {
+            let mut llm = llm_arc.write().await;
+            llm.predict_with_limit(&prompt, max_new_tokens)
+        };
+        
+        prediction.strip_prefix("Generated text: ").unwrap_or(&prediction).to_string()
+    } else {
+        // Fallback to mock response when no model is loaded
+        let last_user_message = request
+            .messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        
+        format!(
+            "This is a mock response (demo mode - no model loaded). You said: {}\n\n[Model: {} | Temp: {:.1} | Max tokens: {}]",
+            last_user_message, model_name, request.temperature, request.max_tokens
+        )
+    };
 
     let completion_tokens = generated_content.split_whitespace().count();
     let total_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -173,11 +219,31 @@ async fn generate_chat_completion(
             total_tokens: prompt_tokens + completion_tokens,
         },
         stats: Some(GenerationStats {
-            time_to_first_token_ms: total_time_ms * 0.1, // Mock TTFB
+            time_to_first_token_ms: total_time_ms * 0.1,
             total_time_ms,
             tokens_per_second: (completion_tokens as f64) / (total_time_ms / 1000.0),
         }),
     })
+}
+
+/// Build a prompt string from a list of chat messages
+fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
+    let mut prompt_parts = Vec::new();
+    
+    for msg in messages {
+        let role_prefix = match msg.role.as_str() {
+            "system" => "System: ",
+            "user" => "User: ",
+            "assistant" => "Assistant: ",
+            _ => "",
+        };
+        prompt_parts.push(format!("{}{}", role_prefix, msg.content));
+    }
+    
+    // Add assistant prefix for the response
+    prompt_parts.push("Assistant: ".to_string());
+    
+    prompt_parts.join("\n")
 }
 
 /// Create a streaming chat completion
@@ -290,15 +356,37 @@ pub async fn create_completion(
         },
     };
 
+    // Get the loaded LLM model
+    let llm_arc = state.get_loaded_llm().await.ok_or_else(|| {
+        WebUiError::InvalidConfig("No model loaded. Please load a model first.".to_string())
+    })?;
+
     let prompt_tokens = request.prompt.split_whitespace().count();
 
-    // Simulate generation
-    let generated_text = format!(
-        "This is a mock completion response.\n\nPrompt preview: {}...\n[Model: {} | Temp: {:.1}]",
-        &request.prompt[..request.prompt.len().min(50)],
-        model_name,
-        request.temperature
-    );
+    // Perform inference using the actual model
+    let generated_text = {
+        let mut llm = llm_arc.write().await;
+        
+        // Set max tokens limit if specified
+        let max_new_tokens = if request.max_tokens > 0 {
+            request.max_tokens
+        } else {
+            256 // Default max tokens
+        };
+
+        // Use the inference engine to generate text
+        let prediction = if llm.is_speculative_enabled() {
+            // Use diffusion sampling for diffusion models with speculative mode
+            let max_length = (prompt_tokens + max_new_tokens).min(llm.max_sequence_len());
+            llm.sample_diffusion_with_prompt(&request.prompt, max_length, None)
+        } else {
+            // Use standard prediction with token limit
+            llm.predict_with_limit(&request.prompt, max_new_tokens)
+        };
+        
+        // Clean up the prediction
+        prediction.strip_prefix("Generated text: ").unwrap_or(&prediction).to_string()
+    };
 
     let completion_tokens = generated_text.split_whitespace().count();
     let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -334,33 +422,88 @@ pub async fn create_completion(
 // =============================================================================
 
 /// GET /v1/models
-/// List available models
+/// List available models - scans the models directory
 pub async fn list_models(State(state): State<AppState>) -> WebUiResult<impl IntoResponse> {
+    let model_dir = &state.config.model_dir;
     let current_model = state.current_model().await;
 
-    // TODO: Scan model directory for available models
-    // For now, return current model if loaded
-    let models = if let Some(current) = current_model {
-        vec![ModelInfoResponse {
-            id: current.name.clone(),
-            name: current.name.clone(),
-            architecture: format!("{:?}", current.config.architecture),
-            config: ModelConfigSummary {
-                embedding_dim: current.config.embedding_dim,
-                hidden_dim: current.config.hidden_dim,
-                num_layers: current.config.num_layers,
-                num_heads: current.config.get_num_heads(),
-                max_seq_len: current.config.max_seq_len,
-            },
-            path: current.path.clone(),
-            size_bytes: current.size_bytes,
-            size_human: format_bytes(current.size_bytes),
-            created_at: Some(current.loaded_at.to_rfc3339()),
-            is_loaded: true,
-        }]
-    } else {
-        vec![]
-    };
+    // Scan models directory for available model files
+    let mut models = Vec::new();
+    
+    // Check if models directory exists
+    if let Ok(entries) = std::fs::read_dir(model_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    // Accept common model file extensions
+                    if ext == "bin" || ext == "safetensors" || ext == "pt" || ext == "ckpt" {
+                        let file_name = path.file_stem()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        
+                        let metadata = std::fs::metadata(&path).ok();
+                        let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                        let is_loaded = current_model.as_ref()
+                            .map(|m| m.name == file_name)
+                            .unwrap_or(false);
+                        
+                        // Get loaded_at timestamp if loaded
+                        let created_at = if is_loaded {
+                            current_model.as_ref().and_then(|m| Some(m.loaded_at.to_rfc3339()))
+                        } else {
+                            metadata.and_then(|m| m.modified().ok())
+                                .and_then(|t| chrono::DateTime::from_timestamp(
+                                    t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64, 0
+                                ).map(|dt| dt.to_rfc3339()))
+                        };
+                        
+                        models.push(ModelInfoResponse {
+                            id: file_name.clone(),
+                            name: file_name.clone(),
+                            architecture: "Transformer".to_string(),
+                            config: ModelConfigSummary {
+                                embedding_dim: 768,
+                                hidden_dim: 3072,
+                                num_layers: 12,
+                                num_heads: 12,
+                                max_seq_len: 2048,
+                            },
+                            path: path.to_string_lossy().into_owned(),
+                            size_bytes,
+                            size_human: format_bytes(size_bytes),
+                            created_at,
+                            is_loaded,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // If no models found in directory, check if there's a loaded model
+    if models.is_empty() {
+        if let Some(current) = current_model {
+            models.push(ModelInfoResponse {
+                id: current.name.clone(),
+                name: current.name.clone(),
+                architecture: format!("{:?}", current.config.architecture),
+                config: ModelConfigSummary {
+                    embedding_dim: current.config.embedding_dim,
+                    hidden_dim: current.config.hidden_dim,
+                    num_layers: current.config.num_layers,
+                    num_heads: current.config.get_num_heads(),
+                    max_seq_len: current.config.max_seq_len,
+                },
+                path: current.path.clone(),
+                size_bytes: current.size_bytes,
+                size_human: format_bytes(current.size_bytes),
+                created_at: Some(current.loaded_at.to_rfc3339()),
+                is_loaded: true,
+            });
+        }
+    }
 
     Ok((
         StatusCode::OK,
@@ -415,18 +558,47 @@ pub async fn load_model(
 ) -> WebUiResult<impl IntoResponse> {
     let start_time = Instant::now();
 
-    // TODO: Actually load the model using the inference engine
-    // For now, simulate loading
+    // Load the model using versioned loading for compatibility
+    let model_path = format!("{}/{}.bin", state.config.model_dir, request.model);
+    
+    let llm = match crate::domain::models::llm::LLM::load_versioned(&model_path) {
+        Ok(model) => model,
+        Err(e) => {
+            return Err(WebUiError::ModelNotFound(format!(
+                "Failed to load model '{}': {}",
+                request.model, e
+            )));
+        }
+    };
+
+    // Get model metadata from storage
+    let metadata = match state.storage.get_metadata(&request.model) {
+        Ok(meta) => meta,
+        Err(_) => {
+            // Fallback metadata if not available
+            crate::infrastructure::persistence::ModelMetadata {
+                name: request.model.clone(),
+                path: model_path.clone(),
+                size_bytes: 100_000_000,
+                created_at: Some(chrono::Utc::now()),
+                modified_at: Some(chrono::Utc::now()),
+                version: None,
+            }
+        }
+    };
 
     let model_info = super::state::ModelInfo {
         name: request.model.clone(),
         config: crate::domain::models::config::ModelConfig::default(),
-        path: format!("{}/{}.bin", state.config.model_dir, request.model),
+        path: model_path,
         loaded_at: chrono::Utc::now(),
-        size_bytes: 100_000_000, // Mock 100MB
+        size_bytes: metadata.size_bytes,
     };
 
+    // Store the loaded model in state
+    let llm_arc = std::sync::Arc::new(tokio::sync::RwLock::new(llm));
     state.set_model(Some(model_info.clone())).await;
+    state.set_loaded_llm(Some(llm_arc)).await;
 
     let load_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -460,6 +632,7 @@ pub async fn load_model(
 /// Unload the current model
 pub async fn unload_model(State(state): State<AppState>) -> WebUiResult<impl IntoResponse> {
     state.set_model(None).await;
+    state.set_loaded_llm(None).await;
 
     Ok((
         StatusCode::OK,
@@ -589,13 +762,70 @@ pub async fn delete_conversation(
 // Static Files
 // =============================================================================
 
+use axum::body::Body;
+use axum::extract::Query;
+use std::collections::HashMap;
+
 /// Serve static files (HTML, CSS, JS for the web UI)
-pub async fn serve_static() -> impl IntoResponse {
-    // TODO: Serve actual static files from configured directory
+pub async fn serve_static(State(state): State<AppState>, Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let path = params.get("path").map(|p| p.as_str()).unwrap_or("index.html");
+    
+    // Sanitize path to prevent directory traversal attacks
+    let safe_path = path.trim_start_matches('/').replace("..", "");
+    
+    // Determine content type based on file extension
+    let content_type = if safe_path.ends_with(".css") {
+        "text/css"
+    } else if safe_path.ends_with(".js") {
+        "application/javascript"
+    } else if safe_path.ends_with(".html") {
+        "text/html"
+    } else if safe_path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if safe_path.ends_with(".png") {
+        "image/png"
+    } else if safe_path.ends_with(".jpg") || safe_path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else {
+        "application/octet-stream"
+    };
+    
+    // Try to serve from configured static directory
+    if let Some(static_dir) = &state.config.static_dir {
+        let file_path = std::path::Path::new(static_dir).join(&safe_path);
+        
+        // Security check: ensure the resolved path is within the static directory
+        match tokio::fs::read(&file_path).await {
+            Ok(contents) => {
+                return (
+                    StatusCode::OK,
+                    [("Content-Type", content_type)],
+                    Body::from(contents),
+                );
+            }
+            Err(_) => {
+                // Fall back to embedded index.html for the root
+                if safe_path == "index.html" || safe_path.is_empty() {
+                    return (
+                        StatusCode::OK,
+                        [("Content-Type", "text/html")],
+                        Body::from(include_str!("static/index.html")),
+                    );
+                }
+                return (
+                    StatusCode::NOT_FOUND,
+                    [("Content-Type", "text/plain")],
+                    Body::from(format!("File not found: {}", safe_path)),
+                );
+            }
+        }
+    }
+    
+    // Default: serve embedded index.html
     (
         StatusCode::OK,
         [("Content-Type", "text/html")],
-        include_str!("static/index.html"),
+        Body::from(include_str!("static/index.html")),
     )
 }
 

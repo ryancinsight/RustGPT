@@ -5867,6 +5867,78 @@ impl LLM {
             Self::load_binary(path)
         }
     }
+
+    /// Enable continual learning with the given configuration
+    pub fn enable_continual_learning(&mut self, config: crate::application::training::ContinualLearningConfig) {
+        use crate::application::training::ContinualLearningManager;
+        self.continual_learning = Some(ContinualLearningManager::new(config));
+        tracing::info!("Continual learning enabled");
+    }
+
+    /// Set the current user for continual learning personalization
+    pub fn set_continual_learning_user(&mut self, user_id: &str) {
+        if let Some(ref mut manager) = self.continual_learning {
+            manager.set_user(user_id);
+            tracing::info!(user_id = user_id, "Continual learning user set");
+        }
+    }
+
+    /// Record a user interaction for continual learning
+    pub fn record_interaction(&mut self, user_input: &str, model_output: &str) -> Result<()> {
+        if self.continual_learning.is_none() {
+            return Ok(());
+        }
+        // Tokenize first to avoid borrowing issues
+        let token_ids = self.tokenize(&format!("{} {}", user_input, model_output));
+        
+        // Now borrow continual_learning mutably
+        if let Some(ref mut manager) = self.continual_learning {
+            manager.record_interaction(user_input, model_output, token_ids, None)?;
+        }
+        Ok(())
+    }
+
+    /// Record user feedback for the last interaction
+    pub fn record_feedback(&mut self, feedback: crate::application::training::UserFeedback) -> Result<()> {
+        if let Some(ref mut manager) = self.continual_learning {
+            manager.record_feedback(feedback)?;
+        }
+        Ok(())
+    }
+
+    /// Perform an online learning update based on accumulated feedback
+    pub fn online_update(&mut self) -> Result<f32> {
+        if let Some(mut manager) = self.continual_learning.take() {
+            let result = manager.online_update(self);
+            self.continual_learning = Some(manager);
+            result
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Load user memories from disk
+    pub fn load_user_memories(&mut self, path: &str) -> Result<()> {
+        if let Some(ref mut manager) = self.continual_learning {
+            manager.load_memories(path)?;
+            tracing::info!(path = path, "User memories loaded");
+        }
+        Ok(())
+    }
+
+    /// Save user memories to disk
+    pub fn save_user_memories(&self, path: &str) -> Result<()> {
+        if let Some(ref manager) = self.continual_learning {
+            manager.save_memories(path)?;
+            tracing::info!(path = path, "User memories saved");
+        }
+        Ok(())
+    }
+
+    /// Check if continual learning is enabled
+    pub fn is_continual_learning_enabled(&self) -> bool {
+        self.continual_learning.is_some()
+    }
 }
 
 fn diffusion_checkpoint_path(

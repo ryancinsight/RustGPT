@@ -119,6 +119,13 @@ impl FileModelStorage {
     }
 }
 
+impl FileModelStorage {
+    /// Get the path for a model file with specific extension
+    fn model_path_with_ext(&self, name: &str, ext: &str) -> std::path::PathBuf {
+        self.base_dir.join(format!("{}.{}", name, ext))
+    }
+}
+
 impl ModelStorage for FileModelStorage {
     fn save(&self, model: &LLM, name: &str) -> Result<String> {
         let path = self.model_path(name);
@@ -128,13 +135,55 @@ impl ModelStorage for FileModelStorage {
     }
 
     fn load(&self, name: &str) -> Result<LLM> {
-        let path = self.model_path(name);
-        let path_str = path.to_string_lossy();
-        LLM::load_binary(&path_str)
+        // Try binary format first (default)
+        let bin_path = self.model_path(name);
+        if bin_path.exists() {
+            let path_str = bin_path.to_string_lossy();
+            match LLM::load_binary(&path_str) {
+                Ok(model) => return Ok(model),
+                Err(e) => {
+                    // If binary fails, check if it's actually a JSON file
+                    let json_path = self.model_path_with_ext(name, "json");
+                    if json_path.exists() {
+                        return LLM::load_json(&json_path.to_string_lossy());
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        
+        // Try JSON format if binary doesn't exist
+        let json_path = self.model_path_with_ext(name, "json");
+        if json_path.exists() {
+            return LLM::load_json(&json_path.to_string_lossy());
+        }
+        
+        // Try auto-detect format from any extension
+        if let Ok(entries) = std::fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                if let Some(file_stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                    if file_stem == name {
+                        let path = entry.path();
+                        let path_str = path.to_string_lossy();
+                        if path.extension().map(|e| e == "json").unwrap_or(false) {
+                            return LLM::load_json(&path_str);
+                        } else {
+                            return LLM::load_binary(&path_str);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Err(crate::common::errors::ModelError::Generic(format!(
+            "Model not found: {}. Looked for {}.bin and {}.json",
+            name, name, name
+        )))
     }
 
     fn list_models(&self) -> Result<Vec<String>> {
         let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
         if let Ok(entries) = std::fs::read_dir(&self.base_dir) {
             for entry in entries.flatten() {
@@ -144,7 +193,9 @@ impl ModelStorage for FileModelStorage {
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_string())
                 {
-                    models.push(name);
+                    if seen.insert(name.clone()) {
+                        models.push(name);
+                    }
                 }
             }
         }
@@ -153,21 +204,37 @@ impl ModelStorage for FileModelStorage {
     }
 
     fn exists(&self, name: &str) -> bool {
-        self.model_path(name).exists()
+        self.model_path(name).exists() || 
+        self.model_path_with_ext(name, "json").exists()
     }
 
     fn delete(&self, name: &str) -> Result<bool> {
-        let path = self.model_path(name);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        let mut deleted = false;
+        
+        // Try to delete binary version
+        let bin_path = self.model_path(name);
+        if bin_path.exists() {
+            std::fs::remove_file(&bin_path)?;
+            deleted = true;
         }
+        
+        // Try to delete JSON version
+        let json_path = self.model_path_with_ext(name, "json");
+        if json_path.exists() {
+            std::fs::remove_file(&json_path)?;
+            deleted = true;
+        }
+        
+        Ok(deleted)
     }
 
     fn get_metadata(&self, name: &str) -> Result<ModelMetadata> {
-        let path = self.model_path(name);
+        // Try binary first, then JSON
+        let path = if self.model_path(name).exists() {
+            self.model_path(name)
+        } else {
+            self.model_path_with_ext(name, "json")
+        };
 
         if !path.exists() {
             return Err(crate::common::errors::ModelError::Generic(format!(

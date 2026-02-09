@@ -5,13 +5,18 @@
 //! - Configuration
 //! - Request counters and metrics
 //! - Conversation history cache
+//! - File-based persistence for conversations
 
-use crate::domain::models::config::ModelConfig;
+use crate::domain::models::{config::ModelConfig, llm::LLM};
 use crate::infrastructure::persistence::model_storage::ModelStorage;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::config::WebUiConfig;
+
+/// Default directory name for conversation storage
+const DEFAULT_CONVERSATIONS_DIR: &str = "conversations";
 
 /// Shared application state for the web UI server
 #[derive(Clone)]
@@ -22,6 +27,8 @@ pub struct AppState {
     pub config: WebUiConfig,
     /// Model storage backend
     pub storage: Arc<dyn ModelStorage>,
+    /// Directory for persisting conversations
+    conversations_dir: PathBuf,
 }
 
 /// Internal mutable state
@@ -29,6 +36,8 @@ pub struct AppState {
 struct AppStateInner {
     /// Currently loaded model configuration
     current_model: Option<ModelInfo>,
+    /// The actual loaded LLM model (wrapped in Arc<RwLock> for thread-safe access)
+    loaded_llm: Option<Arc<tokio::sync::RwLock<LLM>>>,
     /// Request statistics
     stats: RequestStats,
     /// Server start time
@@ -68,7 +77,7 @@ pub struct RequestStats {
 }
 
 /// Conversation session
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
     /// Session ID
     pub id: String,
@@ -96,8 +105,18 @@ pub struct Message {
 impl AppState {
     /// Create a new application state
     pub fn new(config: WebUiConfig, storage: Arc<dyn ModelStorage>) -> Self {
+        let conversations_dir = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| config.model_dir.clone());
+        let conversations_dir = PathBuf::from(conversations_dir).join(DEFAULT_CONVERSATIONS_DIR);
+
+        // Create conversations directory if it doesn't exist
+        let _ = std::fs::create_dir_all(&conversations_dir);
+
         let inner = AppStateInner {
             current_model: None,
+            loaded_llm: None,
             stats: RequestStats::default(),
             started_at: std::time::Instant::now(),
             conversations: std::collections::HashMap::new(),
@@ -107,6 +126,7 @@ impl AppState {
             inner: Arc::new(RwLock::new(inner)),
             config,
             storage,
+            conversations_dir,
         }
     }
 
@@ -118,6 +138,16 @@ impl AppState {
     /// Set the currently loaded model
     pub async fn set_model(&self, model: Option<ModelInfo>) {
         self.inner.write().await.current_model = model;
+    }
+
+    /// Get the loaded LLM model for inference
+    pub async fn get_loaded_llm(&self) -> Option<Arc<tokio::sync::RwLock<LLM>>> {
+        self.inner.read().await.loaded_llm.clone()
+    }
+
+    /// Set the loaded LLM model
+    pub async fn set_loaded_llm(&self, llm: Option<Arc<tokio::sync::RwLock<LLM>>>) {
+        self.inner.write().await.loaded_llm = llm;
     }
 
     /// Get request statistics
@@ -164,24 +194,69 @@ impl AppState {
             guard.conversations.insert(id.to_string(), conv.clone());
             conv
         } else {
-            let conv = Conversation {
-                id: id.to_string(),
-                created_at: chrono::Utc::now(),
-                last_activity: chrono::Utc::now(),
-                messages: Vec::new(),
-                model_name: model_name.to_string(),
+            // Try to load from disk first
+            let conv = if let Some(loaded) = self.load_conversation_from_disk(id).await {
+                loaded
+            } else {
+                Conversation {
+                    id: id.to_string(),
+                    created_at: chrono::Utc::now(),
+                    last_activity: chrono::Utc::now(),
+                    messages: Vec::new(),
+                    model_name: model_name.to_string(),
+                }
             };
             guard.conversations.insert(id.to_string(), conv.clone());
             conv
         }
     }
 
+    /// Save a conversation to disk
+    async fn save_conversation_to_disk(&self, conversation: &Conversation) -> std::io::Result<()> {
+        let file_path = self.conversations_dir.join(format!("{}.json", conversation.id));
+        let json = serde_json::to_string_pretty(conversation)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        tokio::fs::write(&file_path, json).await
+    }
+
+    /// Load a conversation from disk
+    async fn load_conversation_from_disk(&self, id: &str) -> Option<Conversation> {
+        let file_path = self.conversations_dir.join(format!("{}.json", id));
+        if file_path.exists() {
+            match tokio::fs::read_to_string(&file_path).await {
+                Ok(json) => serde_json::from_str(&json).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Persist all conversations to disk
+    async fn persist_all_conversations(&self) -> std::io::Result<()> {
+        let guard = self.inner.read().await;
+        for conv in guard.conversations.values() {
+            self.save_conversation_to_disk(conv).await?;
+        }
+        Ok(())
+    }
+
     /// Add a message to a conversation
     pub async fn add_message(&self, conversation_id: &str, message: Message) {
         let mut guard = self.inner.write().await;
         if let Some(conv) = guard.conversations.get_mut(conversation_id) {
-            conv.messages.push(message);
+            conv.messages.push(message.clone());
             conv.last_activity = chrono::Utc::now();
+
+            // Persist to disk asynchronously
+            let conv = conv.clone();
+            let dir = self.conversations_dir.clone();
+            tokio::spawn(async move {
+                let file_path = dir.join(format!("{}.json", conv.id));
+                if let Ok(json) = serde_json::to_string_pretty(&conv) {
+                    let _ = tokio::fs::write(&file_path, json).await;
+                }
+            });
         }
     }
 
@@ -204,7 +279,15 @@ impl AppState {
     /// Delete a conversation
     pub async fn delete_conversation(&self, id: &str) -> bool {
         let mut guard = self.inner.write().await;
-        guard.conversations.remove(id).is_some()
+        let removed = guard.conversations.remove(id).is_some();
+        
+        // Also delete from disk
+        if removed {
+            let file_path = self.conversations_dir.join(format!("{}.json", id));
+            let _ = tokio::fs::remove_file(&file_path).await;
+        }
+        
+        removed
     }
 
     /// Cleanup old conversations (older than specified duration)

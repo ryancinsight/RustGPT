@@ -1,0 +1,271 @@
+Main Input[0,0]: 0.79696673
+--- Memory Retrieval Verification (Step 0) ---
+Batch Retrieve Step 0:
+  q: [0.049493, 0.029603, -0.013108, 0.015578], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000932, 0.001230, -0.002449, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000932, 0.001230, 0.000000, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000028, 0.000112, 0.000112, -0.000054], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Retrieve Step 1:
+  q: [0.020807, 0.007903, -0.020372, 0.010707], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000566, -0.001483, -0.001664, 0.002295], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000566, 0.000000, 0.000000, 0.002295], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000017, -0.000038, -0.000008, 0.000015], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Retrieve Step 2:
+  q: [0.000567, -0.003498, 0.025686, 0.052690], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.002043, -0.001446, 0.000701, 0.001194], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.002043, 0.000000, 0.000701, 0.001194], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [0.000076, -0.000018, -0.000027, 0.000165], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Retrieve Step 3:
+  q: [0.022517, -0.008783, -0.014136, 0.048836], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [-0.005910, -0.005682, 0.002155, 0.000552], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000000, 0.000000, 0.002155, 0.000552], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [0.000121, -0.000242, 0.000203, 0.000222], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Retrieve Step:
+  q: [0.049493, 0.029603, -0.013108, 0.015578], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000932, 0.001230, -0.002449, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000932, 0.001230, 0.000000, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000028, 0.000112, 0.000112, -0.000054], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch h_t[0]: [-2.7649934e-5, 0.00011175855, 0.000111813875, -5.395388e-5, -1.5023013e-5, 8.0442565e-5, -0.00011067871, 6.255269e-5, 8.38553e-5, 7.703404e-5, 5.1680232e-5, -0.00011175235, 9.686008e-5, -3.5420133e-5, -6.063297e-5, -7.2001116e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream h_t[0]: [-2.7649934e-5, 0.00011175855, 0.000111813875, -5.395388e-5, -1.5023013e-5, 8.0442565e-5, -0.00011067871, 6.255269e-5, 8.38553e-5, 7.703404e-5, 5.1680232e-5, -0.00011175235, 9.686008e-5, -3.5420133e-5, -6.063297e-5, -7.2001116e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+h_t Diff: 0.000000e0
+--- End Memory Verification ---
+Running Batch Forward...
+Batch Retrieve Step 0:
+  q: [0.049493, 0.029603, -0.013108, 0.015578], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000932, 0.001230, -0.002449, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000932, 0.001230, 0.000000, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000028, 0.000112, 0.000112, -0.000054], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Retrieve Step 1:
+  q: [0.020807, 0.007903, -0.020372, 0.010707], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000566, -0.001483, -0.001664, 0.002295], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000566, 0.000000, 0.000000, 0.002295], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000017, -0.000038, -0.000008, 0.000015], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Retrieve Step 2:
+  q: [0.000567, -0.003498, 0.025686, 0.052690], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.002043, -0.001446, 0.000701, 0.001194], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.002043, 0.000000, 0.000701, 0.001194], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [0.000076, -0.000018, -0.000027, 0.000165], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Retrieve Step 3:
+  q: [0.022517, -0.008783, -0.014136, 0.048836], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [-0.005910, -0.005682, 0.002155, 0.000552], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000000, 0.000000, 0.002155, 0.000552], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [0.000121, -0.000242, 0.000203, 0.000222], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Step 3 (Last):
+  Retrieve Input (segment row): [0.2889371, 0.8987813, 0.15211982, 0.90772897, 0.024651527, 0.50006205, 0.35627472, 0.7977069, 0.88223326, 0.27957153, 0.75784796, 0.070473135, 0.25439864, 0.25314736, 0.9161083, 0.21988654], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.0001210502, -0.00024167067, 0.00020315866, 0.00022151766, 6.8791975e-5, 4.1224383e-5, 6.340115e-5, -7.967475e-5, 3.263056e-5, -5.2608717e-5, -0.00023504757, 2.460121e-5, 0.00020498382, 5.7702193e-5, 0.0001235102, 0.0001998101], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+DEBUG: Entering compute_poly_attention_forward_into n=4 d=16 heads=4
+--- Batch Step Debug (Head 0, Last Token i=3) ---
+  eff_i: 0.18426923
+  Q: [0.225066, -0.334611, -0.565375, -0.446809], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in (last): [0.170065, -0.170478, -0.696137, -0.207495], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [0.000103, 0.000170, 0.000057, 0.000006], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.29080433
+  Scores Raw Ctx (last): -0.00003437754
+  CoPE[0] (Input): 0.027350003
+  CoPE[1] (Ctx Last): -0.01940673
+  Final Scores Dump (len 4):
+    Last (Input): 0.007267831
+    Ctx Last: -0.00044433135
+  Final Scores Dump (len 4):
+    Last (Input): -0.0498472
+    Ctx Last: -0.003092948
+  Final Scores Dump (len 4):
+    Last (Input): -0.0091085285
+    Ctx Last: -0.00003298773
+  Final Scores Dump (len 4):
+    Last (Input): -0.012266142
+    Ctx Last: 0.0017236734
+Batch Step 0:
+  Input: [0.79696673, 0.21631336, 0.6352857, 0.11855191, 0.11816138, 0.5307466, 0.65741014, 0.48763216, 0.04409206, 0.7778605, 0.81001246, 0.49393666, 0.31024194, 0.5430912, 0.18535876, 0.9875867], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-2.7649934e-5, 0.00011175855, 0.000111813875, -5.395388e-5, -1.5023013e-5, 8.0442565e-5, -0.00011067871, 6.255269e-5, 8.38553e-5, 7.703404e-5, 5.1680232e-5, -0.00011175235, 9.686008e-5, -3.5420133e-5, -6.063297e-5, -7.2001116e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+DEBUG: Entering compute_poly_attention_forward_into n=4 d=16 heads=4
+--- Batch Step Debug (Head 0, Last Token i=3) ---
+  eff_i: 0.29843616
+  Q: [-0.246359, 0.410864, -1.502199, 0.032287], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in (last): [0.460250, -0.496813, -0.869928, -0.489519], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [-0.000017, 0.000057, 0.000015, -0.000032], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.48674542
+  Scores Raw Ctx (last): 0.000002165531
+  CoPE[0] (Input): 0.002381096
+  CoPE[1] (Ctx Last): 0.0071842773
+  Final Scores Dump (len 4):
+    Last (Input): 0.018083192
+    Ctx Last: 0.00026599783
+  Final Scores Dump (len 4):
+    Last (Input): -0.034005877
+    Ctx Last: -0.0012933786
+  Final Scores Dump (len 4):
+    Last (Input): -0.024200058
+    Ctx Last: 0.0027719708
+  Final Scores Dump (len 4):
+    Last (Input): 0.013171911
+    Ctx Last: 0.0018503085
+Batch Step 1:
+  Input: [0.4380291, 0.8211299, 0.39809686, 0.43805927, 0.3179866, 0.11890811, 0.1354338, 0.21774358, 0.115679145, 0.47868747, 0.5585732, 0.6999404, 0.9412351, 0.5716976, 0.4581476, 0.6936925], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-1.7294342e-5, -3.821744e-5, -8.436076e-6, 1.4642693e-5, 4.2723892e-5, 6.678696e-5, -5.8952166e-5, 8.0242855e-5, 7.55326e-5, 5.2696858e-5, 1.017843e-5, -3.931731e-5, 0.00015174298, 2.4339854e-5, -2.301094e-5, -1.448163e-6], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+DEBUG: Entering compute_poly_attention_forward_into n=4 d=16 heads=4
+--- Batch Step Debug (Head 0, Last Token i=3) ---
+  eff_i: 0.19045213
+  Q: [-0.399654, -0.065517, -1.463038, 0.018641], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in (last): [0.715753, -0.296650, -0.826436, -0.627272], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [-0.000166, 0.000092, -0.000027, -0.000012], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.4653983
+  Scores Raw Ctx (last): 0.000049630984
+  CoPE[0] (Input): 0.0027577414
+  CoPE[1] (Ctx Last): 0.008206972
+  Final Scores Dump (len 4):
+    Last (Input): 0.011046502
+    Ctx Last: 0.00019502785
+  Final Scores Dump (len 4):
+    Last (Input): -0.06814469
+    Ctx Last: -0.0025480888
+  Final Scores Dump (len 4):
+    Last (Input): -0.017316591
+    Ctx Last: 0.00079673005
+  Final Scores Dump (len 4):
+    Last (Input): -0.016369471
+    Ctx Last: 0.0025084028
+Batch Step 2:
+  Input: [0.88365465, 0.9887144, 0.9555661, 0.39782447, 0.34533548, 0.61036193, 0.331829, 0.8209855, 0.37680835, 0.30397344, 0.14941257, 0.58974534, 0.38666707, 0.82915634, 0.40676212, 0.78433543], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [7.6297016e-5, -1.8160807e-5, -2.7441014e-5, 0.00016482678, -3.784869e-5, 0.00021045542, 2.732967e-5, 7.1855156e-6, 1.7105729e-5, -1.03103275e-5, 2.1311382e-5, 5.5845267e-5, -0.00015924341, -1.9849615e-5, 7.3159026e-7, -0.00011154462], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+DEBUG: Entering compute_poly_attention_forward_into n=4 d=16 heads=4
+--- Batch Step Debug (Head 0, Last Token i=3) ---
+  eff_i: 0.20893714
+  Q: [0.508471, 0.025715, -1.405536, -0.234164], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in (last): [0.392729, -0.968048, -0.942797, -0.329271], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [-0.000188, -0.000153, -0.000104, -0.000169], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.7885183
+  Scores Raw Ctx (last): 0.000043469678
+  CoPE[0] (Input): 0.044097394
+  CoPE[1] (Ctx Last): -0.010643679
+  Final Scores Dump (len 4):
+    Last (Input): 0.021500044
+    Ctx Last: -0.00027470622
+  Final Scores Dump (len 4):
+    Last (Input): -0.009207577
+    Ctx Last: -0.00072275446
+  Final Scores Dump (len 4):
+    Last (Input): -0.006151198
+    Ctx Last: -0.0014132607
+  Final Scores Dump (len 4):
+    Last (Input): -0.08348682
+    Ctx Last: -0.0002080225
+Batch Step 3:
+  Input: [0.2889371, 0.8987813, 0.15211982, 0.90772897, 0.024651527, 0.50006205, 0.35627472, 0.7977069, 0.88223326, 0.27957153, 0.75784796, 0.070473135, 0.25439864, 0.25314736, 0.9161083, 0.21988654], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.0001210502, -0.00024167067, 0.00020315866, 0.00022151766, 6.8791975e-5, 4.1224383e-5, 6.340115e-5, -7.967475e-5, 3.263056e-5, -5.2608717e-5, -0.00023504757, 2.460121e-5, 0.00020498382, 5.7702193e-5, 0.0001235102, 0.0001998101], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+Batch Update: k[0]=0.002539 alpha=0.499925 theta=0.500228 Grad_w1_sum=-0.000001 M_w1_sum=0.000001 Mem_w1_sum=-0.108120
+Batch Update: k[0]=-0.001409 alpha=0.500030 theta=0.499982 Grad_w1_sum=0.000000 M_w1_sum=0.000000 Mem_w1_sum=-0.054057
+Batch Update: k[0]=-0.001760 alpha=0.500274 theta=0.500246 Grad_w1_sum=0.000000 M_w1_sum=-0.000000 Mem_w1_sum=-0.027014
+Batch Update: k[0]=0.002798 alpha=0.499956 theta=0.500064 Grad_w1_sum=0.000000 M_w1_sum=-0.000000 Mem_w1_sum=-0.013508
+Batch Memory W1 Sum: -0.013508
+Batch Momentum W1 Sum: -0.000000
+Running Streaming Forward...
+Stream Retrieve Step:
+  q: [0.049493, 0.029603, -0.013108, 0.015578], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000932, 0.001230, -0.002449, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000932, 0.001230, 0.000000, 0.001110], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000028, 0.000112, 0.000112, -0.000054], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 0:
+  Input: [0.79696673, 0.21631336, 0.6352857, 0.11855191, 0.11816138, 0.5307466, 0.65741014, 0.48763216, 0.04409206, 0.7778605, 0.81001246, 0.49393666, 0.31024194, 0.5430912, 0.18535876, 0.9875867], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-2.7649934e-5, 0.00011175855, 0.000111813875, -5.395388e-5, -1.5023013e-5, 8.0442565e-5, -0.00011067871, 6.255269e-5, 8.38553e-5, 7.703404e-5, 5.1680232e-5, -0.00011175235, 9.686008e-5, -3.5420133e-5, -6.063297e-5, -7.2001116e-5], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+--- Stream Step Debug (Head 0, CtxLen 3) ---
+  eff_h: 0.18426923
+  Q: [0.225066, -0.334611, -0.565375, -0.446809], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in: [0.170065, -0.170478, -0.696137, -0.207495], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [0.000103, 0.000170, 0.000057, 0.000006], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.6089586
+  Scores Raw Ctx (last): -0.019475486
+  DEBUG Actual: dk_scale=0.5, s_in=0.2908043
+  CoPE[0] (Input): 0.02735
+  CoPE[LastCtx] (Pos 1): -0.01940673
+  Final Scores Dump (Last 2):
+    Ctx Last: -0.019441107
+    Last (Input): 0.3181543
+Stream Retrieve Step:
+  q: [0.020807, 0.007903, -0.020372, 0.010707], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.000566, -0.001483, -0.001664, 0.002295], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000566, 0.000000, 0.000000, 0.002295], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [-0.000017, -0.000038, -0.000008, 0.000015], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 1:
+  Input: [0.4380291, 0.8211299, 0.39809686, 0.43805927, 0.3179866, 0.11890811, 0.1354338, 0.21774358, 0.115679145, 0.47868747, 0.5585732, 0.6999404, 0.9412351, 0.5716976, 0.4581476, 0.6936925], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [-1.7294342e-5, -3.821744e-5, -8.436076e-6, 1.4642693e-5, 4.2723892e-5, 6.678696e-5, -5.8952166e-5, 8.0242855e-5, 7.55326e-5, 5.2696858e-5, 1.017843e-5, -3.931731e-5, 0.00015174298, 2.4339854e-5, -2.301094e-5, -1.448163e-6], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+--- Stream Step Debug (Head 0, CtxLen 3) ---
+  eff_h: 0.29843622
+  Q: [-0.246359, 0.410864, -1.502199, 0.032287], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in: [0.460251, -0.496813, -0.869928, -0.489519], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [-0.000017, 0.000057, 0.000015, -0.000032], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.97587186
+  Scores Raw Ctx (last): 0.007188613
+  DEBUG Actual: dk_scale=0.5, s_in=0.4867454
+  CoPE[0] (Input): 0.0023810968
+  CoPE[LastCtx] (Pos 1): 0.007184282
+  Final Scores Dump (Last 2):
+    Ctx Last: 0.0071864473
+    Last (Input): 0.48912647
+Stream Retrieve Step:
+  q: [0.000567, -0.003498, 0.025686, 0.052690], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [0.002043, -0.001446, 0.000701, 0.001194], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.002043, 0.000000, 0.000701, 0.001194], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [0.000076, -0.000018, -0.000027, 0.000165], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 2:
+  Input: [0.88365465, 0.9887144, 0.9555661, 0.39782447, 0.34533548, 0.61036193, 0.331829, 0.8209855, 0.37680835, 0.30397344, 0.14941257, 0.58974534, 0.38666707, 0.82915634, 0.40676212, 0.78433543], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [7.6297016e-5, -1.8160807e-5, -2.7441014e-5, 0.00016482678, -3.784869e-5, 0.00021045542, 2.732967e-5, 7.1855156e-6, 1.7105729e-5, -1.03103275e-5, 2.1311382e-5, 5.5845267e-5, -0.00015924341, -1.9849615e-5, 7.3159026e-7, -0.00011154462], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+--- Stream Step Debug (Head 0, CtxLen 3) ---
+  eff_h: 0.19045213
+  Q: [-0.399654, -0.065517, -1.463038, 0.018641], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in: [0.715753, -0.296650, -0.826436, -0.627272], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [-0.000166, 0.000092, -0.000027, -0.000012], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 0.93355423
+  Scores Raw Ctx (last): 0.008306234
+  DEBUG Actual: dk_scale=0.5, s_in=0.46539825
+  CoPE[0] (Input): 0.0027577379
+  CoPE[LastCtx] (Pos 1): 0.008206972
+  Final Scores Dump (Last 2):
+    Ctx Last: 0.008256603
+    Last (Input): 0.46815598
+Stream Retrieve Step:
+  q: [0.022517, -0.008783, -0.014136, 0.048836], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  z: [-0.005910, -0.005682, 0.002155, 0.000552], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  h: [0.000000, 0.000000, 0.002155, 0.000552], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  y: [0.000121, -0.000242, 0.000203, 0.000222], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Step 3:
+  Input: [0.2889371, 0.8987813, 0.15211982, 0.90772897, 0.024651527, 0.50006205, 0.35627472, 0.7977069, 0.88223326, 0.27957153, 0.75784796, 0.070473135, 0.25439864, 0.25314736, 0.9161083, 0.21988654], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+  h_t: [0.0001210502, -0.00024167067, 0.00020315866, 0.00022151766, 6.8791975e-5, 4.1224383e-5, 6.340115e-5, -7.967475e-5, 3.263056e-5, -5.2608717e-5, -0.00023504757, 2.460121e-5, 0.00020498382, 5.7702193e-5, 0.0001235102, 0.0001998101], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+--- Stream Step Debug (Head 0, CtxLen 3) ---
+  eff_h: 0.20893714
+  Q: [0.508471, 0.025715, -1.405536, -0.234164], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_in: [0.392729, -0.968048, -0.942797, -0.329271], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  K_ctx_last: [-0.000188, -0.000153, -0.000104, -0.000169], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+  Scores Raw In: 1.6211342
+  Scores Raw Ctx (last): -0.010556741
+  DEBUG Actual: dk_scale=0.5, s_in=0.78851837
+  CoPE[0] (Input): 0.04409739
+  CoPE[LastCtx] (Pos 1): -0.01064368
+  Final Scores Dump (Last 2):
+    Ctx Last: -0.01060021
+    Last (Input): 0.83261573
+Stream Update: k[0]=0.002324 alpha=0.500047 theta=0.499973 Grad_w1_sum=-0.000000 M_w1_sum=0.000000 Mem_w1_sum=-0.108094
+Stream Update: k[0]=-0.000896 alpha=0.500125 theta=0.499684 Grad_w1_sum=-0.000000 M_w1_sum=0.000000 Mem_w1_sum=-0.054034
+Stream Update: k[0]=-0.001147 alpha=0.500339 theta=0.499896 Grad_w1_sum=0.000000 M_w1_sum=0.000000 Mem_w1_sum=-0.026998
+Stream Update: k[0]=0.002261 alpha=0.499932 theta=0.499613 Grad_w1_sum=-0.000000 M_w1_sum=0.000000 Mem_w1_sum=-0.013501
+Stream Step 3 (Last) Out: [-0.021326903, 0.004960776, -0.02240713, 0.002444476, -0.026614096, 0.010038473, -0.003880246, -0.009594771, -0.015013624, 0.01637851, -0.012804685, -0.008514806, -0.023273902, -0.006485314, -0.028383281, -0.033737276], shape=[16], strides=[1], layout=CFcf (0xf), const ndim=1
+End of segment 1
+  Stream Memory W1 Sum: -0.013501
+  Stream Momentum W1 Sum: 0.000000
+--- Segment 1 Comparison (0..4) ---
+Max Diff Seg 1: 0.019835934
+Max Difference: 0.019835934
+
+--- Head 3 (Last Head) Debug ---
+Batch Scores: [0.0039661503, 0.002348046, -0.0002080225, -0.08348682], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Stream Scores: [0.003966151, 0.0023480463, -0.00020802251, -0.083486825], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Diff: 8.1636e-9
+
+=== Manual Projection Check (Head 3) ===
+Manual Q_h3: [-1.5312957, -0.777824, 0.49521467, -0.38560662], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Manual K_in_h3: [1.2402718, 1.2969663, -1.1579193, -0.105411455], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Manual K_p0_h3: [0.0253506, -0.012357505, -0.0044788183, -0.021877935], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+Manual Score In Raw (Q*K*scale): -1.7204028
+=== End Manual Check ===
+
+FAILURE: Significant divergence detected.

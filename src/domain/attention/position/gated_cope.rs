@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{infrastructure::optimizer::adam::Adam, common::rng::get_rng};
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gated Contextual Position Embeddings (GatedCoPE)
 ///
@@ -46,15 +46,16 @@ impl GatedCoPE {
     pub fn new(max_pos: usize, embed_dim: usize) -> Self {
         let mut rng = get_rng();
         let normal = Normal::new(0.0, 0.02).unwrap();
-        
+
         // Base CoPE
         let base_cope = CoPE::new(max_pos, embed_dim);
-        
+
         // Gate projection: (embed_dim * 2) × (max_pos + 1)
         let gate_input_dim = embed_dim * 2;
-        let w_gate = Array2::from_shape_fn((gate_input_dim, max_pos + 1), |_| normal.sample(&mut rng));
+        let w_gate =
+            Array2::from_shape_fn((gate_input_dim, max_pos + 1), |_| normal.sample(&mut rng));
         let opt_w_gate = Adam::new((gate_input_dim, max_pos + 1));
-        
+
         // Gate bias: (1, max_pos+1) for Adam compatibility
         let b_gate = Array2::zeros((1, max_pos + 1));
         let opt_b_gate = Adam::new((1, max_pos + 1));
@@ -194,9 +195,9 @@ mod tests {
         let gated = GatedCoPE::new(10, 8);
         let q = Array1::from_elem(8, 0.5);
         let k = Array1::from_elem(8, 0.3);
-        
+
         let contrib = gated.gated_cope_contribution(&q.view(), &k.view(), 0);
-        
+
         // Should be finite and non-zero
         assert!(contrib.is_finite());
     }
@@ -205,7 +206,7 @@ mod tests {
     fn test_gated_cope_parameters() {
         let gated = GatedCoPE::new(64, 32);
         let params = gated.parameters();
-        
+
         // CoPE: (65, 32) = 2080
         // W_gate: (64, 65) = 4160
         // b_gate: (1, 65) = 65

@@ -344,7 +344,9 @@ pub fn with_tls_poly_workspace<R>(
     WORKSPACE.with(|ws| {
         let mut ws = ws.borrow_mut();
         if ws.is_none() {
-            *ws = Some(PolyAttentionWorkspace::new(embed_dim, num_heads, max_window));
+            *ws = Some(PolyAttentionWorkspace::new(
+                embed_dim, num_heads, max_window,
+            ));
         }
         let workspace = ws.as_mut().unwrap();
         workspace.verify_dimensions(embed_dim, num_heads, max_window);
@@ -376,12 +378,12 @@ mod tests {
         let mut buf = ReusableBuffer2D::with_capacity(10, 20);
         assert_eq!(buf.dims(), (10, 20));
 
-        let slice = buf.get(5, 10);
-        assert!(slice.nrows() >= 5);
-        assert!(slice.ncols() >= 10);
+        let _slice = buf.get(5, 10);
+        assert!(_slice.nrows() >= 5);
+        assert!(_slice.ncols() >= 10);
 
         // Larger request triggers reallocation
-        let slice = buf.get(20, 40);
+        let _slice2 = buf.get(20, 40);
         assert_eq!(buf.dims(), (32, 64)); // next power of 2
     }
 

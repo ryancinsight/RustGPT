@@ -33,11 +33,13 @@ pub fn create_router(state: AppState, config: &WebUiConfig) -> Router {
     Router::new()
         // Health check (no auth required)
         .route("/health", get(health_check))
-        // API v1 routes
-        .merge(api_v1_routes(state))
         // Static files for web UI
         .route("/", get(serve_static))
         .route("/ui/*path", get(serve_static))
+        // Add state for static routes
+        .with_state(state.clone())
+        // API v1 routes
+        .merge(api_v1_routes(state))
         // Global middleware
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -74,7 +76,8 @@ pub fn create_router_with_auth(
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/", get(serve_static))
-        .route("/ui/*path", get(serve_static));
+        .route("/ui/*path", get(serve_static))
+        .with_state(state.clone());
 
     let protected_routes = api_v1_routes(state.clone()).layer(middleware::from_fn_with_state(
         api_key.clone(),

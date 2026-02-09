@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use llm::{Dataset, DatasetType};
+use llm::infrastructure::persistence::dataset::{Dataset, DatasetType};
 use tempfile::NamedTempFile;
 
 fn create_csv_file(rows: usize) -> NamedTempFile {

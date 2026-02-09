@@ -194,23 +194,30 @@ pub fn load_mnist_training_data(data_dir: &str, max_samples: Option<usize>) -> R
 mod tests {
     use super::*;
     use std::io::Write;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use tempfile::NamedTempFile;
     
     #[test]
     fn test_mnist_header_parsing() {
-        // Create a minimal MNIST image file
-        let mut file = NamedTempFile::new().unwrap();
+        // Create a minimal MNIST image file (gzip compressed)
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         
         // Magic number (0x00000803)
-        file.write_all(&[0x00, 0x00, 0x08, 0x03]).unwrap();
+        encoder.write_all(&[0x00, 0x00, 0x08, 0x03]).unwrap();
         // Number of images: 2
-        file.write_all(&[0x00, 0x00, 0x00, 0x02]).unwrap();
+        encoder.write_all(&[0x00, 0x00, 0x00, 0x02]).unwrap();
         // Rows: 28
-        file.write_all(&[0x00, 0x00, 0x00, 0x1c]).unwrap();
+        encoder.write_all(&[0x00, 0x00, 0x00, 0x1c]).unwrap();
         // Columns: 28
-        file.write_all(&[0x00, 0x00, 0x00, 0x1c]).unwrap();
+        encoder.write_all(&[0x00, 0x00, 0x00, 0x1c]).unwrap();
         // 2 images * 28 * 28 = 1568 bytes of pixel data
-        file.write_all(&[128u8; 1568]).unwrap();
+        encoder.write_all(&[128u8; 1568]).unwrap();
+        
+        let compressed = encoder.finish().unwrap();
+        
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&compressed).unwrap();
         
         let path = file.path();
         let images = load_mnist_images(path).unwrap();

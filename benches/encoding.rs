@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use llm::{SimpleTokenizer, Vocab};
+use llm::application::encoding::{SimpleTokenizer, Vocab};
 
 fn bench_tokenize(c: &mut Criterion) {
     let tokenizer = SimpleTokenizer::new();

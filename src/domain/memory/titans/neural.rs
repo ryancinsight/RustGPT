@@ -266,7 +266,18 @@ impl NeuralMemory {
         for t in 0..seq_len {
             let x_t = input.row(t);
             let q_t = self.w_q.dot(&x_t);
-            let (y_t, _) = Self::mlp_forward(memory, &q_t);
+            let (y_t, h) = Self::mlp_forward(memory, &q_t); // Modified mlp_forward to return h too
+            
+            if cfg!(debug_assertions) {
+                println!("Batch Retrieve Step {}:", t);
+                println!("  q: {:.6?}", q_t.slice(ndarray::s![0..4]));
+                // Recalculate z for debug
+                let z = memory.w1.dot(&q_t) + &memory.b1;
+                println!("  z: {:.6?}", z.slice(ndarray::s![0..4]));
+                println!("  h: {:.6?}", h.slice(ndarray::s![0..4]));
+                println!("  y: {:.6?}", y_t.slice(ndarray::s![0..4]));
+            }
+
             output.row_mut(t).assign(&y_t);
         }
         output
@@ -311,6 +322,14 @@ impl NeuralMemory {
         ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
         ws.y_ret += &memory.b2;
         
+        if cfg!(debug_assertions) {
+             println!("Stream Retrieve Step:");
+             println!("  q: {:.6?}", ws.q.slice(ndarray::s![0..4]));
+             println!("  z: {:.6?}", ws.z_ret.slice(ndarray::s![0..4]));
+             println!("  h: {:.6?}", ws.h_ret.slice(ndarray::s![0..4]));
+             println!("  y: {:.6?}", ws.y_ret.slice(ndarray::s![0..4]));
+        }
+
         output.assign(&ws.y_ret);
     }
 

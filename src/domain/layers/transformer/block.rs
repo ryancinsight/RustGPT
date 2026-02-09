@@ -197,6 +197,20 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 #[serde(default)]
                 eprop_adaptor: Option<EPropAdaptor>,
             },
+            // V3: Current format with UnifiedCoPE in TemporalMixingLayer
+            V3 {
+                pre_attention_norm: RichardsNorm,
+                temporal_mixing: Box<TemporalMixingLayer>,
+                pre_ffn_norm: RichardsNorm,
+                feedforward: FeedForwardVariant,
+                config: TransformerBlockConfig,
+
+                #[serde(default = "default_similarity_context_strength")]
+                similarity_context_strength: Array2<f32>,
+
+                #[serde(default)]
+                eprop_adaptor: Option<EPropAdaptor>,
+            },
         }
 
         let (
@@ -225,6 +239,23 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 None,
             ),
             TransformerBlockSerdeCompat::V2 {
+                pre_attention_norm,
+                temporal_mixing,
+                pre_ffn_norm,
+                feedforward,
+                config,
+                similarity_context_strength,
+                eprop_adaptor,
+            } => (
+                pre_attention_norm,
+                *temporal_mixing,
+                pre_ffn_norm,
+                feedforward,
+                config,
+                similarity_context_strength,
+                eprop_adaptor,
+            ),
+            TransformerBlockSerdeCompat::V3 {
                 pre_attention_norm,
                 temporal_mixing,
                 pre_ffn_norm,

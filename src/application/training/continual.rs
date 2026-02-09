@@ -21,14 +21,13 @@
 
 use std::collections::VecDeque;
 
-use ndarray::{Array1, Array2, Axis};
+use ndarray::Array2;
 use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     common::errors::{ModelError, Result},
     domain::models::llm::LLM,
-    infrastructure::persistence::dataset::ConversationTurn,
 };
 
 /// Configuration for continual learning
@@ -321,14 +320,11 @@ impl ContinualLearningManager {
 
     /// Compute gradient from a single feedback interaction
     fn compute_gradient_from_feedback(
-        &mut self,
-        llm: &mut LLM,
+        &self,
+        _llm: &mut LLM,
         interaction: &UserInteraction,
         feedback: &UserFeedback,
     ) -> Result<f32> {
-        use crate::domain::soft::Softmax;
-        use crate::domain::loss;
-
         let reward = feedback.to_reward();
         
         // Skip if reward is too small
@@ -342,8 +338,8 @@ impl ContinualLearningManager {
             return Ok(0.0);
         }
 
-        let input_ids = &token_ids[..token_ids.len() - 1];
-        let target_ids = &token_ids[1..];
+        let _input_ids = &token_ids[..token_ids.len() - 1];
+        let _target_ids = &token_ids[1..];
 
         // Get logits from model (simplified - would need actual forward pass)
         // For now, return a placeholder loss
@@ -364,7 +360,6 @@ impl ContinualLearningManager {
             return None;
         }
 
-        use rand::seq::SliceRandom;
         let mut rng = crate::common::rng::get_rng();
         let index = (0..self.replay_buffer.len())
             .collect::<Vec<_>>()
@@ -375,7 +370,7 @@ impl ContinualLearningManager {
     }
 
     /// Apply accumulated gradients with EWC regularization
-    fn apply_accumulated_gradients(&mut self, llm: &mut LLM) -> Result<()> {
+    fn apply_accumulated_gradients(&mut self, _llm: &mut LLM) -> Result<()> {
         if self.gradient_buffer.is_empty() {
             return Ok(());
         }
@@ -405,15 +400,17 @@ impl ContinualLearningManager {
         if let Some(user_id) = &self.current_user {
             if let Some(memory) = self.user_memories.get(user_id) {
                 if self.config.ewc_lambda > 0.0 {
-                    if let (Some(ref fisher), Some(ref old_params)) = 
+                    if let (Some(fisher), Some(old_params)) =
                         (&memory.fisher_information, &memory.old_params) {
                         // Add EWC penalty to gradients
-                        for (i, (grad, (fisher_mat, old_param))) in averaged_gradients
+                        for (_i, (grad, (fisher_mat, old_param))) in averaged_gradients
                             .iter_mut()
                             .zip(fisher.iter().zip(old_params.iter()))
                             .enumerate() {
                             // EWC penalty: λ * F * (θ - θ_old)
-                            let penalty = fisher_mat * (grad.view() - old_param.view()) * self.config.ewc_lambda;
+                            // Need to convert to owned arrays for subtraction
+                            let diff = grad.to_owned() - old_param;
+                            let penalty = fisher_mat * &diff * self.config.ewc_lambda;
                             *grad += &penalty;
                         }
                     }
@@ -431,7 +428,7 @@ impl ContinualLearningManager {
     }
 
     /// Compute Fisher Information matrix for EWC
-    pub fn compute_fisher_information(&mut self, llm: &LLM) -> Result<()> {
+    pub fn compute_fisher_information(&mut self, _llm: &LLM) -> Result<()> {
         if !self.config.enabled || self.config.ewc_lambda <= 0.0 {
             return Ok(());
         }
@@ -449,10 +446,10 @@ impl ContinualLearningManager {
         // Compute Fisher Information using past interactions
         // F = E[(∇log p(y|x,θ))^2]
         
-        let mut fisher_accumulator: Vec<Array2<f32>> = Vec::new();
+        let fisher_accumulator: Vec<Array2<f32>> = Vec::new();
         let num_samples = memory.conversations.len().min(100);
 
-        for interaction in memory.conversations.iter().rev().take(num_samples) {
+        for _interaction in memory.conversations.iter().rev().take(num_samples) {
             // Compute gradient squared for this sample
             // In a full implementation, this would do a forward-backward pass
             // and accumulate the squared gradients

@@ -2,7 +2,7 @@ use ndarray::{Array2, ArrayView1};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{infrastructure::optimizer::adam::Adam, common::rng::get_rng};
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Hierarchical Contextual Position Embeddings (HierarchicalCoPE)
 ///
@@ -54,19 +54,21 @@ impl HierarchicalCoPE {
     pub fn new(chunk_size: usize, max_chunks: usize, embed_dim: usize) -> Self {
         let mut rng = get_rng();
         let normal = Normal::new(0.0, 0.02).unwrap();
-        
+
         // Local CoPE: learnable within-chunk positions
-        let local_cope = Array2::from_shape_fn((chunk_size, embed_dim), |_| normal.sample(&mut rng));
+        let local_cope =
+            Array2::from_shape_fn((chunk_size, embed_dim), |_| normal.sample(&mut rng));
         let opt_local_cope = Adam::new((chunk_size, embed_dim));
-        
+
         // Global CoPE: chunk-level positions
-        let global_cope = Array2::from_shape_fn((max_chunks, embed_dim), |_| normal.sample(&mut rng));
+        let global_cope =
+            Array2::from_shape_fn((max_chunks, embed_dim), |_| normal.sample(&mut rng));
         let opt_global_cope = Adam::new((max_chunks, embed_dim));
-        
+
         // Chunk boundary predictor
         let chunk_predictor_w = Array2::from_shape_fn((embed_dim, 2), |_| normal.sample(&mut rng));
         let opt_chunk_predictor_w = Adam::new((embed_dim, 2));
-        
+
         let chunk_predictor_b = Array2::zeros((1, 2));
         let opt_chunk_predictor_b = Adam::new((1, 2));
 
@@ -77,7 +79,7 @@ impl HierarchicalCoPE {
             opt_local_cope,
             global_cope,
             opt_global_cope,
-            alpha_local: 0.7,  // Default: emphasize local positions more
+            alpha_local: 0.7, // Default: emphasize local positions more
             alpha_global: 0.3,
             chunk_predictor_w,
             opt_chunk_predictor_w,
@@ -108,31 +110,27 @@ impl HierarchicalCoPE {
         let local_pos = pos % self.chunk_size;
 
         // Predict chunk boundary adjustment
-        let boundary_logit = q.dot(&self.chunk_predictor_w.column(0)) 
-            + content_sim * self.chunk_predictor_w[[0, 1]] 
+        let boundary_logit = q.dot(&self.chunk_predictor_w.column(0))
+            + content_sim * self.chunk_predictor_w[[0, 1]]
             + self.chunk_predictor_b[[0, 0]];
         let boundary_gate = self.sigmoid(boundary_logit);
 
         // Local contribution: q · PE_local
         let local_contrib = q.dot(&self.local_cope.row(local_pos));
-        
+
         // Global contribution: q · PE_global
         let global_contrib = q.dot(&self.global_cope.row(chunk_idx));
-        
+
         // Blend with boundary-aware mixing
         let mixed = self.alpha_local * local_contrib + self.alpha_global * global_contrib;
-        
+
         // Apply boundary adjustment (smooth transition near chunk boundaries)
         mixed * (1.0 + boundary_gate * 0.1)
     }
 
     /// Compute local and global components separately for gradient flow
     #[inline]
-    pub fn hierarchical_components(
-        &self,
-        q: &ArrayView1<'_, f32>,
-        pos: usize,
-    ) -> (f32, f32) {
+    pub fn hierarchical_components(&self, q: &ArrayView1<'_, f32>, pos: usize) -> (f32, f32) {
         let chunk_idx = (pos / self.chunk_size).min(self.max_chunks - 1);
         let local_pos = pos % self.chunk_size;
 
@@ -153,31 +151,46 @@ impl HierarchicalCoPE {
     pub fn apply_gradients(
         &mut self,
         grads: &(
-            Array2<f32>,  // local_cope gradient
-            Array2<f32>,  // global_cope gradient
+            Array2<f32>, // local_cope gradient
+            Array2<f32>, // global_cope gradient
             Array2<f32>, // chunk_predictor_w gradient
             Array2<f32>, // chunk_predictor_b gradient
         ),
         lr: f32,
     ) {
         self.opt_local_cope.step(&mut self.local_cope, &grads.0, lr);
-        self.opt_global_cope.step(&mut self.global_cope, &grads.1, lr);
-        self.opt_chunk_predictor_w.step(&mut self.chunk_predictor_w, &grads.2, lr);
-        self.opt_chunk_predictor_b.step(&mut self.chunk_predictor_b, &grads.3, lr);
+        self.opt_global_cope
+            .step(&mut self.global_cope, &grads.1, lr);
+        self.opt_chunk_predictor_w
+            .step(&mut self.chunk_predictor_w, &grads.2, lr);
+        self.opt_chunk_predictor_b
+            .step(&mut self.chunk_predictor_b, &grads.3, lr);
     }
 
     /// Get total parameter count
     pub fn parameters(&self) -> usize {
-        self.local_cope.len() + self.global_cope.len() 
-            + self.chunk_predictor_w.len() + self.chunk_predictor_b.len()
+        self.local_cope.len()
+            + self.global_cope.len()
+            + self.chunk_predictor_w.len()
+            + self.chunk_predictor_b.len()
     }
 
     /// Get weight norm
     pub fn weight_norm(&self) -> f32 {
         let local_norm: f32 = self.local_cope.iter().map(|&w| w * w).sum::<f32>().sqrt();
         let global_norm: f32 = self.global_cope.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        let pred_norm: f32 = self.chunk_predictor_w.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        let bias_norm: f32 = self.chunk_predictor_b.iter().map(|&w| w * w).sum::<f32>().sqrt();
+        let pred_norm: f32 = self
+            .chunk_predictor_w
+            .iter()
+            .map(|&w| w * w)
+            .sum::<f32>()
+            .sqrt();
+        let bias_norm: f32 = self
+            .chunk_predictor_b
+            .iter()
+            .map(|&w| w * w)
+            .sum::<f32>()
+            .sqrt();
         (local_norm.powi(2) + global_norm.powi(2) + pred_norm.powi(2) + bias_norm.powi(2)).sqrt()
     }
 
@@ -214,13 +227,13 @@ mod tests {
     fn test_hierarchical_cope_contribution() {
         let hcope = HierarchicalCoPE::new(64, 16, 32);
         let q = Array1::from_elem(32, 0.5);
-        
+
         // Test various positions
         let contrib0 = hcope.hierarchical_cope_contribution(&q.view(), 0, 0.0);
         let contrib63 = hcope.hierarchical_cope_contribution(&q.view(), 63, 0.0);
         let contrib64 = hcope.hierarchical_cope_contribution(&q.view(), 64, 0.0);
         let contrib1000 = hcope.hierarchical_cope_contribution(&q.view(), 1000, 0.5);
-        
+
         assert!(contrib0.is_finite());
         assert!(contrib63.is_finite());
         assert!(contrib64.is_finite());
@@ -231,7 +244,7 @@ mod tests {
     fn test_hierarchical_parameters() {
         let hcope = HierarchicalCoPE::new(64, 16, 32);
         let params = hcope.parameters();
-        
+
         // local_cope: 64 * 32 = 2048
         // global_cope: 16 * 32 = 512
         // chunk_predictor_w: 32 * 2 = 64

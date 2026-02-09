@@ -23,8 +23,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::mem;
+use std::sync::{Arc, Mutex};
 
 /// Thread-local buffer pool for per-thread allocations.
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl ThreadLocalPool {
     pub fn acquire_f32(&mut self, min_size: usize) -> Vec<f32> {
         // Round up to power of 2 for efficiency
         let size = min_size.next_power_of_two().max(64);
-        
+
         if let Some(bucket) = self.buckets.get_mut(&size) {
             if let Some(buf) = bucket.pop() {
                 // Buffer taken from pool - reduce current usage
@@ -68,7 +68,7 @@ impl ThreadLocalPool {
                 return buf;
             }
         }
-        
+
         // Allocate new buffer - don't count it until it's returned
         Vec::with_capacity(size)
     }
@@ -78,14 +78,11 @@ impl ThreadLocalPool {
     pub fn release(&mut self, mut buf: Vec<f32>) {
         let size = buf.capacity();
         let bytes = size * mem::size_of::<f32>();
-        
+
         // Check if we have capacity to retain this buffer
         if self.current_bytes + bytes <= self.capacity_bytes {
             buf.clear();
-            self.buckets
-                .entry(size)
-                .or_insert_with(Vec::new)
-                .push(buf);
+            self.buckets.entry(size).or_insert_with(Vec::new).push(buf);
             self.current_bytes += bytes;
         }
         // Otherwise: buffer is dropped and freed naturally
@@ -175,7 +172,7 @@ impl MemoryPool {
     #[inline]
     pub fn new(capacity_bytes: usize) -> Self {
         let bucket_count = (capacity_bytes / 1024).max(16);
-        
+
         Self {
             inner: Arc::new(Mutex::new(PoolInner {
                 buckets: HashMap::with_capacity(bucket_count),
@@ -188,16 +185,16 @@ impl MemoryPool {
     #[inline]
     pub fn acquire(&self, min_size: usize) -> Vec<f32> {
         let size = min_size.next_power_of_two().max(64);
-        
+
         let mut inner = self.inner.lock().unwrap();
-        
+
         if let Some(bucket) = inner.buckets.get_mut(&size) {
             let buf = bucket.acquire();
             if !buf.is_empty() {
                 return buf;
             }
         }
-        
+
         Vec::with_capacity(size)
     }
 
@@ -206,18 +203,19 @@ impl MemoryPool {
     pub fn release(&self, buf: Vec<f32>) {
         let size = buf.capacity();
         let bytes = size * mem::size_of::<f32>();
-        
+
         if bytes > self.total_capacity / 16 {
             // Too large for pool, let it be freed
             return;
         }
-        
+
         let mut inner = self.inner.lock().unwrap();
-        
-        let bucket = inner.buckets
+
+        let bucket = inner
+            .buckets
             .entry(size)
             .or_insert_with(|| BufferBucket::new(size, 64));
-        
+
         bucket.release(buf);
     }
 
@@ -227,12 +225,12 @@ impl MemoryPool {
         let inner = self.inner.lock().unwrap();
         let mut total_buffers = 0;
         let mut total_capacity = 0;
-        
+
         for (size, bucket) in &inner.buckets {
             total_buffers += bucket.len();
             total_capacity += bucket.len() * size * mem::size_of::<f32>();
         }
-        
+
         PoolStats {
             total_buffers,
             total_capacity,
@@ -253,16 +251,16 @@ pub struct PoolStats {
 }
 
 /// Get or create thread-local memory pool.
-/// 
+///
 /// Note: This returns a mutable borrow that must be released within the same closure.
 /// For most use cases, create a ThreadLocalPool instance directly.
 #[inline]
 pub fn with_tls_pool<R>(f: impl FnOnce(&mut ThreadLocalPool) -> R) -> R {
     thread_local! {
-        static POOL: std::cell::RefCell<ThreadLocalPool> = 
+        static POOL: std::cell::RefCell<ThreadLocalPool> =
             std::cell::RefCell::new(ThreadLocalPool::default());
     }
-    
+
     POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         f(&mut pool)
@@ -276,15 +274,15 @@ mod tests {
     #[test]
     fn test_buffer_pool_acquire_release() {
         let mut pool = ThreadLocalPool::new(1024 * 1024);
-        
+
         // Acquire buffers
         let buf1 = pool.acquire_f32(256);
         assert!(buf1.capacity() >= 256);
         assert!(buf1.is_empty());
-        
+
         let buf2 = pool.acquire_f32(128);
         assert!(buf2.capacity() >= 128);
-        
+
         // Release and reacquire
         pool.release(buf1);
         let buf1_reacquired = pool.acquire_f32(256);
@@ -294,27 +292,31 @@ mod tests {
     #[test]
     fn test_buffer_pool_capacity_limit() {
         let mut pool = ThreadLocalPool::new(1024); // 1KB limit
-        
+
         // Acquire and release buffers
         for _ in 0..100 {
             let buf = pool.acquire_f32(512);
             pool.release(buf);
         }
-        
+
         // After stabilization, pool should be at or near capacity
         // The pool rounds up sizes to power of 2, so 512 -> 512 or 1024
         // With 1KB limit, we can fit at most 2 buffers of 512 bytes each
         let usage = pool.memory_usage();
-        assert!(usage <= 1024 * 4, "Pool usage {} exceeds reasonable limit", usage);
+        assert!(
+            usage <= 1024 * 4,
+            "Pool usage {} exceeds reasonable limit",
+            usage
+        );
     }
 
     #[test]
     fn test_shared_pool_stats() {
         let pool = MemoryPool::new(1024 * 1024);
-        
+
         let buf = pool.acquire(512);
         pool.release(buf);
-        
+
         let stats = pool.stats();
         assert!(stats.total_buffers >= 1);
     }
