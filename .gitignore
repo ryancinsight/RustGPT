@@ -13,3 +13,5 @@ models/*.onnx
 
 # Local logs / run artifacts
 /logs/
+"*.zip"  
+"data/speech_commands/*.zip" 
