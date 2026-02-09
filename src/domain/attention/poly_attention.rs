@@ -995,9 +995,17 @@ impl PolyAttention {
         ndarray::linalg::general_mat_vec_mul(1.0, &self.moh.w_g.t(), input, 0.0, &mut workspace.xw_all);
 
         // 2. Project Context (K, V) -> Context Workspace
+        // Update context_len to match input context
+        let current_context_len = context.nrows();
+        ctx_workspace.context_len = current_context_len;
+
+        // Slice buffers to match current context length
+        let mut k_ctx_slice = ctx_workspace.k_context.slice_mut(s![0..current_context_len, ..]);
+        let mut v_ctx_slice = ctx_workspace.v_context.slice_mut(s![0..current_context_len, ..]);
+
         // K = Context * W_k (assuming W_k is In x Out)
-        ndarray::linalg::general_mat_mul(1.0, context, &self.w_k, 0.0, &mut ctx_workspace.k_context);
-        ndarray::linalg::general_mat_mul(1.0, context, &self.w_v, 0.0, &mut ctx_workspace.v_context);
+        ndarray::linalg::general_mat_mul(1.0, context, &self.w_k, 0.0, &mut k_ctx_slice);
+        ndarray::linalg::general_mat_mul(1.0, context, &self.w_v, 0.0, &mut v_ctx_slice);
 
         // 3. Gating
         workspace.gate_values.fill(0.0);
@@ -1031,10 +1039,14 @@ impl PolyAttention {
 
             let q = workspace.q_all.slice(s![start..end]);
             
-            if h_idx == 0 && cfg!(debug_assertions) {
-                println!("Stream Q Head 0: {:?}", q);
+            // Debug logging for Head 0 at the last step (context_len == 3 for seq_len=4)
+            // This assumes verify_titans_mac.rs uses seq_len=4.
+            // Ideally pass a debug flag or step index, but using context_len is a good proxy for now.
+            if h_idx == 0 && cfg!(debug_assertions) && context_len == 3 {
+                println!("Stream Step (Last):");
+                println!("  Q: {:?}", q);
                 let k_in = workspace.k_all.slice(s![start..end]);
-                println!("Stream K_in Head 0: {:?}", k_in);
+                println!("  K_in: {:?}", k_in);
             }
 
             let q_scaled = &q * dk_scale;
@@ -1074,9 +1086,19 @@ impl PolyAttention {
                 }
             }
 
-            if cfg!(debug_assertions) && n_ctx > 0 {
-                 println!("Stream Scores Ctx (last): {}", scores_ctx[n_ctx-1]);
-                 println!("Stream Scores In: {}", scores_in[0]);
+            if cfg!(debug_assertions) && n_ctx > 0 && context_len == 3 && h_idx == 0 {
+                 println!("  Scores Ctx (last): {}", scores_ctx[n_ctx-1]);
+                 println!("  Scores In: {}", scores_in[0]);
+                 println!("  CoPE[0] (Input): {}", cope_in);
+                 if n_ctx > 0 {
+                      // Recalculate context cope for debugging
+                      let pos = 1; // Last context element is at pos 1 relative to input?
+                      // Wait, n_ctx=3.
+                      // Loop: i=0 (pos=3), i=1 (pos=2), i=2 (pos=1).
+                      // Last element of scores_ctx corresponds to i=2, pos=1.
+                      let pe = self.cope.pos_embeddings.row(1);
+                      println!("  CoPE[LastCtx] (Pos 1): {}", q.dot(&pe));
+                 }
             }
 
 

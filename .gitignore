@@ -13,7 +13,21 @@ models/*.onnx
 
 # Local logs / run artifacts
 /logs/
-"*.zip"  
-"data/speech_commands/*.zip" 
-"*.zip"  
-"data/speech_commands/" 
+
+# Large data files
+*.zip
+data/speech_commands/*.zip
+data/speech_commands/
+
+# Training artifacts
+training_logs/
+*.log
+
+# Debug outputs
+debug_output*.txt
+test_output.txt
+verify_log.txt
+verify_full.txt
+
+# Temp files
+temp_*.json

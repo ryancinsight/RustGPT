@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument, warn};
 
 use crate::{
-    application::{decoding::GreedyDecoder, encoding::Vocab},
+    application::{decoding::GreedyDecoder, encoding::Vocab, training::ContinualLearningManager},
     common::{
         errors::{ModelError, Result},
         rng::get_rng,
@@ -482,6 +482,10 @@ pub struct LLM {
     training_scratch: TrainingScratch,
     #[serde(skip, default)]
     tool_registry: ToolRegistry,
+
+    /// Continual learning manager for online learning from user feedback
+    #[serde(skip, default)]
+    continual_learning: Option<ContinualLearningManager>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -602,6 +606,7 @@ impl Default for LLM {
             residual_neg_bank: ResidualNegBank::default(),
             training_scratch: TrainingScratch::default(),
             tool_registry: ToolRegistry::with_defaults(),
+            continual_learning: None,
         }
     }
 }

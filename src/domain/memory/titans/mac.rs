@@ -15,6 +15,7 @@ pub struct TitansMACStreamingWorkspace {
     pub neural_memory_workspace: NeuralMemoryStreamingWorkspace,
     pub poly_context_workspace: PolyAttentionContextWorkspace,
     pub update_buffer: Array2<f32>,
+    pub segment_input_buffer: Array2<f32>,
     pub buffer_idx: usize,
 }
 
