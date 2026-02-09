@@ -629,6 +629,7 @@ impl LLM {
             residual_neg_bank: ResidualNegBank::default(),
             training_scratch: TrainingScratch::default(),
             tool_registry: ToolRegistry::with_defaults(),
+            continual_learning: None,
         }
     }
 
@@ -671,6 +672,7 @@ impl LLM {
             residual_neg_bank: ResidualNegBank::default(),
             training_scratch: TrainingScratch::default(),
             tool_registry: ToolRegistry::with_defaults(),
+            continual_learning: None,
         }
     }
 

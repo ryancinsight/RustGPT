@@ -90,7 +90,6 @@ impl TitansMAC {
         &mut self,
         segment: &Array2<f32>,
     ) -> (Array2<f32>, Vec<PolyAttentionCache>) {
-        println!("ENTERING PROCESS SEGMENT");
         // 1. Retrieve h_t from Memory using input context (segment) as query.
         let h_t = self.memory.retrieve(segment);
 
@@ -98,7 +97,7 @@ impl TitansMAC {
         let p_len = self.persistent_len;
         let s_len = segment.nrows();
         let d = segment.ncols();
-        
+
         let mut seg_out_rows = Vec::with_capacity(s_len);
         let mut caches = Vec::with_capacity(s_len);
 
@@ -106,30 +105,19 @@ impl TitansMAC {
             let current_h_t = h_t.row(i);
             let current_seg = segment.row(i);
 
-            if i == 0 {
-                println!("[MAC BATCH] Segment[0,0]: {}", current_seg[0]);
-            }
-            
             // Input: [Persistent | h_t[i] | Segment[i]]
             let total_len = p_len + 1 + 1;
             let mut input_seq = Array2::<f32>::zeros((total_len, d));
-            
+
             input_seq.slice_mut(s![0..p_len, ..]).assign(&self.persistent_memory);
             input_seq.row_mut(p_len).assign(&current_h_t);
             input_seq.row_mut(p_len + 1).assign(&current_seg);
-            
+
             // Forward detached (causal=true ensures C attends to A, B, C)
             let (attn_out, cache) = self.core.forward_detached(&input_seq, true);
-            
+
             // Extract output for segment[i] (last row)
             let out_i = attn_out.row(total_len - 1).to_owned();
-
-            if i == 0 {
-                 println!("Batch Step {}:", i);
-                 println!("  Input: {:?}", current_seg);
-                 println!("  h_t: {:?}", current_h_t);
-                 println!("  Out: {:?}", out_i);
-            }
 
             seg_out_rows.push(out_i);
             caches.push(cache);
@@ -189,6 +177,7 @@ impl TitansMAC {
                 },
                 poly_context_workspace: PolyAttentionContextWorkspace::new(context_len, d),
                 update_buffer: Array2::zeros((self.segment_len, d)),
+                segment_input_buffer: Array2::zeros((self.segment_len, d)),
                 buffer_idx: 0,
             });
         }
