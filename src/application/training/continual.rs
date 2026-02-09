@@ -412,7 +412,7 @@ impl ContinualLearningManager {
                             .zip(fisher.iter().zip(old_params.iter()))
                             .enumerate() {
                             // EWC penalty: λ * F * (θ - θ_old)
-                            let penalty = fisher_mat * (grad - old_param) * self.config.ewc_lambda;
+                            let penalty = fisher_mat * (grad.view() - old_param.view()) * self.config.ewc_lambda;
                             *grad += &penalty;
                         }
                     }
