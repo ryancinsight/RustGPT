@@ -152,6 +152,70 @@ impl Dataset {
         Ok(dataset)
     }
 
+    /// Load multi-modal datasets with actual data from MNIST and Speech Commands
+    pub fn with_real_multimodal_data(
+        pretraining_data_path: String,
+        chat_training_data_path: String,
+        type_of_data: DatasetType,
+        mnist_max_samples: Option<usize>,
+        speech_max_per_class: Option<usize>,
+    ) -> Result<Self> {
+        let mut dataset = Self::with_multimodal(
+            pretraining_data_path,
+            chat_training_data_path,
+            type_of_data,
+        )?;
+
+        // Load MNIST image data
+        let mnist_dir = "data/mnist";
+        if Path::new(mnist_dir).exists() {
+            match crate::infrastructure::persistence::mnist_loader::load_mnist_training_data(
+                mnist_dir,
+                mnist_max_samples,
+            ) {
+                Ok(mut image_examples) => {
+                    tracing::info!(
+                        count = image_examples.len(),
+                        "Loaded MNIST training data"
+                    );
+                    dataset.image_training_data.append(&mut image_examples);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load MNIST data: {}", e);
+                }
+            }
+        }
+
+        // Load Speech Commands audio data
+        let speech_dir = "data/speech_commands";
+        if Path::new(speech_dir).exists() {
+            match crate::infrastructure::persistence::speech_loader::load_speech_training_data(
+                speech_dir,
+                speech_max_per_class,
+            ) {
+                Ok(mut speech_examples) => {
+                    tracing::info!(
+                        count = speech_examples.len(),
+                        "Loaded Speech Commands training data"
+                    );
+                    dataset.speech_training_data.append(&mut speech_examples);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load Speech Commands data: {}", e);
+                }
+            }
+        }
+
+        tracing::info!(
+            images = dataset.image_training_data.len(),
+            speech = dataset.speech_training_data.len(),
+            video = dataset.video_training_data.len(),
+            "Total multimodal training data loaded"
+        );
+
+        Ok(dataset)
+    }
+
     /// Get all text data from all modalities for pretraining
     pub fn get_all_text_data(&self) -> Vec<String> {
         let mut all_text = Vec::new();
