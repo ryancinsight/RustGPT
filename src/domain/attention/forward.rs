@@ -83,6 +83,7 @@ pub fn compute_poly_attention_forward_into(
 
     // Resize workspace if needed
     if workspace.q_all.shape() != [n, ctx.num_heads * ctx.head_dim] {
+        println!("Forward Start: n={}, d={}, heads={}", n, d_model, ctx.num_heads);
         workspace.q_all = Array2::zeros((n, ctx.num_heads * ctx.head_dim));
     }
     if workspace.k_all.shape() != [n, ctx.num_heads * ctx.head_dim] {
@@ -348,13 +349,19 @@ pub fn compute_poly_attention_forward_into(
                          println!("  Eff Gating: {}", eff_i);
                     }
 
+                    let mut debug_cope = 0.0;
                     with_tls_qpe(max_pos + 1, |q_pe| {
                         for (pos, q_pe_val) in q_pe.iter_mut().enumerate() {
+                            // Reverted dk_scale (Stream uses unscaled CoPE)
                             *q_pe_val = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
                         }
                         
                         if h_idx == 0 && i == n - 1 {
+                            debug_cope = q_pe[0];
+                            println!("Batch Last Step ({}):", i);
                             println!("  CoPE[0]: {}", q_pe[0]);
+                            println!("  Q: {:?}", q_row_i);
+                            println!("  Score Raw Last (Input): {}", scores_row[scores_row.len()-1]);
                         }
 
                         let mlen = j_end_excl.saturating_sub(j_start);

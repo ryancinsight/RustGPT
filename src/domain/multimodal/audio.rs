@@ -391,10 +391,16 @@ impl AudioAugmentation {
         let mut waveform = sample.waveform.clone();
 
         // Volume perturbation
-        if self.config.volume_range != (1.0, 1.0) {
-            let factor = self.rng.random_range(self.config.volume_range.0..self.config.volume_range.1);
+        let volume_range = self.config.volume_range;
+        if volume_range.0 < volume_range.1 {
+            let factor = self.rng.random_range(volume_range.0..volume_range.1);
             for sample in &mut waveform {
                 *sample *= factor;
+            }
+        } else if volume_range.0 == volume_range.1 && volume_range.0 != 1.0 {
+            // Fixed volume factor
+            for sample in &mut waveform {
+                *sample *= volume_range.0;
             }
         }
 
@@ -404,9 +410,13 @@ impl AudioAugmentation {
         }
 
         // Time stretching
-        if self.config.time_stretch_range != (1.0, 1.0) {
-            let rate = self.rng.random_range(self.config.time_stretch_range.0..self.config.time_stretch_range.1);
+        let stretch_range = self.config.time_stretch_range;
+        if stretch_range.0 < stretch_range.1 {
+            let rate = self.rng.random_range(stretch_range.0..stretch_range.1);
             waveform = self.time_stretch(&waveform, rate);
+        } else if stretch_range.0 == stretch_range.1 && stretch_range.0 != 1.0 {
+            // Fixed stretch rate
+            waveform = self.time_stretch(&waveform, stretch_range.0);
         }
 
         let mut result = AudioSample::new(waveform, sample.sample_rate);

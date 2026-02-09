@@ -25,7 +25,6 @@ pub use processor::{Modality, MultiModalBatch, MultiModalProcessor};
 pub use video::{VideoConfig, VideoEncoder, VideoSample};
 
 use crate::common::errors::Result;
-use crate::common::rng::DeterministicRng;
 use ndarray::{Array1, Array2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
@@ -574,7 +573,7 @@ mod tests {
     #[test]
     fn test_modality_dropout() {
         let config = ModalityDropoutConfig::none();
-        let mut dropout = ModalityDropout::new(config).unwrap();
+        let dropout = ModalityDropout::new(config).unwrap();
 
         // With no dropout, all modalities should be kept
         let modalities = vec![Modality::Text, Modality::Image];

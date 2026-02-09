@@ -70,6 +70,7 @@ pub fn get_seed() -> Option<u64> {
 ///
 /// This provides a uniform interface regardless of whether deterministic
 /// mode is enabled.
+#[derive(Clone)]
 pub enum DeterministicRng {
     Seeded(Box<StdRng>),
     Random(rand::rngs::ThreadRng),

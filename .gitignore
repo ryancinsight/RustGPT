@@ -15,3 +15,5 @@ models/*.onnx
 /logs/
 "*.zip"  
 "data/speech_commands/*.zip" 
+"*.zip"  
+"data/speech_commands/" 

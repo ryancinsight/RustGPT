@@ -17,7 +17,7 @@ use ndarray::{Array1, Array2, Array3, Axis};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::common::{errors::Result, rng::{get_rng, DeterministicRng}};
+use crate::common::{errors::Result, rng::get_rng};
 use crate::domain::multimodal::patch::PatchEmbed;
 
 /// Configuration for image processing
@@ -464,8 +464,8 @@ impl ImageAugmentation {
         let cutout_h = (h as f32 * self.config.cutout_size) as usize;
         let cutout_w = (w as f32 * self.config.cutout_size) as usize;
 
-        let start_y = self.rng.gen_range(0..h.saturating_sub(cutout_h).max(1));
-        let start_x = self.rng.gen_range(0..w.saturating_sub(cutout_w).max(1));
+        let start_y = self.rng.random_range(0..h.saturating_sub(cutout_h).max(1));
+        let start_x = self.rng.random_range(0..w.saturating_sub(cutout_w).max(1));
 
         for y in start_y..(start_y + cutout_h).min(h) {
             for x in start_x..(start_x + cutout_w).min(w) {

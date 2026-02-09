@@ -19,8 +19,7 @@ use crate::domain::multimodal::{
     audio::{AudioConfig, AudioEncoder, AudioSample},
     image::{ImageConfig, ImageEncoder, ImageSample},
     video::{VideoConfig, VideoEncoder, VideoSample},
-    CrossModalMaskBuilder, ModalityDropout, ModalityDropoutConfig, ModalityTokenType,
-    ModalityTypeEmbeddings,
+    CrossModalMaskBuilder, ModalityTokenType, ModalityTypeEmbeddings,
 };
 
 /// Supported modalities
@@ -216,7 +215,7 @@ impl MultiModalBatch {
         let type_emb_array = type_embeddings.get_sequence(&token_types);
         
         // Add type embeddings to each position
-        for (i, row) in concatenated.rows_mut().into_iter().enumerate() {
+        for (i, mut row) in concatenated.rows_mut().into_iter().enumerate() {
             for (j, &val) in type_emb_array.row(i).iter().enumerate() {
                 row[j] += val;
             }
