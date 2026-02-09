@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     infrastructure::optimizer::adam::Adam,
-    common::{errors::Result, rng::get_rng},
+    common::{errors::Result, rng::get_rng, utils::ring_buffer::RingBuffer1D},
     domain::{
         layers::ssm::components::selective_scan::{
             Mamba2ScanBackwardInput, Mamba2ScanInput, MambaScanBackwardInput, MambaScanInput,
@@ -173,6 +173,11 @@ pub struct MambaStreamingWorkspace {
     // Mamba2 helpers
     pub b_h: Array1<f32>, // N (per head temp)
     pub c_h: Array1<f32>, // N (per head temp)
+    
+    /// Unified ring buffer for convolution history (SSOT).
+    /// Replaces manual ring buffer implementation with RingBuffer1D abstraction.
+    /// Provides O(1) push/access with zero allocation after initialization.
+    pub conv_ring: RingBuffer1D,
 }
 
 /// A more complete Mamba-style selective SSM layer.
@@ -324,9 +329,9 @@ pub struct Mamba {
     cached_a_scale_head: Option<Array2<f32>>, // [1, H]
 
     #[serde(skip)]
-    streaming_conv_queue: Option<VecDeque<Array1<f32>>>,
-    #[serde(skip)]
     pub streaming_ssm_state: Option<Array2<f32>>,
+    #[serde(skip)]
+    pub streaming_conv_queue: Option<VecDeque<Array1<f32>>>,
     #[serde(skip)]
     pub streaming_workspace: Option<Box<MambaStreamingWorkspace>>,
 }
@@ -437,8 +442,8 @@ impl<'de> Deserialize<'de> for Mamba {
             cached_dt_head: None,
             cached_a_head: None,
             cached_a_scale_head: None,
-            streaming_conv_queue: None,
             streaming_ssm_state: None,
+            streaming_conv_queue: None,
         })
     }
 }
@@ -696,14 +701,14 @@ impl Mamba {
             cached_dt_head: None,
             cached_a_head: None,
             cached_a_scale_head: None,
-            streaming_conv_queue: None,
             streaming_ssm_state: None,
+            streaming_conv_queue: None,
         }
     }
 
 
     fn ensure_streaming_workspace(&mut self) {
-        if self.streaming_workspace.is_some() && self.streaming_conv_queue.is_some() && self.streaming_ssm_state.is_some() {
+        if self.streaming_workspace.is_some() && self.streaming_ssm_state.is_some() {
             return;
         }
 
@@ -716,9 +721,6 @@ impl Mamba {
         }
         let n = self.cached_state_dim;
         
-        if self.streaming_conv_queue.is_none() {
-             self.streaming_conv_queue = Some(VecDeque::with_capacity(k_conv));
-        }
         if self.streaming_ssm_state.is_none() {
              self.streaming_ssm_state = Some(Array2::zeros((d, n)));
         }
@@ -751,6 +753,8 @@ impl Mamba {
                 out_pre: Array1::zeros(d),
                 b_h: Array1::zeros(n),
                 c_h: Array1::zeros(n),
+                // Unified ring buffer for convolution history (SSOT)
+                conv_ring: RingBuffer1D::new(k_conv, d),
             };
             self.streaming_workspace = Some(Box::new(ws));
         }
@@ -774,7 +778,6 @@ impl Mamba {
 
     fn forward_step_mamba1_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         let d = self.embed_dim;
-        let k_conv = self.conv_kernel;
         let n = self.cached_state_dim;
         
         let ws = self.streaming_workspace.as_mut().unwrap();
@@ -843,21 +846,19 @@ impl Mamba {
             }
         }
 
-        // 3. Convolution
-        let conv_queue = self.streaming_conv_queue.as_mut().unwrap();
-        if conv_queue.len() >= k_conv {
-            conv_queue.pop_front();
-        }
-        conv_queue.push_back(ws.u_act.clone()); // Allocate clone of u_act (D) - acceptable for now as it's small?
-        // To be strictly zero-alloc, we should use a fixed ring buffer in workspace instead of VecDeque<Array1>.
-        // But let's accept this small alloc for now.
-
+        // 3. Convolution using unified RingBuffer1D (SSOT)
+        // Push current u_act into the ring buffer
+        ws.conv_ring.push(&ws.u_act.view());
+        
+        // Compute convolution using weighted sum with conv_w rows as weights
         ws.u_conv.assign(&self.conv_b.row(0));
-        for (i, item) in conv_queue.iter().enumerate() {
-            let w_row = self.conv_w.row(i);
-             Zip::from(&mut ws.u_conv).and(&w_row).and(item).for_each(|y, &w, &x| {
-                 *y += w * x;
-             });
+        for i in 0..ws.conv_ring.len() {
+            if let Some(item) = ws.conv_ring.get(i) {
+                let w_row = self.conv_w.row(i);
+                Zip::from(&mut ws.u_conv).and(&w_row).and(&item).for_each(|y, &w, &x| {
+                    *y += w * x;
+                });
+            }
         }
 
         // 4. Recurrence
@@ -893,7 +894,6 @@ impl Mamba {
 
     fn forward_step_mamba2_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         let d = self.embed_dim;
-        let k_conv = self.conv_kernel;
         let n = self.cached_state_dim;
         let proj_state = self.cached_proj_state.as_ref().unwrap();
 
@@ -960,19 +960,19 @@ impl Mamba {
             }
         }
 
-        // 3. Convolution
-        let conv_queue = self.streaming_conv_queue.as_mut().unwrap();
-        if conv_queue.len() >= k_conv {
-            conv_queue.pop_front();
-        }
-        conv_queue.push_back(ws.u_act.clone());
-
+        // 3. Convolution using unified RingBuffer1D (SSOT)
+        // Push current u_act into the ring buffer
+        ws.conv_ring.push(&ws.u_act.view());
+        
+        // Compute convolution using weighted sum with conv_w rows as weights
         ws.u_conv.assign(&self.conv_b.row(0));
-        for (i, item) in conv_queue.iter().enumerate() {
-            let w_row = self.conv_w.row(i);
-             Zip::from(&mut ws.u_conv).and(&w_row).and(item).for_each(|y, &w, &x| {
-                 *y += w * x;
-             });
+        for i in 0..ws.conv_ring.len() {
+            if let Some(item) = ws.conv_ring.get(i) {
+                let w_row = self.conv_w.row(i);
+                Zip::from(&mut ws.u_conv).and(&w_row).and(&item).for_each(|y, &w, &x| {
+                    *y += w * x;
+                });
+            }
         }
 
         // 4. Recurrence (SSD)

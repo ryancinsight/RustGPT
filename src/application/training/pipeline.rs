@@ -313,6 +313,9 @@ mod tests {
         let dataset = Dataset {
             pretraining_data: vec!["hello world".to_string()],
             chat_training_data: vec!["hello".to_string()],
+            image_training_data: Vec::new(),
+            video_training_data: Vec::new(),
+            speech_training_data: Vec::new(),
         };
         let vocab = Vocab::default();
         let config = crate::domain::models::config::ModelConfig::transformer(8, 16, 1, 16, None, Some(1));
@@ -337,6 +340,9 @@ mod tests {
         let dataset = Dataset {
             pretraining_data: vec!["hello world".to_string()],
             chat_training_data: vec!["hello".to_string()],
+            image_training_data: Vec::new(),
+            video_training_data: Vec::new(),
+            speech_training_data: Vec::new(),
         };
         let vocab = Vocab::default();
         let mut config = crate::domain::models::config::ModelConfig::transformer(8, 16, 1, 16, None, Some(1));

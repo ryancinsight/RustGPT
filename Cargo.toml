@@ -22,6 +22,12 @@ clap = { version = "4.0", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rkyv = { version = "0.7", features = ["validation"] }
 
+# Web UI dependencies
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
 [dev-dependencies]
 proptest = "1.5"
 tempfile = "3.0"

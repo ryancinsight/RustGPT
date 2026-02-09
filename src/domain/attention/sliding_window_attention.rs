@@ -18,29 +18,74 @@ struct AttentionCache {
     input: Array2<f32>,
 }
 
+/// Optimized sliding window cache with pre-sized buffers.
+///
+/// This implementation pre-allocates all buffers to their maximum expected dimensions,
+/// eliminating allocation checks in the hot path of streaming inference.
 #[derive(Debug, Clone)]
 pub struct SlidingWindowCache {
     pub k_cache: Array2<f32>, // (window_size, embed_dim)
     pub v_cache: Array2<f32>, // (window_size, embed_dim)
     pub step: usize,
     pub titan_memory_state: Option<Array1<f32>>,
+    /// Cached dimensions for fast validation
+    cached_window_size: usize,
+    cached_embed_dim: usize,
 }
 
 impl SlidingWindowCache {
+    /// Create a new cache with pre-sized buffers.
+    #[inline]
     pub fn new(window_size: usize, embed_dim: usize) -> Self {
         Self {
             k_cache: Array2::zeros((window_size, embed_dim)),
             v_cache: Array2::zeros((window_size, embed_dim)),
             step: 0,
             titan_memory_state: None,
+            cached_window_size: window_size,
+            cached_embed_dim: embed_dim,
         }
     }
 
+    /// Reset the cache without deallocating buffers.
+    /// Uses fill(0.0) for cache invalidation - faster than reallocation.
+    #[inline]
     pub fn reset(&mut self) {
         self.k_cache.fill(0.0);
         self.v_cache.fill(0.0);
         self.step = 0;
         self.titan_memory_state = None;
+    }
+
+    /// Check if cache dimensions match expected (for validation).
+    #[inline]
+    pub fn is_compatible(&self, window_size: usize, embed_dim: usize) -> bool {
+        self.cached_window_size == window_size && self.cached_embed_dim == embed_dim
+    }
+
+    /// Get the current valid range for streaming access.
+    /// Returns (start_index, valid_count) for the circular buffer.
+    #[inline]
+    pub fn valid_range(&self) -> (usize, usize) {
+        let valid_count = self.step.min(self.cached_window_size);
+        let start = if self.step >= self.cached_window_size {
+            self.step % self.cached_window_size
+        } else {
+            0
+        };
+        (start, valid_count)
+    }
+
+    /// Get pre-computed capacity info.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cached_window_size
+    }
+
+    /// Get current fill level.
+    #[inline]
+    pub fn fill_level(&self) -> usize {
+        self.step.min(self.cached_window_size)
     }
 }
 
@@ -148,11 +193,13 @@ impl SlidingWindowAttention {
     }
 
     /// Process a single token step using a workspace to minimize allocations.
-    pub fn forward_step_with_workspace(
+    /// Returns a view into the workspace output buffer - caller must clone if needed.
+    #[inline]
+    pub fn forward_step_with_workspace<'a>(
         &mut self,
         input: &Array1<f32>,
-        ws: &mut SlidingWindowStreamingWorkspace,
-    ) -> Array1<f32> {
+        ws: &'a mut SlidingWindowStreamingWorkspace,
+    ) -> ndarray::ArrayView1<'a, f32> {
         if self.streaming_cache.is_none() {
             self.streaming_cache = Some(SlidingWindowCache::new(self.window_size, self.embed_dim));
         }
@@ -194,7 +241,20 @@ impl SlidingWindowAttention {
         let v_window = cache.v_cache.slice(s![0..valid_count, ..]);
         ndarray::linalg::general_mat_vec_mul(1.0, &v_window.t(), &scores_view, 0.0, &mut ws.output);
 
-        ws.output.clone()
+        ws.output.view()
+    }
+
+    /// Process a single token step using a workspace, writing output into provided buffer.
+    /// This is the true zero-allocation variant for hot paths.
+    #[inline]
+    pub fn forward_step_with_workspace_into(
+        &mut self,
+        input: &Array1<f32>,
+        ws: &mut SlidingWindowStreamingWorkspace,
+        output: &mut Array1<f32>,
+    ) {
+        let result = self.forward_step_with_workspace(input, ws);
+        output.assign(&result);
     }
 }
 

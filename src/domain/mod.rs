@@ -7,6 +7,7 @@ pub mod memory;
 pub mod metrics;
 pub mod mixtures;
 pub mod models;
+pub mod multimodal;
 pub mod network;
 pub mod pade;
 pub mod richards;

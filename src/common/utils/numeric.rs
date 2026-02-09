@@ -2,6 +2,12 @@
 //!
 //! Provides helper functions for common numeric conversions that avoid
 //! precision loss warnings and handle edge cases properly.
+//!
+//! # Note on Activation Functions
+//!
+//! This codebase uses learnable adaptive Richards activations from the
+//! `domain::richards` module instead of fixed activation functions.
+//! See [`domain::richards::RichardsCurve`] for the primary activation API.
 
 /// Convert `usize` to `f32` with precision loss acknowledgment
 #[inline]

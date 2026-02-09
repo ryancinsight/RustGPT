@@ -127,10 +127,10 @@ pub struct NeuralMemory {
     pub init_memory: MemoryWeights,
 
     #[serde(skip)]
-    curr_memory: Option<MemoryWeights>,
+    pub curr_memory: Option<MemoryWeights>,
 
     #[serde(skip)]
-    momentum: Option<MemoryWeights>,
+    pub momentum: Option<MemoryWeights>,
 }
 
 impl NeuralMemory {
@@ -622,6 +622,55 @@ impl NeuralMemory {
         self.update_memory_step(&k, &v, alpha, eta, theta);
 
         y
+    }
+    
+    /// Process a single time step into pre-allocated output buffer (zero-allocation hot path).
+    ///
+    /// This is the most efficient method for streaming inference, requiring no allocations
+    /// after the workspace is initialized.
+    ///
+    /// # Arguments
+    /// * `input` - Input vector for the current time step (size: input_dim)
+    /// * `output` - Pre-allocated output buffer (size: val_dim)
+    /// * `ws` - Pre-allocated workspace buffers
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut Array1<f32>,
+        ws: &mut NeuralMemoryStreamingWorkspace,
+    ) {
+        if self.curr_memory.is_none() {
+            self.reset_memory();
+        }
+
+        // 1. Projections into workspace
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q, input, 0.0, &mut ws.q);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k, input, 0.0, &mut ws.k);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v, input, 0.0, &mut ws.v);
+
+        let alpha = Self::sigmoid(self.w_alpha.dot(input));
+        let eta = Self::sigmoid(self.w_eta.dot(input));
+        let theta = Self::sigmoid(self.w_theta.dot(input));
+
+        // 2. Retrieve from current memory into output (inline to avoid recomputing ws.q)
+        let memory = self.curr_memory.as_ref().unwrap();
+        
+        // z = W1 * q + b1 (using pre-computed ws.q)
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
+        ws.z_ret += &memory.b1;
+        
+        // h = ReLU(z)
+        ws.h_ret.assign(&ws.z_ret);
+        ws.h_ret.mapv_inplace(|x| x.max(0.0));
+        
+        // y = W2 * h + b2
+        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
+        ws.y_ret += &memory.b2;
+        
+        output.assign(&ws.y_ret);
+
+        // 3. Update memory using workspace
+        self.update_memory_step_with_workspace(alpha, eta, theta, ws);
     }
 
     fn forward_mac_with_trace(

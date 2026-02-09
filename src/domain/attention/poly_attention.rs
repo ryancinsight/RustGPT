@@ -372,6 +372,7 @@ pub struct PolyAttentionCache {
     pub cached_soft_top_p_mask: Option<Array2<f32>>,
     pub last_causal: bool,
     pub predictor_cache: Option<ThresholdPredictorCache>,
+    pub scores_dump: Option<Vec<ndarray::Array1<f32>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -656,8 +657,9 @@ impl PolyAttention {
     /// Uses pre-allocated workspace to minimize allocations in hot path.
     /// 
     /// # Performance Optimizations
-    /// - Workspace is pre-sized at initialization to avoid hot-path reallocations
-    /// - Uses thread-local buffers for temporary computations
+    /// - Uses thread-local workspace pool for zero-allocation hot path
+    /// - Pre-sized buffers eliminate runtime allocation checks
+    /// - TLS provides thread isolation without contention
     /// - Minimizes bounds checking in the critical loop
     #[inline]
     pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut Array1<f32>) {
@@ -666,86 +668,115 @@ impl PolyAttention {
         let num_heads = self.num_heads;
         let window_size = self.window_size.unwrap_or(4096);
 
-        // Initialize cache and workspace once
+        // Initialize cache once
         if self.streaming_cache.is_none() {
             self.streaming_cache = Some(SlidingWindowCache::new(window_size, dim));
         }
+        
+        // Extract references to avoid borrowing issues
         let cache = self.streaming_cache.as_mut().unwrap();
+        let moh = &mut self.moh;
+        let cope = &self.cope;
+        let w_q = &self.w_q;
+        let w_k = &self.w_k;
+        let w_v = &self.w_v;
+        let w_out = &self.w_out;
+        let a = self.a[[0, 0]];
+        let b = self.b[[0, 0]];
+        let scale = self.scale[[0, 0]];
+        let p = self.p;
+        let titan_memory = &self.titan_memory;
+        let eff_skip_threshold = self.eff_skip_threshold;
+        let training_progress = self.training_progress;
 
-        // Initialize workspace with exact sizing - no resize checks in hot path
-        if self.streaming_workspace.is_none() {
-            self.streaming_workspace = Some(PolyAttentionStreamingWorkspace::with_exact_capacity(
-                dim, num_heads, window_size, head_dim
-            ));
-        }
-        let workspace = self.streaming_workspace.as_mut().unwrap();
-        
-        // Debug assertion only - removed in release builds
-        #[cfg(debug_assertions)]
-        {
-            workspace.ensure_capacity(dim, num_heads, window_size);
-            if workspace.head_output_buffer.len() != head_dim {
-                workspace.head_output_buffer = Array1::zeros(head_dim);
-            }
-        }
+        // Use thread-local workspace pool for zero-allocation hot path
+        crate::common::utils::workspace_pool::with_tls_poly_workspace(
+            dim,
+            num_heads,
+            window_size,
+            |ws| {
+                Self::forward_step_into_with_workspace(
+                    input, output, cache, ws, 
+                    dim, head_dim, num_heads, window_size,
+                    w_q, w_k, w_v, w_out, moh, cope,
+                    a, b, scale, p,
+                    titan_memory, eff_skip_threshold, training_progress
+                );
+            },
+        );
+    }
 
+    /// Core streaming step implementation with explicit workspace.
+    /// Separated to allow both TLS and custom workspace usage.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step_into_with_workspace(
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut Array1<f32>,
+        cache: &mut SlidingWindowCache,
+        ws: &mut crate::common::utils::workspace_pool::PolyAttentionWorkspace,
+        dim: usize,
+        head_dim: usize,
+        num_heads: usize,
+        window_size: usize,
+        w_q: &Array2<f32>,
+        w_k: &Array2<f32>,
+        w_v: &Array2<f32>,
+        w_out: &Array2<f32>,
+        moh: &mut MoHGating,
+        cope: &CoPE,
+        a: f32,
+        b: f32,
+        scale: f32,
+        p: usize,
+        titan_memory: &TitanMemoryConfig,
+        eff_skip_threshold: f32,
+        training_progress: f64,
+    ) {
         // 1. Projections (Monolithic) -> Into Workspace
-        // input: (D), w_q: (D, D) -> q_all: (D)
-        // We use general_mat_vec_mul with Transpose because w_q is (In, Out) and we want Input * Weights
-        // Actually, ndarray dot for 1D * 2D is: [x_i] * [W_ij] = [sum_i x_i W_ij] = [y_j]
-        // This is equivalent to W.T * x if W is (In, Out) and we treat x as column?
-        // Wait, input.dot(&w_q): (D) * (D, D) -> (D).
-        // general_mat_vec_mul(alpha, a, x, beta, y): y = alpha * A * x + beta * y
-        // If we want x * W, that is (W^T * x^T)^T.
-        // Or simply: A * x where A = W^T.
-        // So we use w_q.t() and input.
-        
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q.t(), input, 0.0, &mut workspace.q_all);
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut workspace.k_all);
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut workspace.v_all);
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.moh.w_g.t(), input, 0.0, &mut workspace.xw_all);
+        // Use TLS workspace buffers directly - zero allocation hot path
+        ndarray::linalg::general_mat_vec_mul(1.0, &w_q.t(), input, 0.0, &mut ws.q);
+        ndarray::linalg::general_mat_vec_mul(1.0, &w_k.t(), input, 0.0, &mut ws.k);
+        ndarray::linalg::general_mat_vec_mul(1.0, &w_v.t(), input, 0.0, &mut ws.v);
+        ndarray::linalg::general_mat_vec_mul(1.0, &moh.w_g.t(), input, 0.0, &mut ws.xw);
 
         // 2. Update Cache
         let idx = cache.step % window_size;
-        cache.k_cache.row_mut(idx).assign(&workspace.k_all);
-        cache.v_cache.row_mut(idx).assign(&workspace.v_all);
+        cache.k_cache.row_mut(idx).assign(&ws.k);
+        cache.v_cache.row_mut(idx).assign(&ws.v);
         cache.step += 1;
         let current_step = cache.step - 1; // 0-based index of current token
 
-        // 3. Gating
-        workspace.gate_values.fill(0.0);
+        // 3. Gating - inline calculation to avoid allocations
+        ws.gate_values.fill(0.0);
         
         for h in 0..num_heads {
-            let xw = workspace.xw_all[h];
-            let a = self.moh.alpha_g[[0, h]];
-            let b = self.moh.beta_g[[0, h]];
-            let z = a * xw + b;
+            let xw = ws.xw[h];
+            let a_g = moh.alpha_g[[0, h]];
+            let b_g = moh.beta_g[[0, h]];
+            let z = a_g * xw + b_g;
 
-            // Richards Gate for single value
-            let gate_poly = self.moh.gate.update_scaling_from_max_abs(z.abs() as f64);
-            
-            // Avoid allocation for z_arr/g_arr
-            workspace.gate_z[[0, 0]] = z;
-            gate_poly.forward_matrix_f32_into(&workspace.gate_z, &mut workspace.gate_g);
-            workspace.gate_values[h] = workspace.gate_g[[0, 0]];
+            // Richards Gate - direct scalar evaluation (no matrix alloc)
+            let gate_poly = moh.gate.update_scaling_from_max_abs(z.abs() as f64);
+            ws.gate_values[h] = gate_poly.forward_scalar_f32(z);
         }
 
         // Apply Threshold Predictor if enabled
-        if self.moh.head_selection_config.gating.use_learned_predictor {
-            if let Some(predictor) = &mut self.moh.threshold_predictor {
-                // Copy input to predictor_input buffer
-                workspace.predictor_input.row_mut(0).assign(input);
+        if moh.head_selection_config.gating.use_learned_predictor {
+            if let Some(predictor) = &mut moh.threshold_predictor {
+                // Create a temporary 2D view for predictor
+                let input_2d = input.to_owned().insert_axis(ndarray::Axis(0));
                 
                 let mut t = predictor.predict_with_condition(
-                    &workspace.predictor_input.view(),
+                    &input_2d.view(),
                     None, // No latent features in streaming for now
                 );
                 
-                let m = self.moh.head_selection_config.threshold_modulation.value(self.training_progress);
+                let m = moh.head_selection_config.threshold_modulation.value(training_progress);
                 t.mapv_inplace(|v| v * m);
                 
                 // Top-k normalization logic
-                let k = self.moh.head_selection_config.gating.num_active as f32;
+                let k = moh.head_selection_config.gating.num_active as f32;
                 let sum: f32 = t.iter().sum();
                 if sum > 0.0 {
                     let s = k / sum;
@@ -754,80 +785,69 @@ impl PolyAttention {
                 
                 let thresholds = t.row(0);
                 for h in 0..num_heads {
-                    workspace.gate_values[h] *= thresholds[h];
+                    ws.gate_values[h] *= thresholds[h];
                 }
             }
         }
 
         // 4. Attention per head
-        workspace.output.fill(0.0);
+        ws.output.fill(0.0);
         
         let dk_scale = 1.0 / (head_dim as f32).sqrt();
-        let p_i32 = self.p as i32;
-        let a_scalar = self.a[[0, 0]];
-        let b_scalar = self.b[[0, 0]];
-        let scale_scalar = self.scale[[0, 0]];
+        let p_i32 = p as i32;
 
         // Precompute valid window ranges
         let idx_now = current_step % window_size;
 
-        // Process each head
+        // Process each head using TLS workspace buffers
         for h_idx in 0..num_heads {
             let start = h_idx * head_dim;
             let end = start + head_dim;
 
-            let eff_h = workspace.gate_values[h_idx];
-            if eff_h <= self.eff_skip_threshold {
+            let eff_h = ws.gate_values[h_idx];
+            if eff_h <= eff_skip_threshold {
                 continue;
             }
 
-            let q = workspace.q_all.slice(s![start..end]);
+            let q = ws.q.slice(s![start..end]);
             let q_scaled = &q * dk_scale;
 
             // Vectorized History Processing
-            // -----------------------------
-            
-            // 1. Prepare Position Embeddings (CoPE)
             let max_lookback = if current_step < window_size {
                 current_step
             } else {
                 window_size - 1
             };
             
-            // Step 1: K*Q + PE
-            // Chunk 1
+            // Chunk 1: Most recent tokens
             let min_pos_chunk1 = usize::min(max_lookback, idx_now);
             let c1_start = idx_now - min_pos_chunk1;
             let c1_end = idx_now + 1; 
             let len1 = c1_end - c1_start;
             
             let k_chunk1 = cache.k_cache.slice(s![c1_start..c1_end, start..end]);
-            let mut scores_slice1 = workspace.scores_buffer.slice_mut(s![0..len1]);
+            let mut scores_slice1 = ws.scores.slice_mut(s![0..len1]);
             
             // scores = K * Q_scaled
             ndarray::linalg::general_mat_vec_mul(1.0, &k_chunk1, &q_scaled, 0.0, &mut scores_slice1);
             
-            // Add PE for Chunk 1
-            // Indices: [min_pos_chunk1, ..., 0]
-            // We only add PE if pos <= max_pos
-            if min_pos_chunk1 <= self.cope.max_pos {
-                let pe_rows = self.cope.pos_embeddings.slice(s![0..=min_pos_chunk1, ..]);
+            // Add CoPE position embeddings
+            if min_pos_chunk1 <= cope.max_pos {
+                let pe_rows = cope.pos_embeddings.slice(s![0..=min_pos_chunk1, ..]);
                 let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
                 ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut scores_slice1);
             } else {
-                 // Partially valid
-                 let offset = min_pos_chunk1.saturating_sub(self.cope.max_pos);
+                 let offset = min_pos_chunk1.saturating_sub(cope.max_pos);
                  if offset < len1 {
                      let mut valid_scores = scores_slice1.slice_mut(s![offset..]);
-                     let valid_max = min_pos_chunk1 - offset; // should be max_pos
-                     let pe_rows = self.cope.pos_embeddings.slice(s![0..=valid_max, ..]);
+                     let valid_max = min_pos_chunk1 - offset;
+                     let pe_rows = cope.pos_embeddings.slice(s![0..=valid_max, ..]);
                      let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
                      ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut valid_scores);
                  }
             }
 
-            
-            // Activation 1
+            // Polynomial activation
             let poly_act = |x: f32| -> f32 {
                 let s_stable = smooth_clip_tanh(x, 8.0);
                 let sp = if p_i32 <= 3 {
@@ -840,49 +860,35 @@ impl PolyAttention {
                 } else {
                     s_stable.powi(p_i32)
                 };
-                scale_scalar * (a_scalar * sp + b_scalar)
+                scale * (a * sp + b)
             };
             
             scores_slice1.mapv_inplace(|x| poly_act(x) * eff_h);
             
-            // Aggregate 1
+            // Aggregate: head_out = V.T * scores
             let v_chunk1 = cache.v_cache.slice(s![c1_start..c1_end, start..end]);
-            // head_out_acc += scores * V
-            // scores: (N), V: (N, D) -> (D)
-            // general_mat_vec_mul: alpha * A * x + beta * y
-            // We want x * A. = (A^T * x^T)^T.
-            // = V.T * scores.
-            ndarray::linalg::general_mat_vec_mul(1.0, &v_chunk1.t(), &scores_slice1, 0.0, &mut workspace.head_output_buffer);
+            ndarray::linalg::general_mat_vec_mul(1.0, &v_chunk1.t(), &scores_slice1, 0.0, &mut ws.head_out);
 
-            // Chunk 2 (Wrap around)
+            // Chunk 2 (Wrap around for circular buffer)
             if max_lookback > idx_now {
-                let _pos_start = idx_now + 1;
                 let pos_end = max_lookback;
-                
                 let c2_end = window_size;
                 let c2_start = window_size - (pos_end - idx_now);
                 let len2 = c2_end - c2_start;
                 
                 let k_chunk2 = cache.k_cache.slice(s![c2_start..c2_end, start..end]);
-                // Use next part of scores buffer
-                let mut scores_slice2 = workspace.scores_buffer.slice_mut(s![len1..len1+len2]);
+                let mut scores_slice2 = ws.scores.slice_mut(s![len1..len1+len2]);
                 
-                // scores = K * Q_scaled
                 ndarray::linalg::general_mat_vec_mul(1.0, &k_chunk2, &q_scaled, 0.0, &mut scores_slice2);
                 
-                // Add PE for Chunk 2
-                // Chunk 2 corresponds to pos: pos_end down to pos_start.
-                // scores_slice2[0] corresponds to pos = pos_end
-                // scores_slice2[len2-1] corresponds to pos = pos_start
-                
-                let offset = pos_end.saturating_sub(self.cope.max_pos);
+                let offset = pos_end.saturating_sub(cope.max_pos);
                 if offset < len2 {
                     let mut valid_scores = scores_slice2.slice_mut(s![offset..]);
                     let valid_len = len2 - offset;
                     let valid_pos_end = pos_end - offset;
                     let valid_pos_start = valid_pos_end.saturating_sub(valid_len - 1);
                     
-                    let pe_rows = self.cope.pos_embeddings.slice(s![valid_pos_start..=valid_pos_end, ..]);
+                    let pe_rows = cope.pos_embeddings.slice(s![valid_pos_start..=valid_pos_end, ..]);
                     let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
                     ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut valid_scores);
                 }
@@ -890,47 +896,33 @@ impl PolyAttention {
                 scores_slice2.mapv_inplace(|x| poly_act(x) * eff_h);
                 
                 let v_chunk2 = cache.v_cache.slice(s![c2_start..c2_end, start..end]);
-                // Accumulate into head_output_buffer (beta = 1.0)
-                ndarray::linalg::general_mat_vec_mul(1.0, &v_chunk2.t(), &scores_slice2, 1.0, &mut workspace.head_output_buffer);
+                // Accumulate (beta = 1.0)
+                ndarray::linalg::general_mat_vec_mul(1.0, &v_chunk2.t(), &scores_slice2, 1.0, &mut ws.head_out);
             }
 
-            // Project to output
-            let w_block = self.w_out.slice(s![start..end, ..]);
-            // workspace.head_output_buffer is (head_dim)
-            // output += head_out * w_block
-            // head_out: (H), w_block: (H, D) -> (D)
-            // output = 1.0 * w_block.T * head_out + 1.0 * output
-            
-            ndarray::linalg::general_mat_vec_mul(
-                1.0, 
-                &w_block.t(), 
-                &workspace.head_output_buffer, 
-                1.0, 
-                &mut workspace.output
-            );
+            // Project head output to final output
+            let w_block = w_out.slice(s![start..end, ..]);
+            ndarray::linalg::general_mat_vec_mul(1.0, &w_block.t(), &ws.head_out, 1.0, &mut ws.output);
         }
 
         // Apply Titan Memory if enabled
-        if self.titan_memory.enabled {
-            let retain = 1.0 - self.titan_memory.decay;
-            let eta = self.titan_memory.eta;
-            let scale = self.titan_memory.scale;
+        if titan_memory.enabled {
+            let retain = 1.0 - titan_memory.decay;
+            let eta = titan_memory.eta;
+            let tm_scale = titan_memory.scale;
             
             if cache.titan_memory_state.is_none() {
                 cache.titan_memory_state = Some(Array1::zeros(dim));
             }
             let state = cache.titan_memory_state.as_mut().unwrap();
             
-            // Update state: state = retain * state + eta * input
-            // output += scale * state
-            // Note: input is Array1<f32>
             for j in 0..dim {
                 state[j] = retain * state[j] + eta * input[j];
-                workspace.output[j] += scale * state[j];
+                ws.output[j] += tm_scale * state[j];
             }
         }
 
-        output.assign(&workspace.output);
+        output.assign(&ws.output);
     }
 
 
@@ -1014,10 +1006,8 @@ impl PolyAttention {
             let a = self.moh.alpha_g[[0, h]];
             let b = self.moh.beta_g[[0, h]];
             let z = a * xw + b;
-            let gate_poly = self.moh.gate.update_scaling_from_max_abs(z.abs() as f64);
-            workspace.gate_z[[0, 0]] = z;
-            gate_poly.forward_matrix_f32_into(&workspace.gate_z, &mut workspace.gate_g);
-            workspace.gate_values[h] = workspace.gate_g[[0, 0]];
+            // Parity with batch: Use base curve directly without dynamic scaling
+            workspace.gate_values[h] = self.moh.gate.curve.forward_scalar_f32(z);
         }
 
         // 4. Attention
@@ -1040,6 +1030,13 @@ impl PolyAttention {
             }
 
             let q = workspace.q_all.slice(s![start..end]);
+            
+            if h_idx == 0 && cfg!(debug_assertions) {
+                println!("Stream Q Head 0: {:?}", q);
+                let k_in = workspace.k_all.slice(s![start..end]);
+                println!("Stream K_in Head 0: {:?}", k_in);
+            }
+
             let q_scaled = &q * dk_scale;
 
             // K part 1: Context
@@ -1054,49 +1051,34 @@ impl PolyAttention {
             let (mut scores_ctx, mut scores_in) = scores_all.split_at(ndarray::Axis(0), context_len);
             ndarray::linalg::general_mat_vec_mul(1.0, &k_ctx, &q_scaled, 0.0, &mut scores_ctx);
 
-            if h_idx == 0 {
-                println!("[DEBUG STREAM] Head 0 Context Len: {}", context_len);
-                println!("[DEBUG STREAM] Q_scaled: {:?}", q_scaled);
-                if context_len > 0 {
-                    println!("[DEBUG STREAM] K_ctx[0]: {:?}", k_ctx.row(0));
-                    println!("[DEBUG STREAM] K_ctx[Last]: {:?}", k_ctx.row(context_len-1));
-                    println!("[DEBUG STREAM] Scores_ctx[0]: {}", scores_ctx[0]);
-                }
-                println!("[DEBUG STREAM] eff_h: {}", eff_h);
-                if context_len > 0 {
-                    println!("[DEBUG STREAM] V_ctx[0]: {:?}", ctx_workspace.v_context.slice(s![0, start..end]));
-                    println!("[DEBUG STREAM] V_ctx[Last]: {:?}", ctx_workspace.v_context.slice(s![context_len-1, start..end]));
-                }
-                println!("[DEBUG STREAM] V_in: {:?}", workspace.v_all.slice(s![start..end]));
-            }
-
             // 2. Input Score: K_in * Q_scaled
             let s_in = k_in.dot(&q_scaled);
             scores_in[0] = s_in;
-            
-            if h_idx == 0 {
-                println!("[DEBUG STREAM] Scores_in[0] (Raw): {}", s_in);
-            }
 
             // 3. Add CoPE
             // Input is at relative pos 0.
             let pe0 = self.cope.pos_embeddings.row(0);
             let cope_in = q.dot(&pe0);
             scores_in[0] += cope_in;
-            
-            if h_idx == 0 {
-                println!("[DEBUG STREAM] CoPE_in: {}", cope_in);
-                println!("[DEBUG STREAM] Scores_in[0] (w/ CoPE): {}", scores_in[0]);
-            }
 
             // Context PE
             let n_ctx = context_len;
             let max_p = self.cope.max_pos;
             if n_ctx > 0 && n_ctx <= max_p {
-                let pe_rows = self.cope.pos_embeddings.slice(s![1..=n_ctx, ..]);
-                let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
-                ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut scores_ctx);
+                // Manual loop to avoid potential stride issues with general_mat_vec_mul on reversed slice
+                for i in 0..n_ctx {
+                    let pos = n_ctx - i; // Distance: End(n_ctx) - Current(i)
+                    // pos ranges from n_ctx (at i=0) down to 1 (at i=n_ctx-1)
+                    let pe = self.cope.pos_embeddings.row(pos);
+                    scores_ctx[i] += q.dot(&pe);
+                }
             }
+
+            if cfg!(debug_assertions) && n_ctx > 0 {
+                 println!("Stream Scores Ctx (last): {}", scores_ctx[n_ctx-1]);
+                 println!("Stream Scores In: {}", scores_in[0]);
+            }
+
 
             // 4. Activation
             let poly_act = |x: f32| -> f32 {
@@ -1117,13 +1099,6 @@ impl PolyAttention {
             // Apply activation to parts
             scores_ctx.mapv_inplace(|x| poly_act(x) * eff_h);
             scores_in.mapv_inplace(|x| poly_act(x) * eff_h);
-            
-            if h_idx == 0 {
-                if context_len > 0 {
-                    println!("[DEBUG STREAM] Phi_ctx[0]: {}", scores_ctx[0]);
-                }
-                println!("[DEBUG STREAM] Phi_in: {}", scores_in[0]);
-            }
 
             // 5. Aggregate
             // Context part
@@ -1139,10 +1114,6 @@ impl PolyAttention {
             let v_in = workspace.v_all.slice(s![start..end]);
             let s_in_val = scores_in[0];
             workspace.head_output_buffer.zip_mut_with(&v_in, |o, &v| *o += v * s_in_val);
-            
-            if h_idx == 0 {
-                 println!("[DEBUG STREAM] Head Output (Pre-Proj): {:?}", workspace.head_output_buffer);
-            }
 
             // 6. Project to Output
             let w_block = self.w_out.slice(s![start..end, ..]);
@@ -1355,6 +1326,7 @@ impl PolyAttention {
                 cached_soft_top_p_mask,
                 last_causal: causal,
                 predictor_cache,
+                scores_dump: result.scores_dump,
             },
         )
     }
@@ -2678,6 +2650,7 @@ impl PolyAttention {
             cached_soft_top_p_mask: self.moh.cached_soft_top_p_mask.take(),
             last_causal: self.last_causal,
             predictor_cache,
+            scores_dump: None,
         })
     }
 

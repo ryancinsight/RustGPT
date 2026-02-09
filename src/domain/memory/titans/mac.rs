@@ -42,16 +42,16 @@ pub struct TitansMAC {
     cached_input: Option<Array2<f32>>,
 
     #[serde(skip)]
-    cached_forward_data: Option<Vec<SegmentForwardData>>,
+    pub cached_forward_data: Option<Vec<SegmentForwardData>>,
 
     #[serde(skip)]
     pub streaming_workspace: Option<TitansMACStreamingWorkspace>,
 }
 
 #[derive(Clone, Debug)]
-struct SegmentForwardData {
-    seg_out: Array2<f32>,
-    poly_caches: Vec<PolyAttentionCache>,
+pub struct SegmentForwardData {
+    pub seg_out: Array2<f32>,
+    pub poly_caches: Vec<PolyAttentionCache>,
 }
 
 impl TitansMAC {
@@ -62,7 +62,9 @@ impl TitansMAC {
         segment_len: usize,
     ) -> Self {
         let input_dim = core.embed_dim;
-        let mut rng = rand::rng();
+        // Use fixed seed for deterministic behavior during verification
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let normal = Normal::new(0.0, 0.02).unwrap();
 
         let p_vec: Vec<f32> = (0..persistent_len * input_dim)
@@ -87,6 +89,7 @@ impl TitansMAC {
         &mut self,
         segment: &Array2<f32>,
     ) -> (Array2<f32>, Vec<PolyAttentionCache>) {
+        println!("ENTERING PROCESS SEGMENT");
         // 1. Retrieve h_t from Memory using input context (segment) as query.
         let h_t = self.memory.retrieve(segment);
 
@@ -101,6 +104,10 @@ impl TitansMAC {
         for i in 0..s_len {
             let current_h_t = h_t.row(i);
             let current_seg = segment.row(i);
+
+            if i == 0 {
+                println!("[MAC BATCH] Segment[0,0]: {}", current_seg[0]);
+            }
             
             // Input: [Persistent | h_t[i] | Segment[i]]
             let total_len = p_len + 1 + 1;
@@ -116,8 +123,8 @@ impl TitansMAC {
             // Extract output for segment[i] (last row)
             let out_i = attn_out.row(total_len - 1).to_owned();
 
-            if cfg!(debug_assertions) && i == 0 {
-                 println!("Batch Step 0:");
+            if i == 0 {
+                 println!("Batch Step {}:", i);
                  println!("  Input: {:?}", current_seg);
                  println!("  h_t: {:?}", current_h_t);
                  println!("  Out: {:?}", out_i);

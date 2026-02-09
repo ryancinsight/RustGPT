@@ -1,1 +1,1 @@
-FAILURE: Significant divergence detected.
+error: process didn't exit successfully: `target\debug\verify_titans_mac.exe` (exit code: 101)

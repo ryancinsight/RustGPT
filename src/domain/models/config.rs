@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
     mixtures::{moe::ExpertRouter, moe::ExpertRoutingMode, moh::HeadSelectionStrategy},
+    multimodal::MultiModalConfig,
 };
 
 use crate::domain::richards::adaptive::AdaptiveScalar;
@@ -324,6 +325,10 @@ pub struct ModelConfig {
     /// Memory bank size.
     #[serde(default = "residual_hardneg_bank_size_default")]
     pub residual_hardneg_bank_size: usize,
+
+    /// Multi-modal configuration for image/video/audio processing
+    #[serde(default)]
+    pub multimodal: Option<MultiModalConfig>,
 }
 
 impl ModelConfig {
@@ -431,6 +436,7 @@ impl ModelConfig {
             residual_hardneg_bank_size: residual_hardneg_bank_size_default(),
             eprop_enabled: false,
             eprop_neuron_config: None,
+            multimodal: None,
         }
     }
 }

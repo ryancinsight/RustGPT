@@ -1,0 +1,2564 @@
+{
+  "examples": [
+    {
+      "audio_id": "speech_down_000",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\004ae714_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_001",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\00b01445_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_002",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\00f0204f_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_003",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\0132a06d_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_004",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\0132a06d_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_005",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\0137b3f4_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_006",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\014f9f65_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_007",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\016e2c6d_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_008",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\016e2c6d_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_down_009",
+      "duration_seconds": 1.0,
+      "transcript": "down",
+      "speaker": "unknown_down_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'down'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "down"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "down",
+        "file_path": "speech_commands\\mini_speech_commands\\down\\01b4757a_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_000",
+      "duration_seconds": 0.7,
+      "transcript": "go",
+      "speaker": "unknown_go_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\004ae714_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_001",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\0132a06d_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_002",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\0137b3f4_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_003",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\0137b3f4_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_004",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\0137b3f4_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_005",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\0137b3f4_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_006",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\016e2c6d_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_007",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\016e2c6d_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_008",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\01bb6a2a_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_go_009",
+      "duration_seconds": 1.0,
+      "transcript": "go",
+      "speaker": "unknown_go_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'go'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "go"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "go",
+        "file_path": "speech_commands\\mini_speech_commands\\go\\01bb6a2a_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_000",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\00b01445_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_001",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\012c8314_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_002",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0132a06d_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_003",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0132a06d_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_004",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0132a06d_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_005",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0137b3f4_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_006",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0137b3f4_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_007",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0137b3f4_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_008",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\0137b3f4_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_left_009",
+      "duration_seconds": 1.0,
+      "transcript": "left",
+      "speaker": "unknown_left_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'left'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "left"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "left",
+        "file_path": "speech_commands\\mini_speech_commands\\left\\01648c51_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_000",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\012c8314_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_001",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\0132a06d_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_002",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\0132a06d_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_003",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\0137b3f4_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_004",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\0137b3f4_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_005",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\01bb6a2a_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_006",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\01bcfc0c_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_007",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\01d22d03_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_008",
+      "duration_seconds": 0.93,
+      "transcript": "no",
+      "speaker": "unknown_no_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\0227998e_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_no_009",
+      "duration_seconds": 1.0,
+      "transcript": "no",
+      "speaker": "unknown_no_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'no'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "no"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "no",
+        "file_path": "speech_commands\\mini_speech_commands\\no\\026290a7_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_000",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\012c8314_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_001",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0132a06d_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_002",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0132a06d_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_003",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0132a06d_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_004",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0135f3f2_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_005",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0137b3f4_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_006",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0137b3f4_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_007",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\0137b3f4_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_008",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\01bb6a2a_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_right_009",
+      "duration_seconds": 1.0,
+      "transcript": "right",
+      "speaker": "unknown_right_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'right'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "right"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "right",
+        "file_path": "speech_commands\\mini_speech_commands\\right\\01bb6a2a_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_000",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\012c8314_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_001",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\0132a06d_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_002",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\0132a06d_nohash_4.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_003",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\0135f3f2_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_004",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\0135f3f2_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_005",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\0137b3f4_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_006",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\0137b3f4_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_007",
+      "duration_seconds": 0.98,
+      "transcript": "stop",
+      "speaker": "unknown_stop_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\014f9f65_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_008",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\019fa366_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_stop_009",
+      "duration_seconds": 1.0,
+      "transcript": "stop",
+      "speaker": "unknown_stop_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'stop'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "stop"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "stop",
+        "file_path": "speech_commands\\mini_speech_commands\\stop\\019fa366_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_000",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\0132a06d_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_001",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\0135f3f2_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_002",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\0137b3f4_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_003",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\016e2c6d_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_004",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\019fa366_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_005",
+      "duration_seconds": 0.94,
+      "transcript": "up",
+      "speaker": "unknown_up_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\01b4757a_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_006",
+      "duration_seconds": 0.68,
+      "transcript": "up",
+      "speaker": "unknown_up_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\01b4757a_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_007",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\01bb6a2a_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_008",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\01bb6a2a_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_up_009",
+      "duration_seconds": 1.0,
+      "transcript": "up",
+      "speaker": "unknown_up_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'up'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "up"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "up",
+        "file_path": "speech_commands\\mini_speech_commands\\up\\01d22d03_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_000",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_0",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\004ae714_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_001",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_1",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\00f0204f_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_002",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_2",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\012c8314_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_003",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_3",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\0132a06d_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_004",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_4",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\0132a06d_nohash_3.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_005",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_5",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\0135f3f2_nohash_0.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_006",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_6",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\0135f3f2_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_007",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_7",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\0137b3f4_nohash_2.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_008",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_8",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\01648c51_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    },
+    {
+      "audio_id": "speech_yes_009",
+      "duration_seconds": 1.0,
+      "transcript": "yes",
+      "speaker": "unknown_yes_9",
+      "language": "en",
+      "conversations": [
+        {
+          "from": "human",
+          "value": "What word is spoken in this audio?"
+        },
+        {
+          "from": "gpt",
+          "value": "The spoken word is 'yes'."
+        },
+        {
+          "from": "human",
+          "value": "Transcribe this audio clip."
+        },
+        {
+          "from": "gpt",
+          "value": "yes"
+        }
+      ],
+      "metadata": {
+        "dataset": "Google Mini Speech Commands",
+        "command": "yes",
+        "file_path": "speech_commands\\mini_speech_commands\\yes\\019fa366_nohash_1.wav",
+        "sample_rate": 16000,
+        "format": "wav"
+      }
+    }
+  ]
+}

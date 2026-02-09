@@ -52,6 +52,7 @@ pub struct ForwardResult {
     pub avg_active_heads: Option<f32>,
     pub head_activity_vec: Option<Vec<f32>>,
     pub token_head_activity_vec: Option<Vec<f32>>,
+    pub scores_dump: Option<Vec<ndarray::Array1<f32>>>,
 }
 
 /// Workspace for batch forward pass to avoid allocations
@@ -74,9 +75,6 @@ pub fn compute_poly_attention_forward_into(
     output: &mut ndarray::Array2<f32>,
     workspace: &mut PolyAttentionBatchWorkspace,
 ) -> ForwardResult {
-    if ctx.input.nrows() > 1 && ctx.num_heads > 0 {
-         println!("[DEBUG BATCH ENTRY] n={} heads={}", ctx.input.nrows(), ctx.num_heads);
-    }
     // input: (N, embed_dim)
     let (n, d_model) = (ctx.input.nrows(), ctx.input.ncols());
     assert_eq!(d_model, ctx.embed_dim);
@@ -223,19 +221,6 @@ pub fn compute_poly_attention_forward_into(
 
     // Monolithic Projections
     // q_all: (N, H*D_h)
-    
-    if ctx.input.nrows() > 0 && ctx.input.ncols() > 0 {
-        println!("[DEBUG BATCH] Input[Last, 0]: {}", ctx.input[[ctx.input.nrows()-1, 0]]);
-        println!("[DEBUG BATCH] W_q[0,0]: {}", ctx.w_q[[0, 0]]);
-        // Manually compute Q[Last, 0]
-        let last_idx = ctx.input.nrows() - 1;
-        let mut q0_manual = 0.0;
-        for k in 0..ctx.input.ncols() {
-            q0_manual += ctx.input[[last_idx, k]] * ctx.w_q[[k, 0]];
-        }
-        println!("[DEBUG BATCH] Q[Last, 0] Manual: {}", q0_manual);
-    }
-
     ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_q, 0.0, &mut workspace.q_all);
     ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_k, 0.0, &mut workspace.k_all);
     ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_v, 0.0, &mut workspace.v_all);
@@ -262,21 +247,10 @@ pub fn compute_poly_attention_forward_into(
         workspace.z_col.assign(&xw_col_view);
         workspace.z_col.mapv_inplace(|v| a_h * v + b_h);
         
-        // Reuse workspace.g_col (must be zeroed or overwritten?)
-        // forward_into_f32 overwrites? No, it accumulates? 
-        // RichardsGate::forward_into_f32(input, output).
-        // It likely overwrites.
-        // But let's check RichardsGate. 
-        // Assuming it does what it says.
-        // But the loop iterates tokens.
-        
         for i in 0..n {
             let z = workspace.z_col[[i, 0]];
-            // Match streaming behavior: max_abs is local z.abs() per token
-            let gate_poly_local = ctx.gate.update_scaling_from_max_abs(z.abs() as f64);
-            let mut g_val = 0.0;
-            gate_poly_local.forward_into_f32(&[z], std::slice::from_mut(&mut g_val));
-            workspace.g_col[[i, 0]] = g_val;
+            // Match streaming behavior: use base curve directly without dynamic scaling
+            workspace.g_col[[i, 0]] = ctx.gate.curve.forward_scalar_f32(z);
         }
 
         g_sq_sum_global += xw_col_view.iter().map(|&v| v * v).sum::<f32>();
@@ -315,6 +289,12 @@ pub fn compute_poly_attention_forward_into(
     // Reuse a single head-output buffer across heads to reduce allocations.
     // workspace.y_head is used.
 
+    let mut scores_dump = if cfg!(debug_assertions) {
+        Some(vec![ndarray::Array1::<f32>::zeros(0); ctx.num_heads])
+    } else {
+        None
+    };
+
     // Process attention computation for each head
     for h_idx in 0..ctx.num_heads {
         let start = h_idx * ctx.head_dim;
@@ -335,10 +315,9 @@ pub fn compute_poly_attention_forward_into(
             let end = start + ctx.head_dim;
             let w_block = ctx.w_out.slice(s![start..end, ..]);
             workspace.y_head.fill(0.0);
-            use rayon::prelude::*;
             workspace.y_head
                 .axis_iter_mut(ndarray::Axis(0))
-                .into_par_iter()
+                // .into_par_iter()
                 .enumerate()
                 .for_each(|(i, mut y_row)| {
                     let eff_i = eff_col[i];
@@ -351,42 +330,41 @@ pub fn compute_poly_attention_forward_into(
                     };
                     let j_end_excl = if causal { i + 1 } else { n };
                     let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
+                    
+                    // Slice Q for this head
                     let q_row_i = q.row(i);
+
+                    // Slice K for this head
+                    let k_slice = k.slice(s![j_start..j_end_excl, ..]);
+                    let k_slice_t = k_slice.t();
+                    let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
+                    
+                    if h_idx == 0 {
+                         println!("Batch Step {}:", i);
+                         println!("  Q: {:?}", q_row_i);
+                         if i == n - 1 {
+                             let k_last = k_slice.row(k_slice.nrows()-1);
+                             println!("  K_last: {:?}", k_last);
+                             println!("  Score Raw Last: {}", scores_row[scores_row.len()-1]);
+                         }
+                    }
+
                     with_tls_qpe(max_pos + 1, |q_pe| {
                         for (pos, q_pe_val) in q_pe.iter_mut().enumerate() {
                             *q_pe_val = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
                         }
-
-                        let k_slice = k.slice(s![j_start..j_end_excl, ..]);
-                        let k_slice_t = k_slice.t();
-                        let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
-                        let mlen = j_end_excl.saturating_sub(j_start);
-                        with_tls_phi(mlen, |phi_row| {
-                        // DEBUG: Log for last token, head 0
+                        
                         if h_idx == 0 && i == n - 1 {
-                             println!("[DEBUG BATCH] i={} (Last), Head 0", i);
-                             println!("[DEBUG BATCH] Q_row: {:?}", q_row_i);
-                             let q_scaled = &q_row_i * dk_scale;
-                             println!("[DEBUG BATCH] Q_scaled: {:?}", q_scaled);
-                             println!("[DEBUG BATCH] K_slice shape: {:?}", k_slice.shape());
-                             // Log first few K values
-                             if k_slice.nrows() > 0 {
-                                 println!("[DEBUG BATCH] K[0]: {:?}", k_slice.row(0));
-                                 println!("[DEBUG BATCH] K[Last]: {:?}", k_slice.row(k_slice.nrows()-1));
-                             }
-                             println!("[DEBUG BATCH] eff_i: {}", eff_i);
+                            println!("  CoPE[0]: {}", q_pe[0]);
                         }
 
-                        for idx in 0..mlen {
-                            let j = j_start + idx;
-                            let mut s_val = scores_row[idx];
-                            
-                            if h_idx == 0 && i == n - 1 {
-                                let pos = i.saturating_sub(j);
-                                println!("[DEBUG BATCH] Score raw idx {}: {}, Pos: {}", idx, s_val, pos);
-                            }
+                        let mlen = j_end_excl.saturating_sub(j_start);
+                        with_tls_phi(mlen, |phi_row| {
+                            for idx in 0..mlen {
+                                let j = j_start + idx;
+                                let mut s_val = scores_row[idx];
 
-                            let pos = i.saturating_sub(j);
+                                let pos = i.saturating_sub(j);
                                 if pos < q_pe.len() {
                                     s_val += q_pe[pos];
                                 }
@@ -410,19 +388,21 @@ pub fn compute_poly_attention_forward_into(
                                 };
 
                                 phi_row[idx] = scale * (a * sp + b);
+                            }
+                            
+                            if let Some(dump) = scores_dump.as_mut() {
+                                // Capture scores for Head 0, Last Token (i == n-1)
                                 if h_idx == 0 && i == n - 1 {
-                                    println!("[DEBUG BATCH] Phi idx {}: {}", idx, phi_row[idx]);
+                                    let mut effective_scores = ndarray::Array1::zeros(mlen);
+                                    for idx in 0..mlen {
+                                        effective_scores[idx] = phi_row[idx] * eff_i;
+                                    }
+                                    dump[h_idx] = effective_scores;
                                 }
                             }
-
+                            
+                            // Slice V for this head
                             let v_slice = v.slice(s![j_start..j_end_excl, ..]);
-                            if h_idx == 0 && i == n - 1 {
-                                 if v_slice.nrows() > 0 {
-                                     println!("[DEBUG BATCH] V[0]: {:?}", v_slice.row(0));
-                                     println!("[DEBUG BATCH] V[Last]: {:?}", v_slice.row(v_slice.nrows()-1));
-                                 }
-                            }
-
                             with_tls_acc_f64(ctx.head_dim, |acc| {
                                 acc.fill(0.0);
                                 let eff = eff_i as f64;
@@ -431,9 +411,6 @@ pub fn compute_poly_attention_forward_into(
                                     for h in 0..ctx.head_dim {
                                         acc[h] += phi * (v_slice[[idx, h]] as f64);
                                     }
-                                }
-                                if h_idx == 0 && i == n - 1 {
-                                    println!("[DEBUG BATCH] Head Output (Pre-Proj): {:?}", acc);
                                 }
                                 for h in 0..ctx.head_dim {
                                     y_row[h] = acc[h] as f32;
@@ -518,6 +495,7 @@ pub fn compute_poly_attention_forward_into(
         avg_active_heads,
         head_activity_vec,
         token_head_activity_vec,
+        scores_dump,
     }
 }
 
@@ -566,10 +544,8 @@ pub fn compute_poly_attention_forward_baseline(
                 let mut g_col = ndarray::Array2::<f32>::zeros(xw_col.raw_dim());
                 for (i, &xw) in xw_col.iter().enumerate() {
                     let z = a_h * xw + b_h;
-                    let gate_poly_local = ctx.gate.update_scaling_from_max_abs(z.abs() as f64);
-                    let mut g_val = 0.0;
-                    gate_poly_local.forward_into_f32(&[z], std::slice::from_mut(&mut g_val));
-                    g_col[[i, 0]] = g_val;
+                    // Match streaming behavior: use base curve directly without dynamic scaling
+                    g_col[[i, 0]] = ctx.gate.curve.forward_scalar_f32(z);
                 }
                 let g_sq_sum = xw_col.iter().map(|&v| v * v).sum::<f32>();
                 let g_count = n;
@@ -682,28 +658,6 @@ pub fn compute_poly_attention_forward_baseline(
                                 result
                             };
                             phi_row[idx] = scale * (a * sp + b);
-                            
-                            // DEBUG BATCH
-                            if i == n - 1 && h_idx == 0 {
-                                if idx == 0 {
-                                     println!("[DEBUG BATCH] Q_scaled (first 4): {:?}", q_row_i.slice(s![0..4]));
-                                     println!("[DEBUG BATCH] eff_i: {}", eff_i);
-                                }
-                                if idx == 0 { // Context token 0 (Persistent)
-                                    println!("[DEBUG BATCH] Ctx[0] Score (Raw): {}", s_val - if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
-                                    println!("[DEBUG BATCH] Ctx[0] CoPE: {}", if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
-                                    println!("[DEBUG BATCH] Ctx[0] Score (Total): {}", s_val);
-                                    println!("[DEBUG BATCH] Ctx[0] Phi: {}", phi_row[idx]);
-                                    println!("[DEBUG BATCH] Ctx[0] V (first 4): {:?}", v.slice(s![j, 0..4]));
-                                }
-                                if idx == mlen - 1 { // Last token (Input itself)
-                                    println!("[DEBUG BATCH] In Score (Raw): {}", s_val - if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
-                                    println!("[DEBUG BATCH] In CoPE: {}", if pos < q_pe.len() { q_pe[pos] } else { 0.0 });
-                                    println!("[DEBUG BATCH] In Score (Total): {}", s_val);
-                                    println!("[DEBUG BATCH] In Phi: {}", phi_row[idx]);
-                                    println!("[DEBUG BATCH] In V (first 4): {:?}", v.slice(s![j, 0..4]));
-                                }
-                            }
                         }
 
                         let v_slice = v.slice(s![j_start..j_end_excl, ..]);
@@ -716,11 +670,6 @@ pub fn compute_poly_attention_forward_baseline(
                                     acc[h] += phi * (v_slice[[idx, h]] as f64);
                                 }
                             }
-                            
-                            if i == n - 1 && h_idx == 0 {
-                                println!("[DEBUG BATCH] Head Output (Pre-Proj, first 4): {:?}", &acc[0..4]);
-                            }
-
                             for h in 0..ctx.head_dim {
                                 y_row[h] = acc[h] as f32;
                             }
@@ -794,6 +743,7 @@ pub fn compute_poly_attention_forward_baseline(
         avg_active_heads,
         head_activity_vec,
         token_head_activity_vec,
+        scores_dump: None,
     }
 }
 

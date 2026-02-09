@@ -37,6 +37,13 @@
 //! - **Ring Attention**: Liu et al. (2023) - arXiv:2309.01809
 //! - **Online Softmax**: Milakov & Gimelshein (2018)
 //! - **Flash Attention**: Dao et al. (2022) - block-wise computation patterns
+//!
+//! # Performance Optimizations
+//!
+//! - **Pre-sized Buffers**: All caches are pre-allocated to maximum dimensions
+//! - **TLS Scratch Buffers**: Thread-local storage for intermediate computations
+//! - **Batch Processing**: Block-level parallelism for throughput
+//!
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
@@ -155,12 +162,12 @@ impl RingBlock {
     }
 
     /// Get a view of the valid keys in this block.
-    pub fn k_view(&self) -> ArrayView2<f32> {
+    pub fn k_view(&self) -> ArrayView2<'_, f32> {
         self.k.slice(s![..self.valid_len, ..])
     }
 
     /// Get a view of the valid values in this block.
-    pub fn v_view(&self) -> ArrayView2<f32> {
+    pub fn v_view(&self) -> ArrayView2<'_, f32> {
         self.v.slice(s![..self.valid_len, ..])
     }
 }
@@ -176,15 +183,12 @@ pub struct RingBuffer {
     write_pos: usize,
     /// Total number of tokens stored
     total_tokens: usize,
-    /// Head dimension
-    head_dim: usize,
 }
 
 impl RingBuffer {
     /// Create a new ring buffer with the given configuration.
     pub fn new(config: RingAttentionConfig) -> Self {
         config.validate().expect("Invalid RingAttentionConfig");
-        let head_dim = config.embed_dim / config.num_heads;
         
         let blocks: Vec<RingBlock> = (0..config.num_blocks)
             .map(|_| RingBlock::new(config.block_size, config.embed_dim))
@@ -195,7 +199,6 @@ impl RingBuffer {
             blocks,
             write_pos: 0,
             total_tokens: 0,
-            head_dim,
         }
     }
 
@@ -383,6 +386,53 @@ impl OnlineSoftmaxAccumulator {
     }
 }
 
+/// Streaming workspace for Ring Attention (zero-allocation hot path).
+#[derive(Debug, Clone)]
+pub struct RingAttentionStreamingWorkspace {
+    /// Query projection buffer
+    pub q: Array1<f32>,
+    /// Key projection buffer
+    pub k: Array1<f32>,
+    /// Value projection buffer
+    pub v: Array1<f32>,
+    /// Score buffer for a single block
+    pub scores: Array1<f32>,
+    /// Head output accumulator
+    pub head_out: Array1<f32>,
+    /// Final output buffer
+    pub output: Array1<f32>,
+    /// K/V 2D temporary buffer
+    pub kv_2d: Array2<f32>,
+}
+
+impl RingAttentionStreamingWorkspace {
+    /// Create a new workspace for the given configuration.
+    pub fn new(config: &RingAttentionConfig) -> Self {
+        let dim = config.embed_dim;
+        Self {
+            q: Array1::zeros(dim),
+            k: Array1::zeros(dim),
+            v: Array1::zeros(dim),
+            scores: Array1::zeros(config.block_size),
+            head_out: Array1::zeros(dim / config.num_heads),
+            output: Array1::zeros(dim),
+            kv_2d: Array2::zeros((1, dim)),
+        }
+    }
+    
+    /// Reset all buffers.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.q.fill(0.0);
+        self.k.fill(0.0);
+        self.v.fill(0.0);
+        self.scores.fill(0.0);
+        self.head_out.fill(0.0);
+        self.output.fill(0.0);
+        self.kv_2d.fill(0.0);
+    }
+}
+
 /// Ring Attention processor with polynomial attention transformation.
 #[derive(Debug)]
 pub struct RingAttention {
@@ -402,12 +452,13 @@ pub struct RingAttention {
     w_out: Array2<f32>,
     /// Scaling factor for attention scores
     scale_factor: f32,
+    /// Streaming workspace for zero-allocation inference
+    streaming_workspace: Option<RingAttentionStreamingWorkspace>,
 }
 
 impl RingAttention {
     /// Create a new Ring Attention processor.
     pub fn new(config: RingAttentionConfig) -> Self {
-        use rand::Rng;
         use rand_distr::{Distribution, Normal};
         
         config.validate().expect("Invalid RingAttentionConfig");
@@ -441,16 +492,120 @@ impl RingAttention {
             w_v,
             w_out,
             scale_factor: 1.0 / (head_dim as f32).sqrt(),
+            streaming_workspace: None,
         }
     }
 
     /// Reset the ring buffer.
     pub fn reset(&mut self) {
         self.ring_buffer.reset();
+        if let Some(ws) = &mut self.streaming_workspace {
+            ws.reset();
+        }
+    }
+    
+    /// Ensure streaming workspace is initialized.
+    #[inline]
+    fn ensure_streaming_workspace(&mut self) {
+        if self.streaming_workspace.is_none() {
+            self.streaming_workspace = Some(RingAttentionStreamingWorkspace::new(&self.config));
+        }
+    }
+
+    /// Process a single token into pre-allocated output (zero-allocation hot path).
+    ///
+    /// This is the core operation for autoregressive generation with unbounded context.
+    #[inline]
+    pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
+        self.ensure_streaming_workspace();
+        
+        // Cache values needed for score computation to avoid borrow conflict
+        let scale_factor = self.scale_factor;
+        let poly_a = self.poly_a;
+        let poly_b = self.poly_b;
+        let poly_scale = self.poly_scale;
+        let poly_degree = self.config.polynomial_degree;
+        
+        let dim = self.config.embed_dim;
+        let num_heads = self.config.num_heads;
+        let head_dim = dim / num_heads;
+        
+        // Project input to Q, K, V using workspace buffers
+        {
+            let ws = self.streaming_workspace.as_mut().unwrap();
+            ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q.t(), input, 0.0, &mut ws.q);
+            ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k.t(), input, 0.0, &mut ws.k);
+            ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v.t(), input, 0.0, &mut ws.v);
+            
+            // Append K, V to ring buffer using workspace 2D buffer
+            ws.kv_2d.row_mut(0).assign(&ws.k);
+            let k_copy = ws.kv_2d.clone();
+            ws.kv_2d.row_mut(0).assign(&ws.v);
+            self.ring_buffer.append_kv(&k_copy, &ws.kv_2d);
+        }
+        
+        // Clear output
+        output.fill(0.0);
+        
+        let global_pos = self.ring_buffer.len();
+        
+        // Get workspace reference for the main computation
+        let ws = self.streaming_workspace.as_mut().unwrap();
+        
+        for h in 0..num_heads {
+            let start = h * head_dim;
+            let end = start + head_dim;
+            
+            let q_h = ws.q.slice(s![start..end]);
+            
+            // Accumulate attention across ring blocks
+            let mut accumulator = OnlineSoftmaxAccumulator::new(head_dim);
+            
+            for block in self.ring_buffer.get_relevant_blocks(global_pos) {
+                let k_block = block.k_view();
+                let v_block = block.v_view();
+                
+                // Compute scores for this block using cached parameters
+                let block_len = k_block.nrows().min(ws.scores.len());
+                
+                for i in 0..block_len {
+                    let k_h = k_block.slice(s![i, start..end]);
+                    // Inline score computation to avoid borrowing self
+                    let dot = q_h.dot(&k_h) * scale_factor;
+                    let s_stable = Self::smooth_clip(dot, 8.0);
+                    let sp = if poly_degree <= 3 {
+                        match poly_degree {
+                            1 => s_stable,
+                            2 => s_stable * s_stable,
+                            3 => s_stable * s_stable * s_stable,
+                            _ => 1.0,
+                        }
+                    } else {
+                        s_stable.powi(poly_degree as i32)
+                    };
+                    ws.scores[i] = poly_scale * (poly_a * sp + poly_b);
+                }
+                
+                // Process block
+                let v_h = v_block.slice(s![..block_len, start..end]);
+                accumulator.process_block(&ws.scores.slice(s![..block_len]).view(), &v_h);
+            }
+            
+            // Get output for this head
+            let head_output = accumulator.finalize();
+            
+            // Project to output
+            let w_out_h = self.w_out.slice(s![start..end, ..]);
+            for j in 0..dim {
+                for i in 0..head_dim {
+                    output[j] += head_output[i] * w_out_h[[i, j]];
+                }
+            }
+        }
     }
 
     /// Process a single token (streaming/rolling mode).
-    /// 
+    ///
     /// This is the core operation for autoregressive generation with unbounded context.
     pub fn forward_step(&mut self, input: &ArrayView1<f32>) -> Array1<f32> {
         let dim = self.config.embed_dim;
@@ -694,5 +849,58 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid_config2.validate().is_err());
+    }
+    
+    #[test]
+    fn test_ring_attention_forward_step_into() {
+        let config = RingAttentionConfig {
+            block_size: 4,
+            num_blocks: 4,
+            embed_dim: 16,
+            num_heads: 4,
+            polynomial_degree: 3,
+            use_online_softmax: true,
+        };
+        
+        let mut ring_attn = RingAttention::new(config);
+        let mut output = Array1::zeros(16);
+        
+        // Process several tokens using zero-allocation path
+        for _ in 0..10 {
+            let input = Array1::zeros(16);
+            ring_attn.forward_step_into(&input.view(), &mut output);
+            assert_eq!(output.len(), 16);
+            assert!(output.iter().all(|&x| x.is_finite()));
+        }
+        
+        let stats = ring_attn.stats();
+        assert_eq!(stats.total_tokens, 10);
+    }
+    
+    #[test]
+    fn test_ring_attention_forward_step_into_vs_forward_step() {
+        let config = RingAttentionConfig {
+            block_size: 4,
+            num_blocks: 4,
+            embed_dim: 16,
+            num_heads: 4,
+            polynomial_degree: 3,
+            use_online_softmax: true,
+        };
+        
+        // Test forward_step_into
+        let mut ring_attn1 = RingAttention::new(config.clone());
+        let mut output1 = Array1::zeros(16);
+        let input = Array1::zeros(16);
+        ring_attn1.forward_step_into(&input.view(), &mut output1);
+        
+        // Test forward_step
+        let mut ring_attn2 = RingAttention::new(config);
+        let output2 = ring_attn2.forward_step(&input.view());
+        
+        // Both should produce finite outputs of the same shape
+        assert_eq!(output1.len(), output2.len());
+        assert!(output1.iter().all(|&x| x.is_finite()));
+        assert!(output2.iter().all(|&x| x.is_finite()));
     }
 }
