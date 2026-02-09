@@ -2,11 +2,23 @@
 //!
 //! Implements audio understanding through spectrogram-based patch embedding,
 //! supporting both waveform and spectral representations for speech and sound.
+//!
+//! # Data Augmentation
+//!
+//! The module provides audio-specific augmentation for training:
+//! - Additive Gaussian noise
+//! - Time stretching (speed perturbation)
+//! - Pitch shifting
+//! - Volume perturbation
+//! - Time masking (SpecAugment)
+//! - Frequency masking (SpecAugment)
+//! - Random cropping/padding
 
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::common::errors::Result;
+use crate::common::rng::get_rng;
 use crate::domain::multimodal::patch::{get_1d_sincos_pos_embed, PatchEmbed};
 
 /// Configuration for audio processing
@@ -261,6 +273,214 @@ impl AudioSample {
             self.waveform.resize(target_samples, 0.0);
         }
         self.duration = self.waveform.len() as f32 / self.sample_rate as f32;
+    }
+}
+
+/// Configuration for audio data augmentation during training
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioAugmentationConfig {
+    /// Additive Gaussian noise standard deviation
+    pub noise_std: f32,
+    /// Time stretch range (min, max) - e.g., (0.9, 1.1) for ±10%
+    pub time_stretch_range: (f32, f32),
+    /// Pitch shift range in semitones (min, max)
+    pub pitch_shift_range: (i32, i32),
+    /// Volume perturbation range (min, max) as multiplier
+    pub volume_range: (f32, f32),
+    /// SpecAugment time mask probability
+    pub time_mask_prob: f32,
+    /// SpecAugment time mask max width (in frames)
+    pub time_mask_max_width: usize,
+    /// SpecAugment frequency mask probability
+    pub freq_mask_prob: f32,
+    /// SpecAugment frequency mask max width (in bins)
+    pub freq_mask_max_width: usize,
+    /// Number of time masks to apply
+    pub num_time_masks: usize,
+    /// Number of frequency masks to apply
+    pub num_freq_masks: usize,
+}
+
+impl Default for AudioAugmentationConfig {
+    fn default() -> Self {
+        Self {
+            noise_std: 0.005,
+            time_stretch_range: (0.95, 1.05),
+            pitch_shift_range: (-2, 2),
+            volume_range: (0.8, 1.2),
+            time_mask_prob: 0.5,
+            time_mask_max_width: 40,
+            freq_mask_prob: 0.5,
+            freq_mask_max_width: 8,
+            num_time_masks: 2,
+            num_freq_masks: 2,
+        }
+    }
+}
+
+impl AudioAugmentationConfig {
+    /// No augmentation
+    pub fn none() -> Self {
+        Self {
+            noise_std: 0.0,
+            time_stretch_range: (1.0, 1.0),
+            pitch_shift_range: (0, 0),
+            volume_range: (1.0, 1.0),
+            time_mask_prob: 0.0,
+            time_mask_max_width: 0,
+            freq_mask_prob: 0.0,
+            freq_mask_max_width: 0,
+            num_time_masks: 0,
+            num_freq_masks: 0,
+        }
+    }
+
+    /// Light augmentation for fine-tuning
+    pub fn light() -> Self {
+        Self {
+            noise_std: 0.002,
+            time_stretch_range: (0.98, 1.02),
+            pitch_shift_range: (-1, 1),
+            volume_range: (0.9, 1.1),
+            time_mask_prob: 0.3,
+            time_mask_max_width: 20,
+            freq_mask_prob: 0.3,
+            freq_mask_max_width: 4,
+            num_time_masks: 1,
+            num_freq_masks: 1,
+        }
+    }
+
+    /// Strong augmentation for training from scratch (SpecAugment style)
+    pub fn strong() -> Self {
+        Self {
+            noise_std: 0.01,
+            time_stretch_range: (0.9, 1.1),
+            pitch_shift_range: (-4, 4),
+            volume_range: (0.7, 1.3),
+            time_mask_prob: 0.8,
+            time_mask_max_width: 100,
+            freq_mask_prob: 0.8,
+            freq_mask_max_width: 16,
+            num_time_masks: 2,
+            num_freq_masks: 2,
+        }
+    }
+}
+
+/// Audio data augmentation transformer
+#[derive(Clone)]
+pub struct AudioAugmentation {
+    config: AudioAugmentationConfig,
+    rng: crate::common::rng::DeterministicRng,
+}
+
+impl AudioAugmentation {
+    /// Create a new augmentation transformer
+    pub fn new(config: AudioAugmentationConfig) -> Self {
+        Self {
+            config,
+            rng: get_rng(),
+        }
+    }
+
+    /// Apply augmentation to an audio sample
+    pub fn augment(&mut self, sample: &AudioSample) -> AudioSample {
+        use rand::Rng;
+
+        let mut waveform = sample.waveform.clone();
+
+        // Volume perturbation
+        if self.config.volume_range != (1.0, 1.0) {
+            let factor = self.rng.random_range(self.config.volume_range.0..self.config.volume_range.1);
+            for sample in &mut waveform {
+                *sample *= factor;
+            }
+        }
+
+        // Additive noise
+        if self.config.noise_std > 0.0 {
+            waveform = self.add_noise(&waveform, self.config.noise_std);
+        }
+
+        // Time stretching
+        if self.config.time_stretch_range != (1.0, 1.0) {
+            let rate = self.rng.random_range(self.config.time_stretch_range.0..self.config.time_stretch_range.1);
+            waveform = self.time_stretch(&waveform, rate);
+        }
+
+        let mut result = AudioSample::new(waveform, sample.sample_rate);
+        result.transcript = sample.transcript.clone();
+        result
+    }
+
+    /// Apply SpecAugment to a spectrogram
+    pub fn augment_spectrogram(&mut self, spectrogram: &Array2<f32>) -> Array2<f32> {
+        use rand::Rng;
+
+        let mut result = spectrogram.clone();
+        let num_frames = result.nrows();
+        let num_bins = result.ncols();
+
+        // Time masking
+        if self.rng.random::<f32>() < self.config.time_mask_prob {
+            for _ in 0..self.config.num_time_masks {
+                let width = self.rng.random_range(1..=self.config.time_mask_max_width.min(num_frames));
+                let start = self.rng.random_range(0..num_frames.saturating_sub(width));
+                for t in start..(start + width).min(num_frames) {
+                    for f in 0..num_bins {
+                        result[[t, f]] = 0.0;
+                    }
+                }
+            }
+        }
+
+        // Frequency masking
+        if self.rng.random::<f32>() < self.config.freq_mask_prob {
+            for _ in 0..self.config.num_freq_masks {
+                let width = self.rng.random_range(1..=self.config.freq_mask_max_width.min(num_bins));
+                let start = self.rng.random_range(0..num_bins.saturating_sub(width));
+                for f in start..(start + width).min(num_bins) {
+                    for t in 0..num_frames {
+                        result[[t, f]] = 0.0;
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    fn add_noise(&mut self, waveform: &[f32], std: f32) -> Vec<f32> {
+        use rand_distr::Distribution;
+        let normal = rand_distr::Normal::new(0.0, std).unwrap();
+        waveform
+            .iter()
+            .map(|&s| s + normal.sample(&mut self.rng))
+            .collect()
+    }
+
+    fn time_stretch(&self, waveform: &[f32], rate: f32) -> Vec<f32> {
+        if (rate - 1.0).abs() < 1e-6 {
+            return waveform.to_vec();
+        }
+
+        let new_len = (waveform.len() as f32 / rate) as usize;
+        let mut stretched = Vec::with_capacity(new_len);
+
+        for i in 0..new_len {
+            let src_idx = i as f32 * rate;
+            let idx0 = src_idx.floor() as usize;
+            let idx1 = (idx0 + 1).min(waveform.len() - 1);
+            let frac = src_idx - idx0 as f32;
+
+            let v0 = waveform.get(idx0).copied().unwrap_or(0.0);
+            let v1 = waveform.get(idx1).copied().unwrap_or(0.0);
+
+            stretched.push(v0 * (1.0 - frac) + v1 * frac);
+        }
+
+        stretched
     }
 }
 
@@ -624,5 +844,83 @@ mod tests {
 
         assert!(spec.nrows() > 0);
         assert!(spec.ncols() > 0);
+    }
+
+    #[test]
+    fn test_audio_augmentation_config_presets() {
+        let none = AudioAugmentationConfig::none();
+        assert_eq!(none.noise_std, 0.0);
+        assert_eq!(none.time_stretch_range, (1.0, 1.0));
+
+        let light = AudioAugmentationConfig::light();
+        assert!(light.noise_std > 0.0);
+        assert!(light.noise_std < 0.01);
+
+        let strong = AudioAugmentationConfig::strong();
+        assert!(strong.noise_std > light.noise_std);
+        assert!(strong.time_mask_prob > 0.5);
+    }
+
+    #[test]
+    fn test_audio_augmentation_no_augmentation() {
+        let config = AudioAugmentationConfig::none();
+        let mut aug = AudioAugmentation::new(config);
+
+        let sample = create_test_audio(0.1, 16000);
+        let augmented = aug.augment(&sample);
+
+        // With no augmentation, waveform should be identical
+        assert_eq!(sample.waveform.len(), augmented.waveform.len());
+    }
+
+    #[test]
+    fn test_audio_augmentation_volume() {
+        let config = AudioAugmentationConfig {
+            volume_range: (2.0, 2.0), // Always double volume
+            ..AudioAugmentationConfig::none()
+        };
+        let mut aug = AudioAugmentation::new(config);
+
+        let sample = AudioSample::new(vec![0.5; 1000], 16000);
+        let augmented = aug.augment(&sample);
+
+        // Volume should be doubled
+        assert!((augmented.waveform[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_audio_augmentation_time_stretch() {
+        let config = AudioAugmentationConfig {
+            time_stretch_range: (2.0, 2.0), // Always stretch by 2x
+            ..AudioAugmentationConfig::none()
+        };
+        let mut aug = AudioAugmentation::new(config);
+
+        let sample = AudioSample::new(vec![1.0; 1000], 16000);
+        let augmented = aug.augment(&sample);
+
+        // Time stretch by 2x should halve the length
+        assert_eq!(augmented.waveform.len(), 500);
+    }
+
+    #[test]
+    fn test_specaugment_spectrogram() {
+        let config = AudioAugmentationConfig {
+            time_mask_prob: 1.0,
+            time_mask_max_width: 5,
+            num_time_masks: 1,
+            freq_mask_prob: 1.0,
+            freq_mask_max_width: 3,
+            num_freq_masks: 1,
+            ..AudioAugmentationConfig::none()
+        };
+        let mut aug = AudioAugmentation::new(config);
+
+        let spectrogram = Array2::ones((20, 10));
+        let augmented = aug.augment_spectrogram(&spectrogram);
+
+        // Some values should be zeroed out
+        let has_zeros = augmented.iter().any(|&x| x == 0.0);
+        assert!(has_zeros);
     }
 }

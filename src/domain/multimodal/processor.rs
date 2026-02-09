@@ -2,6 +2,14 @@
 //!
 //! Provides unified batching and processing of mixed-modality data,
 //! enabling training on text, image, video, and audio samples.
+//!
+//! # Features
+//!
+//! - **Modality Token Type Embeddings**: Adds learnable type embeddings to distinguish
+//!   between different modalities in a unified sequence.
+//! - **Modality Dropout**: Randomly drops modalities during training for robustness.
+//! - **Cross-Modal Attention Masks**: Builds attention masks for cross-modal attention.
+//! - **Data Augmentation**: Applies modality-specific augmentation during training.
 
 use ndarray::{concatenate, Array2, Axis};
 use serde::{Deserialize, Serialize};
@@ -11,6 +19,8 @@ use crate::domain::multimodal::{
     audio::{AudioConfig, AudioEncoder, AudioSample},
     image::{ImageConfig, ImageEncoder, ImageSample},
     video::{VideoConfig, VideoEncoder, VideoSample},
+    CrossModalMaskBuilder, ModalityDropout, ModalityDropoutConfig, ModalityTokenType,
+    ModalityTypeEmbeddings,
 };
 
 /// Supported modalities
@@ -81,7 +91,7 @@ impl MultiModalExample {
     }
 }
 
-/// A batch of multi-modal data
+/// A batch of multi-modal data with enhanced features for training
 #[derive(Debug, Clone)]
 pub struct MultiModalBatch {
     /// Encoded embeddings for each modality
@@ -92,6 +102,8 @@ pub struct MultiModalBatch {
     pub labels: Vec<Option<Vec<usize>>>,
     /// Batch size
     pub batch_size: usize,
+    /// Modality token types for each position in the sequence
+    pub token_types: Vec<ModalityTokenType>,
 }
 
 impl MultiModalBatch {
@@ -102,6 +114,7 @@ impl MultiModalBatch {
             attention_masks: Vec::new(),
             labels: Vec::new(),
             batch_size: 0,
+            token_types: Vec::new(),
         }
     }
 
@@ -153,6 +166,63 @@ impl MultiModalBatch {
     /// Get the total sequence length across all modalities
     pub fn total_sequence_length(&self) -> usize {
         self.embeddings.iter().map(|(_, emb)| emb.nrows()).sum()
+    }
+
+    /// Build token types array for the entire batch
+    pub fn build_token_types(&self) -> Vec<ModalityTokenType> {
+        self.embeddings
+            .iter()
+            .flat_map(|(modality, emb)| {
+                let token_type = ModalityTokenType::from(*modality);
+                vec![token_type; emb.nrows()]
+            })
+            .collect()
+    }
+
+    /// Build cross-modal attention mask
+    pub fn build_attention_mask(&self, cross_attention_enabled: bool) -> Option<Array2<f32>> {
+        let token_types = self.build_token_types();
+        if token_types.is_empty() {
+            return None;
+        }
+
+        let builder = CrossModalMaskBuilder::new(cross_attention_enabled);
+        Some(builder.build_mask(&token_types))
+    }
+
+    /// Build causal attention mask (for autoregressive generation)
+    pub fn build_causal_mask(&self) -> Option<Array2<f32>> {
+        let token_types = self.build_token_types();
+        if token_types.is_empty() {
+            return None;
+        }
+
+        let builder = CrossModalMaskBuilder::default();
+        Some(builder.build_causal_mask(&token_types))
+    }
+
+    /// Add modality type embeddings to the concatenated embeddings
+    pub fn add_modality_type_embeddings(
+        &self,
+        type_embeddings: &ModalityTypeEmbeddings,
+    ) -> Option<Array2<f32>> {
+        let mut concatenated = self.concat_embeddings()?;
+        let token_types = self.build_token_types();
+
+        if token_types.len() != concatenated.nrows() {
+            return None;
+        }
+
+        let type_emb_array = type_embeddings.get_sequence(&token_types);
+        
+        // Add type embeddings to each position
+        for (i, row) in concatenated.rows_mut().into_iter().enumerate() {
+            for (j, &val) in type_emb_array.row(i).iter().enumerate() {
+                row[j] += val;
+            }
+        }
+
+        Some(concatenated)
     }
 }
 

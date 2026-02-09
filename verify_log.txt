@@ -1,1 +1,1 @@
-error: process didn't exit successfully: `target\debug\verify_titans_mac.exe` (exit code: 101)
+error: could not compile `llm` (lib) due to 4 previous errors; 9 warnings emitted

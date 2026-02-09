@@ -128,8 +128,9 @@ pub fn run_training_pipeline(
 
 /// Run TRM (Tiny Recursive Model) training
 fn run_trm_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Result<()> {
-    let pre_texts: Vec<&str> = dataset
-        .pretraining_data
+    // Use all text data including multimodal captions/transcripts
+    let all_text_data = dataset.get_all_text_data();
+    let pre_texts: Vec<&str> = all_text_data
         .iter()
         .map(|s| s.as_str())
         .collect();
@@ -138,6 +139,18 @@ fn run_trm_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Result<()>
         .iter()
         .map(|s| s.as_str())
         .collect();
+
+    // Log multimodal data usage
+    let multimodal_stats = format!(
+        "Training data: {} pretraining, {} chat, {} images, {} speech, {} video",
+        dataset.pretraining_data.len(),
+        dataset.chat_training_data.len(),
+        dataset.image_training_data.len(),
+        dataset.speech_training_data.len(),
+        dataset.video_training_data.len()
+    );
+    println!("{}", multimodal_stats);
+    tracing::info!("{}", multimodal_stats);
 
     llm.set_trm_training_mode();
 
@@ -250,15 +263,31 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Resu
 
 /// Run standard transformer training
 fn run_standard_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Result<()> {
+    // Log multimodal data usage
+    let multimodal_stats = format!(
+        "Training data: {} pretraining, {} chat, {} images, {} speech, {} video",
+        dataset.pretraining_data.len(),
+        dataset.chat_training_data.len(),
+        dataset.image_training_data.len(),
+        dataset.speech_training_data.len(),
+        dataset.video_training_data.len()
+    );
+    println!("{}", multimodal_stats);
+    tracing::info!("{}", multimodal_stats);
+
+    // Use all text data including multimodal captions/transcripts
+    let all_text_data = dataset.get_all_text_data();
+    
     if args.continue_from.is_none() {
         println!("\n=== PRE-TRAINING MODEL ===");
-        let pre_count = dataset.pretraining_data.len();
         println!(
-            "Pre-training on {} examples for {} epochs with learning rate {}",
-            pre_count, args.pretrain_epochs, 0.0005
+            "Pre-training on {} text examples (including {} multimodal captions/transcripts) for {} epochs with learning rate {}",
+            all_text_data.len(),
+            dataset.image_training_data.len() + dataset.speech_training_data.len() + dataset.video_training_data.len(),
+            args.pretrain_epochs,
+            0.0005
         );
-        let pre_texts: Vec<&str> = dataset
-            .pretraining_data
+        let pre_texts: Vec<&str> = all_text_data
             .iter()
             .map(|s| s.as_str())
             .collect();
