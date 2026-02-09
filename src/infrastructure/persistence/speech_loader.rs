@@ -139,8 +139,8 @@ fn load_wav_file<P: AsRef<Path>>(path: P, config: &SpeechConfig) -> Result<Audio
                 .chunks_exact(3)
                 .map(|chunk| {
                     let sample = if chunk[2] & 0x80 != 0 {
-                        // Negative
-                        ((chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16) | 0xFF000000) as f32
+                        // Negative - sign extend
+                        ((chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16) | (-16777216i32)) as f32
                     } else {
                         ((chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16)) as f32
                     };

@@ -25,6 +25,7 @@ pub use processor::{Modality, MultiModalBatch, MultiModalProcessor};
 pub use video::{VideoConfig, VideoEncoder, VideoSample};
 
 use crate::common::errors::Result;
+use crate::common::rng::DeterministicRng;
 use ndarray::{Array1, Array2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
@@ -116,9 +117,9 @@ impl ModalityTypeEmbeddings {
         self.embeddings.row(token_type.to_index()).to_owned()
     }
 
-    /// Get embedding as a slice
-    pub fn get_slice(&self, token_type: ModalityTokenType) -> &[f32] {
-        self.embeddings.row(token_type.to_index()).as_slice().unwrap_or(&[])
+    /// Get embedding as a vector (copies data)
+    pub fn get_vec(&self, token_type: ModalityTokenType) -> Vec<f32> {
+        self.embeddings.row(token_type.to_index()).to_vec()
     }
 
     /// Get embeddings for a sequence of modality types
@@ -126,7 +127,7 @@ impl ModalityTypeEmbeddings {
         Array2::from_shape_vec(
             (token_types.len(), self.embedding_dim),
             token_types.iter()
-                .flat_map(|&t| self.get_slice(t).to_vec())
+                .flat_map(|&t| self.get_vec(t))
                 .collect()
         ).unwrap_or_else(|_| Array2::zeros((token_types.len(), self.embedding_dim)))
     }
@@ -218,23 +219,20 @@ impl ModalityDropoutConfig {
 #[derive(Debug, Clone)]
 pub struct ModalityDropout {
     config: ModalityDropoutConfig,
-    rng: rand::rngs::StdRng,
 }
 
 impl ModalityDropout {
     /// Create a new modality dropout layer
     pub fn new(config: ModalityDropoutConfig) -> Result<Self> {
         config.validate()?;
-        Ok(Self {
-            config,
-            rng: crate::common::rng::get_rng(),
-        })
+        Ok(Self { config })
     }
 
     /// Apply dropout to determine which modalities to keep
-    pub fn apply_dropout(&mut self, available_modalities: &[Modality]) -> Vec<Modality> {
+    pub fn apply_dropout(&self, available_modalities: &[Modality]) -> Vec<Modality> {
         use rand::Rng;
 
+        let mut rng = crate::common::rng::get_rng();
         let mut kept = Vec::new();
         
         for &modality in available_modalities {
@@ -245,7 +243,7 @@ impl ModalityDropout {
                 Modality::Audio => self.config.audio_drop_prob,
             };
 
-            if self.rng.gen::<f32>() >= drop_prob {
+            if rng.random::<f32>() >= drop_prob {
                 kept.push(modality);
             }
         }
@@ -510,5 +508,141 @@ mod tests {
         assert_eq!(image.modality(), Modality::Image);
         assert_eq!(video.modality(), Modality::Video);
         assert_eq!(audio.modality(), Modality::Audio);
+    }
+
+    #[test]
+    fn test_modality_token_type_conversions() {
+        // Test index conversions
+        assert_eq!(ModalityTokenType::Text.to_index(), 0);
+        assert_eq!(ModalityTokenType::Image.to_index(), 1);
+        assert_eq!(ModalityTokenType::Video.to_index(), 2);
+        assert_eq!(ModalityTokenType::Audio.to_index(), 3);
+        assert_eq!(ModalityTokenType::Padding.to_index(), 4);
+
+        // Test from_index
+        assert_eq!(ModalityTokenType::from_index(0), Some(ModalityTokenType::Text));
+        assert_eq!(ModalityTokenType::from_index(5), None);
+
+        // Test from Modality
+        assert_eq!(ModalityTokenType::from(Modality::Text), ModalityTokenType::Text);
+        assert_eq!(ModalityTokenType::from(Modality::Image), ModalityTokenType::Image);
+    }
+
+    #[test]
+    fn test_modality_type_embeddings() {
+        let embeddings = ModalityTypeEmbeddings::new(64).unwrap();
+        assert_eq!(embeddings.embedding_dim, 64);
+        assert_eq!(embeddings.embeddings.nrows(), ModalityTokenType::num_types());
+        assert_eq!(embeddings.embeddings.ncols(), 64);
+
+        // Test getting single embedding
+        let text_emb = embeddings.get(ModalityTokenType::Text);
+        assert_eq!(text_emb.len(), 64);
+
+        // Test getting sequence
+        let seq_types = vec![ModalityTokenType::Text, ModalityTokenType::Image, ModalityTokenType::Text];
+        let seq_emb = embeddings.get_sequence(&seq_types);
+        assert_eq!(seq_emb.shape(), &[3, 64]);
+
+        // Test parameter count
+        assert_eq!(embeddings.num_parameters(), 5 * 64);
+    }
+
+    #[test]
+    fn test_modality_dropout_config() {
+        let config = ModalityDropoutConfig::default();
+        assert_eq!(config.text_drop_prob, 0.0);
+        assert!(config.image_drop_prob > 0.0);
+
+        let uniform = ModalityDropoutConfig::uniform(0.2);
+        assert_eq!(uniform.text_drop_prob, 0.2);
+        assert_eq!(uniform.image_drop_prob, 0.2);
+
+        let none = ModalityDropoutConfig::none();
+        assert_eq!(none.text_drop_prob, 0.0);
+        assert_eq!(none.image_drop_prob, 0.0);
+
+        // Validation
+        assert!(config.validate().is_ok());
+        let invalid = ModalityDropoutConfig {
+            text_drop_prob: -0.1,
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn test_modality_dropout() {
+        let config = ModalityDropoutConfig::none();
+        let mut dropout = ModalityDropout::new(config).unwrap();
+
+        // With no dropout, all modalities should be kept
+        let modalities = vec![Modality::Text, Modality::Image];
+        let kept = dropout.apply_dropout(&modalities);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn test_cross_modal_mask_builder() {
+        let builder = CrossModalMaskBuilder::new(true);
+
+        let token_types = vec![
+            ModalityTokenType::Text,
+            ModalityTokenType::Text,
+            ModalityTokenType::Image,
+            ModalityTokenType::Padding,
+        ];
+
+        let mask = builder.build_mask(&token_types);
+        assert_eq!(mask.shape(), &[4, 4]);
+
+        // Padding should be masked in all key positions
+        for i in 0..4 {
+            assert_eq!(mask[[i, 3]], 0.0); // Padding column should be 0
+        }
+
+        // Non-padding should be attendable
+        assert_eq!(mask[[0, 0]], 1.0);
+        assert_eq!(mask[[0, 2]], 1.0); // Cross-modal attention enabled
+    }
+
+    #[test]
+    fn test_cross_modal_mask_builder_no_cross_attention() {
+        let builder = CrossModalMaskBuilder::new(false);
+
+        let token_types = vec![
+            ModalityTokenType::Text,
+            ModalityTokenType::Text,
+            ModalityTokenType::Image,
+        ];
+
+        let mask = builder.build_mask(&token_types);
+
+        // Text can attend to text
+        assert_eq!(mask[[0, 0]], 1.0);
+        assert_eq!(mask[[0, 1]], 1.0);
+        // Text cannot attend to image (cross-attention disabled)
+        assert_eq!(mask[[0, 2]], 0.0);
+        // Image can attend to image
+        assert_eq!(mask[[2, 2]], 1.0);
+    }
+
+    #[test]
+    fn test_causal_mask() {
+        let builder = CrossModalMaskBuilder::default();
+        let token_types = vec![
+            ModalityTokenType::Text,
+            ModalityTokenType::Text,
+            ModalityTokenType::Image,
+        ];
+
+        let mask = builder.build_causal_mask(&token_types);
+
+        // Causal: can only attend to past and current
+        assert_eq!(mask[[0, 0]], 1.0); // Can attend to self
+        assert_eq!(mask[[0, 1]], 0.0); // Cannot attend to future
+        assert_eq!(mask[[1, 0]], 1.0); // Can attend to past
+        assert_eq!(mask[[1, 1]], 1.0); // Can attend to self
+        assert_eq!(mask[[1, 2]], 0.0); // Cannot attend to future
     }
 }

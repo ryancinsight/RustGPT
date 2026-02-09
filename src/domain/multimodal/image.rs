@@ -2,6 +2,16 @@
 //!
 //! Implements Vision Transformer (ViT)-style patch embedding and encoding
 //! for image understanding capabilities.
+//!
+//! # Data Augmentation
+//!
+//! The module provides comprehensive data augmentation for training:
+//! - Random horizontal/vertical flip
+//! - Random crop and resize
+//! - Color jitter (brightness, contrast, saturation, hue)
+//! - Random rotation
+//! - Gaussian noise injection
+//! - Cutout/Random erasing
 
 use ndarray::{Array1, Array2, Array3, Axis};
 use rand_distr::{Distribution, Normal};

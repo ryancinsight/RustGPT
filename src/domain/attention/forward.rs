@@ -339,14 +339,13 @@ pub fn compute_poly_attention_forward_into(
                     let k_slice_t = k_slice.t();
                     let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
                     
-                    if h_idx == 0 {
-                         println!("Batch Step {}:", i);
+                    if h_idx == 0 && i == n - 1 {
+                         println!("Batch Last Step ({}):", i);
                          println!("  Q: {:?}", q_row_i);
-                         if i == n - 1 {
-                             let k_last = k_slice.row(k_slice.nrows()-1);
-                             println!("  K_last: {:?}", k_last);
-                             println!("  Score Raw Last: {}", scores_row[scores_row.len()-1]);
-                         }
+                         let k_last = k_slice.row(k_slice.nrows()-1);
+                         println!("  K_last (Input): {:?}", k_last);
+                         println!("  Score Raw Last (Input): {}", scores_row[scores_row.len()-1]);
+                         println!("  Eff Gating: {}", eff_i);
                     }
 
                     with_tls_qpe(max_pos + 1, |q_pe| {
