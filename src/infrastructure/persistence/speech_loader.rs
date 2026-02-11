@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::common::errors::{ModelError, Result};
 use crate::domain::multimodal::audio::AudioSample;
 use crate::infrastructure::persistence::dataset::SpeechExample;
+use crate::infrastructure::persistence::loader::DatasetLoader;
 
 /// Command categories in the mini speech commands dataset
 pub const SPEECH_COMMANDS: &[&str] = &[
@@ -37,13 +38,36 @@ impl Default for SpeechConfig {
     }
 }
 
+/// Speech dataset loader
+pub struct SpeechLoader {
+    config: SpeechConfig,
+    max_samples_per_class: Option<usize>,
+}
+
+impl SpeechLoader {
+    pub fn new(config: SpeechConfig, max_samples_per_class: Option<usize>) -> Self {
+        Self {
+            config,
+            max_samples_per_class,
+        }
+    }
+}
+
+impl DatasetLoader for SpeechLoader {
+    type Item = Vec<SpeechExample>;
+
+    fn load<P: AsRef<Path>>(&self, source: P) -> Result<Self::Item> {
+        load_speech_commands(source, &self.config, self.max_samples_per_class)
+    }
+}
+
 /// Load speech commands dataset from directory
-pub fn load_speech_commands(
-    data_dir: &str,
+pub fn load_speech_commands<P: AsRef<Path>>(
+    data_dir: P,
     config: &SpeechConfig,
     max_samples_per_class: Option<usize>,
 ) -> Result<Vec<SpeechExample>> {
-    let base_path = Path::new(data_dir).join("mini_speech_commands");
+    let base_path = data_dir.as_ref().join("mini_speech_commands");
     
     if !base_path.exists() {
         return Err(ModelError::InvalidInput {

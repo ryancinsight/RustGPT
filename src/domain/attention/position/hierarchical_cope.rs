@@ -1,29 +1,34 @@
-use ndarray::{Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
+use super::traits::PositionEmbedding;
+
+/// Gradients container for HierarchicalCoPE
+#[derive(Clone, Debug)]
+pub struct HierarchicalCoPEGradients {
+    pub local_cope_grads: Option<Array2<f32>>,
+    pub global_cope_grads: Option<Array2<f32>>,
+    pub chunk_predictor_w_grads: Option<Array2<f32>>,
+    pub chunk_predictor_b_grads: Option<Array2<f32>>,
+}
+
+impl HierarchicalCoPEGradients {
+    pub fn new(chunk_size: usize, max_chunks: usize, embed_dim: usize) -> Self {
+        Self {
+            local_cope_grads: Some(Array2::zeros((chunk_size, embed_dim))),
+            global_cope_grads: Some(Array2::zeros((max_chunks, embed_dim))),
+            chunk_predictor_w_grads: Some(Array2::zeros((embed_dim, 2))),
+            chunk_predictor_b_grads: Some(Array2::zeros((1, 2))),
+        }
+    }
+}
 
 /// Hierarchical Contextual Position Embeddings (HierarchicalCoPE)
 ///
 /// Extends CoPE with multiple levels of positional granularity for better
 /// generalization to longer sequences.
-///
-/// Structure:
-/// - Local CoPE: Fine-grained positions (within-chunk), positions 0 to chunk_size-1
-/// - Global CoPE: Chunk-level positions for document/sentence structure
-/// - Chunk boundaries learned via content-aware clustering
-///
-/// Mathematical Formulation:
-/// ```
-/// pos_ij = chunk_idx * chunk_size + local_pos
-/// CoPE_total = α_local * CoPE_local(local_pos) + α_global * CoPE_global(chunk_idx)
-/// ```
-///
-/// Benefits:
-/// - Better generalization to sequences longer than max_pos
-/// - Learns natural chunking boundaries from data
-/// - Reduced parameters for equivalent range
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HierarchicalCoPE {
     /// Chunk size for local positions
@@ -47,6 +52,197 @@ pub struct HierarchicalCoPE {
     opt_chunk_predictor_b: Adam,
     /// Embedding dimension
     embed_dim: usize,
+}
+
+impl PositionEmbedding for HierarchicalCoPE {
+    type Gradients = HierarchicalCoPEGradients;
+
+    fn contribution(
+        &self,
+        q: &ArrayView1<f32>,
+        k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+    ) -> f32 {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos >= self.effective_max_pos() {
+            return 0.0;
+        }
+
+        // Determine chunk index and local position
+        let chunk_idx = (pos / self.chunk_size).min(self.max_chunks - 1);
+        let local_pos = pos % self.chunk_size;
+
+        // Content similarity for boundary detection
+        let content_sim = q.dot(k);
+
+        // Predict chunk boundary adjustment
+        let boundary_logit = q.dot(&self.chunk_predictor_w.column(0))
+            + content_sim * self.chunk_predictor_w[[0, 1]]
+            + self.chunk_predictor_b[[0, 0]];
+        let boundary_gate = self.sigmoid(boundary_logit);
+
+        // Local contribution: q · PE_local
+        let local_contrib = q.dot(&self.local_cope.row(local_pos));
+
+        // Global contribution: q · PE_global
+        let global_contrib = q.dot(&self.global_cope.row(chunk_idx));
+
+        // Blend with boundary-aware mixing
+        let mixed = self.alpha_local * local_contrib + self.alpha_global * global_contrib;
+
+        // Apply boundary adjustment (smooth transition near chunk boundaries)
+        mixed * (1.0 + boundary_gate * 0.1)
+    }
+
+    fn backward(
+        &self,
+        q: &ArrayView1<f32>,
+        k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+        d_s_ij: f32,
+        grads: &mut Self::Gradients,
+    ) -> (Array1<f32>, Array1<f32>) {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos >= self.effective_max_pos() {
+            return (Array1::zeros(q.dim()), Array1::zeros(k.dim()));
+        }
+
+        let chunk_idx = (pos / self.chunk_size).min(self.max_chunks - 1);
+        let local_pos = pos % self.chunk_size;
+        let content_sim = q.dot(k);
+
+        // Recompute forward values
+        let boundary_logit = q.dot(&self.chunk_predictor_w.column(0))
+            + content_sim * self.chunk_predictor_w[[0, 1]]
+            + self.chunk_predictor_b[[0, 0]];
+        let boundary_gate = self.sigmoid(boundary_logit);
+
+        let local_row = self.local_cope.row(local_pos);
+        let global_row = self.global_cope.row(chunk_idx);
+        
+        let local_contrib = q.dot(&local_row);
+        let global_contrib = q.dot(&global_row);
+        let mixed = self.alpha_local * local_contrib + self.alpha_global * global_contrib;
+
+        // Gradients
+        // Output = mixed * (1 + 0.1 * gate)
+        // dL/dOutput = d_s_ij
+        
+        let d_output = d_s_ij;
+        
+        // dOutput/dMixed = 1 + 0.1 * gate
+        let d_mixed = d_output * (1.0 + 0.1 * boundary_gate);
+        
+        // dOutput/dGate = mixed * 0.1
+        let d_gate = d_output * mixed * 0.1;
+        
+        // dGate/dLogit = gate * (1 - gate)
+        let d_logit = d_gate * boundary_gate * (1.0 - boundary_gate);
+
+        // dMixed/dLocalContrib = alpha_local
+        let d_local_contrib = d_mixed * self.alpha_local;
+        
+        // dMixed/dGlobalContrib = alpha_global
+        let d_global_contrib = d_mixed * self.alpha_global;
+
+        // Accumulate gradients for embeddings
+        // dLocalContrib/dLocalRow = q
+        if let Some(lg) = &mut grads.local_cope_grads {
+            let mut row = lg.row_mut(local_pos);
+            // row += q * d_local_contrib
+             for (r, &q_val) in row.iter_mut().zip(q.iter()) {
+                *r += q_val * d_local_contrib;
+            }
+        }
+
+        if let Some(gg) = &mut grads.global_cope_grads {
+            let mut row = gg.row_mut(chunk_idx);
+            for (r, &q_val) in row.iter_mut().zip(q.iter()) {
+                *r += q_val * d_global_contrib;
+            }
+        }
+
+        // Gradients for predictor
+        // Logit = q . w_col0 + sim * w_col1 + b
+        
+        // dLogit/dw_col0 = q
+        if let Some(wg) = &mut grads.chunk_predictor_w_grads {
+            let mut col0 = wg.column_mut(0);
+            for (w, &q_val) in col0.iter_mut().zip(q.iter()) {
+                *w += q_val * d_logit;
+            }
+            
+            // dLogit/dw_col1 = sim
+            wg[[0, 1]] += content_sim * d_logit;
+        }
+
+        // dLogit/db = 1
+        if let Some(bg) = &mut grads.chunk_predictor_b_grads {
+            bg[[0, 0]] += d_logit;
+        }
+
+        // Gradients w.r.t q and k
+        // dMixed/dq = alpha_local * local_row + alpha_global * global_row
+        let d_mixed_dq = &local_row * self.alpha_local + &global_row * self.alpha_global;
+        
+        // dLogit/dq = w_col0 + w_col1 * dSim/dq
+        // dSim/dq = k
+        // dLogit/dq = w_col0 + w_col1 * k
+        let w_col0 = self.chunk_predictor_w.column(0);
+        let w_col1 = self.chunk_predictor_w[[0, 1]];
+        let d_logit_dq = &w_col0 + &(&k.to_owned() * w_col1);
+        
+        let dq = &d_mixed_dq * d_mixed + &d_logit_dq * d_logit;
+
+        // dSim/dk = q
+        // dLogit/dk = w_col1 * dSim/dk = w_col1 * q
+        let dk = &q.to_owned() * (w_col1 * d_logit);
+
+        (dq, dk)
+    }
+
+    fn init_gradients(&self) -> Self::Gradients {
+        HierarchicalCoPEGradients::new(self.chunk_size, self.max_chunks, self.embed_dim)
+    }
+
+    fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
+        if let Some(lg) = &grads.local_cope_grads {
+            self.opt_local_cope.step(&mut self.local_cope, lg, lr);
+        }
+        if let Some(gg) = &grads.global_cope_grads {
+            self.opt_global_cope.step(&mut self.global_cope, gg, lr);
+        }
+        if let Some(wg) = &grads.chunk_predictor_w_grads {
+            self.opt_chunk_predictor_w.step(&mut self.chunk_predictor_w, wg, lr);
+        }
+        if let Some(bg) = &grads.chunk_predictor_b_grads {
+            self.opt_chunk_predictor_b.step(&mut self.chunk_predictor_b, bg, lr);
+        }
+    }
+
+    fn max_pos(&self) -> usize {
+        self.effective_max_pos()
+    }
+
+    fn embed_dim(&self) -> usize {
+        self.embed_dim
+    }
+
+    fn parameters(&self) -> usize {
+        self.local_cope.len() + self.global_cope.len() + self.chunk_predictor_w.len() + self.chunk_predictor_b.len()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let local_norm: f32 = self.local_cope.iter().map(|x| x * x).sum();
+        let global_norm: f32 = self.global_cope.iter().map(|x| x * x).sum();
+        let w_norm: f32 = self.chunk_predictor_w.iter().map(|x| x * x).sum();
+        let b_norm: f32 = self.chunk_predictor_b.iter().map(|x| x * x).sum();
+        (local_norm + global_norm + w_norm + b_norm).sqrt()
+    }
 }
 
 impl HierarchicalCoPE {
@@ -89,82 +285,11 @@ impl HierarchicalCoPE {
         }
     }
 
-    /// Compute hierarchical CoPE contribution
-    ///
-    /// # Arguments
-    /// * `q` - Query vector (embed_dim,)
-    /// * `pos` - Relative position (0-indexed)
-    /// * `content_sim` - Content similarity for chunk boundary detection
-    ///
-    /// # Returns
-    /// Hierarchical CoPE contribution with learned chunking
-    #[inline]
-    pub fn hierarchical_cope_contribution(
-        &self,
-        q: &ArrayView1<'_, f32>,
-        pos: usize,
-        content_sim: f32,
-    ) -> f32 {
-        // Determine chunk index and local position
-        let chunk_idx = (pos / self.chunk_size).min(self.max_chunks - 1);
-        let local_pos = pos % self.chunk_size;
-
-        // Predict chunk boundary adjustment
-        let boundary_logit = q.dot(&self.chunk_predictor_w.column(0))
-            + content_sim * self.chunk_predictor_w[[0, 1]]
-            + self.chunk_predictor_b[[0, 0]];
-        let boundary_gate = self.sigmoid(boundary_logit);
-
-        // Local contribution: q · PE_local
-        let local_contrib = q.dot(&self.local_cope.row(local_pos));
-
-        // Global contribution: q · PE_global
-        let global_contrib = q.dot(&self.global_cope.row(chunk_idx));
-
-        // Blend with boundary-aware mixing
-        let mixed = self.alpha_local * local_contrib + self.alpha_global * global_contrib;
-
-        // Apply boundary adjustment (smooth transition near chunk boundaries)
-        mixed * (1.0 + boundary_gate * 0.1)
-    }
-
-    /// Compute local and global components separately for gradient flow
-    #[inline]
-    pub fn hierarchical_components(&self, q: &ArrayView1<'_, f32>, pos: usize) -> (f32, f32) {
-        let chunk_idx = (pos / self.chunk_size).min(self.max_chunks - 1);
-        let local_pos = pos % self.chunk_size;
-
-        let local_contrib = q.dot(&self.local_cope.row(local_pos));
-        let global_contrib = q.dot(&self.global_cope.row(chunk_idx));
-
-        (local_contrib, global_contrib)
-    }
-
     /// Sigmoid with numerical stability
     #[inline]
     fn sigmoid(&self, x: f32) -> f32 {
         let x = x.clamp(-500.0, 500.0);
         1.0 / (1.0 + (-x).exp())
-    }
-
-    /// Apply gradients
-    pub fn apply_gradients(
-        &mut self,
-        grads: &(
-            Array2<f32>, // local_cope gradient
-            Array2<f32>, // global_cope gradient
-            Array2<f32>, // chunk_predictor_w gradient
-            Array2<f32>, // chunk_predictor_b gradient
-        ),
-        lr: f32,
-    ) {
-        self.opt_local_cope.step(&mut self.local_cope, &grads.0, lr);
-        self.opt_global_cope
-            .step(&mut self.global_cope, &grads.1, lr);
-        self.opt_chunk_predictor_w
-            .step(&mut self.chunk_predictor_w, &grads.2, lr);
-        self.opt_chunk_predictor_b
-            .step(&mut self.chunk_predictor_b, &grads.3, lr);
     }
 
     /// Get total parameter count
@@ -227,12 +352,23 @@ mod tests {
     fn test_hierarchical_cope_contribution() {
         let hcope = HierarchicalCoPE::new(64, 16, 32);
         let q = Array1::from_elem(32, 0.5);
+        let k = Array1::from_elem(32, 0.3); // Need k for content_sim
 
         // Test various positions
-        let contrib0 = hcope.hierarchical_cope_contribution(&q.view(), 0, 0.0);
-        let contrib63 = hcope.hierarchical_cope_contribution(&q.view(), 63, 0.0);
-        let contrib64 = hcope.hierarchical_cope_contribution(&q.view(), 64, 0.0);
-        let contrib1000 = hcope.hierarchical_cope_contribution(&q.view(), 1000, 0.5);
+        // contribution(q, k, query_pos, key_pos, inputs)
+        // pos = query_pos - key_pos
+        
+        // pos = 0
+        let contrib0 = hcope.contribution(&q.view(), &k.view(), 0, 0, None);
+        
+        // pos = 63 (local boundary)
+        let contrib63 = hcope.contribution(&q.view(), &k.view(), 63, 0, None);
+        
+        // pos = 64 (new chunk)
+        let contrib64 = hcope.contribution(&q.view(), &k.view(), 64, 0, None);
+        
+        // pos = 1000
+        let contrib1000 = hcope.contribution(&q.view(), &k.view(), 1000, 0, None);
 
         assert!(contrib0.is_finite());
         assert!(contrib63.is_finite());

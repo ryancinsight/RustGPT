@@ -1,0 +1,53 @@
+{
+  "id": "conv-1770845025788-lqpgqevgo",
+  "created_at": "2026-02-11T21:23:58.354294700Z",
+  "last_activity": "2026-02-11T21:24:22.942974900Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-11T21:23:58.354298400Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Hello ! Assistant : Hello ! How can I help you . clone ( ) and handle the compiler can I clone ( ) </s>",
+      "timestamp": "2026-02-11T21:23:58.413213900Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-11T21:24:12.112986900Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-11T21:24:12.112992500Z"
+    },
+    {
+      "role": "assistant",
+      "content": "The ? </s>",
+      "timestamp": "2026-02-11T21:24:12.126312900Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-11T21:24:22.903497400Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-11T21:24:22.903500800Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me a joke",
+      "timestamp": "2026-02-11T21:24:22.903509Z"
+    },
+    {
+      "role": "assistant",
+      "content": "The great wall of text to protect ancient china </s>",
+      "timestamp": "2026-02-11T21:24:22.942973400Z"
+    }
+  ],
+  "model_name": "rustgpt"
+}

@@ -1,8 +1,29 @@
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
+use super::traits::PositionEmbedding;
+
+/// Gradients for OptimizedCoPE
+#[derive(Clone, Debug)]
+pub struct OptimizedCoPEGradients {
+    pub up_proj_grads: Option<Array2<f32>>,
+    pub down_proj_grads: Option<Array2<f32>>,
+    pub w_gate_grads: Option<Array2<f32>>,
+    pub b_gate_grads: Option<Array2<f32>>,
+}
+
+impl OptimizedCoPEGradients {
+    pub fn new(max_pos: usize, embed_dim: usize, rank: usize) -> Self {
+        Self {
+            up_proj_grads: Some(Array2::zeros((max_pos + 1, rank))),
+            down_proj_grads: Some(Array2::zeros((rank, embed_dim))),
+            w_gate_grads: Some(Array2::zeros((2 * embed_dim, 1))),
+            b_gate_grads: Some(Array2::zeros((1, 1))),
+        }
+    }
+}
 
 /// Optimized Contextual Position Embeddings (OptimizedCoPE)
 ///
@@ -48,6 +69,175 @@ pub struct OptimizedCoPE {
     embed_dim: usize,
     /// Temperature for gate scaling
     temperature: f32,
+}
+
+impl PositionEmbedding for OptimizedCoPE {
+    type Gradients = OptimizedCoPEGradients;
+
+    fn contribution(
+        &self,
+        q: &ArrayView1<f32>,
+        k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+    ) -> f32 {
+        let pos = query_pos.saturating_sub(key_pos);
+        self.optimized_cope_contribution(q, k, pos)
+    }
+
+    fn init_gradients(&self) -> Self::Gradients {
+        OptimizedCoPEGradients::new(self.max_pos, self.embed_dim, self.rank)
+    }
+
+    fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
+        if let Some(grad) = &grads.up_proj_grads {
+            self.opt_up_proj.step(&mut self.up_proj, grad, lr);
+        }
+        if let Some(grad) = &grads.down_proj_grads {
+            self.opt_down_proj.step(&mut self.down_proj, grad, lr);
+        }
+        if let Some(grad) = &grads.w_gate_grads {
+            self.opt_w_gate.step(&mut self.w_gate, grad, lr);
+        }
+        if let Some(grad) = &grads.b_gate_grads {
+            self.opt_b_gate.step(&mut self.b_gate, grad, lr);
+        }
+    }
+
+    fn max_pos(&self) -> usize {
+        self.max_pos
+    }
+
+    fn embed_dim(&self) -> usize {
+        self.embed_dim
+    }
+
+    fn parameters(&self) -> usize {
+        self.up_proj.len() + self.down_proj.len() + self.w_gate.len() + self.b_gate.len()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let up_norm: f32 = self.up_proj.iter().map(|x| x * x).sum();
+        let down_norm: f32 = self.down_proj.iter().map(|x| x * x).sum();
+        let w_gate_norm: f32 = self.w_gate.iter().map(|x| x * x).sum();
+        let b_gate_norm: f32 = self.b_gate.iter().map(|x| x * x).sum();
+        (up_norm + down_norm + w_gate_norm + b_gate_norm).sqrt()
+    }
+
+    fn backward(
+        &self,
+        q: &ArrayView1<f32>,
+        k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+        d_s_ij: f32,
+        grads: &mut Self::Gradients,
+    ) -> (Array1<f32>, Array1<f32>) {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos > self.max_pos {
+            return (Array1::zeros(q.dim()), Array1::zeros(k.dim()));
+        }
+
+        // --- Recompute Forward Pass ---
+        
+        // 1. vq = Down @ q
+        let mut vq = Array1::zeros(self.rank);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj, q, 0.0, &mut vq);
+
+        // 2. cope_raw = Up[pos] . vq
+        let up_row = self.up_proj.row(pos);
+        let cope_raw = up_row.dot(&vq);
+
+        // 3. Gate
+        let mut gate_input = Array1::zeros(self.embed_dim * 2);
+        gate_input.slice_mut(s![0..self.embed_dim]).assign(q);
+        gate_input.slice_mut(s![self.embed_dim..]).assign(k);
+        
+        let gate_logit = gate_input.dot(&self.w_gate.column(0)) + self.b_gate[[0, 0]];
+        let gate_scaled = gate_logit / self.temperature;
+        let gate = self.smooth_gate(gate_scaled);
+
+        // 4. Interaction
+        let interaction = gate * cope_raw;
+        let interaction_scaled = interaction / self.temperature;
+
+        // --- Backward Pass ---
+
+        // dOutput/dInteraction
+        // y = T * log(1 + exp(x/T))
+        // dy/dx = sigmoid(x/T)
+        // d_interaction = d_s_ij * sigmoid(interaction/T)
+        let sigmoid_int = self.smooth_gate(interaction_scaled);
+        let d_interaction = d_s_ij * sigmoid_int;
+
+        // dInteraction/dGate = cope_raw
+        let d_gate = d_interaction * cope_raw;
+
+        // dInteraction/dCopeRaw = gate
+        let d_cope_raw = d_interaction * gate;
+
+        // dGate/dLogit
+        // gate = sigmoid(logit/T)
+        // dGate/dLogit = gate * (1-gate) / T
+        let d_logit = d_gate * gate * (1.0 - gate) / self.temperature;
+
+        // Gradients for Gate Parameters
+        if let Some(wg) = &mut grads.w_gate_grads {
+            let mut col = wg.column_mut(0);
+            // dLogit/dW = gate_input
+            for (w, &val) in col.iter_mut().zip(gate_input.iter()) {
+                *w += val * d_logit;
+            }
+        }
+        if let Some(bg) = &mut grads.b_gate_grads {
+            bg[[0, 0]] += d_logit;
+        }
+
+        // dLogit/dGateInput = W_gate
+        let w_gate_col = self.w_gate.column(0);
+        let d_gate_input = &w_gate_col * d_logit;
+        
+        let d_q_gate = d_gate_input.slice(s![0..self.embed_dim]);
+        let d_k_gate = d_gate_input.slice(s![self.embed_dim..]);
+
+        // Gradients for Factorized Embeddings
+        
+        // dCopeRaw/dUp[pos] = vq
+        if let Some(ug) = &mut grads.up_proj_grads {
+            let mut row = ug.row_mut(pos);
+            for (u, &v) in row.iter_mut().zip(vq.iter()) {
+                *u += v * d_cope_raw;
+            }
+        }
+
+        // dCopeRaw/dVq = Up[pos]
+        let d_vq = &up_row * d_cope_raw;
+
+        // dVq/dDown = q
+        // dVq_i = sum_j Down_ij * q_j
+        // dVq_i / dDown_ij = q_j
+        if let Some(dg) = &mut grads.down_proj_grads {
+            // outer product d_vq * q
+            for (i, &dv) in d_vq.iter().enumerate() {
+                let mut row = dg.row_mut(i);
+                for (d, &q_val) in row.iter_mut().zip(q.iter()) {
+                    *d += dv * q_val;
+                }
+            }
+        }
+
+        // dVq/dq = Down^T * d_vq
+        let mut d_q_content = Array1::zeros(self.embed_dim);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj.t(), &d_vq, 0.0, &mut d_q_content);
+
+        // Total Gradients
+        let d_q = &d_q_content + &d_q_gate;
+        let d_k = d_k_gate.to_owned();
+
+        (d_q, d_k)
+    }
 }
 
 impl OptimizedCoPE {
@@ -222,43 +412,9 @@ impl OptimizedCoPE {
         self.rank
     }
 
-    /// Apply gradients
-    ///
-    /// # Arguments
-    /// * `grads` - Tuple of (up_grad, down_grad, w_gate_grad, b_gate_grad)
-    pub fn apply_gradients(
-        &mut self,
-        grads: &(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>),
-        lr: f32,
-    ) {
-        self.opt_up_proj.step(&mut self.up_proj, &grads.0, lr);
-        self.opt_down_proj.step(&mut self.down_proj, &grads.1, lr);
-        self.opt_w_gate.step(&mut self.w_gate, &grads.2, lr);
-        self.opt_b_gate.step(&mut self.b_gate, &grads.3, lr);
-    }
-
     /// Get total parameter count
     pub fn parameters(&self) -> usize {
         self.up_proj.len() + self.down_proj.len() + self.w_gate.len() + self.b_gate.len()
-    }
-
-    /// Get weight norm (L2)
-    pub fn weight_norm(&self) -> f32 {
-        let up_norm: f32 = self.up_proj.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        let down_norm: f32 = self.down_proj.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        let gate_norm: f32 = self.w_gate.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        let bias_norm: f32 = self.b_gate.iter().map(|&w| w * w).sum::<f32>().sqrt();
-        (up_norm.powi(2) + down_norm.powi(2) + gate_norm.powi(2) + bias_norm.powi(2)).sqrt()
-    }
-
-    /// Maximum position supported
-    pub fn max_pos(&self) -> usize {
-        self.max_pos
-    }
-
-    /// Embedding dimension
-    pub fn embed_dim(&self) -> usize {
-        self.embed_dim
     }
 }
 

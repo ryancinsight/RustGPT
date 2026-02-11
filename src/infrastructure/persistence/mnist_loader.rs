@@ -12,15 +12,44 @@ use flate2::read::GzDecoder;
 use crate::common::errors::{ModelError, Result};
 use crate::domain::multimodal::image::ImageSample;
 use crate::infrastructure::persistence::dataset::ImageExample;
+use crate::infrastructure::persistence::loader::DatasetLoader;
 
 /// MNIST image dimensions
 pub const MNIST_IMAGE_SIZE: usize = 28;
 pub const MNIST_NUM_CLASSES: usize = 10;
 
+/// MNIST dataset type (train or test)
+pub enum MnistDatasetType {
+    Train,
+    Test,
+}
+
+/// MNIST dataset loader
+pub struct MnistLoader {
+    pub dataset_type: MnistDatasetType,
+}
+
+impl MnistLoader {
+    pub fn new(dataset_type: MnistDatasetType) -> Self {
+        Self { dataset_type }
+    }
+}
+
+impl DatasetLoader for MnistLoader {
+    type Item = (Vec<ImageSample>, Vec<u8>);
+
+    fn load<P: AsRef<Path>>(&self, source: P) -> Result<Self::Item> {
+        match self.dataset_type {
+            MnistDatasetType::Train => load_mnist_train(source),
+            MnistDatasetType::Test => load_mnist_test(source),
+        }
+    }
+}
+
 /// Load MNIST training images and labels
-pub fn load_mnist_train(data_dir: &str) -> Result<(Vec<ImageSample>, Vec<u8>)> {
-    let images_path = Path::new(data_dir).join("train-images.gz");
-    let labels_path = Path::new(data_dir).join("train-labels.gz");
+pub fn load_mnist_train<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>, Vec<u8>)> {
+    let images_path = data_dir.as_ref().join("train-images.gz");
+    let labels_path = data_dir.as_ref().join("train-labels.gz");
     
     let images = load_mnist_images(&images_path)?;
     let labels = load_mnist_labels(&labels_path)?;
@@ -39,9 +68,9 @@ pub fn load_mnist_train(data_dir: &str) -> Result<(Vec<ImageSample>, Vec<u8>)> {
 }
 
 /// Load MNIST test images and labels
-pub fn load_mnist_test(data_dir: &str) -> Result<(Vec<ImageSample>, Vec<u8>)> {
-    let images_path = Path::new(data_dir).join("t10k-images.gz");
-    let labels_path = Path::new(data_dir).join("t10k-labels.gz");
+pub fn load_mnist_test<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>, Vec<u8>)> {
+    let images_path = data_dir.as_ref().join("t10k-images.gz");
+    let labels_path = data_dir.as_ref().join("t10k-labels.gz");
     
     let images = load_mnist_images(&images_path)?;
     let labels = load_mnist_labels(&labels_path)?;

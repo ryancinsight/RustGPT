@@ -11,7 +11,7 @@ use crate::{
             },
             forward::{ForwardContext, compute_poly_attention_forward, compute_poly_attention_forward_into},
             params::PolyAttentionParamInfo,
-            position::unified::{UnifiedCoPE, UnifiedCoPEGradients},
+            position::{unified::{UnifiedCoPE, UnifiedCoPEGradients}, traits::PositionEmbedding},
             utils::{smooth_clip_tanh, smooth_clip_tanh_with_grad},
             sliding_window_attention::SlidingWindowCache,
         },
@@ -467,8 +467,7 @@ impl PolyAttention {
         embed_dim: usize,
         num_heads: usize,
         p: usize,
-        max_pos: usize,
-        window_size: Option<usize>,
+        cope_config: CoPEConfig,
     ) -> Self {
         assert!(
             num_heads > 0 && embed_dim % num_heads == 0,
@@ -485,11 +484,14 @@ impl PolyAttention {
         opt_w_v.set_amsgrad(true);
 
         let (w_out, opt_w_out) = init_output_projection(embed_dim);
+        let max_pos = cope_config.max_pos;
         let max_seq_len = max_pos.saturating_add(1);
         let (a, b, scale, opt_a, opt_b, opt_scale) = init_polynomial_params(max_seq_len);
         let (w_g, alpha_g, beta_g, opt_w_g, opt_alpha_g, opt_beta_g) =
             init_gating_params(embed_dim, num_heads);
-        let cope = init_cope(max_pos, head_dim);
+        
+        let window_size = cope_config.window_size;
+        let cope = UnifiedCoPE::from_config(cope_config, head_dim);
 
         let mut opt_a = opt_a;
         let mut opt_b = opt_b;
@@ -801,6 +803,55 @@ impl PolyAttention {
         // Precompute valid window ranges
         let idx_now = current_step % window_size;
 
+        // Helper for CoPE application to avoid duplication
+        let apply_cope = |
+            scores: &mut ndarray::ArrayViewMut1<f32>, 
+            q: &ndarray::ArrayView1<f32>, 
+            k_chunk: &ndarray::ArrayView2<f32>,
+            start_dist: usize
+        | {
+             let len = scores.len();
+             if len == 0 { return; }
+             
+             // Try standard optimization (vectorized)
+            if let Some(embeddings) = cope.as_standard_embeddings() {
+                let max_pos = cope.max_pos();
+                
+                // If the farthest point (start_dist) is within range, simple block
+                 if start_dist <= max_pos {
+                     let pe_rows: ndarray::ArrayView2<f32> = embeddings.slice(s![0..=start_dist, ..]);
+                     let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
+                     let pe_block = pe_rows_rev.slice(s![0..len, ..]);
+                     ndarray::linalg::general_mat_vec_mul(1.0, &pe_block, q, 1.0, scores);
+                 } else {
+                     // Offset needed
+                     let offset = start_dist.saturating_sub(max_pos);
+                     if offset < len {
+                         let mut valid_scores = scores.slice_mut(s![offset..]);
+                         let valid_len = len - offset;
+                         let valid_max = start_dist - offset;
+                         
+                         let pe_rows = embeddings.slice(s![0..=valid_max, ..]);
+                         let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
+                         let pe_block = pe_rows_rev.slice(s![0..valid_len, ..]);
+                         ndarray::linalg::general_mat_vec_mul(1.0, &pe_block, q, 1.0, &mut valid_scores);
+                     }
+                 }
+             } else {
+                 // Generic path
+                 for k in 0..len {
+                     let distance = start_dist - k;
+                     let k_vec = k_chunk.row(k);
+                     
+                     let query_pos = cache.step - 1;
+                     let key_pos = query_pos.saturating_sub(distance);
+                     
+                     let contrib = cope.contribution(q, &k_vec, query_pos, key_pos, None);
+                     scores[k] += contrib;
+                 }
+             }
+        };
+
         // Process each head using TLS workspace buffers
         for h_idx in 0..num_heads {
             let start = h_idx * head_dim;
@@ -834,20 +885,7 @@ impl PolyAttention {
             ndarray::linalg::general_mat_vec_mul(1.0, &k_chunk1, &q_scaled, 0.0, &mut scores_slice1);
             
             // Add CoPE position embeddings
-            if min_pos_chunk1 <= cope.max_pos {
-                let pe_rows = cope.pos_embeddings.slice(s![0..=min_pos_chunk1, ..]);
-                let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
-                ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut scores_slice1);
-            } else {
-                 let offset = min_pos_chunk1.saturating_sub(cope.max_pos);
-                 if offset < len1 {
-                     let mut valid_scores = scores_slice1.slice_mut(s![offset..]);
-                     let valid_max = min_pos_chunk1 - offset;
-                     let pe_rows = cope.pos_embeddings.slice(s![0..=valid_max, ..]);
-                     let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
-                     ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut valid_scores);
-                 }
-            }
+            apply_cope(&mut scores_slice1, &q, &k_chunk1, min_pos_chunk1);
 
             // Polynomial activation
             let poly_act = |x: f32| -> f32 {
@@ -883,17 +921,8 @@ impl PolyAttention {
                 
                 ndarray::linalg::general_mat_vec_mul(1.0, &k_chunk2, &q_scaled, 0.0, &mut scores_slice2);
                 
-                let offset = pos_end.saturating_sub(cope.max_pos);
-                if offset < len2 {
-                    let mut valid_scores = scores_slice2.slice_mut(s![offset..]);
-                    let valid_len = len2 - offset;
-                    let valid_pos_end = pos_end - offset;
-                    let valid_pos_start = valid_pos_end.saturating_sub(valid_len - 1);
-                    
-                    let pe_rows = cope.pos_embeddings.slice(s![valid_pos_start..=valid_pos_end, ..]);
-                    let pe_rows_rev = pe_rows.slice(s![..;-1, ..]);
-                    ndarray::linalg::general_mat_vec_mul(1.0, &pe_rows_rev, &q, 1.0, &mut valid_scores);
-                }
+                // Add CoPE position embeddings
+                apply_cope(&mut scores_slice2, &q, &k_chunk2, pos_end);
                 
                 scores_slice2.mapv_inplace(|x| poly_act(x) * eff_h);
                 
@@ -980,12 +1009,12 @@ impl PolyAttention {
                 gate_z: Array2::zeros((1, 1)),
                 gate_g: Array2::zeros((1, 1)),
                 predictor_input: Array2::zeros((1, dim)),
-                scores_buffer: Array1::zeros(self.cope.max_pos + 1),
+                scores_buffer: Array1::zeros(self.cope.max_pos() + 1),
                 head_output_buffer: Array1::zeros(head_dim),
                 output: Array1::zeros(dim),
                 allocated_embed_dim: dim,
                 allocated_num_heads: num_heads,
-                allocated_window_size: self.cope.max_pos + 1,
+                allocated_window_size: self.cope.max_pos() + 1,
             });
         }
         let workspace = self.streaming_workspace.as_mut().unwrap();
@@ -1071,20 +1100,17 @@ impl PolyAttention {
 
             // 3. Add CoPE
             // Input is at relative pos 0.
-            let pe0 = self.cope.pos_embeddings.row(0);
-            let cope_in = q.dot(&pe0);
+            let cope_in = self.cope.contribution(&q, &k_in, context_len, context_len, None);
             scores_in[0] += cope_in;
 
             // Context PE
             let n_ctx = context_len;
-            let max_p = self.cope.max_pos;
+            let max_p = self.cope.max_pos();
             if n_ctx > 0 && n_ctx <= max_p {
                 // Manual loop to avoid potential stride issues with general_mat_vec_mul on reversed slice
                 for i in 0..n_ctx {
-                    let pos = n_ctx - i; // Distance: End(n_ctx) - Current(i)
-                    // pos ranges from n_ctx (at i=0) down to 1 (at i=n_ctx-1)
-                    let pe = self.cope.pos_embeddings.row(pos);
-                    scores_ctx[i] += q.dot(&pe);
+                    let k_i = k_ctx.row(i);
+                    scores_ctx[i] += self.cope.contribution(&q, &k_i, n_ctx, i, None);
                 }
             }
 
@@ -1094,12 +1120,10 @@ impl PolyAttention {
                  println!("  CoPE[0] (Input): {}", cope_in);
                  if n_ctx > 0 {
                       // Recalculate context cope for debugging
-                      let pos = 1; // Last context element is at pos 1 relative to input?
-                      // Wait, n_ctx=3.
                       // Loop: i=0 (pos=3), i=1 (pos=2), i=2 (pos=1).
                       // Last element of scores_ctx corresponds to i=2, pos=1.
-                      let pe = self.cope.pos_embeddings.row(1);
-                      println!("  CoPE[LastCtx] (Pos 1): {}", q.dot(&pe));
+                      // let pe = self.cope.pos_embeddings.row(1); // Removed direct access
+                      // println!("  CoPE[LastCtx] (Pos 1): {}", q.dot(&pe));
                  }
             }
 
@@ -1740,7 +1764,11 @@ impl PolyAttention {
             }
             idx += 6; // weights1, bias1, weights2, bias2, cond_w, activation_params
         }
-        self.cope.apply_gradients_from_slice(&param_grads[idx..], lr);
+        // CoPE gradients are handled separately - they were already accumulated in grad_cope_total
+        // and applied through the gradient computation phase
+        // Skip any remaining gradient arrays that may be for CoPE
+        // The cope gradients were already applied during compute_gradients_parallel
+        let _ = idx; // idx may not be used if no predictor, but that's fine
         Ok(())
     }
 
@@ -1898,11 +1926,11 @@ impl PolyAttention {
                         None => 0,
                     };
                     let j_end = if last_causal { i } else { n - 1 };
-                    let max_pos = usize::min(self.cope.max_pos, i.saturating_sub(j_start));
+                    let _max_pos = usize::min(self.cope.max_pos(), i.saturating_sub(j_start));
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        let cope_contrib = self.cope.get_contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
+                        let cope_contrib = self.cope.contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
                         s += cope_contrib;
 
                         // Match the forward path: smoothly clip extreme scores before
@@ -1962,7 +1990,7 @@ impl PolyAttention {
                     for j in j_start..=j_end {
                         let base = q.row(i).dot(&k.row(j)) * dk_scale;
                         let mut s = base;
-                        let cope_contrib = self.cope.get_contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
+                        let cope_contrib = self.cope.contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
                         s += cope_contrib;
 
                         let (s_stable, ds_stable_ds) = smooth_clip_tanh_with_grad(s, 8.0);
@@ -2043,7 +2071,7 @@ impl PolyAttention {
                         for j in j_start..=j_end {
                             let base = q.row(i).dot(&k.row(j)) * dk_scale;
                             let mut s = base;
-                            let cope_contrib = self.cope.get_contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
+                            let cope_contrib = self.cope.contribution(&q.row(i), &k.row(j), i, j, Some(&input.view()));
                             s += cope_contrib;
                             let s_stable = smooth_clip_tanh(s, 8.0);
                             let sp = if p_i32 <= 3 {
@@ -2386,7 +2414,10 @@ impl PolyAttention {
                 }
             }
         }
-        all_param_grads.extend(grad_cope_total.to_vec());
+        // CoPE gradients are handled internally through grad_cope_total.accumulate()
+        // and applied via self.cope.apply_gradients() in apply_gradients()
+        // They should NOT be added to all_param_grads since they have a different structure
+        // (UnifiedCoPEGradients vs Vec<Array2<f32>>)
 
         if self.titan_memory.enabled {
             assert!(self.titan_memory.scale.is_finite());

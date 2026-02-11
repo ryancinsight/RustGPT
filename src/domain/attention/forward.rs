@@ -2,8 +2,9 @@ use ndarray::{Array2, s};
 
 use crate::domain::{
     attention::{
-        memory::{with_tls_acc_f64, with_tls_phi, with_tls_qpe},
+        memory::{with_tls_acc_f64, with_tls_phi},
         position::unified::UnifiedCoPE,
+        position::traits::PositionEmbedding,
         utils::{smooth_clip_tanh, smooth_saturate_01},
     },
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
@@ -329,7 +330,7 @@ pub fn compute_poly_attention_forward_into(
                         None => 0,
                     };
                     let j_end_excl = if causal { i + 1 } else { n };
-                    let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
+                    let _max_pos = usize::min(ctx.cope.max_pos(), i.saturating_sub(j_start));
                     
                     // Slice Q for this head
                     let q_row_i = q.row(i);
@@ -339,24 +340,24 @@ pub fn compute_poly_attention_forward_into(
                     let k_slice_t = k_slice.t();
                     let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
 
-                    with_tls_qpe(max_pos + 1, |q_pe| {
-                        for (pos, q_pe_val) in q_pe.iter_mut().enumerate() {
-                            // Reverted dk_scale (Stream uses unscaled CoPE)
-                            *q_pe_val = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
-                        }
+                    let mlen = j_end_excl.saturating_sub(j_start);
+                    with_tls_phi(mlen, |phi_row| {
+                        for idx in 0..mlen {
+                            let j = j_start + idx;
+                            
+                            // Get position embedding contribution
+                            // Uses static dispatch via UnifiedCoPE enum
+                            let pe_contrib = ctx.cope.contribution(
+                                &q_row_i,
+                                &k_slice.row(idx),
+                                i,
+                                j,
+                                Some(&ctx.input.view())
+                            );
 
-                        let mlen = j_end_excl.saturating_sub(j_start);
-                        with_tls_phi(mlen, |phi_row| {
-                            for idx in 0..mlen {
-                                let j = j_start + idx;
-                                let mut s_val = scores_row[idx];
+                            let s_val = scores_row[idx] + pe_contrib;
 
-                                let pos = i.saturating_sub(j);
-                                if pos < q_pe.len() {
-                                    s_val += q_pe[pos];
-                                }
-
-                                let s_stable = smooth_clip_tanh(s_val, 8.0);
+                            let s_stable = smooth_clip_tanh(s_val, 8.0);
                                 let sp = if p_i32 <= 3 {
                                     match p_i32 {
                                         1 => s_stable,
@@ -403,7 +404,6 @@ pub fn compute_poly_attention_forward_into(
                                     y_row[h] = acc[h] as f32;
                                 }
                             });
-                        });
                     });
                 });
             // Accumulate directly into `output` to avoid allocating an intermediate block.
@@ -610,26 +610,20 @@ pub fn compute_poly_attention_forward_baseline(
                     None => 0,
                 };
                 let j_end_excl = if causal { i + 1 } else { n };
-                let max_pos = usize::min(ctx.cope.max_pos, i.saturating_sub(j_start));
+                // max_pos unused
                 let q_row_i = q.row(i);
-                with_tls_qpe(max_pos + 1, |q_pe| {
-                    for (pos, q_pe_val) in q_pe.iter_mut().enumerate() {
-                        *q_pe_val = q_row_i.dot(&ctx.cope.pos_embeddings.row(pos));
-                    }
 
-                    let k_slice = k.slice(s![j_start..j_end_excl, ..]);
-                    let k_slice_t = k_slice.t();
-                    let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
-                    let mlen = j_end_excl.saturating_sub(j_start);
-                    with_tls_phi(mlen, |phi_row| {
-                        for idx in 0..mlen {
-                            let j = j_start + idx;
-                            let mut s_val = scores_row[idx];
-                            let pos = i.saturating_sub(j);
-                            if pos < q_pe.len() {
-                                s_val += q_pe[pos];
-                            }
-                            let s_stable = smooth_clip_tanh(s_val, 8.0);
+                let k_slice = k.slice(s![j_start..j_end_excl, ..]);
+                let k_slice_t = k_slice.t();
+                let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
+                let mlen = j_end_excl.saturating_sub(j_start);
+                with_tls_phi(mlen, |phi_row| {
+                    for idx in 0..mlen {
+                        let j = j_start + idx;
+                        let mut s_val = scores_row[idx];
+                        let cope_val = ctx.cope.contribution(&q_row_i, &k_slice.row(idx), i, j, Some(&ctx.input.view()));
+                        s_val += cope_val;
+                        let s_stable = smooth_clip_tanh(s_val, 8.0);
                             let sp = if p_i32 <= 3 {
                                 match p_i32 {
                                     1 => s_stable,
@@ -662,7 +656,6 @@ pub fn compute_poly_attention_forward_baseline(
                             }
                         });
                     });
-                });
             });
 
         ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 1.0, &mut out);

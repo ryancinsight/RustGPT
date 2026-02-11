@@ -5,7 +5,7 @@ use crate::{
     common::rng::get_rng,
     domain::{
         attention::position::{
-            optimized_cope::OptimizedCoPE, unified::UnifiedCoPE, window_aware_cope::WindowAwareCoPE,
+            optimized_cope::OptimizedCoPE, unified::UnifiedCoPE,
         },
         mixtures::{
             moh::{HeadSelectionConfig, HeadSelectionStrategy},
@@ -67,23 +67,6 @@ pub fn init_gating_params(
     (w_g, alpha_g, beta_g, opt_w_g, opt_alpha_g, opt_beta_g)
 }
 
-/// CoPE variant selection for positional embeddings
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum CoPEType {
-    /// Standard CoPE (baseline)
-    #[default]
-    Standard,
-    /// OptimizedCoPE: Unified variant with gating, factorization, and log1p
-    Optimized,
-}
-
-impl CoPEType {
-    /// Check if using optimized variant
-    pub fn is_optimized(&self) -> bool {
-        matches!(self, CoPEType::Optimized)
-    }
-}
-
 /// Initialize CoPE positional embeddings
 pub fn init_cope(max_pos: usize, head_dim: usize) -> UnifiedCoPE {
     UnifiedCoPE::new(max_pos, head_dim)
@@ -92,35 +75,6 @@ pub fn init_cope(max_pos: usize, head_dim: usize) -> UnifiedCoPE {
 /// Initialize OptimizedCoPE (unified default with gating + factorization + log1p)
 pub fn init_optimized_cope(max_pos: usize, head_dim: usize) -> OptimizedCoPE {
     OptimizedCoPE::new(max_pos, head_dim, head_dim / 4) // rank = head_dim / 4
-}
-
-/// Initialize WindowAwareCoPE - unified CoPE with sliding window support
-///
-/// This is the RECOMMENDED default for PolyAttention as it provides:
-/// - Window enforcement: positions >= window_size return 0
-/// - All CoPE variants: Standard, Optimized, Gated, Factorized
-/// - Dynamic window resizing at runtime
-///
-/// # Arguments
-/// * `cope_type` - Which CoPE variant to wrap
-/// * `max_pos` - Maximum position to handle
-/// * `head_dim` - Embedding dimension
-/// * `window_size` - Optional sliding window (None = unlimited)
-///
-/// # Returns
-/// Window-aware CoPE wrapper
-pub fn init_window_aware_cope(
-    cope_type: CoPEType,
-    max_pos: usize,
-    head_dim: usize,
-    window_size: Option<usize>,
-) -> WindowAwareCoPE {
-    match cope_type {
-        CoPEType::Standard => WindowAwareCoPE::new_standard(max_pos, head_dim, window_size),
-        CoPEType::Optimized => {
-            WindowAwareCoPE::new_optimized(max_pos, head_dim, head_dim / 4, window_size)
-        }
-    }
 }
 
 /// Initialize head selection configuration with default settings

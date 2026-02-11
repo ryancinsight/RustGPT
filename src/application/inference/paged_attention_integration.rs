@@ -53,7 +53,7 @@ impl PagedAttentionIntegration {
         let mut cache = self.cache.lock().unwrap();
         let mut next = self.next_handle.lock().unwrap();
 
-        let seq_id = cache.create_sequence();
+        let _seq_id = cache.create_sequence();
         let handle = CacheSequenceHandle(*next);
         *next += 1;
 

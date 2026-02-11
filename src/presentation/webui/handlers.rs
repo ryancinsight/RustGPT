@@ -19,6 +19,7 @@ use super::{
     state::{AppState, Message},
     WebUiError, WebUiResult,
 };
+use crate::domain::network::Layer;
 
 // =============================================================================
 // Chat Completions
@@ -145,7 +146,7 @@ pub async fn create_chat_completion(
 async fn generate_chat_completion(
     state: &AppState,
     request: &ChatCompletionRequest,
-    conversation_id: &str,
+    _conversation_id: &str,
     model_name: &str,
     start_time: Instant,
 ) -> WebUiResult<ChatCompletionResponse> {
@@ -160,13 +161,6 @@ async fn generate_chat_completion(
 
     let generated_content = if let Some(llm_arc) = llm_arc {
         // Use the actual inference engine
-        let last_user_message = request
-            .messages
-            .iter()
-            .rfind(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-        
         let prompt = build_prompt_from_messages(&request.messages);
         
         // Perform inference
@@ -246,28 +240,49 @@ fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
     prompt_parts.join("\n")
 }
 
-/// Create a streaming chat completion
+/// Create a streaming chat completion using actual inference
 async fn create_chat_completion_stream(
-    _state: AppState,
-    _request: ChatCompletionRequest,
-    _conversation_id: String,
-    _model_name: String,
-    _start_time: Instant,
+    state: AppState,
+    request: ChatCompletionRequest,
+    conversation_id: String,
+    model_name: String,
+    start_time: Instant,
 ) -> WebUiResult<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
 {
-    // TODO: Implement actual streaming with inference engine
-    // For now, return a mock stream
-
     use axum::response::sse::Event;
     use futures::stream;
+    use tokio::sync::mpsc;
 
-    let stream = stream::iter(vec![
-        Ok(Event::default().data(
+    // Get the loaded LLM model
+    let llm_arc = state.get_loaded_llm().await.ok_or_else(|| {
+        WebUiError::InvalidConfig("No model loaded. Please load a model first.".to_string())
+    })?;
+
+    // Build prompt from messages
+    let prompt = build_prompt_from_messages(&request.messages);
+    
+    // Set generation parameters
+    let max_new_tokens = if request.max_tokens > 0 {
+        request.max_tokens
+    } else {
+        256
+    };
+
+    let completion_id = generate_id("chatcmpl");
+    let model_name_clone = model_name.clone();
+    
+    // Create channel for streaming tokens
+    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+    
+    // Spawn inference task
+    tokio::spawn(async move {
+        // Send initial role delta
+        let _ = tx.send(Ok(Event::default().data(
             serde_json::to_string(&ChatCompletionChunk {
-                id: generate_id("chatcmpl"),
+                id: completion_id.clone(),
                 object: "chat.completion.chunk".to_string(),
                 created: current_timestamp(),
-                model: _model_name.clone(),
+                model: model_name_clone.clone(),
                 choices: vec![ChatCompletionChunkChoice {
                     index: 0,
                     delta: ChatMessageDelta {
@@ -276,63 +291,185 @@ async fn create_chat_completion_stream(
                     },
                     finish_reason: None,
                 }],
-            })
-            .unwrap(),
-        )),
-        Ok(Event::default().data(
+            }).unwrap(),
+        ))).await;
+
+        // Perform token-by-token generation
+        let mut tokens_generated = 0usize;
+        let mut accumulated_text = String::new();
+        
+        // Acquire lock and generate tokens incrementally
+        {
+            let mut llm = llm_arc.write().await;
+            
+            // Tokenize the prompt
+            let mut tokenized = Vec::new();
+            llm.tokenize_into(&prompt, &mut tokenized);
+            let input_len = tokenized.len();
+            
+            // Get EOS token
+            let eos_token = llm.vocab.encode("</s>");
+            let max_seq_len = llm.max_sequence_len().max(input_len.max(1));
+            
+            if input_len < max_seq_len {
+                let available_steps = max_seq_len.saturating_sub(input_len);
+                let generation_steps = available_steps.min(max_new_tokens);
+                
+                for _ in 0..generation_steps {
+                    // Check if we're approaching the maximum sequence length
+                    if tokens_generated >= max_seq_len.saturating_sub(1) {
+                        break;
+                    }
+
+                    // Generate next token
+                    let next_token = generate_next_token(&mut llm, &tokenized).await;
+                    
+                    // Decode the token to text
+                    if let Some(token_text) = llm.vocab.decode(next_token) {
+                        accumulated_text.push_str(token_text);
+                        
+                        // Stream the token text
+                        let _ = tx.send(Ok(Event::default().data(
+                            serde_json::to_string(&ChatCompletionChunk {
+                                id: completion_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: current_timestamp(),
+                                model: model_name_clone.clone(),
+                                choices: vec![ChatCompletionChunkChoice {
+                                    index: 0,
+                                    delta: ChatMessageDelta {
+                                        role: None,
+                                        content: Some(token_text.to_string()),
+                                    },
+                                    finish_reason: None,
+                                }],
+                            }).unwrap(),
+                        ))).await;
+                        
+                        tokens_generated += 1;
+                    }
+                    
+                    tokenized.push(next_token);
+                    
+                    // Check for EOS
+                    if eos_token.is_some_and(|eos| next_token == eos) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Send final chunk with finish_reason
+        let _ = tx.send(Ok(Event::default().data(
             serde_json::to_string(&ChatCompletionChunk {
-                id: generate_id("chatcmpl"),
+                id: completion_id,
                 object: "chat.completion.chunk".to_string(),
                 created: current_timestamp(),
-                model: _model_name.clone(),
+                model: model_name_clone,
                 choices: vec![ChatCompletionChunkChoice {
                     index: 0,
                     delta: ChatMessageDelta {
                         role: None,
-                        content: Some("This ".to_string()),
-                    },
-                    finish_reason: None,
-                }],
-            })
-            .unwrap(),
-        )),
-        Ok(Event::default().data(
-            serde_json::to_string(&ChatCompletionChunk {
-                id: generate_id("chatcmpl"),
-                object: "chat.completion.chunk".to_string(),
-                created: current_timestamp(),
-                model: _model_name.clone(),
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta: ChatMessageDelta {
-                        role: None,
-                        content: Some("is ".to_string()),
-                    },
-                    finish_reason: None,
-                }],
-            })
-            .unwrap(),
-        )),
-        Ok(Event::default().data(
-            serde_json::to_string(&ChatCompletionChunk {
-                id: generate_id("chatcmpl"),
-                object: "chat.completion.chunk".to_string(),
-                created: current_timestamp(),
-                model: _model_name,
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta: ChatMessageDelta {
-                        role: None,
-                        content: Some("a mock streaming response.".to_string()),
+                        content: None,
                     },
                     finish_reason: Some("stop".to_string()),
                 }],
-            })
-            .unwrap(),
-        )),
-    ]);
+            }).unwrap(),
+        ))).await;
+
+        // Record metrics
+        let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        state.record_success(tokens_generated as u64, latency_ms).await;
+        
+        // Add assistant response to conversation
+        if !accumulated_text.is_empty() {
+            state.add_message(
+                &conversation_id,
+                super::state::Message {
+                    role: "assistant".to_string(),
+                    content: accumulated_text,
+                    timestamp: chrono::Utc::now(),
+                },
+            ).await;
+        }
+    });
+
+    // Create stream from receiver
+    let stream = stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(event) => Some((event, rx)),
+            None => None,
+        }
+    });
 
     Ok(stream)
+}
+
+/// Generate a single next token given the current token sequence
+async fn generate_next_token(llm: &mut crate::domain::models::llm::LLM, tokenized: &[usize]) -> usize {
+    use ndarray::Array2;
+    
+    // Prepare input tensor
+    let mut token_input = Array2::zeros((1, tokenized.len()));
+    for (i, &token_id) in tokenized.iter().enumerate() {
+        token_input[[0, i]] = token_id as f32;
+    }
+    
+    // Forward pass through all layers
+    let mut input = token_input;
+    let mut similarity_ctx: Option<Array2<f32>> = None;
+    
+    for layer in llm.network.iter_mut() {
+        input = match layer {
+            crate::domain::network::LayerEnum::TransformerBlock(block) => {
+                block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                let out = block.forward(&input);
+                if let Some(existing) = similarity_ctx.as_mut() {
+                    existing.assign(block.activation_similarity_matrix());
+                } else {
+                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                }
+                out
+            }
+            crate::domain::network::LayerEnum::DiffusionBlock(block) => {
+                block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                let out = block.forward(&input);
+                if let Some(existing) = similarity_ctx.as_mut() {
+                    existing.assign(block.activation_similarity_matrix());
+                } else {
+                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                }
+                out
+            }
+            crate::domain::network::LayerEnum::LRM(block) => {
+                block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                let out = block.forward(&input);
+                if let Some(existing) = similarity_ctx.as_mut() {
+                    existing.assign(block.activation_similarity_matrix());
+                } else {
+                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                }
+                out
+            }
+            _ => {
+                similarity_ctx = None;
+                layer.forward(&input)
+            }
+        };
+    }
+    
+    // Get logits and decode
+    let logits = input;
+    if logits.shape()[0] == 0 {
+        return 0;
+    }
+    
+    let last_logit_row = logits.row(logits.shape()[0] - 1);
+    
+    // Use greedy decoding
+    use crate::application::decoding::GreedyDecoder;
+    let decoder = GreedyDecoder::new();
+    decoder.decode_row(last_logit_row)
 }
 
 // =============================================================================

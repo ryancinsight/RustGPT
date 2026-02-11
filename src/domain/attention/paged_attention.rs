@@ -162,7 +162,7 @@ pub struct KVPage {
 
 impl KVPage {
     /// Create a new empty page
-    pub fn new(page_id: usize, num_heads: usize, page_size: usize, head_dim: usize) -> Self {
+    pub fn new(page_id: usize, _num_heads: usize, page_size: usize, head_dim: usize) -> Self {
         // Store as (page_size, head_dim) - one token per row
         Self {
             page_id,
@@ -428,7 +428,7 @@ impl PagedKVCache {
 
         let num_tokens = keys.nrows();
         let head_dim = keys.ncols();
-        let num_heads = self.config.num_heads;
+        let _num_heads = self.config.num_heads;
         let page_size = self.config.page_size;
 
         // Calculate how many pages we need

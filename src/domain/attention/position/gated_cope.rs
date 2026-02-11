@@ -1,28 +1,33 @@
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
+use super::traits::PositionEmbedding;
+use super::cope::{CoPE, CoPEGradients};
+
+/// Gradients container for GatedCoPE
+#[derive(Clone, Debug)]
+pub struct GatedCoPEGradients {
+    pub base_grads: CoPEGradients,
+    pub w_gate_grads: Option<Array2<f32>>,
+    pub b_gate_grads: Option<Array2<f32>>,
+}
+
+impl GatedCoPEGradients {
+    pub fn new(max_pos: usize, embed_dim: usize) -> Self {
+        Self {
+            base_grads: CoPEGradients::new(max_pos, embed_dim),
+            w_gate_grads: Some(Array2::zeros((embed_dim * 2, max_pos + 1))),
+            b_gate_grads: Some(Array2::zeros((1, max_pos + 1))),
+        }
+    }
+}
 
 /// Gated Contextual Position Embeddings (GatedCoPE)
 ///
 /// Enhances standard CoPE with a learnable gating mechanism that adaptively
 /// blends position-based and content-based attention contributions.
-///
-/// Mathematical Formulation:
-/// ```
-/// s_ij = q_i · k_j + g_ij · CoPE(q_i, pos_ij)
-///
-/// where g_ij = σ(W_g · [q_i; k_j] + b_g)
-/// ```
-///
-/// The gate `g_ij` is computed per query-key pair, allowing the model to
-/// learn when to emphasize position information vs content similarity.
-///
-/// Benefits:
-/// - Adaptive position/content weighting per attention head
-/// - Smoother gradients via log1p-style gate formulation
-/// - Reduced loss of information through multiplicative interaction
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GatedCoPE {
     /// Base CoPE embeddings (max_pos+1, embed_dim)
@@ -39,6 +44,152 @@ pub struct GatedCoPE {
     max_pos: usize,
     /// Embedding dimension
     embed_dim: usize,
+}
+
+impl PositionEmbedding for GatedCoPE {
+    type Gradients = GatedCoPEGradients;
+
+    fn contribution(
+        &self,
+        q: &ArrayView1<f32>,
+        k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+    ) -> f32 {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos > self.max_pos {
+            return 0.0;
+        }
+
+        // Compute base CoPE contribution: q · PE_pos
+        // We can access base_cope directly since we are inside the module or it has public fields.
+        // The PositionEmbedding trait on CoPE uses (q, k, q_pos, k_pos, inputs)
+        // but here we just need the internal dot product which contribution() provides.
+        let cope_contrib = self.base_cope.contribution(q, k, query_pos, key_pos, None);
+
+        // Compute gate: σ((q ⊕ k) · W_gate[:, pos] + b_gate[0, pos])
+        let mut gate_input = Array1::zeros(self.embed_dim * 2);
+        gate_input.slice_mut(s![0..self.embed_dim]).assign(q);
+        gate_input.slice_mut(s![self.embed_dim..]).assign(k);
+
+        // Gate computation with temperature scaling
+        let gate_logit = gate_input.dot(&self.w_gate.column(pos)) + self.b_gate[[0, pos]];
+        let gate = self.smooth_gate(gate_logit / self.gate_temperature);
+
+        // Multiplicative interaction preserves gradient flow better than addition
+        gate * cope_contrib
+    }
+
+    fn backward(
+        &self,
+        q: &ArrayView1<f32>,
+        k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        inputs: Option<&ArrayView2<f32>>,
+        d_s_ij: f32,
+        grads: &mut Self::Gradients,
+    ) -> (Array1<f32>, Array1<f32>) {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos > self.max_pos {
+            return (Array1::zeros(q.dim()), Array1::zeros(k.dim()));
+        }
+
+        // Recompute forward pass values for gradients
+        let cope_contrib = self.base_cope.contribution(q, k, query_pos, key_pos, None);
+        
+        let mut gate_input = Array1::zeros(self.embed_dim * 2);
+        gate_input.slice_mut(s![0..self.embed_dim]).assign(q);
+        gate_input.slice_mut(s![self.embed_dim..]).assign(k);
+
+        let gate_logit = gate_input.dot(&self.w_gate.column(pos)) + self.b_gate[[0, pos]];
+        let scaled_logit = gate_logit / self.gate_temperature;
+        let gate = self.smooth_gate(scaled_logit);
+
+        // dL/d(gate) = dL/ds * cope_contrib
+        let d_gate = d_s_ij * cope_contrib;
+        
+        // dL/d(cope_contrib) = dL/ds * gate
+        let d_cope = d_s_ij * gate;
+
+        // 1. Backprop through base CoPE
+        // We use d_cope as the gradient for the base contribution
+        let (dq_base, dk_base) = self.base_cope.backward(q, k, query_pos, key_pos, inputs, d_cope, &mut grads.base_grads);
+
+        // 2. Backprop through gate
+        // gate = sigmoid(scaled_logit)
+        // d(gate)/d(scaled_logit) = gate * (1 - gate)
+        let d_scaled_logit = d_gate * gate * (1.0 - gate);
+        
+        // scaled_logit = logit / temp
+        // d(logit) = d(scaled_logit) / temp
+        let d_logit = d_scaled_logit / self.gate_temperature;
+
+        // logit = gate_input . W[:, pos] + b[pos]
+        // d(b[pos]) = d_logit
+        if let Some(bg) = &mut grads.b_gate_grads {
+            bg[[0, pos]] += d_logit;
+        }
+
+        // d(W[:, pos]) = gate_input * d_logit
+        if let Some(wg) = &mut grads.w_gate_grads {
+            let mut col = wg.column_mut(pos);
+            // col += gate_input * d_logit
+            for (w, &g) in col.iter_mut().zip(gate_input.iter()) {
+                *w += g * d_logit;
+            }
+        }
+
+        // d(gate_input) = W[:, pos] * d_logit
+        let w_col = self.w_gate.column(pos);
+        let d_gate_input = &w_col * d_logit; // Array1
+
+        // Split d_gate_input into dq_gate and dk_gate
+        let dq_gate = d_gate_input.slice(s![0..self.embed_dim]);
+        let dk_gate = d_gate_input.slice(s![self.embed_dim..]);
+
+        // Combine gradients
+        let dq = dq_base + dq_gate;
+        let dk = dk_base + dk_gate;
+
+        (dq, dk)
+    }
+
+    fn init_gradients(&self) -> Self::Gradients {
+        GatedCoPEGradients::new(self.max_pos, self.embed_dim)
+    }
+
+    fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
+        self.base_cope.apply_gradients(&grads.base_grads, lr);
+        
+        if let Some(wg) = &grads.w_gate_grads {
+            self.opt_w_gate.step(&mut self.w_gate, wg, lr);
+        }
+        
+        if let Some(bg) = &grads.b_gate_grads {
+            self.opt_b_gate.step(&mut self.b_gate, bg, lr);
+        }
+    }
+
+    fn max_pos(&self) -> usize {
+        self.max_pos
+    }
+
+    fn embed_dim(&self) -> usize {
+        self.embed_dim
+    }
+
+    fn parameters(&self) -> usize {
+        self.base_cope.parameters() + self.w_gate.len() + self.b_gate.len()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let base_norm = self.base_cope.weight_norm();
+        let gate_w_norm: f32 = self.w_gate.iter().map(|x| x * x).sum();
+        let gate_b_norm: f32 = self.b_gate.iter().map(|x| x * x).sum();
+        (base_norm.powi(2) + gate_w_norm + gate_b_norm).sqrt()
+    }
 }
 
 impl GatedCoPE {
@@ -79,42 +230,6 @@ impl GatedCoPE {
         instance
     }
 
-    /// Compute gated CoPE contribution for a query at a specific position
-    ///
-    /// # Arguments
-    /// * `q` - Query vector (embed_dim,)
-    /// * `k` - Key vector (embed_dim,)
-    /// * `pos` - Relative position (0-indexed)
-    ///
-    /// # Returns
-    /// Gated CoPE contribution: `gate * CoPE_contribution`
-    #[inline]
-    pub fn gated_cope_contribution(
-        &self,
-        q: &ArrayView1<'_, f32>,
-        k: &ArrayView1<'_, f32>,
-        pos: usize,
-    ) -> f32 {
-        if pos > self.max_pos {
-            return 0.0;
-        }
-
-        // Compute base CoPE contribution: q · PE_pos
-        let cope_contrib = q.dot(&self.base_cope.pos_embeddings.row(pos));
-
-        // Compute gate: σ((q ⊕ k) · W_gate[:, pos] + b_gate[0, pos])
-        let mut gate_input = Array1::zeros(self.embed_dim * 2);
-        gate_input.slice_mut(s![0..self.embed_dim]).assign(q);
-        gate_input.slice_mut(s![self.embed_dim..]).assign(k);
-
-        // Gate computation with temperature scaling
-        let gate_logit = gate_input.dot(&self.w_gate.column(pos)) + self.b_gate[[0, pos]];
-        let gate = self.smooth_gate(gate_logit / self.gate_temperature);
-
-        // Multiplicative interaction preserves gradient flow better than addition
-        gate * cope_contrib
-    }
-
     /// Smooth gate function using log1p-style formulation
     ///
     /// Uses σ(x) = 1 / (1 + exp(-x)) with temperature scaling
@@ -124,15 +239,6 @@ impl GatedCoPE {
         // Numerically stable sigmoid with temperature
         let x = x.clamp(-500.0, 500.0); // Prevent overflow
         1.0 / (1.0 + (-x).exp())
-    }
-
-    /// Apply gradients for gated CoPE
-    pub fn apply_gradients(&mut self, grads: &(Array2<f32>, Array2<f32>, Array2<f32>), lr: f32) {
-        // grads.0 is for base CoPE, grads.1 is for w_gate, grads.2 is for b_gate
-        self.base_cope.apply_gradients(&grads.0, lr);
-
-        self.opt_w_gate.step(&mut self.w_gate, &grads.1, lr);
-        self.opt_b_gate.step(&mut self.b_gate, &grads.2, lr);
     }
 
     /// Get total parameter count
@@ -174,9 +280,6 @@ impl GatedCoPE {
     }
 }
 
-/// Re-export base CoPE for internal use
-use super::cope::CoPE;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +299,7 @@ mod tests {
         let q = Array1::from_elem(8, 0.5);
         let k = Array1::from_elem(8, 0.3);
 
-        let contrib = gated.gated_cope_contribution(&q.view(), &k.view(), 0);
+        let contrib = gated.contribution(&q.view(), &k.view(), 0, 0, None);
 
         // Should be finite and non-zero
         assert!(contrib.is_finite());

@@ -229,7 +229,7 @@ impl BatchProcessor {
         // Create sequences for each request
         {
             let mut cache = self.kv_cache.lock().unwrap();
-            let mut seq_id_guard = self.next_seq_id.lock().unwrap();
+            let _seq_id_guard = self.next_seq_id.lock().unwrap();
 
             for request in &requests {
                 let seq_id = cache.create_sequence();
@@ -302,7 +302,6 @@ impl BatchProcessor {
     pub fn step(&self) -> Vec<InferenceResponse> {
         let now = Instant::now();
         let mut batch = Vec::new();
-        let mut removed_count = 0;
 
         let max_wait = Duration::from_millis(self.config.max_wait_ms);
 
@@ -332,11 +331,6 @@ impl BatchProcessor {
                 if batch.len() >= self.config.max_batch_size {
                     break;
                 }
-            }
-
-            removed_count = self.config.max_batch_size.saturating_sub(batch.len());
-            if batch.is_empty() && removed_count == 0 {
-                // Only update if we actually processed something
             }
         }
 

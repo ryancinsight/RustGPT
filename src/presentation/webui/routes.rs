@@ -48,6 +48,8 @@ pub fn create_router(state: AppState, config: &WebUiConfig) -> Router {
 /// API v1 routes
 fn api_v1_routes(state: AppState) -> Router {
     Router::new()
+        // API documentation
+        .route("/v1/docs", get(api_docs))
         // Chat completions (OpenAI-compatible)
         .route("/v1/chat/completions", post(create_chat_completion))
         // Text completions (legacy)

@@ -1,30 +1,30 @@
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
+use super::traits::PositionEmbedding;
+
+/// Gradients container for FactorizedCoPE
+#[derive(Clone, Debug)]
+pub struct FactorizedCoPEGradients {
+    pub up_proj_grads: Option<Array2<f32>>,
+    pub down_proj_grads: Option<Array2<f32>>,
+}
+
+impl FactorizedCoPEGradients {
+    pub fn new(max_pos: usize, rank: usize, embed_dim: usize) -> Self {
+        Self {
+            up_proj_grads: Some(Array2::zeros((max_pos + 1, rank))),
+            down_proj_grads: Some(Array2::zeros((rank, embed_dim))),
+        }
+    }
+}
 
 /// Factorized Contextual Position Embeddings (FactorizedCoPE)
 ///
 /// Reduces memory footprint by factorizing position embeddings using
 /// low-rank decomposition: PE = U @ V where U ∈ ℝ^(max_pos × r), V ∈ ℝ^(r × embed_dim)
-///
-/// Mathematical Formulation:
-/// ```
-/// CoPE(q, pos) = q · PE[pos] = q · (U[pos, :] @ V)
-///
-/// where PE[pos] = U[pos, :] (1×r) @ V (r×embed_dim) = (1×embed_dim)
-///
-/// = (U[pos, :] @ V^T) · q
-/// = (U[pos, :] @ V^T @ q^T)
-/// = (U[pos, :] @ (V @ q)^T)
-/// ```
-///
-/// Benefits:
-/// - O(max_pos × r) parameters instead of O(max_pos × embed_dim)
-/// - r << embed_dim for significant memory savings
-/// - Still learns position-dependent embeddings
-/// - Log1p-style formulation for numerical stability
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FactorizedCoPE {
     /// Up projection: (max_pos, rank) - position factors
@@ -41,6 +41,136 @@ pub struct FactorizedCoPE {
     embed_dim: usize,
     /// Temperature for normalized scaling
     temperature: f32,
+}
+
+impl PositionEmbedding for FactorizedCoPE {
+    type Gradients = FactorizedCoPEGradients;
+
+    fn contribution(
+        &self,
+        q: &ArrayView1<f32>,
+        _k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+    ) -> f32 {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos > self.max_pos {
+            return 0.0;
+        }
+
+        // Compute intermediate: V @ q^T (rank,)
+        let mut vq = Array1::zeros(self.rank);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj, q, 0.0, &mut vq);
+
+        // Compute: U[pos] @ (V @ q) (scalar)
+        let up_row = self.up_proj.row(pos);
+        let raw = up_row.dot(&vq);
+
+        // Log1p formulation: log(1 + exp(x / T)) * T
+        // This provides smooth, well-behaved gradients
+        let scaled = raw / self.temperature;
+        let stable = self.log1p_exp(scaled);
+        stable * self.temperature
+    }
+
+    fn backward(
+        &self,
+        q: &ArrayView1<f32>,
+        _k: &ArrayView1<f32>,
+        query_pos: usize,
+        key_pos: usize,
+        _inputs: Option<&ArrayView2<f32>>,
+        d_score: f32,
+        grads: &mut Self::Gradients,
+    ) -> (Array1<f32>, Array1<f32>) {
+        let pos = query_pos.saturating_sub(key_pos);
+        if pos > self.max_pos {
+            return (Array1::zeros(self.embed_dim), Array1::zeros(self.embed_dim));
+        }
+
+        // Recompute forward pass intermediates
+        let mut vq = Array1::zeros(self.rank);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj, q, 0.0, &mut vq);
+        
+        let up_row = self.up_proj.row(pos);
+        let raw = up_row.dot(&vq);
+        let scaled = raw / self.temperature;
+        
+        // Derivative of output w.r.t raw
+        // y = T * log(1 + exp(x/T))
+        // dy/dx = sigmoid(x/T)
+        // d_raw = d_score * sigmoid(scaled)
+        let sigmoid = if scaled > 20.0 {
+            1.0
+        } else if scaled < -20.0 {
+            scaled.exp()
+        } else {
+            1.0 / (1.0 + (-scaled).exp())
+        };
+        let d_raw = d_score * sigmoid;
+
+        // Gradients for up_proj (only for row 'pos')
+        // d_up_row = d_raw * vq
+        if let Some(up_grads) = &mut grads.up_proj_grads {
+             let mut d_up_row = vq.clone();
+             d_up_row *= d_raw;
+             let mut row_grad = up_grads.row_mut(pos);
+             row_grad += &d_up_row;
+        }
+
+        // Gradients for down_proj
+        // d_vq = d_raw * up_row
+        // d_down_proj = d_vq.outer(q)
+        let mut d_vq = up_row.to_owned();
+        d_vq *= d_raw;
+        
+        if let Some(down_grads) = &mut grads.down_proj_grads {
+             // Use general_mat_mul for outer product accumulation
+             // d_vq: (rank, 1), q: (1, embed_dim)
+             let d_vq_2d = d_vq.view().into_shape_with_order((self.rank, 1)).unwrap();
+             let q_2d = q.view().into_shape_with_order((1, self.embed_dim)).unwrap();
+             ndarray::linalg::general_mat_mul(1.0, &d_vq_2d, &q_2d, 1.0, down_grads);
+        }
+
+        // Gradient w.r.t q
+        // d_q = down_proj.T @ d_vq
+        let mut d_q = Array1::zeros(self.embed_dim);
+        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj.t(), &d_vq, 0.0, &mut d_q);
+
+        (d_q, Array1::zeros(self.embed_dim))
+    }
+
+    fn init_gradients(&self) -> Self::Gradients {
+        FactorizedCoPEGradients::new(self.max_pos, self.rank, self.embed_dim)
+    }
+
+    fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
+        if let Some(up_g) = &grads.up_proj_grads {
+            self.opt_up_proj.step(&mut self.up_proj, up_g, lr);
+        }
+        if let Some(down_g) = &grads.down_proj_grads {
+            self.opt_down_proj.step(&mut self.down_proj, down_g, lr);
+        }
+    }
+
+    fn max_pos(&self) -> usize {
+        self.max_pos
+    }
+
+    fn embed_dim(&self) -> usize {
+        self.embed_dim
+    }
+
+    fn parameters(&self) -> usize {
+        self.up_proj.len() + self.down_proj.len()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        let up_norm: f32 = self.up_proj.iter().map(|x| x * x).sum();
+        let down_norm: f32 = self.down_proj.iter().map(|x| x * x).sum();
+        (up_norm + down_norm).sqrt()
+    }
 }
 
 impl FactorizedCoPE {
@@ -77,38 +207,6 @@ impl FactorizedCoPE {
         let mut instance = Self::new(max_pos, embed_dim, rank);
         instance.temperature = temp;
         instance
-    }
-
-    /// Compute factorized CoPE contribution using log1p formulation
-    ///
-    /// Computes: `log(1 + exp(U[pos] @ V @ q))` for numerical stability
-    /// This provides smooth gradients and prevents vanishing gradients.
-    ///
-    /// # Arguments
-    /// * `q` - Query vector (embed_dim,)
-    /// * `pos` - Relative position
-    ///
-    /// # Returns
-    /// Factorized CoPE contribution with log1p stabilization
-    #[inline]
-    pub fn factorized_cope_contribution(&self, q: &ArrayView1<'_, f32>, pos: usize) -> f32 {
-        if pos > self.max_pos {
-            return 0.0;
-        }
-
-        // Compute intermediate: V @ q^T (rank,)
-        let mut vq = Array1::zeros(self.rank);
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj, q, 0.0, &mut vq);
-
-        // Compute: U[pos] @ (V @ q) (scalar)
-        let up_row = self.up_proj.row(pos);
-        let raw = up_row.dot(&vq);
-
-        // Log1p formulation: log(1 + exp(x / T)) * T
-        // This provides smooth, well-behaved gradients
-        let scaled = raw / self.temperature;
-        let stable = self.log1p_exp(scaled);
-        stable * self.temperature
     }
 
     /// Numerically stable log(1 + exp(x))
@@ -161,17 +259,6 @@ impl FactorizedCoPE {
         full_params as f32 / factored_params as f32
     }
 
-    /// Apply gradients
-    pub fn apply_gradients(
-        &mut self,
-        grads: &(Array2<f32>, Array2<f32>), // (up_grad, down_grad)
-        lr: f32,
-    ) {
-        self.opt_up_proj.step(&mut self.up_proj, &grads.0, lr);
-        self.opt_down_proj.step(&mut self.down_proj, &grads.1, lr);
-    }
-
-    /// Get total parameter count
     pub fn parameters(&self) -> usize {
         self.up_proj.len() + self.down_proj.len()
     }
@@ -202,9 +289,10 @@ mod tests {
     fn test_factorized_cope_contribution() {
         let fc = FactorizedCoPE::new(128, 64, 16);
         let q = Array1::from_elem(64, 0.5);
+        let k = Array1::zeros(64); // Dummy k
 
-        let contrib0 = fc.factorized_cope_contribution(&q.view(), 0);
-        let contrib100 = fc.factorized_cope_contribution(&q.view(), 100);
+        let contrib0 = fc.contribution(&q.view(), &k.view(), 0, 0, None);
+        let contrib100 = fc.contribution(&q.view(), &k.view(), 100, 0, None);
 
         assert!(contrib0.is_finite());
         assert!(contrib100.is_finite());
