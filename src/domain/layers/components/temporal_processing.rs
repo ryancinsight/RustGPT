@@ -40,6 +40,9 @@ impl SharedTemporalProcessing {
     }
 
     /// Forward pass through the temporal processing layer
+    /// 
+    /// Uses the Layer trait for zero-cost abstraction, eliminating
+    /// redundant match statements across all temporal mixing variants.
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Set window size if using adaptive window and it's attention-based
         if self.use_adaptive_window
@@ -49,95 +52,52 @@ impl SharedTemporalProcessing {
             attn.set_window_size(Some(window_size));
         }
 
-        // Forward through the underlying layer
-        match &mut self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => layer.forward(input),
-            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
-            TemporalMixingLayer::Mamba(layer) => layer.forward(input),
-            TemporalMixingLayer::Mamba2(layer) => layer.forward(input),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
-            TemporalMixingLayer::MambaMoH(layer) => layer.forward(input),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward(input),
-            TemporalMixingLayer::Titans(layer) => layer.forward(input),
-        }
+        // Use Layer trait method - zero-cost abstraction
+        self.temporal_mixing.forward(input)
     }
 
     /// Backward pass through the temporal processing layer
+    /// 
+    /// Uses compute_gradients from Layer trait for consistent
+    /// gradient computation across all temporal mixing variants.
     pub fn backward(
         &mut self,
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match &mut self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::RgLru(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Mamba(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Mamba2(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::MambaMoH(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Titans(layer) => layer.compute_gradients(input, output_grads),
-        }
+        self.temporal_mixing.compute_gradients(input, output_grads)
     }
 
     /// Apply gradients to the temporal processing layer
+    /// 
+    /// Uses Layer trait method for zero-cost delegation.
     pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
-        match &mut self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::RgLru(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::Mamba(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::Mamba2(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::MambaMoH(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.apply_gradients(param_grads, lr),
-            TemporalMixingLayer::Titans(layer) => layer.apply_gradients(param_grads, lr),
-        }
+        self.temporal_mixing.apply_gradients(param_grads, lr)
     }
 
     /// Get the number of parameters
+    /// 
+    /// Uses Layer trait method for zero-cost delegation.
     pub fn parameters(&self) -> usize {
-        match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => layer.parameters(),
-            TemporalMixingLayer::RgLru(layer) => layer.parameters(),
-            TemporalMixingLayer::Mamba(layer) => layer.parameters(),
-            TemporalMixingLayer::Mamba2(layer) => layer.parameters(),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.parameters(),
-            TemporalMixingLayer::MambaMoH(layer) => layer.parameters(),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.parameters(),
-            TemporalMixingLayer::Titans(layer) => layer.parameters(),
-        }
+        self.temporal_mixing.parameters()
     }
 
     /// Get the weight norm
+    /// 
+    /// Uses Layer trait method for zero-cost delegation.
     pub fn weight_norm(&self) -> f32 {
-        match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => layer.weight_norm(),
-            TemporalMixingLayer::RgLru(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Mamba(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Mamba2(layer) => layer.weight_norm(),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.weight_norm(),
-            TemporalMixingLayer::MambaMoH(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Titans(layer) => layer.weight_norm(),
-        }
+        self.temporal_mixing.weight_norm()
     }
 
     /// Zero out gradients
+    /// 
+    /// Uses Layer trait method for zero-cost delegation.
     pub fn zero_gradients(&mut self) {
-        match &mut self.temporal_mixing {
-            TemporalMixingLayer::Attention(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::RgLru(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::Mamba(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::Mamba2(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::MambaMoH(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.zero_gradients(),
-            TemporalMixingLayer::Titans(layer) => layer.zero_gradients(),
-        }
+        self.temporal_mixing.zero_gradients()
     }
 
     /// Get the layer type name
-    pub fn layer_type(&self) -> &str {
+    pub fn layer_type(&self) -> &'static str {
         match &self.temporal_mixing {
             TemporalMixingLayer::Attention(_) => "Attention",
             TemporalMixingLayer::RgLru(_) => "RG-LRU",
@@ -158,7 +118,9 @@ impl SharedTemporalProcessing {
         }
     }
 
-    /// Get head activity metrics if available (for attention-based mixing)
+    /// Get head activity metrics if available (for MoH-based mixing)
+    /// 
+    /// Uses shared accessor pattern with type-specific field access.
     pub fn get_head_activity_metrics(&self) -> (Option<f32>, Option<&[f32]>) {
         match &self.temporal_mixing {
             TemporalMixingLayer::Attention(attn) => {
@@ -210,6 +172,9 @@ impl SharedTemporalProcessing {
         }
     }
 
+    /// Get token head activity vector if available
+    /// 
+    /// Uses shared accessor pattern with zero-copy view returns.
     pub fn get_token_head_activity_vec(&self) -> Option<&[f32]> {
         match &self.temporal_mixing {
             TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
@@ -235,5 +200,80 @@ impl SharedTemporalProcessing {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::models::config::TemporalMixingType;
+
+    #[test]
+    fn test_shared_temporal_processing_layer_type() {
+        // This test verifies that the SharedTemporalProcessing correctly
+        // delegates to Layer trait methods
+        let config = crate::domain::layers::components::common::CommonLayerConfig {
+            embed_dim: 16,
+            hidden_dim: 32,
+            num_heads: 4,
+            poly_degree: 2,
+            max_pos: 32,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: crate::domain::mixtures::HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
+            titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
+            temporal_mixing: TemporalMixingType::Attention,
+        };
+
+        let layers = crate::domain::layers::components::common::CommonLayers::new(&config);
+        let stp = SharedTemporalProcessing::new(
+            layers.temporal_mixing,
+            None,
+            false,
+        );
+
+        assert_eq!(stp.layer_type(), "Attention");
+        assert!(stp.parameters() > 0);
+    }
+
+    #[test]
+    fn test_layer_trait_delegation() {
+        // Test that Layer trait methods are correctly delegated
+        let config = crate::domain::layers::components::common::CommonLayerConfig {
+            embed_dim: 8,
+            hidden_dim: 16,
+            num_heads: 2,
+            poly_degree: 2,
+            max_pos: 16,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: crate::domain::mixtures::HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
+            titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
+            temporal_mixing: TemporalMixingType::Attention,
+        };
+
+        let layers = crate::domain::layers::components::common::CommonLayers::new(&config);
+        let mut stp = SharedTemporalProcessing::new(
+            layers.temporal_mixing,
+            None,
+            false,
+        );
+
+        // Test forward pass through Layer trait
+        let input = Array2::zeros((2, 8));
+        let output = stp.forward(&input);
+        assert_eq!(output.dim(), (2, 8));
+
+        // Test that parameters() returns consistent value
+        let params = stp.parameters();
+        assert!(params > 0);
+
+        // Test weight_norm through Layer trait
+        let norm = stp.weight_norm();
+        assert!(norm >= 0.0);
     }
 }
