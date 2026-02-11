@@ -2807,13 +2807,22 @@ impl Layer for PolyAttention {
 mod tests {
     use ndarray::Array2;
     use crate::domain::network::Layer;
+    use crate::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 
     use super::{AdaptiveDegreeConfig, DegreeAdaptationMetrics, PolyAttention};
     use crate::domain::models::config::TitanMemoryConfig;
 
+    fn test_cope_config(max_pos: usize, window_size: Option<usize>) -> CoPEConfig {
+        CoPEConfig {
+            variant: CoPEVariant::Standard,
+            max_pos,
+            window_size,
+        }
+    }
+
     #[test]
     fn gradients_parallel_match_sequential_small() {
-        let mut pa = PolyAttention::new(16, 4, 3, 64, Some(4));
+        let mut pa = PolyAttention::new(16, 4, 3, test_cope_config(64, Some(4)));
         pa.set_titan_memory_config(TitanMemoryConfig {
             enabled: false,
             ..TitanMemoryConfig::default()
@@ -2855,7 +2864,7 @@ mod tests {
 
     #[test]
     fn adapt_increases_degree_on_slow_convergence() {
-        let mut pa = PolyAttention::new(64, 8, 3, 128, None);
+        let mut pa = PolyAttention::new(64, 8, 3, test_cope_config(128, None));
         pa.set_adaptive_degree_config(AdaptiveDegreeConfig {
             enabled: true,
             p_min: 1,
@@ -2881,7 +2890,7 @@ mod tests {
 
     #[test]
     fn adapt_decreases_degree_on_high_grad() {
-        let mut pa = PolyAttention::new(64, 8, 3, 128, None);
+        let mut pa = PolyAttention::new(64, 8, 3, test_cope_config(128, None));
         pa.set_adaptive_degree_config(AdaptiveDegreeConfig {
             enabled: true,
             p_min: 1,
@@ -2907,7 +2916,7 @@ mod tests {
 
     #[test]
     fn eff_skip_threshold_skips_computation() {
-        let mut pa = PolyAttention::new(64, 4, 3, 64, Some(16));
+        let mut pa = PolyAttention::new(64, 4, 3, test_cope_config(64, Some(16)));
         pa.set_titan_memory_config(TitanMemoryConfig {
             enabled: false,
             ..TitanMemoryConfig::default()
@@ -2930,7 +2939,7 @@ mod tests {
 
     #[test]
     fn soft_top_p_cache_includes_modulation_and_token_scale() {
-        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let mut pa = PolyAttention::new(32, 4, 3, test_cope_config(64, Some(8)));
         pa.moh.head_selection_config.gating.use_soft_top_p = true;
         pa.moh.head_selection_config.gating.top_p = 0.9;
         pa.moh.head_selection_config.gating.soft_top_p_alpha = 2.0;
@@ -2966,7 +2975,7 @@ mod tests {
 
     #[test]
     fn moh_learned_predictor_per_head_thresholds() {
-        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let mut pa = PolyAttention::new(32, 4, 3, test_cope_config(64, Some(8)));
         let strategy = crate::domain::mixtures::moh::HeadSelectionStrategy::Learned {
             num_active: 4,
             load_balance_weight: 0.1,
@@ -3007,7 +3016,7 @@ mod tests {
     fn test_moh_independent_training_decoupling() {
         use crate::domain::mixtures::gating::GatingTrainingMode;
 
-        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let mut pa = PolyAttention::new(32, 4, 3, test_cope_config(64, Some(8)));
 
         // Setup Independent training strategy
         let strategy = crate::domain::mixtures::moh::HeadSelectionStrategy::Learned {
@@ -3110,7 +3119,7 @@ mod tests {
         // This test verifies that in Independent mode with auxiliary losses,
         // RichardsCurve parameters SHOULD receive gradients.
 
-        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let mut pa = PolyAttention::new(32, 4, 3, test_cope_config(64, Some(8)));
 
         // Setup Independent training strategy WITH auxiliary loss
         let strategy = crate::domain::mixtures::moh::HeadSelectionStrategy::Learned {
@@ -3163,7 +3172,7 @@ mod tests {
     #[test]
     fn test_apply_gradients_works() {
         // This test ensures that apply_gradients doesn't panic due to gradient unpacking mismatch
-        let mut pa = PolyAttention::new(32, 4, 3, 64, Some(8));
+        let mut pa = PolyAttention::new(32, 4, 3, test_cope_config(64, Some(8)));
         let n = 2;
         let d = 32;
         let input = Array2::<f32>::zeros((n, d));

@@ -1,9 +1,15 @@
 use llm::domain::attention::poly_attention::PolyAttention;
+use llm::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 use ndarray::Array2;
 
 #[test]
 fn parallel_vs_sequential_forward_match() {
-    let mut pa = PolyAttention::new(64, 4, 3, 64, Some(16));
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos: 64,
+        window_size: Some(16),
+    };
+    let mut pa = PolyAttention::new(64, 4, 3, cope_config);
     pa.set_parallel_batch_size(16);
     pa.set_parallel_timeout_ms(0);
     let n = 32;

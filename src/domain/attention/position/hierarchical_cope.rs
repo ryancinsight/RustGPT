@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 use super::traits::PositionEmbedding;
+use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
 
 /// Gradients container for HierarchicalCoPE
 #[derive(Clone, Debug)]
@@ -22,6 +23,25 @@ impl HierarchicalCoPEGradients {
             chunk_predictor_w_grads: Some(Array2::zeros((embed_dim, 2))),
             chunk_predictor_b_grads: Some(Array2::zeros((1, 2))),
         }
+    }
+
+    /// Accumulate gradients from another HierarchicalCoPEGradients instance.
+    /// Uses zero-cost generic abstractions for optional array handling.
+    pub fn accumulate(&mut self, other: &Self) {
+        accumulate_optional_arrays(&mut self.local_cope_grads, &other.local_cope_grads);
+        accumulate_optional_arrays(&mut self.global_cope_grads, &other.global_cope_grads);
+        accumulate_optional_arrays(&mut self.chunk_predictor_w_grads, &other.chunk_predictor_w_grads);
+        accumulate_optional_arrays(&mut self.chunk_predictor_b_grads, &other.chunk_predictor_b_grads);
+    }
+
+    /// Serialize gradients to a flat vector.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let mut v = Vec::new();
+        append_optional_array_to_vec(&mut v, &self.local_cope_grads);
+        append_optional_array_to_vec(&mut v, &self.global_cope_grads);
+        append_optional_array_to_vec(&mut v, &self.chunk_predictor_w_grads);
+        append_optional_array_to_vec(&mut v, &self.chunk_predictor_b_grads);
+        v
     }
 }
 

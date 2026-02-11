@@ -1,4 +1,5 @@
 use llm::domain::attention::poly_attention::PolyAttention;
+use llm::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 use llm::domain::network::Layer; // Import Layer trait
 use ndarray::Array2;
 use llm::domain::models::config::TitanMemoryConfig;
@@ -13,7 +14,12 @@ fn test_long_context_streaming_consistency() {
     let max_pos = 16;
     let window_size = 4; // Small window to force wrapping quickly
 
-    let mut attention = PolyAttention::new(embed_dim, num_heads, p, max_pos, Some(window_size));
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos,
+        window_size: Some(window_size),
+    };
+    let mut attention = PolyAttention::new(embed_dim, num_heads, p, cope_config);
     
     // Disable random gating for determinism
     attention.moh.head_selection_config.gating.use_learned_predictor = false;
@@ -74,7 +80,12 @@ fn test_poly_attention_forward_backward() {
     let window_size = Some(32);
     let batch_size = 2;
 
-    let mut poly_attn = PolyAttention::new(embed_dim, num_heads, p, max_pos, window_size);
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos,
+        window_size,
+    };
+    let mut poly_attn = PolyAttention::new(embed_dim, num_heads, p, cope_config);
     
     // Create random input (using vec since ndarray-rand might not be available)
     let input_vec: Vec<f32> = (0..batch_size * embed_dim).map(|x| (x as f32) / 1000.0).collect();
@@ -106,7 +117,12 @@ fn test_poly_attention_monolithic_shapes() {
     let max_pos = 128;
     let window_size = Some(32);
 
-    let poly_attn = PolyAttention::new(embed_dim, num_heads, p, max_pos, window_size);
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos,
+        window_size,
+    };
+    let poly_attn = PolyAttention::new(embed_dim, num_heads, p, cope_config);
     
     // Verify monolithic weights shapes
     assert_eq!(poly_attn.w_q.dim(), (embed_dim, embed_dim));

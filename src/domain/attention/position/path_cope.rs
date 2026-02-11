@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 use super::traits::PositionEmbedding;
+use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
 
 /// Gradients for PathCoPE
 #[derive(Clone, Debug)]
@@ -26,6 +27,29 @@ impl PathCoPEGradients {
             alpha_path_grad: 0.0,
             alpha_cope_grad: 0.0,
         }
+    }
+
+    /// Accumulate gradients from another PathCoPEGradients instance.
+    /// Uses zero-cost generic abstractions for optional array handling.
+    pub fn accumulate(&mut self, other: &Self) {
+        accumulate_optional_arrays(&mut self.w_householder_grads, &other.w_householder_grads);
+        accumulate_optional_arrays(&mut self.u_beta_grads, &other.u_beta_grads);
+        accumulate_optional_arrays(&mut self.b_beta_grads, &other.b_beta_grads);
+        accumulate_optional_arrays(&mut self.base_cope_grads, &other.base_cope_grads);
+        self.alpha_path_grad += other.alpha_path_grad;
+        self.alpha_cope_grad += other.alpha_cope_grad;
+    }
+
+    /// Serialize gradients to a flat vector.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let mut v = Vec::new();
+        append_optional_array_to_vec(&mut v, &self.w_householder_grads);
+        append_optional_array_to_vec(&mut v, &self.u_beta_grads);
+        append_optional_array_to_vec(&mut v, &self.b_beta_grads);
+        append_optional_array_to_vec(&mut v, &self.base_cope_grads);
+        v.push(self.alpha_path_grad);
+        v.push(self.alpha_cope_grad);
+        v
     }
 }
 
@@ -698,17 +722,18 @@ mod tests {
     #[test]
     fn test_path_transform_preserves_norm() {
         let path_cope = PathCoPE::new(64, 32);
-        let inputs = Array2::from_elem((64, 32), 0.1);
+        let inputs = Array2::from_elem((64, 32), 0.1f32);
+        let q = inputs.row(10).to_owned();
 
         // Compute path transform
-        let transformed = path_cope.compute_path_transform(10, 5, &inputs.view());
+        let transformed = path_cope.compute_path_transform(&q.view(), 10, 5, &inputs.view());
 
         // Check finiteness
         assert!(transformed.iter().all(|&x| x.is_finite()));
 
         // Householder transformations should preserve approximate norm
-        let original_norm = inputs.row(10).mapv(|x| x * x).sum().sqrt();
-        let transformed_norm = transformed.mapv(|x| x * x).sum().sqrt();
+        let original_norm: f32 = inputs.row(10).mapv(|x| x * x).sum().sqrt();
+        let transformed_norm: f32 = transformed.mapv(|x| x * x).sum().sqrt();
 
         // Norms should be of similar magnitude (Householder is orthogonal-ish)
         let ratio = transformed_norm / original_norm;

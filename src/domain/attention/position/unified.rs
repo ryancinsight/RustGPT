@@ -57,63 +57,22 @@ impl UnifiedCoPEGradients {
                 a.accumulate(b);
             }
             (UnifiedCoPEGradients::Gated(a), UnifiedCoPEGradients::Gated(b)) => {
-                a.base_grads.accumulate(&b.base_grads);
-                if let (Some(ga), Some(gb)) = (&mut a.w_gate_grads, &b.w_gate_grads) {
-                    *ga += gb;
-                }
-                if let (Some(ba), Some(bb)) = (&mut a.b_gate_grads, &b.b_gate_grads) {
-                    *ba += bb;
-                }
+                a.accumulate(b);
             }
             (UnifiedCoPEGradients::Factorized(a), UnifiedCoPEGradients::Factorized(b)) => {
-                if let (Some(qa), Some(qb)) = (&mut a.up_proj_grads, &b.up_proj_grads) {
-                    *qa += qb;
-                }
-                if let (Some(ka), Some(kb)) = (&mut a.down_proj_grads, &b.down_proj_grads) {
-                    *ka += kb;
-                }
+                a.accumulate(b);
             }
             (UnifiedCoPEGradients::Hierarchical(a), UnifiedCoPEGradients::Hierarchical(b)) => {
-                if let (Some(la), Some(lb)) = (&mut a.local_cope_grads, &b.local_cope_grads) {
-                    *la += lb;
-                }
-                if let (Some(ga), Some(gb)) = (&mut a.global_cope_grads, &b.global_cope_grads) {
-                    *ga += gb;
-                }
+                a.accumulate(b);
             }
             (UnifiedCoPEGradients::Optimized(a), UnifiedCoPEGradients::Optimized(b)) => {
-                if let (Some(ua), Some(ub)) = (&mut a.up_proj_grads, &b.up_proj_grads) {
-                    *ua += ub;
-                }
-                if let (Some(da), Some(db)) = (&mut a.down_proj_grads, &b.down_proj_grads) {
-                    *da += db;
-                }
-                if let (Some(wa), Some(wb)) = (&mut a.w_gate_grads, &b.w_gate_grads) {
-                    *wa += wb;
-                }
-                if let (Some(ba), Some(bb)) = (&mut a.b_gate_grads, &b.b_gate_grads) {
-                    *ba += bb;
-                }
+                a.accumulate(b);
             }
             (UnifiedCoPEGradients::Path(a), UnifiedCoPEGradients::Path(b)) => {
-                if let (Some(wa), Some(wb)) = (&mut a.w_householder_grads, &b.w_householder_grads) {
-                    *wa += wb;
-                }
-                if let (Some(ua), Some(ub)) = (&mut a.u_beta_grads, &b.u_beta_grads) {
-                    *ua += ub;
-                }
-                if let (Some(ba), Some(bb)) = (&mut a.b_beta_grads, &b.b_beta_grads) {
-                    *ba += bb;
-                }
-                if let (Some(ca), Some(cb)) = (&mut a.base_cope_grads, &b.base_cope_grads) {
-                    *ca += cb;
-                }
-                // These are f32, not Option<f32>
-                a.alpha_path_grad += b.alpha_path_grad;
-                a.alpha_cope_grad += b.alpha_cope_grad;
+                a.accumulate(b);
             }
             (UnifiedCoPEGradients::WindowAware(a), UnifiedCoPEGradients::WindowAware(b)) => {
-                 a.accumulate(b);
+                a.accumulate(b);
             }
             _ => panic!("Gradient type mismatch in accumulate"),
         }
@@ -121,51 +80,13 @@ impl UnifiedCoPEGradients {
 
     pub fn to_vec(&self) -> Vec<f32> {
         match self {
-            UnifiedCoPEGradients::Standard(g) => {
-                g.pos_embeddings.as_ref().map(|x| x.iter().cloned().collect()).unwrap_or_default()
-            }
-            UnifiedCoPEGradients::Gated(g) => {
-                let mut v = Vec::new();
-                v.extend(g.base_grads.pos_embeddings.as_ref().map(|x| x.iter().cloned().collect::<Vec<_>>()).unwrap_or_default());
-                if let Some(w) = &g.w_gate_grads { v.extend(w.iter()); }
-                if let Some(b) = &g.b_gate_grads { v.extend(b.iter()); }
-                v
-            }
-            UnifiedCoPEGradients::Factorized(g) => {
-                let mut v = Vec::new();
-                if let Some(q) = &g.up_proj_grads { v.extend(q.iter()); }
-                if let Some(k) = &g.down_proj_grads { v.extend(k.iter()); }
-                v
-            }
-            UnifiedCoPEGradients::Hierarchical(g) => {
-                let mut v = Vec::new();
-                if let Some(l) = &g.local_cope_grads { v.extend(l.iter()); }
-                if let Some(gl) = &g.global_cope_grads { v.extend(gl.iter()); }
-                if let Some(cw) = &g.chunk_predictor_w_grads { v.extend(cw.iter()); }
-                if let Some(cb) = &g.chunk_predictor_b_grads { v.extend(cb.iter()); }
-                v
-            }
-            UnifiedCoPEGradients::Optimized(g) => {
-                let mut v = Vec::new();
-                if let Some(u) = &g.up_proj_grads { v.extend(u.iter()); }
-                if let Some(d) = &g.down_proj_grads { v.extend(d.iter()); }
-                if let Some(w) = &g.w_gate_grads { v.extend(w.iter()); }
-                if let Some(b) = &g.b_gate_grads { v.extend(b.iter()); }
-                v
-            }
-            UnifiedCoPEGradients::Path(g) => {
-                let mut v = Vec::new();
-                if let Some(h) = &g.w_householder_grads { v.extend(h.iter()); }
-                if let Some(u) = &g.u_beta_grads { v.extend(u.iter()); }
-                if let Some(b) = &g.b_beta_grads { v.extend(b.iter()); }
-                if let Some(base) = &g.base_cope_grads { v.extend(base.iter()); }
-                v.push(g.alpha_path_grad);
-                v.push(g.alpha_cope_grad);
-                v
-            }
-            UnifiedCoPEGradients::WindowAware(g) => {
-                 g.to_vec()
-            }
+            UnifiedCoPEGradients::Standard(g) => g.to_vec(),
+            UnifiedCoPEGradients::Gated(g) => g.to_vec(),
+            UnifiedCoPEGradients::Factorized(g) => g.to_vec(),
+            UnifiedCoPEGradients::Hierarchical(g) => g.to_vec(),
+            UnifiedCoPEGradients::Optimized(g) => g.to_vec(),
+            UnifiedCoPEGradients::Path(g) => g.to_vec(),
+            UnifiedCoPEGradients::WindowAware(g) => g.to_vec(),
         }
     }
 }

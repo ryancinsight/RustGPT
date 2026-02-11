@@ -785,6 +785,7 @@ mod tests {
 
     use super::*;
     use crate::domain::attention::poly_attention::PolyAttention;
+    use crate::domain::attention::position::config::{CoPEConfig, CoPEVariant};
     use crate::domain::memory::titans::NeuralMemory;
 
     #[test]
@@ -795,7 +796,12 @@ mod tests {
         let segment_len = 4;
         let persistent_len = 2;
 
-        let poly = PolyAttention::new(input_dim, num_heads, 3, 64, None);
+        let cope_config = CoPEConfig {
+            variant: CoPEVariant::Standard,
+            max_pos: 64,
+            window_size: None,
+        };
+        let poly = PolyAttention::new(input_dim, num_heads, 3, cope_config);
         let memory = NeuralMemory::new(input_dim, input_dim, input_dim, memory_hidden_dim);
 
         let mut mac = TitansMAC::new(poly, memory, persistent_len, segment_len);
@@ -817,7 +823,12 @@ mod tests {
         let segment_len = 2;
         let persistent_len = 2;
 
-        let poly = PolyAttention::new(input_dim, num_heads, 1, 16, None);
+        let cope_config = CoPEConfig {
+            variant: CoPEVariant::Standard,
+            max_pos: 16,
+            window_size: None,
+        };
+        let poly = PolyAttention::new(input_dim, num_heads, 1, cope_config);
         let memory = NeuralMemory::new(input_dim, input_dim, input_dim, memory_hidden_dim);
 
         let mac = TitansMAC::new(poly, memory, persistent_len, segment_len);

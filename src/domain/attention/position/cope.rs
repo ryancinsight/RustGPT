@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 use super::traits::PositionEmbedding;
+use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
 
 /// Gradients container for CoPE
 #[derive(Clone, Debug)]
@@ -18,10 +19,17 @@ impl CoPEGradients {
         }
     }
 
-    pub fn accumulate(&mut self, other: &CoPEGradients) {
-        if let (Some(s), Some(o)) = (&mut self.pos_embeddings, &other.pos_embeddings) {
-            *s += o;
-        }
+    /// Accumulate gradients from another CoPEGradients instance.
+    /// Uses zero-cost generic abstractions for optional array handling.
+    pub fn accumulate(&mut self, other: &Self) {
+        accumulate_optional_arrays(&mut self.pos_embeddings, &other.pos_embeddings);
+    }
+
+    /// Serialize gradients to a flat vector.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let mut v = Vec::new();
+        append_optional_array_to_vec(&mut v, &self.pos_embeddings);
+        v
     }
 }
 

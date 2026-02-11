@@ -2,6 +2,7 @@ pub mod cope;
 pub mod config;
 pub mod factorized_cope;
 pub mod gated_cope;
+pub mod gradient_ops;
 pub mod hierarchical_cope;
 pub mod optimized_cope;
 pub mod path_cope;

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 use super::traits::PositionEmbedding;
+use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
 
 /// Gradients container for FactorizedCoPE
 #[derive(Clone, Debug)]
@@ -18,6 +19,21 @@ impl FactorizedCoPEGradients {
             up_proj_grads: Some(Array2::zeros((max_pos + 1, rank))),
             down_proj_grads: Some(Array2::zeros((rank, embed_dim))),
         }
+    }
+
+    /// Accumulate gradients from another FactorizedCoPEGradients instance.
+    /// Uses zero-cost generic abstractions for optional array handling.
+    pub fn accumulate(&mut self, other: &Self) {
+        accumulate_optional_arrays(&mut self.up_proj_grads, &other.up_proj_grads);
+        accumulate_optional_arrays(&mut self.down_proj_grads, &other.down_proj_grads);
+    }
+
+    /// Serialize gradients to a flat vector.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let mut v = Vec::new();
+        append_optional_array_to_vec(&mut v, &self.up_proj_grads);
+        append_optional_array_to_vec(&mut v, &self.down_proj_grads);
+        v
     }
 }
 

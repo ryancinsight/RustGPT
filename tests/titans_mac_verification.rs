@@ -2,6 +2,7 @@ use ndarray::{Array1, Array2};
 use rand::Rng;
 use llm::domain::{
     attention::poly_attention::PolyAttention,
+    attention::position::config::{CoPEConfig, CoPEVariant},
     memory::titans::{mac::TitansMAC, neural::NeuralMemory},
     network::Layer,
 };
@@ -14,7 +15,12 @@ fn test_titans_mac_streaming_consistency() {
     let segment_len = 1; // Must be 1 to match streaming behavior exactly
     
     // Setup
-    let poly = PolyAttention::new(embed_dim, num_heads, 3, 128, None);
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos: 128,
+        window_size: None,
+    };
+    let poly = PolyAttention::new(embed_dim, num_heads, 3, cope_config);
     // val_dim must match embed_dim because memory is used as context token
     // new(input_dim, key_dim, val_dim, memory_hidden_dim)
     let memory = NeuralMemory::new(embed_dim, 16, embed_dim, 16);

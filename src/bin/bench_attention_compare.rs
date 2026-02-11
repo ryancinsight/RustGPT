@@ -1,10 +1,16 @@
 use std::time::Instant;
 
 use llm::domain::attention::poly_attention::PolyAttention;
+use llm::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 use ndarray::Array2;
 
 fn main() {
-    let mut attn = PolyAttention::new(256, 8, 3, 256, Some(256));
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos: 256,
+        window_size: Some(256),
+    };
+    let mut attn = PolyAttention::new(256, 8, 3, cope_config);
     let n = 256usize;
     let d = 256usize;
     let input = Array2::<f32>::zeros((n, d));

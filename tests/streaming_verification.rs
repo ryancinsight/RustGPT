@@ -3,6 +3,7 @@ use llm::domain::attention::sliding_window_attention::SlidingWindowAttention;
 use llm::domain::memory::titans::neural::NeuralMemory;
 use llm::domain::memory::titans::mac::TitansMAC;
 use llm::domain::attention::poly_attention::PolyAttention;
+use llm::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 use llm::domain::network::Layer;
 
 #[test]
@@ -115,7 +116,12 @@ fn test_titans_mac_streaming_consistency() {
     let segment_len = 1; // Force token-by-token in batch mode to match streaming
     let seq_len = 10;
 
-    let poly = PolyAttention::new(embed_dim, num_heads, p, max_pos, None);
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos,
+        window_size: None,
+    };
+    let poly = PolyAttention::new(embed_dim, num_heads, p, cope_config);
     let memory = NeuralMemory::new(embed_dim, 16, embed_dim, 32);
     
     let mut mac = TitansMAC::new(poly, memory, persistent_len, segment_len);
@@ -156,7 +162,12 @@ fn test_poly_attention_streaming_consistency() {
     let seq_len = 50;
 
     println!("DEBUG: Starting test_poly_attention_streaming_consistency");
-    let mut pa = PolyAttention::new(embed_dim, num_heads, p, max_pos, Some(window_size));
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos,
+        window_size: Some(window_size),
+    };
+    let mut pa = PolyAttention::new(embed_dim, num_heads, p, cope_config);
     // DEBUG: Force recompile
     println!("DEBUG: Poly initialized with dim={}, heads={}", embed_dim, num_heads);
     

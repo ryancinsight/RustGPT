@@ -1,4 +1,4 @@
-use ndarray::{Array2, parallel::prelude::*};
+use ndarray::{Array1, Array2, Zip, parallel::prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
@@ -85,12 +85,19 @@ impl TitanMemoryConfig {
         // Note: We do NOT reset workspace.acc here for streaming persistence.
         // Batch callers must call workspace.reset() explicitly before processing a sequence.
         
+        // Optimized loop with Zip and cache-friendly iteration
         for i in 0..n {
-            for j in 0..d {
-                let next = retain * workspace.acc[j] + self.eta * input[[i, j]];
-                workspace.acc[j] = next;
-                out[[i, j]] += self.scale * next;
-            }
+            let input_row = input.row(i);
+            let mut out_row = out.row_mut(i);
+            
+            Zip::from(&mut workspace.acc)
+                .and(&input_row)
+                .and(&mut out_row)
+                .for_each(|acc, &inp, out_val| {
+                    let next = retain * *acc + self.eta * inp;
+                    *acc = next;
+                    *out_val += self.scale * next;
+                });
         }
     }
 
@@ -139,14 +146,19 @@ impl TitanMemoryConfig {
 
         let retain = 1.0 - self.decay;
         let mut input_grads = Array2::<f32>::zeros(output_grads.raw_dim());
-        for j in 0..d {
-            let mut b = 0.0f32;
-            for i in (0..n).rev() {
-                let g = output_grads[[i, j]];
-                assert!(g.is_finite());
-                b = retain * b + g;
-                input_grads[[i, j]] = self.scale * self.eta * b;
-            }
+        
+        let mut b = Array1::<f32>::zeros(d);
+        for i in (0..n).rev() {
+            let g_row = output_grads.row(i);
+            let mut in_g_row = input_grads.row_mut(i);
+            
+            Zip::from(&mut b)
+                .and(&g_row)
+                .and(&mut in_g_row)
+                .for_each(|b_val, &g, in_g| {
+                    *b_val = retain * *b_val + g;
+                    *in_g = self.scale * self.eta * *b_val;
+                });
         }
         input_grads
     }
@@ -171,33 +183,85 @@ impl TitanMemoryConfig {
 
         let retain = 1.0 - self.decay;
         let coeff = self.scale * self.eta;
-        for j in 0..d {
-            let mut b = 0.0f32;
-            for i in (0..n).rev() {
-                let g = output_grads[[i, j]];
-                assert!(g.is_finite());
-                b = retain * b + g;
-                input_grads[[i, j]] += coeff * b;
-            }
+        
+        let mut b = Array1::<f32>::zeros(d);
+        for i in (0..n).rev() {
+            let g_row = output_grads.row(i);
+            let mut in_g_row = input_grads.row_mut(i);
+            
+            Zip::from(&mut b)
+                .and(&g_row)
+                .and(&mut in_g_row)
+                .for_each(|b_val, &g, in_g| {
+                    *b_val = retain * *b_val + g;
+                    *in_g += coeff * *b_val;
+                });
         }
     }
 }
 
-impl TemporalMixingLayer {
-    #[inline]
-    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.forward(input),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
-            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
-            TemporalMixingLayer::MambaMoH(layer) => layer.forward(input),
-            TemporalMixingLayer::Mamba(layer) => layer.forward(input),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward(input),
-            TemporalMixingLayer::Mamba2(layer) => layer.forward(input),
-            TemporalMixingLayer::Titans(layer) => layer.forward(input),
+macro_rules! delegate_layer_method {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            TemporalMixingLayer::Attention(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::RgLru(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::MambaMoH(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::Mamba(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::Mamba2(layer) => layer.$method($($arg),*),
+            TemporalMixingLayer::Titans(layer) => layer.$method($($arg),*),
         }
+    };
+}
+
+impl Layer for TemporalMixingLayer {
+    fn layer_type(&self) -> &str {
+        delegate_layer_method!(self, layer_type)
     }
 
+    fn parameters(&self) -> usize {
+        delegate_layer_method!(self, parameters)
+    }
+
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        delegate_layer_method!(self, forward, input)
+    }
+
+    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        delegate_layer_method!(self, backward, grads, lr)
+    }
+
+    fn weight_norm(&self) -> f32 {
+        delegate_layer_method!(self, weight_norm)
+    }
+
+    fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        delegate_layer_method!(self, compute_gradients, input, output_grads)
+    }
+
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::common::errors::Result<()> {
+        delegate_layer_method!(self, apply_gradients, gradients, learning_rate)
+    }
+
+    fn zero_gradients(&mut self) {
+        delegate_layer_method!(self, zero_gradients)
+    }
+
+    fn set_training_progress(&mut self, progress: f64) {
+        delegate_layer_method!(self, set_training_progress, progress)
+    }
+}
+
+impl TemporalMixingLayer {
     /// Streaming forward step for token-by-token inference.
     ///
     /// Currently only implemented for PolyAttention.
@@ -217,19 +281,6 @@ impl TemporalMixingLayer {
             TemporalMixingLayer::Mamba2(layer) => layer.forward_step_into(input, output),
             TemporalMixingLayer::Mamba2MoH(layer) => layer.forward_step_into(input, output),
             TemporalMixingLayer::Titans(layer) => layer.forward_step_into(input, output),
-        }
-    }
-
-    pub fn set_training_progress(&mut self, progress: f64) {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::RgLru(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::MambaMoH(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::Mamba(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::Mamba2(layer) => layer.set_training_progress(progress),
-            TemporalMixingLayer::Titans(layer) => layer.set_training_progress(progress),
         }
     }
 
@@ -259,66 +310,6 @@ impl TemporalMixingLayer {
                 let _ = causal; // TitansMAC implies causal
                 layer.forward(input)
             }
-        }
-    }
-
-    #[inline]
-    pub fn compute_gradients(
-        &self,
-        input: &Array2<f32>,
-        output_grads: &Array2<f32>,
-    ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::RgLru(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::MambaMoH(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Mamba(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Mamba2(layer) => layer.compute_gradients(input, output_grads),
-            TemporalMixingLayer::Titans(layer) => layer.compute_gradients(input, output_grads),
-        }
-    }
-
-    #[inline]
-    pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::common::errors::Result<()> {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::RgLru(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::MambaMoH(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::Mamba(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::Mamba2(layer) => layer.apply_gradients(grads, lr),
-            TemporalMixingLayer::Titans(layer) => layer.apply_gradients(grads, lr),
-        }
-    }
-
-    #[inline]
-    pub fn parameters(&self) -> usize {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.parameters(),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.parameters(),
-            TemporalMixingLayer::RgLru(layer) => layer.parameters(),
-            TemporalMixingLayer::MambaMoH(layer) => layer.parameters(),
-            TemporalMixingLayer::Mamba(layer) => layer.parameters(),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.parameters(),
-            TemporalMixingLayer::Mamba2(layer) => layer.parameters(),
-            TemporalMixingLayer::Titans(layer) => layer.parameters(),
-        }
-    }
-
-    #[inline]
-    pub fn weight_norm(&self) -> f32 {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.weight_norm(),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.weight_norm(),
-            TemporalMixingLayer::RgLru(layer) => layer.weight_norm(),
-            TemporalMixingLayer::MambaMoH(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Mamba(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Mamba2(layer) => layer.weight_norm(),
-            TemporalMixingLayer::Titans(layer) => layer.weight_norm(),
         }
     }
 }
