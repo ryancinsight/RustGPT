@@ -6,12 +6,12 @@ use crate::{
     domain::{
         attention::{
             config::{
-                init_attention_weights, init_cope, init_gating_params, init_output_projection,
+                init_attention_weights, init_gating_params, init_output_projection,
                 init_polynomial_params,
             },
             forward::{ForwardContext, compute_poly_attention_forward, compute_poly_attention_forward_into},
             params::PolyAttentionParamInfo,
-            position::{unified::{UnifiedCoPE, UnifiedCoPEGradients}, traits::PositionEmbedding},
+            position::{config::CoPEConfig, unified::{UnifiedCoPE, UnifiedCoPEGradients}, traits::PositionEmbedding},
             utils::{smooth_clip_tanh, smooth_clip_tanh_with_grad},
             sliding_window_attention::SlidingWindowCache,
         },

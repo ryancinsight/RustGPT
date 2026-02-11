@@ -12,6 +12,22 @@ use super::path_cope::{PathCoPE, PathCoPEGradients};
 use super::traits::PositionEmbedding;
 use super::window_aware_cope::WindowAwareCoPE;
 
+/// Macro to reduce boilerplate by delegating method calls to CoPE variants.
+/// This is a zero-cost abstraction that eliminates repetitive match statements.
+macro_rules! delegate_to_cope_variant {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            UnifiedCoPE::Standard(c) => c.$method($($arg),*),
+            UnifiedCoPE::Gated(c) => c.$method($($arg),*),
+            UnifiedCoPE::Factorized(c) => c.$method($($arg),*),
+            UnifiedCoPE::Hierarchical(c) => c.$method($($arg),*),
+            UnifiedCoPE::Optimized(c) => c.$method($($arg),*),
+            UnifiedCoPE::Path(c) => c.$method($($arg),*),
+            UnifiedCoPE::WindowAware(c) => c.$method($($arg),*),
+        }
+    };
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum UnifiedCoPE {
     Standard(CoPE),
@@ -186,69 +202,13 @@ impl UnifiedCoPE {
             _ => None,
         }
     }
-
-    pub fn max_pos(&self) -> usize {
-        match self {
-            UnifiedCoPE::Standard(c) => c.max_pos,
-            UnifiedCoPE::Gated(c) => c.max_pos(),
-            UnifiedCoPE::Factorized(c) => c.max_pos(),
-            UnifiedCoPE::Hierarchical(c) => c.max_pos(),
-            UnifiedCoPE::Optimized(c) => c.max_pos(),
-            UnifiedCoPE::Path(c) => c.max_pos(),
-            UnifiedCoPE::WindowAware(c) => c.inner.max_pos(),
-        }
-    }
-
-    pub fn embed_dim(&self) -> usize {
-        match self {
-            UnifiedCoPE::Standard(c) => c.embed_dim(),
-            UnifiedCoPE::Gated(c) => c.embed_dim(),
-            UnifiedCoPE::Factorized(c) => c.embed_dim(),
-            UnifiedCoPE::Hierarchical(c) => c.embed_dim(),
-            UnifiedCoPE::Optimized(c) => c.embed_dim(),
-            UnifiedCoPE::Path(c) => c.embed_dim(),
-            UnifiedCoPE::WindowAware(c) => c.embed_dim(),
-        }
-    }
-
-    pub fn parameters(&self) -> usize {
-        match self {
-            UnifiedCoPE::Standard(c) => c.parameters(),
-            UnifiedCoPE::Gated(c) => c.parameters(),
-            UnifiedCoPE::Factorized(c) => c.parameters(),
-            UnifiedCoPE::Hierarchical(c) => c.parameters(),
-            UnifiedCoPE::Optimized(c) => c.parameters(),
-            UnifiedCoPE::Path(c) => c.parameters(),
-            UnifiedCoPE::WindowAware(c) => c.parameters(),
-        }
-    }
-
-    pub fn weight_norm(&self) -> f32 {
-        match self {
-            UnifiedCoPE::Standard(c) => c.weight_norm(),
-            UnifiedCoPE::Gated(c) => c.weight_norm(),
-            UnifiedCoPE::Factorized(c) => c.weight_norm(),
-            UnifiedCoPE::Hierarchical(c) => c.weight_norm(),
-            UnifiedCoPE::Optimized(c) => c.weight_norm(),
-            UnifiedCoPE::Path(c) => c.weight_norm(),
-            UnifiedCoPE::WindowAware(c) => c.weight_norm(),
-        }
-    }
 }
 
 impl PositionEmbedding for UnifiedCoPE {
     type Gradients = UnifiedCoPEGradients;
 
     fn max_pos(&self) -> usize {
-        match self {
-            UnifiedCoPE::Standard(c) => c.max_pos(),
-            UnifiedCoPE::Gated(c) => c.max_pos(),
-            UnifiedCoPE::Factorized(c) => c.max_pos(),
-            UnifiedCoPE::Hierarchical(c) => c.max_pos(),
-            UnifiedCoPE::Optimized(c) => c.max_pos(),
-            UnifiedCoPE::Path(c) => c.max_pos(),
-            UnifiedCoPE::WindowAware(c) => c.max_pos(),
-        }
+        delegate_to_cope_variant!(self, max_pos)
     }
 
     fn contribution(
@@ -259,15 +219,7 @@ impl PositionEmbedding for UnifiedCoPE {
         key_pos: usize,
         inputs: Option<&ArrayView2<f32>>,
     ) -> f32 {
-        match self {
-            UnifiedCoPE::Standard(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-            UnifiedCoPE::Gated(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-            UnifiedCoPE::Factorized(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-            UnifiedCoPE::Hierarchical(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-            UnifiedCoPE::Optimized(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-            UnifiedCoPE::Path(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-            UnifiedCoPE::WindowAware(cope) => cope.contribution(q, k, query_pos, key_pos, inputs),
-        }
+        delegate_to_cope_variant!(self, contribution, q, k, query_pos, key_pos, inputs)
     }
 
     fn backward(
@@ -302,7 +254,7 @@ impl PositionEmbedding for UnifiedCoPE {
             (UnifiedCoPE::WindowAware(c), UnifiedCoPEGradients::WindowAware(g)) => {
                 c.backward(q, k, query_pos, key_pos, inputs, d_score, g)
             }
-            _ => panic!("Gradient type mismatch in UnifiedCoPE"),
+            _ => panic!("Gradient type mismatch in UnifiedCoPE::backward"),
         }
     }
 
@@ -320,40 +272,26 @@ impl PositionEmbedding for UnifiedCoPE {
 
     fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
         match (self, grads) {
-            (UnifiedCoPE::Standard(c), UnifiedCoPEGradients::Standard(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            (UnifiedCoPE::Gated(c), UnifiedCoPEGradients::Gated(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            (UnifiedCoPE::Factorized(c), UnifiedCoPEGradients::Factorized(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            (UnifiedCoPE::Hierarchical(c), UnifiedCoPEGradients::Hierarchical(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            (UnifiedCoPE::Optimized(c), UnifiedCoPEGradients::Optimized(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            (UnifiedCoPE::Path(c), UnifiedCoPEGradients::Path(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            (UnifiedCoPE::WindowAware(c), UnifiedCoPEGradients::WindowAware(g)) => {
-                c.apply_gradients(g, lr)
-            }
-            _ => panic!("Gradient type mismatch in UnifiedCoPE"),
+            (UnifiedCoPE::Standard(c), UnifiedCoPEGradients::Standard(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Gated(c), UnifiedCoPEGradients::Gated(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Factorized(c), UnifiedCoPEGradients::Factorized(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Hierarchical(c), UnifiedCoPEGradients::Hierarchical(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Optimized(c), UnifiedCoPEGradients::Optimized(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Path(c), UnifiedCoPEGradients::Path(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::WindowAware(c), UnifiedCoPEGradients::WindowAware(g)) => c.apply_gradients(g, lr),
+            _ => panic!("Gradient type mismatch in UnifiedCoPE::apply_gradients"),
         }
     }
 
     fn embed_dim(&self) -> usize {
-        self.embed_dim()
+        delegate_to_cope_variant!(self, embed_dim)
     }
 
     fn parameters(&self) -> usize {
-        self.parameters()
+        delegate_to_cope_variant!(self, parameters)
     }
 
     fn weight_norm(&self) -> f32 {
-        self.weight_norm()
+        delegate_to_cope_variant!(self, weight_norm)
     }
 }

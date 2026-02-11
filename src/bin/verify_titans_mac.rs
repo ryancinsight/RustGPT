@@ -1,4 +1,5 @@
 use llm::domain::attention::poly_attention::PolyAttention;
+use llm::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 use llm::domain::memory::titans::NeuralMemory;
 use llm::domain::memory::titans::mac::TitansMAC;
 use llm::domain::network::Layer;
@@ -14,8 +15,13 @@ fn main() {
     let persistent_len = 2;
     let seq_len = 4; // 1 segment
 
-    // Initialize components
-    let poly = PolyAttention::new(input_dim, num_heads, 3, 64, None);
+    // Initialize components with CoPEConfig
+    let cope_config = CoPEConfig {
+        variant: CoPEVariant::Standard,
+        max_pos: 64,
+        window_size: None,
+    };
+    let poly = PolyAttention::new(input_dim, num_heads, 3, cope_config);
     let memory = NeuralMemory::new(input_dim, input_dim, input_dim, memory_hidden_dim);
     let mut mac = TitansMAC::new(poly, memory, persistent_len, segment_len);
 

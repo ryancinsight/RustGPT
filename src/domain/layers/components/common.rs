@@ -2,7 +2,10 @@ use ndarray::{Array2, parallel::prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    attention::poly_attention::PolyAttention,
+    attention::{
+        poly_attention::PolyAttention,
+        position::config::{CoPEConfig, CoPEVariant},
+    },
     layers::ssm::{
         Mamba, Mamba2, MoHMamba, MoHMamba2,
         rg_lru::{MoHRgLru, RgLru},
@@ -689,12 +692,16 @@ impl CommonLayers {
         let temporal_mixing =
             match config.temporal_mixing {
                 TemporalMixingType::Attention => {
+                    let cope_config = CoPEConfig {
+                        variant: CoPEVariant::Standard,
+                        max_pos: config.max_pos,
+                        window_size: config.window_size,
+                    };
                     let mut attention = PolyAttention::new(
                         config.embed_dim,
                         config.num_heads,
                         config.poly_degree,
-                        config.max_pos,
-                        config.window_size,
+                        cope_config,
                     );
                     attention.set_titan_memory_config(config.titan_memory.clone());
                     attention.set_head_selection_config(&config.head_selection);
@@ -741,12 +748,16 @@ impl CommonLayers {
                     }
                 }
                 TemporalMixingType::Titans => {
+                    let cope_config = CoPEConfig {
+                        variant: CoPEVariant::Standard,
+                        max_pos: config.max_pos,
+                        window_size: config.window_size,
+                    };
                     let mut attention = PolyAttention::new(
                         config.embed_dim,
                         config.num_heads,
                         config.poly_degree,
-                        config.max_pos,
-                        config.window_size,
+                        cope_config,
                     );
                     attention.set_titan_memory_config(config.titan_memory.clone());
                     attention.set_head_selection_config(&config.head_selection);
