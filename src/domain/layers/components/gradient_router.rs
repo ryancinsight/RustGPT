@@ -42,7 +42,11 @@ impl<'a> GradientSlice<'a> {
     /// Create a new gradient slice from a vector of Cow arrays.
     #[inline]
     pub fn new(grads: Vec<std::borrow::Cow<'a, Array2<f32>>>, start: usize, count: usize) -> Self {
-        Self { grads, start, count }
+        Self {
+            grads,
+            start,
+            count,
+        }
     }
 
     /// Returns a sub-slice of gradients for a component.
@@ -118,6 +122,51 @@ impl<'a> GradientSlice<'a> {
     }
 }
 
+/// Convert a borrowed/owned Cow gradient slice into owned arrays.
+#[inline]
+pub fn cow_grads_to_owned(grads: &[std::borrow::Cow<'_, Array2<f32>>]) -> Vec<Array2<f32>> {
+    grads.iter().map(|c| c.as_ref().clone()).collect()
+}
+
+/// Apply LARS-style scaling to Cow gradients, then forward owned arrays to a closure.
+#[inline]
+pub fn apply_lars_to_cow_grads<F>(
+    grads: &[std::borrow::Cow<'_, Array2<f32>>],
+    weight_norm: f32,
+    learning_rate: f32,
+    mut apply_fn: F,
+) -> Result<()>
+where
+    F: FnMut(&[Array2<f32>], f32) -> Result<()>,
+{
+    if grads.is_empty() {
+        return Ok(());
+    }
+
+    let gnorm: f32 = grads
+        .iter()
+        .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
+        .sum::<f32>()
+        .sqrt();
+    let wnorm = weight_norm.max(1e-6);
+    let scale = (wnorm / gnorm.max(1e-6)).clamp(0.01, 5.0);
+
+    let scaled: Vec<Array2<f32>> = if (scale - 1.0).abs() < 1e-6 {
+        cow_grads_to_owned(grads)
+    } else {
+        grads
+            .par_iter()
+            .map(|g| {
+                let mut gg = g.as_ref().clone();
+                gg.mapv_inplace(|x| x * scale);
+                gg
+            })
+            .collect()
+    };
+
+    apply_fn(&scaled, learning_rate)
+}
+
 /// Generic gradient router that eliminates repetitive gradient application patterns.
 ///
 /// This struct manages the routing of gradients to multiple components using a
@@ -139,9 +188,9 @@ impl<'a> GradientRouter<'a> {
             .iter()
             .map(|grad| {
                 // Check if sanitization is needed
-                let needs_fix = grad.iter().any(|&val| {
-                    !val.is_finite() || val.abs() > clip_threshold
-                });
+                let needs_fix = grad
+                    .iter()
+                    .any(|&val| !val.is_finite() || val.abs() > clip_threshold);
 
                 if needs_fix {
                     let mut fixed = grad.clone();
@@ -256,11 +305,7 @@ impl<'a> GradientRouter<'a> {
     ///
     /// This allows ad-hoc gradient application for components that don't
     /// implement GradientRoutable or need special handling.
-    pub fn route_to_closure<F>(
-        &mut self,
-        count: usize,
-        mut f: F,
-    ) -> Result<()>
+    pub fn route_to_closure<F>(&mut self, count: usize, mut f: F) -> Result<()>
     where
         F: FnMut(&[std::borrow::Cow<'_, Array2<f32>>]) -> Result<()>,
     {
@@ -279,6 +324,125 @@ impl<'a> GradientRouter<'a> {
         f(slice)?;
         self.position += actual_count;
         Ok(())
+    }
+
+    /// Route gradients to a closure after converting them to owned arrays.
+    ///
+    /// Useful for downstream APIs that require owned gradient buffers.
+    pub fn route_owned_to_closure<F>(&mut self, count: usize, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[Array2<f32>]) -> Result<()>,
+    {
+        self.route_to_closure(count, |grads| {
+            let owned = cow_grads_to_owned(grads);
+            f(&owned)
+        })
+    }
+
+    /// Route gradients to a closure with owned arrays only when `enabled` is true.
+    ///
+    /// When disabled, gradients are still consumed to preserve partition alignment,
+    /// but no owned conversion is performed.
+    pub fn route_owned_to_closure_if<F>(
+        &mut self,
+        count: usize,
+        enabled: bool,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[Array2<f32>]) -> Result<()>,
+    {
+        self.route_to_closure(count, |grads| {
+            if !enabled {
+                return Ok(());
+            }
+            let owned = cow_grads_to_owned(grads);
+            f(&owned)
+        })
+    }
+
+    /// Route gradients to a closure only when the routed slice has exactly `N` items.
+    ///
+    /// The closure receives an array reference, enabling typed access without
+    /// repeated length checks at call sites.
+    pub fn route_exact_owned_ref_to_closure<const N: usize, F>(
+        &mut self,
+        count: usize,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[Array2<f32>; N]) -> Result<()>,
+    {
+        self.route_owned_to_closure(count, |grads| {
+            if let Ok(arr_ref) = <&[Array2<f32>; N]>::try_from(grads) {
+                f(arr_ref)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Route gradients to a closure only when the routed slice has exactly `N` items.
+    ///
+    /// This variant stays zero-copy by passing Cow references directly.
+    pub fn route_exact_ref_to_closure<const N: usize, F>(
+        &mut self,
+        count: usize,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: for<'b> FnMut(&[std::borrow::Cow<'b, Array2<f32>>; N]) -> Result<()>,
+    {
+        self.route_to_closure(count, |grads| {
+            if let Ok(arr_ref) = <&[std::borrow::Cow<'_, Array2<f32>>; N]>::try_from(grads) {
+                f(arr_ref)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Route gradients to a closure only when enabled and the routed slice has exactly `N` items.
+    ///
+    /// This is useful for optional components where gradients must still be consumed for
+    /// partition alignment, while preserving strict shape validation when the component exists.
+    pub fn route_exact_ref_to_closure_if<const N: usize, F>(
+        &mut self,
+        count: usize,
+        enabled: bool,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: for<'b> FnMut(&[std::borrow::Cow<'b, Array2<f32>>; N]) -> Result<()>,
+    {
+        self.route_to_closure(count, |grads| {
+            if !enabled {
+                return Ok(());
+            }
+            let arr_ref =
+                <&[std::borrow::Cow<'_, Array2<f32>>; N]>::try_from(grads).map_err(|_| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: format!("Expected {} gradient arrays, got {}", N, grads.len()),
+                    }
+                })?;
+            f(arr_ref)
+        })
+    }
+
+    /// Route gradients to a closure with LARS-style adaptive scaling.
+    ///
+    /// This combines slicing, Cow handling, and LARS scaling into one shared accessor.
+    pub fn route_lars_to_closure<F>(
+        &mut self,
+        count: usize,
+        weight_norm: f32,
+        learning_rate: f32,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[Array2<f32>], f32) -> Result<()>,
+    {
+        self.route_to_closure(count, |grads| {
+            apply_lars_to_cow_grads(grads, weight_norm, learning_rate, |owned, lr| f(owned, lr))
+        })
     }
 
     /// Returns the number of gradients that have been consumed.
@@ -380,7 +544,11 @@ mod tests {
             self.weight_norm
         }
 
-        fn apply_gradients(&mut self, _gradients: &[Array2<f32>], _learning_rate: f32) -> Result<()> {
+        fn apply_gradients(
+            &mut self,
+            _gradients: &[Array2<f32>],
+            _learning_rate: f32,
+        ) -> Result<()> {
             self.applied = true;
             Ok(())
         }
@@ -426,7 +594,7 @@ mod tests {
     fn test_lars_scaling() {
         let grads = vec![Array2::from_elem((2, 2), 1.0)];
         let router = GradientRouter::new(&grads, 5.0);
-        
+
         let slice = GradientSlice {
             grads: router.gradients.clone(),
             start: 0,
@@ -436,5 +604,190 @@ mod tests {
         // Weight norm = 2.0, gradient norm = 2.0, scale should be ~1.0
         let scaled = slice.with_lars_scaling(2.0);
         assert_eq!(scaled.len(), 1);
+    }
+
+    #[test]
+    fn test_route_owned_to_closure() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_owned_to_closure(1, |owned| {
+                called = true;
+                assert_eq!(owned.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_lars_to_closure() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_lars_to_closure(1, 2.0, 0.01, |scaled, lr| {
+                called = true;
+                assert_eq!(scaled.len(), 1);
+                assert_eq!(lr, 0.01);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_owned_to_closure_if_enabled() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_owned_to_closure_if(1, true, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_owned_to_closure_if_disabled() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_owned_to_closure_if(1, false, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_owned_ref_to_closure() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_exact_owned_ref_to_closure::<1, _>(1, |arr| {
+                called = true;
+                assert_eq!(arr[0].shape(), &[2, 2]);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_owned_ref_to_closure_mismatch_skips() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_exact_owned_ref_to_closure::<2, _>(1, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_ref_to_closure() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_exact_ref_to_closure::<1, _>(1, |arr| {
+                called = true;
+                assert_eq!(arr[0].shape(), &[2, 2]);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_ref_to_closure_mismatch_skips() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_exact_ref_to_closure::<2, _>(1, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_ref_to_closure_if_enabled() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_exact_ref_to_closure_if::<1, _>(1, true, |arr| {
+                called = true;
+                assert_eq!(arr[0].shape(), &[2, 2]);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_ref_to_closure_if_disabled() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+        let mut called = false;
+
+        router
+            .route_exact_ref_to_closure_if::<1, _>(1, false, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!called);
+        assert_eq!(router.consumed(), 1);
+    }
+
+    #[test]
+    fn test_route_exact_ref_to_closure_if_enabled_mismatch_errors() {
+        let grads = vec![Array2::from_elem((2, 2), 1.0)];
+        let mut router = GradientRouter::new(&grads, 5.0);
+
+        let result = router.route_exact_ref_to_closure_if::<2, _>(1, true, |_| Ok(()));
+        assert!(result.is_err());
     }
 }

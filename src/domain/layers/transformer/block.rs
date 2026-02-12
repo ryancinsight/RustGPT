@@ -8,30 +8,33 @@ use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    infrastructure::optimizer::adam::Adam,
-    domain::{
-        attention::poly_attention::PolyAttention,
-    },
     common::errors::Result,
+    domain::attention::poly_attention::PolyAttention,
     domain::{
         layers::{
             components::{
                 adaptive_residuals::AdaptiveResiduals,
                 attention_context::SharedAttentionContext,
-                feedforward::SharedFeedforward,
-                temporal_processing::SharedTemporalProcessing,
                 common::{
                     CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
-                    TitanMemoryWorkspace, apply_adaptive_gradients,
+                    TitanMemoryWorkspace,
                 },
+                feedforward::SharedFeedforward,
+                gradient_router::GradientRouter,
+                temporal_processing::SharedTemporalProcessing,
             },
-            transformer::components::eprop_adaptor::{EPropAdaptor, EPropAdaptorConfig, EPropAdaptorStreamingWorkspace},
+            transformer::components::eprop_adaptor::{
+                EPropAdaptor, EPropAdaptorConfig, EPropAdaptorStreamingWorkspace,
+            },
         },
         mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
-        models::config::{ModelConfig, TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy},
+        models::config::{
+            ModelConfig, TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy,
+        },
         network::Layer,
         richards::RichardsNorm,
     },
+    infrastructure::optimizer::adam::Adam,
 };
 
 fn default_similarity_context_strength() -> Array2<f32> {
@@ -46,7 +49,7 @@ pub struct TransformerBlockStreamingWorkspace {
     pub ffn_out: Array1<f32>,
     pub residual: Array1<f32>,
     pub input_used: Array1<f32>,
-    
+
     // E-Prop buffers
     pub eprop_out: Array1<f32>,
     pub eprop_workspace: EPropAdaptorStreamingWorkspace,
@@ -301,7 +304,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             .unwrap_or(0.0);
         let mut similarity_context_strength = Array2::zeros((1, 1));
         similarity_context_strength[[0, 0]] = if scalar.is_finite() { scalar } else { 0.0 };
-        
+
         let mut context = SharedAttentionContext::new();
         context.similarity_context_strength = similarity_context_strength;
 
@@ -404,7 +407,7 @@ pub struct TransformerBlockConfig {
 
 /// Pre-allocated workspace for transformer block operations.
 /// Enables buffer reuse across forward/backward passes to reduce allocations.
-/// 
+///
 /// # Design
 /// Uses a generational buffer pattern where buffers are resized only when
 /// dimensions change, avoiding repeated allocations during training.
@@ -651,12 +654,11 @@ impl TransformerBlock {
 
     #[inline]
 
-
     /// Streaming forward step for token-by-token inference (Zero-Allocation).
     pub fn forward_step_into(
-        &mut self, 
-        input: &ndarray::ArrayView1<f32>, 
-        output: &mut ndarray::Array1<f32>
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
     ) {
         self.forward_step_into_with_overrides(input, output, None, None, None);
     }
@@ -689,8 +691,9 @@ impl TransformerBlock {
         let mut workspace = self.streaming_workspace.take().unwrap();
 
         // Apply incoming similarity context if present
-        self.context.apply_step_into(input, &mut workspace.input_used);
-        
+        self.context
+            .apply_step_into(input, &mut workspace.input_used);
+
         let input_used_view = workspace.input_used.view();
 
         // 1. Pre-Attention Norm
@@ -705,15 +708,22 @@ impl TransformerBlock {
         // Apply overrides if available
         if let Some(overrides) = moh_overrides {
             match &mut self.temporal_mixing.temporal_mixing {
-                TemporalMixingLayer::RgLruMoH(rglru) => rglru.set_verification_overrides(Some(overrides)),
-                TemporalMixingLayer::MambaMoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
-                TemporalMixingLayer::Mamba2MoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
+                TemporalMixingLayer::RgLruMoH(rglru) => {
+                    rglru.set_verification_overrides(Some(overrides))
+                }
+                TemporalMixingLayer::MambaMoH(mamba) => {
+                    mamba.set_verification_overrides(Some(overrides))
+                }
+                TemporalMixingLayer::Mamba2MoH(mamba) => {
+                    mamba.set_verification_overrides(Some(overrides))
+                }
                 _ => {}
             }
         }
 
-        self.temporal_mixing.forward_step_into(&norm1_out_view, &mut workspace.mix_out);
-        
+        self.temporal_mixing
+            .forward_step_into(&norm1_out_view, &mut workspace.mix_out);
+
         // Titan Memory Integration
         if !matches!(
             self.temporal_mixing.temporal_mixing,
@@ -727,7 +737,7 @@ impl TransformerBlock {
             // Original code:
             // apply_into_out_with_workspace(&mut mix_out, &norm1_out, ...)
             // Yes, it accumulates into mix_out.
-            
+
             self.config.titan_memory.apply_step_into(
                 &norm1_out_view,
                 &mut workspace.mix_out,
@@ -742,27 +752,31 @@ impl TransformerBlock {
         // For now, use existing with view insert.
         let input_used_2d = input_used_view.insert_axis(ndarray::Axis(0));
         let mix_out_2d = mix_out_view.insert_axis(ndarray::Axis(0));
-        
-        self.context.update_outgoing_context(&input_used_2d, &mix_out_2d, self.config.embed_dim);
-        
+
+        self.context
+            .update_outgoing_context(&input_used_2d, &mix_out_2d, self.config.embed_dim);
+
         // Head activity ratio logic...
-        let (head_activity_ratio, head_activity_vec) = self.temporal_mixing.get_head_activity_metrics();
+        let (head_activity_ratio, head_activity_vec) =
+            self.temporal_mixing.get_head_activity_metrics();
         let head_activity_ratio = head_activity_ratio.unwrap_or(1.0);
 
         // Adaptive Residuals
         let alpha = 1.0;
         if let Some(ar) = &mut self.adaptive_residuals {
-             ar.apply_attention_residual_step_into(
-                 &input_used_view,
-                 &mix_out_view,
-                 &mut workspace.residual,
-                 Some(head_activity_ratio),
-                 head_activity_vec,
-             );
+            ar.apply_attention_residual_step_into(
+                &input_used_view,
+                &mix_out_view,
+                &mut workspace.residual,
+                Some(head_activity_ratio),
+                head_activity_vec,
+            );
         } else {
-             // workspace.residual = input + alpha * mix_out
-             workspace.residual.assign(&input_used_view);
-             workspace.residual.zip_mut_with(&workspace.mix_out, |r, &m| *r += alpha * m);
+            // workspace.residual = input + alpha * mix_out
+            workspace.residual.assign(&input_used_view);
+            workspace
+                .residual
+                .zip_mut_with(&workspace.mix_out, |r, &m| *r += alpha * m);
         }
         let residual_view = workspace.residual.view();
 
@@ -779,7 +793,7 @@ impl TransformerBlock {
             .temporal_mixing
             .get_token_head_activity_vec()
             .and_then(|v| v.first().copied());
-            
+
         self.feedforward.forward_step_into(
             &norm2_out_view,
             &mut workspace.ffn_out,
@@ -787,7 +801,7 @@ impl TransformerBlock {
             head_activity_vec,
             token_head_activity,
         );
-        
+
         // Final Residual: output = residual + ffn_out
         if let Some(ref mut residuals) = self.adaptive_residuals {
             residuals.apply_ffn_residual_step_into(
@@ -802,12 +816,12 @@ impl TransformerBlock {
 
         // E-Prop Adaptor
         if let Some(ref mut adaptor) = self.eprop_adaptor {
-             // TODO: Make EProp zero-alloc. For now, we adapt.
-             let out_2d = output.view().insert_axis(ndarray::Axis(0)).to_owned();
-             if let Ok(adaptation) = adaptor.forward(&out_2d) {
-                 let adapt_1d = adaptation.index_axis(ndarray::Axis(0), 0);
-                 *output += &adapt_1d;
-             }
+            // TODO: Make EProp zero-alloc. For now, we adapt.
+            let out_2d = output.view().insert_axis(ndarray::Axis(0)).to_owned();
+            if let Ok(adaptation) = adaptor.forward(&out_2d) {
+                let adapt_1d = adaptation.index_axis(ndarray::Axis(0), 0);
+                *output += &adapt_1d;
+            }
         }
 
         self.streaming_workspace = Some(workspace);
@@ -827,7 +841,13 @@ impl TransformerBlock {
     ) -> ndarray::Array1<f32> {
         let dim = input.len();
         let mut output = ndarray::Array1::<f32>::zeros(dim);
-        self.forward_step_into_with_overrides(&input.view(), &mut output, norm1_overrides, norm2_overrides, moh_overrides);
+        self.forward_step_into_with_overrides(
+            &input.view(),
+            &mut output,
+            norm1_overrides,
+            norm2_overrides,
+            moh_overrides,
+        );
         output
     }
 
@@ -955,7 +975,10 @@ impl Layer for TransformerBlock {
 
         let mut reuse_ffn_out_cache = None;
         if let Ok(mut guard) = self.cached_intermediates.write()
-            && let Some(CachedIntermediates { ffn_out: ffn_out_arc, .. }) = guard.take()
+            && let Some(CachedIntermediates {
+                ffn_out: ffn_out_arc,
+                ..
+            }) = guard.take()
         {
             reuse_ffn_out_cache = Some(ffn_out_arc);
         }
@@ -964,10 +987,11 @@ impl Layer for TransformerBlock {
         // This makes the similarity matrix an explicit signal used by the next layer.
         let input_original_arc = Arc::new(input.clone());
 
-        let input_used_arc: Arc<Array2<f32>> = match self.context.apply_context(input_original_arc.as_ref()) {
-            Cow::Borrowed(_) => input_original_arc.clone(),
-            Cow::Owned(owned) => Arc::new(owned),
-        };
+        let input_used_arc: Arc<Array2<f32>> =
+            match self.context.apply_context(input_original_arc.as_ref()) {
+                Cow::Borrowed(_) => input_original_arc.clone(),
+                Cow::Owned(owned) => Arc::new(owned),
+            };
 
         // Pre-attention normalization
         let norm1_out = self.pre_attention_norm.forward(input_used_arc.as_ref());
@@ -983,7 +1007,10 @@ impl Layer for TransformerBlock {
             let min_w = self.config.min_window_size.max(1);
             let max_w = self.config.max_window_size.max(min_w);
             // Adaptive window is attention-specific; skip when not using attention.
-            if matches!(self.temporal_mixing.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+            if matches!(
+                self.temporal_mixing.temporal_mixing,
+                TemporalMixingLayer::Attention(_)
+            ) {
                 match self.config.window_adaptation_strategy {
                     WindowAdaptationStrategy::Fixed => {
                         dynamic_w = base_w.min(seq_len.max(1));
@@ -1027,10 +1054,15 @@ impl Layer for TransformerBlock {
         }
 
         // Update per-layer similarity representation matrix (input→mix-output channel similarity).
-        self.context.update_outgoing_context(&input_used_arc.as_ref().view(), &mix_out.view(), self.config.embed_dim);
+        self.context.update_outgoing_context(
+            &input_used_arc.as_ref().view(),
+            &mix_out.view(),
+            self.config.embed_dim,
+        );
 
         // Head activity ratio from MoH (avg active heads / num_heads).
-        let (head_activity_ratio_opt, head_activity_vec) = self.temporal_mixing.get_head_activity_metrics();
+        let (head_activity_ratio_opt, head_activity_vec) =
+            self.temporal_mixing.get_head_activity_metrics();
         let head_activity_ratio = head_activity_ratio_opt.unwrap_or(1.0);
         let token_head_activity_vec = self.temporal_mixing.get_token_head_activity_vec();
 
@@ -1166,8 +1198,7 @@ impl Layer for TransformerBlock {
             let residual1_grads = &grads_at_ffn_sum;
 
             // Get feedforward gradients
-            let (ffn_input_grad, ffn_param_grads) =
-                self.feedforward.backward(norm2_out, ffn_grads);
+            let (ffn_input_grad, ffn_param_grads) = self.feedforward.backward(norm2_out, ffn_grads);
 
             let (residual1_from_ffn, pre_ffn_param_grads) = self
                 .pre_ffn_norm
@@ -1203,10 +1234,9 @@ impl Layer for TransformerBlock {
             let final_input_used_grads = input_grads_ref + &norm1_input_grad;
 
             // Compute gradients for similarity context (strength and input backprop)
-            let (final_input_grads, similarity_strength_grad) = self.context.compute_gradients(
-                input_original,
-                &final_input_used_grads
-            );
+            let (final_input_grads, similarity_strength_grad) = self
+                .context
+                .compute_gradients(input_original, &final_input_used_grads);
 
             // Capture gradient partition sizes so apply_gradients can re-slice accurately later
             // Compute adaptive-residual gradients first, but append them *last* so the
@@ -1296,131 +1326,67 @@ impl Layer for TransformerBlock {
                 }
             });
 
-        // Zero-copy gradient sanitization: only clone and modify gradients that need fixing.
-        // This avoids O(n) clones when all gradients are already valid (common case).
-        let sanitized = param_grads
-            .iter()
-            .map(|grad| {
-                let mut clipped = grad.clone();
-                // Clip extreme gradients to prevent instability
-                for &val in grad.iter() {
-                    if val.is_nan() || val.is_infinite() {
-                        // Replace NaN/inf with small random noise to break symmetry
-                        use rand::Rng;
-                        let mut rng = crate::common::rng::get_rng();
-                        clipped.mapv_inplace(|_| 0.01 * (rng.random::<f32>() - 0.5));
-                        break;
-                    }
-                    // Clip extreme values
-                    if val.abs() > 5.0 {
-                        clipped.mapv_inplace(|x| x.clamp(-5.0, 5.0));
-                        break;
-                    }
-                }
-                Cow::Owned(clipped)
-            })
-            .collect::<Vec<Cow<'_, Array2<f32>>>>();
-
-        let mut idx = 0usize;
+        let mut router = GradientRouter::new(param_grads, 5.0);
         let total_expected = partitions.total();
-        if total_expected != sanitized.len() {
+        if total_expected != router.total() {
             tracing::warn!(
                 expected = total_expected,
-                actual = sanitized.len(),
+                actual = router.total(),
                 "TransformerBlock::apply_gradients received unexpected gradient count"
             );
         }
 
-        let mut next_range = |count: usize| {
-            let available = sanitized.len().saturating_sub(idx);
-            let len = count.min(available);
-            let start = idx;
-            idx += len;
-            start..idx
-        };
+        let temporal_weight_norm = self.temporal_mixing.weight_norm();
+        router.route_lars_to_closure(
+            partitions.temporal_mixing,
+            temporal_weight_norm,
+            lr,
+            |grads, lr| self.temporal_mixing.apply_gradients(grads, lr),
+        )?;
 
-        // Apply temporal-mixing gradients with adaptive scaling (LARS-style)
-        let mix_range = next_range(partitions.temporal_mixing);
-        let mixing_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[mix_range.clone()].to_vec();
-        if !mixing_grads.is_empty() {
-            // Convert Cow to owned for apply_gradients (needed for downstream API)
-            let owned_grads: Vec<Array2<f32>> =
-                mixing_grads.iter().map(|c| c.as_ref().clone()).collect();
-            apply_adaptive_gradients(
-                &owned_grads,
-                self.temporal_mixing.weight_norm(),
-                lr,
-                |grads, lr| self.temporal_mixing.apply_gradients(grads, lr),
-            )?;
-        }
+        let feedforward_weight_norm = self.feedforward.weight_norm();
+        router.route_lars_to_closure(
+            partitions.feedforward,
+            feedforward_weight_norm,
+            lr,
+            |grads, lr| self.feedforward.apply_gradients(grads, lr),
+        )?;
 
-        // Apply feedforward gradients with adaptive scaling
-        let ffn_range = next_range(partitions.feedforward);
-        let feedforward_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[ffn_range.clone()].to_vec();
-        if !feedforward_grads.is_empty() {
-            let owned_grads: Vec<Array2<f32>> = feedforward_grads
-                .iter()
-                .map(|c| c.as_ref().clone())
-                .collect();
-            apply_adaptive_gradients(
-                &owned_grads,
-                self.feedforward.weight_norm(),
-                lr,
-                |grads, lr| self.feedforward.apply_gradients(grads, lr),
-            )?;
-        }
+        router.route_to_closure(partitions.pre_ffn_norm, |grads| {
+            self.pre_ffn_norm.apply_gradients_ref(grads, lr)
+        })?;
 
-        // Apply pre-FFN norm gradients
-        let pre_ffn_range = next_range(partitions.pre_ffn_norm);
-        let pre_ffn_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[pre_ffn_range.clone()].to_vec();
-        if !pre_ffn_grads.is_empty() {
-            let owned_grads: Vec<Array2<f32>> =
-                pre_ffn_grads.iter().map(|c| c.as_ref().clone()).collect();
-            self.pre_ffn_norm.apply_gradients(&owned_grads, lr)?;
-        }
+        router.route_to_closure(partitions.pre_attn_norm, |grads| {
+            self.pre_attention_norm.apply_gradients_ref(grads, lr)
+        })?;
 
-        // Apply pre-attention norm gradients
-        let pre_attn_range = next_range(partitions.pre_attn_norm);
-        let pre_attn_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[pre_attn_range.clone()].to_vec();
-        if !pre_attn_grads.is_empty() {
-            let owned_grads: Vec<Array2<f32>> =
-                pre_attn_grads.iter().map(|c| c.as_ref().clone()).collect();
-            self.pre_attention_norm.apply_gradients(&owned_grads, lr)?;
-        }
-
-        // Apply learned similarity-context strength gradient (scalar)
-        let ctx_range = next_range(partitions.context);
-        if !ctx_range.is_empty()
-            && let Some(g) = sanitized.get(ctx_range.start)
-        {
+        router.route_exact_ref_to_closure::<1, _>(partitions.context, |grads| {
             self.opt_similarity_context_strength.step(
                 &mut self.context.similarity_context_strength,
-                g.as_ref(),
+                grads[0].as_ref(),
                 lr,
             );
-        }
+            Ok(())
+        })?;
 
-        // Apply adaptive residuals gradients
-        let adaptive_range = next_range(partitions.adaptive_residuals);
-        let adaptive_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[adaptive_range.clone()].to_vec();
-        if !adaptive_grads.is_empty() && self.adaptive_residuals.is_some() {
-            let owned_grads: Vec<Array2<f32>> =
-                adaptive_grads.iter().map(|c| c.as_ref().clone()).collect();
-            if let Some(ref mut residuals) = self.adaptive_residuals {
-                residuals.apply_gradients(&owned_grads, lr)?;
-            }
-        }
+        let has_adaptive_residuals = self.adaptive_residuals.is_some();
+        router.route_exact_ref_to_closure_if::<2, _>(
+            partitions.adaptive_residuals,
+            has_adaptive_residuals,
+            |grads| {
+                if let Some(ref mut residuals) = self.adaptive_residuals {
+                    residuals.apply_gradients_ref((grads[0].as_ref(), grads[1].as_ref()), lr)?;
+                }
+                Ok(())
+            },
+        )?;
 
-        // Apply eprop gradients
-        let eprop_range = next_range(partitions.eprop_adaptor);
-        let eprop_grads: Vec<Cow<'_, Array2<f32>>> = sanitized[eprop_range.clone()].to_vec();
-        if !eprop_grads.is_empty() && self.eprop_adaptor.is_some() {
-            let owned_grads: Vec<Array2<f32>> =
-                eprop_grads.iter().map(|c| c.as_ref().clone()).collect();
+        router.route_to_closure(partitions.eprop_adaptor, |grads| {
             if let Some(ref mut adaptor) = self.eprop_adaptor {
-                adaptor.apply_gradients(&owned_grads, lr)?;
+                adaptor.apply_gradients_ref(grads, lr)?;
             }
-        }
+            Ok(())
+        })?;
 
         if let Ok(mut guard) = self.param_partitions.write() {
             *guard = None;
@@ -1445,7 +1411,8 @@ impl Layer for TransformerBlock {
 mod tests {
     use super::*;
     use crate::{
-        domain::layers::components::adaptive_residuals::AdaptiveResiduals, domain::models::config::ModelConfig,
+        domain::layers::components::adaptive_residuals::AdaptiveResiduals,
+        domain::models::config::ModelConfig,
     };
 
     #[test]
@@ -1468,7 +1435,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -1511,7 +1479,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -1550,7 +1519,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -1585,7 +1555,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -1623,7 +1594,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -1668,7 +1640,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -2169,7 +2142,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
@@ -2280,7 +2254,8 @@ mod tests {
             use_adaptive_window: false,
             min_window_size: 16,
             max_window_size: 4096,
-            window_adaptation_strategy: crate::domain::models::config::WindowAdaptationStrategy::Fixed,
+            window_adaptation_strategy:
+                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),

@@ -3,13 +3,12 @@
 //! This module contains components for time embeddings, FiLM conditioning,
 //! and other modulation mechanisms used in diffusion models and potentially others.
 
+use std::borrow::Cow;
+
 use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    domain::richards::RichardsCurve,
-    infrastructure::optimizer::adam::Adam,
-};
+use crate::{domain::richards::RichardsCurve, infrastructure::optimizer::adam::Adam};
 
 /// Standard transformer-style sinusoidal time embedding
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -80,7 +79,7 @@ impl TimeConditioner {
             (rand::random::<f32>() - 0.5) * scale
         });
         let b1 = Array2::zeros((hidden_dim, 1));
-        
+
         let scale2 = (2.0 / hidden_dim as f32).sqrt();
         let w2 = Array2::from_shape_fn((output_dim, hidden_dim), |_| {
             (rand::random::<f32>() - 0.5) * scale2
@@ -115,21 +114,21 @@ impl TimeConditioner {
         // input shape: [dim]
         // w1 shape: [hidden, dim]
         let h_pre = w1.dot(input); // [hidden]
-        
+
         // Add bias (broadcast)
         let h_pre = h_pre + b1.column(0);
-        
+
         // Swish activation: x * sigmoid(x)
         let h = h_pre.mapv(|x| x / (1.0 + (-x).exp()));
-        
+
         // Layer 2: Linear
         let out_pre = w2.dot(&h);
         let out = out_pre + b2.column(0);
-        
+
         // Return output and hidden state (for caching/skip connections if needed)
         // Hidden state returned as 2D [1, hidden] for consistency with previous API
         let h_2d = h.insert_axis(ndarray::Axis(0));
-        
+
         (out, h_2d)
     }
 
@@ -137,29 +136,41 @@ impl TimeConditioner {
         &self,
         input: &Array1<f32>,
         grad_output: &Array1<f32>,
-    ) -> (Array1<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>) {
+    ) -> (
+        Array1<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+    ) {
         // Recompute forward pass for gradients
         // We assume non-EMA weights for training
         let h_pre = self.w1.dot(input) + self.b1.column(0);
         let h = h_pre.mapv(|x| x / (1.0 + (-x).exp())); // Swish
-        
+
         // Layer 2 gradients
         // out = w2 * h + b2
         // dL/dw2 = dL/dout * h^T
         // dL/db2 = dL/dout
         // dL/dh = w2^T * dL/dout
-        
-        let grad_w2 = grad_output.clone().insert_axis(ndarray::Axis(1)).dot(&h.clone().insert_axis(ndarray::Axis(0)));
+
+        let grad_w2 = grad_output
+            .clone()
+            .insert_axis(ndarray::Axis(1))
+            .dot(&h.clone().insert_axis(ndarray::Axis(0)));
         let grad_b2 = grad_output.clone().insert_axis(ndarray::Axis(1));
-        
+
         let grad_h = self.w2.t().dot(grad_output);
-        
+
         // Swish gradient: f'(x) = f(x) + sigmoid(x)(1 - f(x))
         let sigmoid_h_pre = h_pre.mapv(|x| 1.0 / (1.0 + (-x).exp()));
         let grad_h_pre = &grad_h * (&h + &sigmoid_h_pre * (1.0 - &h));
-        
+
         // Layer 1 gradients
-        let grad_w1 = grad_h_pre.clone().insert_axis(ndarray::Axis(1)).dot(&input.clone().insert_axis(ndarray::Axis(0)));
+        let grad_w1 = grad_h_pre
+            .clone()
+            .insert_axis(ndarray::Axis(1))
+            .dot(&input.clone().insert_axis(ndarray::Axis(0)));
         let grad_b1 = grad_h_pre.clone().insert_axis(ndarray::Axis(1));
         let grad_input = self.w1.t().dot(&grad_h_pre);
 
@@ -168,31 +179,35 @@ impl TimeConditioner {
 
     pub fn apply_gradients(
         &mut self,
-        grads: (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>),
+        grads: (&Array2<f32>, &Array2<f32>, &Array2<f32>, &Array2<f32>),
         lr: f32,
         ema_decay: f32,
     ) {
         let (g_w1, g_b1, g_w2, g_b2) = grads;
-        
+
         if let Some(opt) = &mut self.opt_w2 {
-            opt.step(&mut self.w2, &g_w2, lr);
+            opt.step(&mut self.w2, g_w2, lr);
         }
         if let Some(opt) = &mut self.opt_b2 {
-            opt.step(&mut self.b2, &g_b2, lr);
+            opt.step(&mut self.b2, g_b2, lr);
         }
         if let Some(opt) = &mut self.opt_w1 {
-            opt.step(&mut self.w1, &g_w1, lr);
+            opt.step(&mut self.w1, g_w1, lr);
         }
         if let Some(opt) = &mut self.opt_b1 {
-            opt.step(&mut self.b1, &g_b1, lr);
+            opt.step(&mut self.b1, g_b1, lr);
         }
 
         // Update EMA
         let d = ema_decay;
-        self.ema_w2.zip_mut_with(&self.w2, |e, &w| *e = d * *e + (1.0 - d) * w);
-        self.ema_b2.zip_mut_with(&self.b2, |e, &w| *e = d * *e + (1.0 - d) * w);
-        self.ema_w1.zip_mut_with(&self.w1, |e, &w| *e = d * *e + (1.0 - d) * w);
-        self.ema_b1.zip_mut_with(&self.b1, |e, &w| *e = d * *e + (1.0 - d) * w);
+        self.ema_w2
+            .zip_mut_with(&self.w2, |e, &w| *e = d * *e + (1.0 - d) * w);
+        self.ema_b2
+            .zip_mut_with(&self.b2, |e, &w| *e = d * *e + (1.0 - d) * w);
+        self.ema_w1
+            .zip_mut_with(&self.w1, |e, &w| *e = d * *e + (1.0 - d) * w);
+        self.ema_b1
+            .zip_mut_with(&self.b1, |e, &w| *e = d * *e + (1.0 - d) * w);
     }
 
     pub fn weight_norm(&self) -> f32 {
@@ -223,6 +238,49 @@ pub struct SharedFilmModulation {
     pub scale_beta: f32,
     #[serde(skip)]
     scratch: Vec<f32>,
+}
+
+#[inline]
+fn apply_film_inplace(
+    output: &mut Array2<f32>,
+    gamma: ArrayView1<'_, f32>,
+    beta: ArrayView1<'_, f32>,
+) {
+    for mut row in output.outer_iter_mut() {
+        row.zip_mut_with(&gamma, |x, &g| *x *= g);
+        row.zip_mut_with(&beta, |x, &b| *x += b);
+    }
+}
+
+#[inline]
+fn apply_delta_film_inplace(
+    output: &mut Array2<f32>,
+    gamma_delta: ArrayView1<'_, f32>,
+    beta: ArrayView1<'_, f32>,
+) {
+    for mut row in output.outer_iter_mut() {
+        row.zip_mut_with(&gamma_delta, |x, &g| *x *= 1.0 + g);
+        row.zip_mut_with(&beta, |x, &b| *x += b);
+    }
+}
+
+/// Apply FiLM modulation with delta-gamma (`x *= 1 + gamma`) when both inputs are present.
+///
+/// Returns a borrowed input when conditioning is disabled, and an owned
+/// conditioned tensor when enabled.
+pub fn apply_optional_delta_film<'a>(
+    input: &'a Array2<f32>,
+    gamma: Option<ArrayView1<'_, f32>>,
+    beta: Option<ArrayView1<'_, f32>>,
+) -> Cow<'a, Array2<f32>> {
+    match (gamma, beta) {
+        (Some(gamma), Some(beta)) => {
+            let mut out = input.clone();
+            apply_delta_film_inplace(&mut out, gamma, beta);
+            Cow::Owned(out)
+        }
+        _ => Cow::Borrowed(input),
+    }
 }
 
 impl Default for SharedFilmModulation {
@@ -259,7 +317,7 @@ impl SharedFilmModulation {
     /// Update modulation parameters from a flat gamma_beta vector
     pub fn update(&mut self, gamma_beta: &[f32], embed_dim: usize) {
         let tanh = RichardsCurve::tanh(false);
-        
+
         // Ensure buffers are sized correctly (in case embed_dim changed or init was empty)
         if self.gamma_attn.len() != embed_dim {
             self.gamma_attn = Array2::zeros((1, embed_dim));
@@ -270,7 +328,7 @@ impl SharedFilmModulation {
 
         self.scratch.resize(gamma_beta.len(), 0.0);
         tanh.forward_into_f32(gamma_beta, &mut self.scratch);
-        
+
         let ga = self.gamma_attn.as_slice_mut().unwrap();
         let ba = self.beta_attn.as_slice_mut().unwrap();
         let gf = self.gamma_ffn.as_slice_mut().unwrap();
@@ -282,7 +340,7 @@ impl SharedFilmModulation {
             // embed..2*embed: beta_attn
             // 2*embed..3*embed: gamma_ffn
             // 3*embed..4*embed: beta_ffn
-            
+
             ga[j] = 1.0 + self.scale_gamma * self.scratch[j];
             ba[j] = self.scale_beta * self.scratch[embed_dim + j];
             gf[j] = 1.0 + self.scale_gamma * self.scratch[2 * embed_dim + j];
@@ -312,10 +370,7 @@ impl SharedFilmModulation {
         beta: ArrayView1<f32>,
     ) -> Array2<f32> {
         let mut out = input.clone();
-        for mut row in out.outer_iter_mut() {
-            row.zip_mut_with(&gamma, |x, &g| *x *= g);
-            row.zip_mut_with(&beta, |x, &b| *x += b);
-        }
+        apply_film_inplace(&mut out, gamma, beta);
         out
     }
 
@@ -388,5 +443,32 @@ impl SharedFilmModulation {
         }
 
         grad
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::{Array2, array};
+
+    use super::apply_optional_delta_film;
+
+    #[test]
+    fn apply_optional_delta_film_borrows_when_disabled() {
+        let input = Array2::<f32>::ones((2, 3));
+        let conditioned = apply_optional_delta_film(&input, None, None);
+        assert!(matches!(conditioned, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn apply_optional_delta_film_applies_delta_gamma_and_beta() {
+        let input = array![[1.0f32, 2.0f32]];
+        let gamma = array![0.5f32, -0.5f32];
+        let beta = array![0.25f32, 1.0f32];
+
+        let conditioned = apply_optional_delta_film(&input, Some(gamma.view()), Some(beta.view()));
+        let output = conditioned.into_owned();
+
+        assert!((output[[0, 0]] - 1.75).abs() < 1e-6);
+        assert!((output[[0, 1]] - 2.0).abs() < 1e-6);
     }
 }

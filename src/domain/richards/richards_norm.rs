@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -197,9 +199,9 @@ impl RichardsNorm {
     pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // Cache input for backward (needed for gradient computation)
         self.cached_input = Some(input.clone());
-        
+
         // For training, we also need to cache the adjusted curve parameters.
-        // However, since we now compute adjustments per-row (per-token), 
+        // However, since we now compute adjustments per-row (per-token),
         // a single "adjusted_richards" doesn't capture the full state.
         // But the original implementation cached it.
         // The implementation in `normalize_impl` doesn't update `cached_adjusted_richards`.
@@ -207,39 +209,38 @@ impl RichardsNorm {
         // Actually, `normalize_impl` is what does the work.
         // Let's call it.
         let out = self.normalize_impl(input);
-        
+
         // Update the cached curve using batch statistics for backward pass approximation
-        // (This preserves the original behavior for training, though strictly speaking 
+        // (This preserves the original behavior for training, though strictly speaking
         // gradients should be per-token adjusted).
         let (adj_temp, _, _) = self.compute_dynamic_adjustments(input);
         if let Some(t) = adj_temp {
-             let mut curve = self.richards.clone();
-             curve.learned_temperature = Some(t);
-             self.cached_adjusted_richards = Some(curve);
+            let mut curve = self.richards.clone();
+            curve.learned_temperature = Some(t);
+            self.cached_adjusted_richards = Some(curve);
         } else {
-             self.cached_adjusted_richards = Some(self.richards.clone());
+            self.cached_adjusted_richards = Some(self.richards.clone());
         }
-        
+
         out
     }
 
     /// Normalize into a pre-allocated slice (no allocations)
     pub fn normalize_into_f32(&self, input: &[f32], output: &mut [f32]) {
-         use ndarray::ArrayView1;
-         // Wrap slice as ArrayView1 then promote to 2D (1, N) for adjustment calc
-         let in_view = ArrayView1::from(input);
-         let in_2d = in_view.insert_axis(ndarray::Axis(0));
-         
-         let (adjusted_temp, adjusted_m, adjusted_beta) =
-             self.compute_dynamic_adjustments(&in_2d);
-             
-         self.richards.forward_into_f32_with_overrides(
-             input,
-             output,
-             adjusted_temp,
-             adjusted_m,
-             adjusted_beta,
-         );
+        use ndarray::ArrayView1;
+        // Wrap slice as ArrayView1 then promote to 2D (1, N) for adjustment calc
+        let in_view = ArrayView1::from(input);
+        let in_2d = in_view.insert_axis(ndarray::Axis(0));
+
+        let (adjusted_temp, adjusted_m, adjusted_beta) = self.compute_dynamic_adjustments(&in_2d);
+
+        self.richards.forward_into_f32_with_overrides(
+            input,
+            output,
+            adjusted_temp,
+            adjusted_m,
+            adjusted_beta,
+        );
     }
 
     /// Forward normalization with dynamic parameter adjustments (immutable for inference)
@@ -259,16 +260,16 @@ impl RichardsNorm {
 
         // We use the overrides for ALL rows if provided.
         // This is useful when we want to force specific behavior during verification.
-        
+
         ndarray::Zip::from(out.outer_iter_mut())
             .and(input.outer_iter())
             .par_for_each(|mut out_row, in_row| {
                 let in_row_2d = in_row.insert_axis(ndarray::Axis(0));
-                
-                // If overrides are provided, use them. 
+
+                // If overrides are provided, use them.
                 // Otherwise calculate dynamic adjustments as usual.
                 let (dyn_temp, dyn_m, dyn_beta) = self.compute_dynamic_adjustments(&in_row_2d);
-                
+
                 let effective_temp = temp_override.or(dyn_temp);
                 let effective_m = m_override.or(dyn_m);
                 let effective_beta = beta_override.or(dyn_beta);
@@ -310,18 +311,18 @@ impl RichardsNorm {
         // Wrap as 2D for compute_dynamic_adjustments (1, D)
         // This is a view, so it's cheap.
         let in_2d = input.insert_axis(ndarray::Axis(0));
-        
+
         let (dyn_temp, dyn_m, dyn_beta) = self.compute_dynamic_adjustments(&in_2d);
-        
+
         let (temp_ov, m_ov, beta_ov) = overrides.unwrap_or((None, None, None));
-        
+
         let effective_temp = temp_ov.or(dyn_temp);
         let effective_m = m_ov.or(dyn_m);
         let effective_beta = beta_ov.or(dyn_beta);
-        
+
         let in_slice = input.as_slice().unwrap();
         let out_slice = output.as_slice_mut().unwrap();
-        
+
         self.richards.forward_into_f32_with_overrides(
             in_slice,
             out_slice,
@@ -367,6 +368,51 @@ impl RichardsNorm {
             });
 
         out
+    }
+
+    #[inline]
+    fn apply_gradients_from_iter<'a, I>(
+        &mut self,
+        gradients: I,
+        learning_rate: f32,
+    ) -> Result<(), crate::common::errors::ModelError>
+    where
+        I: IntoIterator<Item = &'a Array2<f32>>,
+    {
+        let grads: Vec<&Array2<f32>> = gradients.into_iter().collect();
+
+        // Track gradient norms for stability without allocating temporaries.
+        let total_norm_sq: f32 = grads
+            .iter()
+            .map(|g| g.iter().map(|&x| x * x).sum::<f32>())
+            .sum();
+        let total_norm = total_norm_sq.sqrt();
+
+        // Update EMA of gradient norm
+        if let Some(ema) = self.grad_norm_ema {
+            self.grad_norm_ema = Some(EMA_BETA_GRAD * ema + (1.0 - EMA_BETA_GRAD) * total_norm);
+        } else {
+            self.grad_norm_ema = Some(total_norm);
+        }
+
+        // Flatten all gradients (scalars and vectors) into a single vector for RichardsCurve.
+        let total_values: usize = grads.iter().map(|g| g.len()).sum();
+        let mut curve_grads: Vec<f64> = Vec::with_capacity(total_values);
+        for g in grads {
+            curve_grads.extend(g.iter().map(|&val| val as f64));
+        }
+
+        self.richards.step(&curve_grads, learning_rate as f64);
+        Ok(())
+    }
+
+    /// Apply borrowed/owned Cow gradients without forcing owned conversion at call sites.
+    pub fn apply_gradients_ref(
+        &mut self,
+        gradients: &[Cow<'_, Array2<f32>>],
+        learning_rate: f32,
+    ) -> Result<(), crate::common::errors::ModelError> {
+        self.apply_gradients_from_iter(gradients.iter().map(|g| g.as_ref()), learning_rate)
     }
 }
 
@@ -502,31 +548,7 @@ impl Layer for RichardsNorm {
         gradients: &[Array2<f32>],
         learning_rate: f32,
     ) -> Result<(), crate::common::errors::ModelError> {
-        // Track gradient norms for stability
-        let mut total_norm = 0.0;
-        for g in gradients {
-            total_norm += g.mapv(|x| x * x).sum();
-        }
-        total_norm = total_norm.sqrt();
-
-        // Update EMA of gradient norm
-        if let Some(ema) = self.grad_norm_ema {
-            self.grad_norm_ema = Some(EMA_BETA_GRAD * ema + (1.0 - EMA_BETA_GRAD) * total_norm);
-        } else {
-            self.grad_norm_ema = Some(total_norm);
-        }
-
-        // Flatten all gradients (scalars and vectors) into a single vector for RichardsCurve
-        let mut curve_grads: Vec<f64> = Vec::with_capacity(gradients.len());
-        for g in gradients {
-            for &val in g.iter() {
-                curve_grads.push(val as f64);
-            }
-        }
-
-        self.richards.step(&curve_grads, learning_rate as f64);
-
-        Ok(())
+        self.apply_gradients_from_iter(gradients.iter(), learning_rate)
     }
 
     fn weight_norm(&self) -> f32 {
@@ -537,7 +559,7 @@ impl Layer for RichardsNorm {
             .sum::<f32>()
             .sqrt()
     }
-    
+
     fn zero_gradients(&mut self) {
         // RichardsCurve doesn't hold gradients, they are passed in apply_gradients
     }

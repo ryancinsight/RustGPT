@@ -238,11 +238,11 @@ impl AdaptiveResiduals {
 
         // Apply position-aware scaling with contrast enhancement
         output.zip_mut_with(input, |o, &i| *o = i);
-        
+
         for channel in 0..embed_dim {
             let attn_val = attn_out[channel];
             let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
-            
+
             let scale = if channel < self.scratch_channel_scales.len() {
                 self.scratch_channel_scales[channel]
             } else {
@@ -466,7 +466,7 @@ impl AdaptiveResiduals {
         let min_scale = 0.1f32;
         let ffn_scales = &self.ffn_residual_scales;
         let embed_dim = ffn_out.len().min(self.config.embed_dim);
-        
+
         let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
         let contrast_alpha = self.config.contrastive_strength;
 
@@ -490,10 +490,10 @@ impl AdaptiveResiduals {
 
         // Compute output directly
         // output = residual1 + ffn_out * scale
-        
+
         // Initialize output with residual1
         output.zip_mut_with(residual1, |o, &r| *o = r);
-        
+
         // Add scaled ffn_out
         for channel in 0..embed_dim {
             let scale = self.scratch_channel_scales[channel];
@@ -937,20 +937,13 @@ impl AdaptiveResiduals {
         vec![attention_scale_grads, ffn_scale_grads]
     }
 
-    /// Apply gradients to adaptive residuals with similarity-based learning
-    pub fn apply_gradients(
+    /// Apply gradients to adaptive residuals with similarity-based learning using borrowed refs.
+    pub fn apply_gradients_ref(
         &mut self,
-        param_grads: &[Array2<f32>],
+        grads: (&Array2<f32>, &Array2<f32>),
         lr: f32,
     ) -> crate::common::errors::Result<()> {
-        if param_grads.len() != 2 {
-            return Err(crate::common::errors::ModelError::InvalidInput {
-                message: format!("Expected 2 gradient arrays, got {}", param_grads.len()),
-            });
-        }
-
-        let attention_scale_grads = &param_grads[0];
-        let ffn_scale_grads = &param_grads[1];
+        let (attention_scale_grads, ffn_scale_grads) = grads;
 
         // Clip gradients for stability (then run Adam for smoother adaptivity).
         // Keep parameter deltas bounded by `threshold`, but allow larger gradients so learning
@@ -990,14 +983,28 @@ impl AdaptiveResiduals {
         }
 
         // Update gradient norm for monitoring
-        let grad_norm_sq: f32 = param_grads
+        let grad_norm_sq: f32 = attention_scale_grads
             .iter()
-            .flat_map(|g| g.iter())
+            .chain(ffn_scale_grads.iter())
             .map(|x| x * x)
             .sum();
         self.gradient_norm = grad_norm_sq.sqrt();
 
         Ok(())
+    }
+
+    /// Apply gradients to adaptive residuals from a two-item gradient slice.
+    pub fn apply_gradients(
+        &mut self,
+        param_grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::common::errors::Result<()> {
+        let grads = <&[Array2<f32>; 2]>::try_from(param_grads).map_err(|_| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: format!("Expected 2 gradient arrays, got {}", param_grads.len()),
+            }
+        })?;
+        self.apply_gradients_ref((&grads[0], &grads[1]), lr)
     }
 
     /// Frobenius norm of all learnable parameters.

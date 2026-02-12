@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     common::errors::Result,
     domain::{
-        layers::components::common::TemporalMixingLayer,
+        layers::components::{
+            common::TemporalMixingLayer, conditioning::apply_optional_delta_film,
+        },
         network::Layer,
     },
 };
@@ -40,7 +42,7 @@ impl SharedTemporalProcessing {
     }
 
     /// Forward pass through the temporal processing layer
-    /// 
+    ///
     /// Uses the Layer trait for zero-cost abstraction, eliminating
     /// redundant match statements across all temporal mixing variants.
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
@@ -63,25 +65,9 @@ impl SharedTemporalProcessing {
         beta: Option<&Array1<f32>>,
         causal: bool,
     ) -> Array2<f32> {
-        if let (Some(g), Some(b)) = (gamma, beta) {
-            let mut modified = input.clone();
-            // Apply FiLM: x = x * (1 + gamma) + beta
-            // Note: g and b are broadcast across the sequence length (axis 0)
-            for mut row in modified.outer_iter_mut() {
-                // We use explicit loops or zip to avoid allocation if possible,
-                // but ndarray ops on views are efficient.
-                // row = row * (1 + g) + b
-                // 1 + g can be precomputed if reused, but here it's per-step usually.
-                // Optimization: Precompute (1+g) if possible, but here we just do it.
-                
-                // Using zip_mut_with for zero-allocation iteration
-                row.zip_mut_with(g, |x, &g_val| *x *= 1.0 + g_val);
-                row.zip_mut_with(b, |x, &b_val| *x += b_val);
-            }
-            self.forward_with_causal(&modified, causal)
-        } else {
-            self.forward_with_causal(input, causal)
-        }
+        let conditioned =
+            apply_optional_delta_film(input, gamma.map(|g| g.view()), beta.map(|b| b.view()));
+        self.forward_with_causal(conditioned.as_ref(), causal)
     }
 
     /// Prepares the layer for a forward pass (e.g. setting window size)
@@ -97,7 +83,7 @@ impl SharedTemporalProcessing {
     }
 
     /// Backward pass through the temporal processing layer
-    /// 
+    ///
     /// Uses compute_gradients from Layer trait for consistent
     /// gradient computation across all temporal mixing variants.
     pub fn backward(
@@ -109,35 +95,35 @@ impl SharedTemporalProcessing {
     }
 
     /// Apply gradients to the temporal processing layer
-    /// 
+    ///
     /// Uses Layer trait method for zero-cost delegation.
     pub fn apply_gradients(&mut self, param_grads: &[Array2<f32>], lr: f32) -> Result<()> {
         self.temporal_mixing.apply_gradients(param_grads, lr)
     }
 
     /// Get the number of parameters
-    /// 
+    ///
     /// Uses Layer trait method for zero-cost delegation.
     pub fn parameters(&self) -> usize {
         self.temporal_mixing.parameters()
     }
 
     /// Get the weight norm
-    /// 
+    ///
     /// Uses Layer trait method for zero-cost delegation.
     pub fn weight_norm(&self) -> f32 {
         self.temporal_mixing.weight_norm()
     }
 
     /// Zero out gradients
-    /// 
+    ///
     /// Uses Layer trait method for zero-cost delegation.
     pub fn zero_gradients(&mut self) {
         self.temporal_mixing.zero_gradients()
     }
 
     /// Set training progress
-    /// 
+    ///
     /// Uses Layer trait method for zero-cost delegation.
     pub fn set_training_progress(&mut self, progress: f64) {
         self.temporal_mixing.set_training_progress(progress);
@@ -166,7 +152,7 @@ impl SharedTemporalProcessing {
     }
 
     /// Get head activity metrics if available (for MoH-based mixing)
-    /// 
+    ///
     /// Uses shared accessor pattern with type-specific field access.
     pub fn get_head_activity_metrics(&self) -> (Option<f32>, Option<&[f32]>) {
         match &self.temporal_mixing {
@@ -220,7 +206,7 @@ impl SharedTemporalProcessing {
     }
 
     /// Get token head activity vector if available
-    /// 
+    ///
     /// Uses shared accessor pattern with zero-copy view returns.
     pub fn get_token_head_activity_vec(&self) -> Option<&[f32]> {
         match &self.temporal_mixing {
@@ -268,21 +254,23 @@ impl SharedTemporalProcessing {
     }
 
     /// Get a reference to the underlying temporal mixing layer
-    /// 
+    ///
     /// This provides direct access for pattern matching and type-specific operations
     pub fn inner(&self) -> &TemporalMixingLayer {
         &self.temporal_mixing
     }
 
     /// Get a mutable reference to the underlying temporal mixing layer
-    /// 
+    ///
     /// This provides direct mutable access for type-specific operations
     pub fn inner_mut(&mut self) -> &mut TemporalMixingLayer {
         &mut self.temporal_mixing
     }
 }
 
-impl crate::domain::layers::components::gradient_router::GradientRoutable for SharedTemporalProcessing {
+impl crate::domain::layers::components::gradient_router::GradientRoutable
+    for SharedTemporalProcessing
+{
     fn gradient_count(&self) -> usize {
         self.temporal_mixing.parameters()
     }
@@ -291,8 +279,13 @@ impl crate::domain::layers::components::gradient_router::GradientRoutable for Sh
         self.temporal_mixing.weight_norm()
     }
 
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> crate::common::errors::Result<()> {
-        self.temporal_mixing.apply_gradients(gradients, learning_rate)
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> crate::common::errors::Result<()> {
+        self.temporal_mixing
+            .apply_gradients(gradients, learning_rate)
     }
 }
 
@@ -321,11 +314,7 @@ mod tests {
         };
 
         let layers = crate::domain::layers::components::common::CommonLayers::new(&config);
-        let stp = SharedTemporalProcessing::new(
-            layers.temporal_mixing,
-            None,
-            false,
-        );
+        let stp = SharedTemporalProcessing::new(layers.temporal_mixing, None, false);
 
         assert_eq!(stp.layer_type(), "Attention");
         assert!(stp.parameters() > 0);
@@ -350,11 +339,7 @@ mod tests {
         };
 
         let layers = crate::domain::layers::components::common::CommonLayers::new(&config);
-        let mut stp = SharedTemporalProcessing::new(
-            layers.temporal_mixing,
-            None,
-            false,
-        );
+        let mut stp = SharedTemporalProcessing::new(layers.temporal_mixing, None, false);
 
         // Test forward pass through Layer trait
         let input = Array2::zeros((2, 8));

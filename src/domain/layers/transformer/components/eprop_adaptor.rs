@@ -6,6 +6,8 @@
 //! It maintains neuron state and eligibility traces, processing inputs sequentially
 //! to update internal dynamics and generate adaptation signals.
 
+use std::borrow::Cow;
+
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +111,13 @@ impl EPropAdaptor {
         }
     }
 
+    #[inline]
+    fn apply_gradient_matrix(&mut self, grad: &Array2<f32>, lr: f32) {
+        let grad_1d = grad.column(0);
+        self.adaptation_weights
+            .zip_mut_with(&grad_1d, |w, &g| *w -= lr * g);
+    }
+
     /// Process a single step for streaming inference (Zero-Allocation)
     pub fn forward_step_into(
         &mut self,
@@ -124,30 +133,36 @@ impl EPropAdaptor {
 
         // Initialize state if needed
         if self.neuron_state.voltage.len() != self.config.dim {
-             self.neuron_state = NeuronState::new(
+            self.neuron_state = NeuronState::new(
                 self.config.dim,
                 self.config.neuron_config.is_alif(),
                 &self.config.neuron_config,
             );
-            
-             self.traces = EligibilityTraces::new(
+
+            self.traces = EligibilityTraces::new(
                 self.config.dim,
                 self.config.dim,
                 self.config.neuron_config.is_alif(),
             );
 
             if self.config.use_multi_scale {
-                self.traces.multi_scale_traces = Some(crate::domain::eprop::traces::MultiScaleTraces::new(
-                    self.config.dim,
-                    self.config.dim,
-                    [0.8, 0.95, 0.99],
-                ));
+                self.traces.multi_scale_traces =
+                    Some(crate::domain::eprop::traces::MultiScaleTraces::new(
+                        self.config.dim,
+                        self.config.dim,
+                        [0.8, 0.95, 0.99],
+                    ));
             }
         }
 
         // 1. Update neuron dynamics
         dynamics
-            .update(&mut self.neuron_state, input, None, &mut workspace.neuron_workspace)
+            .update(
+                &mut self.neuron_state,
+                input,
+                None,
+                &mut workspace.neuron_workspace,
+            )
             .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
 
         // 2. Update eligibility traces
@@ -161,22 +176,22 @@ impl EPropAdaptor {
         use ndarray::Zip;
 
         if let Some(multi_scale) = &self.traces.multi_scale_traces {
-             // Ensure workspace capacity
-             if workspace.eps_f_workspace.len() != self.config.dim {
-                 workspace.eps_f_workspace = Array1::zeros(self.config.dim);
-             }
+            // Ensure workspace capacity
+            if workspace.eps_f_workspace.len() != self.config.dim {
+                workspace.eps_f_workspace = Array1::zeros(self.config.dim);
+            }
 
-             // Compute weighted eps_f into workspace
-             multi_scale.compute_weighted_traces_into(None, Some(&mut workspace.eps_f_workspace));
-             
-             // adaptation = eps_f * learned_weights
-             Zip::from(output)
+            // Compute weighted eps_f into workspace
+            multi_scale.compute_weighted_traces_into(None, Some(&mut workspace.eps_f_workspace));
+
+            // adaptation = eps_f * learned_weights
+            Zip::from(output)
                 .and(&workspace.eps_f_workspace)
                 .and(&self.adaptation_weights)
                 .for_each(|o, &e, &w| *o = e * w);
         } else {
-             // Fallback: adaptation = spikes * learned_weights
-             Zip::from(output)
+            // Fallback: adaptation = spikes * learned_weights
+            Zip::from(output)
                 .and(&self.neuron_state.spikes) // Note: using spikes directly, not filtered_spikes, matching forward() logic
                 .and(&self.adaptation_weights)
                 .for_each(|o, &s, &w| *o = s * w);
@@ -222,55 +237,68 @@ impl EPropAdaptor {
             );
 
             if self.config.use_multi_scale {
-                self.traces.multi_scale_traces = Some(crate::domain::eprop::traces::MultiScaleTraces::new(
-                    self.config.dim,
-                    self.config.dim,
-                    [0.8, 0.95, 0.99],
-                ));
+                self.traces.multi_scale_traces =
+                    Some(crate::domain::eprop::traces::MultiScaleTraces::new(
+                        self.config.dim,
+                        self.config.dim,
+                        [0.8, 0.95, 0.99],
+                    ));
             }
         }
 
         let mut output = Array2::zeros((seq_len, dim));
         // Allocate cache for traces
         let mut trace_cache = Array2::zeros((seq_len, dim));
+        // Reused weighted-trace workspace to avoid per-step allocations.
+        let mut eps_f_workspace = Array1::zeros(dim);
 
         let dynamics = self.dynamics.as_ref().unwrap();
         let mut neuron_workspace = NeuronWorkspace::new(self.config.dim);
 
         // Process sequence step-by-step
         for t in 0..seq_len {
-            let input_t = input.row(t).to_owned();
+            let input_t = input.row(t);
 
             // 1. Update neuron dynamics
             // We treat the input as the current injection
             dynamics
-                .update(&mut self.neuron_state, &input_t.view(), None, &mut neuron_workspace)
+                .update(
+                    &mut self.neuron_state,
+                    &input_t,
+                    None,
+                    &mut neuron_workspace,
+                )
                 .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
 
             // 2. Update eligibility traces
             if let Some(multi_scale) = &mut self.traces.multi_scale_traces {
                 multi_scale
-                    .update_all_scales(&self.neuron_state, input_t.view())
+                    .update_all_scales(&self.neuron_state, input_t)
                     .map_err(|e| crate::common::errors::ModelError::Generic(e.to_string()))?;
             }
 
-            // 3. Compute adaptation signal
-            let adaptation_signal = if let Some(multi_scale) = &self.traces.multi_scale_traces {
-                let (_eps_x, eps_f) = multi_scale.compute_weighted_traces();
-                // Store trace for gradient computation
-                trace_cache.row_mut(t).assign(&eps_f);
+            // 3. Compute adaptation signal and write output in-place.
+            if let Some(multi_scale) = &self.traces.multi_scale_traces {
+                multi_scale.compute_weighted_traces_into(None, Some(&mut eps_f_workspace));
+                // Store trace for gradient computation.
+                trace_cache.row_mut(t).assign(&eps_f_workspace);
 
-                eps_f * &self.adaptation_weights
+                let mut out_row = output.row_mut(t);
+                ndarray::Zip::from(&mut out_row)
+                    .and(&eps_f_workspace)
+                    .and(&self.adaptation_weights)
+                    .for_each(|o, &e, &w| *o = e * w);
             } else {
-                // Fallback: use spikes as simple adaptation
-                // Store spikes as "trace"
+                // Fallback: use spikes as simple adaptation.
+                // Store spikes as "trace".
                 trace_cache.row_mut(t).assign(&self.neuron_state.spikes);
 
-                &self.neuron_state.spikes * &self.adaptation_weights
-            };
-
-            // 4. Apply adaptation to generate output
-            output.row_mut(t).assign(&adaptation_signal);
+                let mut out_row = output.row_mut(t);
+                ndarray::Zip::from(&mut out_row)
+                    .and(&self.neuron_state.spikes)
+                    .and(&self.adaptation_weights)
+                    .for_each(|o, &s, &w| *o = s * w);
+            }
         }
 
         // Save traces for backward pass
@@ -302,8 +330,11 @@ impl EPropAdaptor {
             for t in 0..len {
                 let grad_t = output_grads.row(t);
                 let trace_t = traces.row(t);
-                // Element-wise multiplication and accumulation
-                param_grads = param_grads + (&grad_t * &trace_t);
+                // Element-wise multiplication and accumulation (in-place to avoid temporaries).
+                ndarray::Zip::from(&mut param_grads)
+                    .and(&grad_t)
+                    .and(&trace_t)
+                    .for_each(|pg, &g, &tr| *pg += g * tr);
             }
         }
 
@@ -315,18 +346,30 @@ impl EPropAdaptor {
     }
 
     /// Apply gradients to adaptation weights
-    pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::common::errors::Result<()> {
+    pub fn apply_gradients(
+        &mut self,
+        grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::common::errors::Result<()> {
         if grads.is_empty() {
             return Ok(());
         }
 
         // We expect one gradient matrix of shape (dim, 1)
-        let grad = &grads[0];
-        let grad_1d = grad.column(0);
+        self.apply_gradient_matrix(&grads[0], lr);
+        Ok(())
+    }
 
-        // Simple SGD update: W = W - lr * grad
-        self.adaptation_weights = &self.adaptation_weights - &(grad_1d.mapv(|x| x * lr));
-
+    /// Apply gradients to adaptation weights from borrowed/owned Cow buffers.
+    pub fn apply_gradients_ref(
+        &mut self,
+        grads: &[Cow<'_, Array2<f32>>],
+        lr: f32,
+    ) -> crate::common::errors::Result<()> {
+        if grads.is_empty() {
+            return Ok(());
+        }
+        self.apply_gradient_matrix(grads[0].as_ref(), lr);
         Ok(())
     }
 
@@ -352,5 +395,51 @@ impl EPropAdaptor {
             .map(|x| x * x)
             .sum::<f32>()
             .sqrt()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use ndarray::Array2;
+
+    use super::{EPropAdaptor, EPropAdaptorConfig};
+
+    #[test]
+    fn apply_gradients_ref_matches_owned_path() {
+        let config = EPropAdaptorConfig {
+            dim: 4,
+            ..Default::default()
+        };
+        let mut owned_adaptor = EPropAdaptor::new(config.clone());
+        let mut borrowed_adaptor = EPropAdaptor::new(config);
+
+        let grad = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let owned = vec![grad.clone()];
+        let borrowed = vec![Cow::Borrowed(&grad)];
+
+        owned_adaptor.apply_gradients(&owned, 0.1).unwrap();
+        borrowed_adaptor
+            .apply_gradients_ref(&borrowed, 0.1)
+            .unwrap();
+
+        assert_eq!(
+            owned_adaptor.adaptation_weights,
+            borrowed_adaptor.adaptation_weights
+        );
+    }
+
+    #[test]
+    fn apply_gradients_ref_empty_is_noop() {
+        let config = EPropAdaptorConfig {
+            dim: 3,
+            ..Default::default()
+        };
+        let mut adaptor = EPropAdaptor::new(config);
+        let before = adaptor.adaptation_weights.clone();
+
+        adaptor.apply_gradients_ref(&[], 0.5).unwrap();
+        assert_eq!(before, adaptor.adaptation_weights);
     }
 }

@@ -9,32 +9,29 @@ use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    infrastructure::optimizer::adam::Adam,
     common::{errors::Result, rng::get_rng},
     domain::{
         layers::{
             components::{
                 adaptive_residuals::AdaptiveResiduals,
                 attention_context::SharedAttentionContext,
+                common::{
+                    CommonLayerConfig, CommonLayers, TemporalMixingLayer, TitanMemoryWorkspace,
+                },
                 conditioning::{SharedFilmModulation, TimeConditioner, TimeEmbedding},
                 feedforward::SharedFeedforward,
+                gradient_router::GradientRouter,
                 temporal_processing::SharedTemporalProcessing,
-                common::{
-                    CommonLayerConfig, CommonLayers, TemporalMixingLayer,
-                    TitanMemoryWorkspace, apply_adaptive_gradients, sanitize_and_clip_gradients,
-                },
             },
             diffusion::edm,
             transformer::TransformerBlockConfig,
         },
         mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
-        models::config::{
-            DiffusionTimestepStrategy,
-            TemporalMixingType, TitanMemoryConfig,
-        },
+        models::config::{DiffusionTimestepStrategy, TemporalMixingType, TitanMemoryConfig},
         network::Layer,
         richards::RichardsNorm,
     },
+    infrastructure::optimizer::adam::Adam,
 };
 
 /// Noise schedule types for diffusion models
@@ -543,7 +540,6 @@ impl NoiseScheduler {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub struct DiffusionCachedIntermediates {
     pub input_original: Arc<Array2<f32>>,
@@ -623,7 +619,8 @@ pub struct DiffusionBlock {
     #[serde(skip)]
     pub cached_intermediates: RwLock<Option<DiffusionCachedIntermediates>>,
     #[serde(skip)]
-    pub discrete_scheduler: Option<crate::domain::layers::diffusion::discrete::DiscreteMaskScheduler>,
+    pub discrete_scheduler:
+        Option<crate::domain::layers::diffusion::discrete::DiscreteMaskScheduler>,
     pub current_window_size: Option<usize>,
     pub win_max: usize,
     pub win_min: usize,
@@ -861,7 +858,6 @@ impl DiffusionBlock {
         self.config.discrete_masked
     }
 
-
     pub fn mask_token_id(&self) -> Option<usize> {
         self.config.mask_token_id
     }
@@ -952,7 +948,8 @@ impl DiffusionBlock {
             .forward(&time_embed, self.use_ema_for_sampling);
 
         // Update FiLM modulation parameters using the shared component
-        self.film_modulation.update(gamma_beta.as_slice().unwrap(), self.config.embed_dim);
+        self.film_modulation
+            .update(gamma_beta.as_slice().unwrap(), self.config.embed_dim);
 
         let (x_model_in, c_skip, c_out, edm_on) =
             if self.config.prediction_target == DiffusionPredictionTarget::EdmX0 {
@@ -966,12 +963,13 @@ impl DiffusionBlock {
         let input_used = self.context.apply_context(&input_original).into_owned();
 
         let norm1_out = self.pre_attention_norm.forward(&input_used);
-        
+
         // Use shared FiLM modulation
         let norm1_mod = self.film_modulation.apply_attn_conditioning(&norm1_out);
-        
+
         // Update window size if needed
-        self.temporal_mixing.set_window_size(self.current_window_size);
+        self.temporal_mixing
+            .set_window_size(self.current_window_size);
 
         // Forward with conditioning (although Attention might not use it directly in this variant,
         // we use the film-modulated input).
@@ -987,11 +985,11 @@ impl DiffusionBlock {
         // So we will keep that pattern for now to match the "Manual Modulation" style of DiffusionBlock,
         // unless we want to push modulation *into* the layer.
         // For now, let's keep manual modulation using the helper, then call the layer.
-        
+
         let mut attn_out = self
             .temporal_mixing
             .forward_with_causal(&norm1_mod, self.config.causal_attention);
-            
+
         if !matches!(
             self.temporal_mixing.temporal_mixing,
             TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
@@ -1010,7 +1008,7 @@ impl DiffusionBlock {
             &attn_out.view(),
             self.config.embed_dim,
         );
-        
+
         let (head_ratio_opt, head_vec_opt) = self.temporal_mixing.get_head_activity_metrics();
         let head_activity_ratio = head_ratio_opt.unwrap_or(1.0);
         let head_activity_vec = head_vec_opt;
@@ -1026,28 +1024,28 @@ impl DiffusionBlock {
             &input_used + &attn_out
         };
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
-        
+
         // FFN Modulation
         // We can use the new `forward_with_film` in `SharedFeedforward`!
         // But first let's see if we want to modulate *before* passing or pass parameters.
         // SharedFeedforward::forward(input) just runs the FFN.
         // If we want FiLM, we should use `forward_with_film` OR modulate manually.
         // The previous code did manual modulation: `norm2_mod = apply_film(...)`.
-        // Let's switch to using `SharedFeedforward::forward_with_film` if possible, 
+        // Let's switch to using `SharedFeedforward::forward_with_film` if possible,
         // OR just keep manual modulation + standard forward for consistency with Attention.
         // Actually, `SharedFeedforward` has `forward_with_film`.
         // However, `SharedTemporalProcessing` does NOT have `forward_with_film` exposed in the same way (it delegates).
         // To be consistent, let's do manual modulation here using `SharedFilmModulation` helper, then standard forward.
-        
+
         let norm2_mod = self.film_modulation.apply_ffn_conditioning(&norm2_out);
-        
+
         let mut ffn_out = self.feedforward.forward_with_token_head_activity(
             &norm2_mod,
             Some(head_activity_ratio),
             head_activity_vec,
             token_head_activity_vec,
         );
-            
+
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut ffn_out, self.dropout_rate);
         }
@@ -1145,7 +1143,8 @@ impl DiffusionBlock {
             }
         }
 
-        let timesteps = crate::domain::layers::diffusion::solvers::make_discrete_timesteps(k, total);
+        let timesteps =
+            crate::domain::layers::diffusion::solvers::make_discrete_timesteps(k, total);
         for i in 0..(timesteps.len() - 1) {
             let t = timesteps[i];
             let t_prev = timesteps[i + 1];
@@ -1368,8 +1367,9 @@ impl DiffusionBlock {
             }
 
             DiffusionSampler::DDIM { eta } => {
-                let timesteps =
-                    crate::domain::layers::diffusion::solvers::make_discrete_timesteps(steps, total);
+                let timesteps = crate::domain::layers::diffusion::solvers::make_discrete_timesteps(
+                    steps, total,
+                );
                 for i in 0..(timesteps.len() - 1) {
                     let t = timesteps[i];
                     let t_prev = timesteps[i + 1];
@@ -1417,8 +1417,9 @@ impl DiffusionBlock {
             }
 
             DiffusionSampler::PNDM => {
-                let timesteps =
-                    crate::domain::layers::diffusion::solvers::make_discrete_timesteps(steps, total);
+                let timesteps = crate::domain::layers::diffusion::solvers::make_discrete_timesteps(
+                    steps, total,
+                );
                 let scheduler = self.noise_scheduler.clone();
                 let mut model_eps = |x: &Array2<f32>, t: usize| -> Array2<f32> {
                     self.set_timestep(t);
@@ -1680,8 +1681,9 @@ impl Layer for DiffusionBlock {
             let (ffn_input_grad_mod, ffn_param_grads) =
                 self.feedforward.backward(norm2_mod, &safe_scaled_grads);
 
-            let (norm2_grad, grad_gamma_ffn_1d, grad_beta_ffn_1d) =
-                self.film_modulation.film_backward(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec);
+            let (norm2_grad, grad_gamma_ffn_1d, grad_beta_ffn_1d) = self
+                .film_modulation
+                .film_backward(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec);
 
             let (residual1_from_ffn, pre_ffn_param_grads) =
                 self.pre_ffn_norm.compute_gradients(residual1, &norm2_grad);
@@ -1708,7 +1710,8 @@ impl Layer for DiffusionBlock {
             }
 
             let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
-                self.film_modulation.film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);
+                self.film_modulation
+                    .film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);
 
             let (input_from_norm, pre_attn_param_grads) = self
                 .pre_attention_norm
@@ -1775,7 +1778,7 @@ impl Layer for DiffusionBlock {
             all_param_grads.push(similarity_strength_grad);
 
             let embed = self.config.embed_dim;
-            
+
             // Calculate backprop for FiLM MLP using SharedFilmModulation helper
             let grad_gamma_beta_1d = self.film_modulation.compute_mlp_gradients(
                 &grad_gamma_attn,
@@ -1786,7 +1789,7 @@ impl Layer for DiffusionBlock {
                 beta_attn_vec,
                 gamma_ffn_vec,
                 beta_ffn_vec,
-                embed
+                embed,
             );
 
             let h_mat = h_vec.view().to_shape((1, h_vec.len())).unwrap().to_owned();
@@ -1849,8 +1852,7 @@ impl Layer for DiffusionBlock {
             return Ok(());
         }
 
-        // Sanitize and globally clip gradients for stability
-        let sanitized = sanitize_and_clip_gradients(param_grads, 5.0);
+        let mut router = GradientRouter::new(param_grads, 5.0);
 
         let cached_partitions = self
             .param_partitions
@@ -1862,95 +1864,78 @@ impl Layer for DiffusionBlock {
                 message: "DiffusionBlock::apply_gradients missing partition metadata".to_string(),
             })?;
 
-        let mut idx0 = 0usize;
-        let mut next_range = |count: usize| {
-            let available = sanitized.len().saturating_sub(idx0);
-            let len = count.min(available);
-            let start = idx0;
-            idx0 += len;
-            start..idx0
-        };
-
         let expected = partitions.total();
-        if expected != sanitized.len() {
+        if expected != router.total() {
             return Err(crate::common::errors::ModelError::GradientError {
                 message: format!(
                     "DiffusionBlock::apply_gradients gradient count mismatch: expected {}, got {}",
                     expected,
-                    sanitized.len()
+                    router.total()
                 ),
             });
         }
 
-        // Temporal-mixing gradients
-        let attn_range = next_range(partitions.temporal_mixing);
-        if !attn_range.is_empty() {
-            let attention_grads = &sanitized[attn_range];
-            apply_adaptive_gradients(
-                attention_grads,
-                self.temporal_mixing.weight_norm(),
-                lr,
-                |grads, lr| self.temporal_mixing.apply_gradients(grads, lr),
-            )?;
-        }
+        let temporal_weight_norm = self.temporal_mixing.weight_norm();
+        router.route_lars_to_closure(
+            partitions.temporal_mixing,
+            temporal_weight_norm,
+            lr,
+            |grads, lr| self.temporal_mixing.apply_gradients(grads, lr),
+        )?;
 
-        // Feedforward gradients
-        let ffn_range = next_range(partitions.feedforward);
-        if !ffn_range.is_empty() {
-            let feedforward_grads = &sanitized[ffn_range];
-            apply_adaptive_gradients(
-                feedforward_grads,
-                self.feedforward.weight_norm(),
-                lr,
-                |grads, lr| self.feedforward.apply_gradients(grads, lr),
-            )?;
-        }
+        let feedforward_weight_norm = self.feedforward.weight_norm();
+        router.route_lars_to_closure(
+            partitions.feedforward,
+            feedforward_weight_norm,
+            lr,
+            |grads, lr| self.feedforward.apply_gradients(grads, lr),
+        )?;
 
-        // Pre-FFN norm gradients
-        let pre_ffn_range = next_range(partitions.pre_ffn_norm);
-        if !pre_ffn_range.is_empty() {
-            let pre_ffn_grads = &sanitized[pre_ffn_range];
-            self.pre_ffn_norm.apply_gradients(pre_ffn_grads, lr)?;
-        }
+        router.route_to_closure(partitions.pre_ffn_norm, |grads| {
+            self.pre_ffn_norm.apply_gradients_ref(grads, lr)
+        })?;
 
-        // Pre-attention norm gradients
-        let pre_attn_range = next_range(partitions.pre_attention_norm);
-        if !pre_attn_range.is_empty() {
-            let pre_attn_grads = &sanitized[pre_attn_range];
-            self.pre_attention_norm
-                .apply_gradients(pre_attn_grads, lr)?;
-        }
+        router.route_to_closure(partitions.pre_attention_norm, |grads| {
+            self.pre_attention_norm.apply_gradients_ref(grads, lr)
+        })?;
 
-        let ctx_range = next_range(partitions.similarity_context_strength);
-        if !ctx_range.is_empty()
-            && let Some(g) = sanitized.get(ctx_range.start)
-        {
-            self.opt_similarity_context_strength
-                .step(&mut self.context.similarity_context_strength, g, lr);
-        }
+        router.route_exact_ref_to_closure::<1, _>(
+            partitions.similarity_context_strength,
+            |grads| {
+                self.opt_similarity_context_strength.step(
+                    &mut self.context.similarity_context_strength,
+                    grads[0].as_ref(),
+                    lr,
+                );
+                Ok(())
+            },
+        )?;
 
-        // Time-conditioner gradients (expect 4 arrays)
-        let time_range = next_range(partitions.time_conditioner);
-        if time_range.len() == 4 {
-            let time_grads = &sanitized[time_range];
+        router.route_exact_ref_to_closure::<4, _>(partitions.time_conditioner, |grads| {
             let grads_tuple = (
-                time_grads[0].clone(),
-                time_grads[1].clone(),
-                time_grads[2].clone(),
-                time_grads[3].clone(),
+                grads[0].as_ref(),
+                grads[1].as_ref(),
+                grads[2].as_ref(),
+                grads[3].as_ref(),
             );
             self.time_conditioner
                 .apply_gradients(grads_tuple, lr, self.ema_decay);
-        }
+            Ok(())
+        })?;
 
-        let adaptive_range = next_range(
-            partitions.adaptive_residual_scales_attention + partitions.adaptive_residual_scales_ffn,
-        );
-        if adaptive_range.len() == 2
-            && let Some(ref mut residuals) = self.adaptive_residuals
-        {
-            residuals.apply_gradients(&sanitized[adaptive_range], lr)?;
-        }
+        let adaptive_count =
+            partitions.adaptive_residual_scales_attention + partitions.adaptive_residual_scales_ffn;
+        let has_adaptive_residuals = self.adaptive_residuals.is_some();
+        router.route_exact_ref_to_closure_if::<2, _>(
+            adaptive_count,
+            has_adaptive_residuals,
+            |grads| {
+                if let Some(ref mut residuals) = self.adaptive_residuals {
+                    residuals.apply_gradients_ref((grads[0].as_ref(), grads[1].as_ref()), lr)?;
+                }
+                Ok(())
+            },
+        )?;
 
         if let Ok(mut guard) = self.param_partitions.write() {
             *guard = None;

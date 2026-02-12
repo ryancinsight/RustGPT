@@ -1,0 +1,53 @@
+{
+  "id": "conv-1770925957273-llnymmprd",
+  "created_at": "2026-02-12T19:52:49.592182800Z",
+  "last_activity": "2026-02-12T19:53:07.279504500Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "How do Mountains form?",
+      "timestamp": "2026-02-12T19:52:49.592189800Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Mountains are formed through tectonic forces or volcanism over long geological time periods </s>",
+      "timestamp": "2026-02-12T19:52:49.962323Z"
+    },
+    {
+      "role": "user",
+      "content": "How do Mountains form?",
+      "timestamp": "2026-02-12T19:52:55.034333100Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T19:52:55.034356500Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Clone unsafe dereference filter , and ? Assistant : Clone , and types </s>",
+      "timestamp": "2026-02-12T19:52:55.844366Z"
+    },
+    {
+      "role": "user",
+      "content": "How do Mountains form?",
+      "timestamp": "2026-02-12T19:53:04.590986100Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T19:53:04.591016700Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-12T19:53:04.591058200Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Clone , and Eq or volcanism over types </s>",
+      "timestamp": "2026-02-12T19:53:07.279487200Z"
+    }
+  ],
+  "model_name": "RustGPT"
+}

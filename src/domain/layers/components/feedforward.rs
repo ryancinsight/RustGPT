@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     common::errors::Result,
-    domain::layers::components::common::FeedForwardVariant,
+    domain::layers::components::{
+        common::FeedForwardVariant, conditioning::apply_optional_delta_film,
+    },
     domain::network::Layer,
 };
 
@@ -50,16 +52,12 @@ impl SharedFeedforward {
     }
 
     #[inline]
-    pub fn as_moe(
-        &self,
-    ) -> Option<&crate::domain::mixtures::moe::MixtureOfExperts> {
+    pub fn as_moe(&self) -> Option<&crate::domain::mixtures::moe::MixtureOfExperts> {
         self.feedforward.as_moe()
     }
 
     #[inline]
-    pub fn as_moe_mut(
-        &mut self,
-    ) -> Option<&mut crate::domain::mixtures::moe::MixtureOfExperts> {
+    pub fn as_moe_mut(&mut self) -> Option<&mut crate::domain::mixtures::moe::MixtureOfExperts> {
         self.feedforward.as_moe_mut()
     }
 
@@ -116,26 +114,14 @@ impl SharedFeedforward {
         head_activity_vec: Option<&[f32]>,
         token_head_activity_vec: Option<&[f32]>,
     ) -> Array2<f32> {
-        if let (Some(g), Some(b)) = (gamma, beta) {
-            let mut modified = input.clone();
-            for mut row in modified.outer_iter_mut() {
-                row.zip_mut_with(g, |x, &g_val| *x *= 1.0 + g_val);
-                row.zip_mut_with(b, |x, &b_val| *x += b_val);
-            }
-            self.forward_with_token_head_activity(
-                &modified,
-                head_activity_ratio,
-                head_activity_vec,
-                token_head_activity_vec,
-            )
-        } else {
-            self.forward_with_token_head_activity(
-                input,
-                head_activity_ratio,
-                head_activity_vec,
-                token_head_activity_vec,
-            )
-        }
+        let conditioned =
+            apply_optional_delta_film(input, gamma.map(|g| g.view()), beta.map(|b| b.view()));
+        self.forward_with_token_head_activity(
+            conditioned.as_ref(),
+            head_activity_ratio,
+            head_activity_vec,
+            token_head_activity_vec,
+        )
     }
 
     pub fn forward_step_into(
