@@ -1660,6 +1660,31 @@ impl MixtureOfExperts {
         }
     }
 
+    /// Streaming forward step with optional MoH conditioning features.
+    ///
+    /// This keeps streaming behavior aligned with batch
+    /// `forward_with_head_features_and_token_activity` when MoE head-conditioning
+    /// or learned-k adaptation is enabled.
+    pub fn forward_step_with_head_features_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+        head_activity: Option<f32>,
+        head_activity_vec: Option<&[f32]>,
+        token_head_activity: Option<f32>,
+    ) {
+        let input_2d = input.to_owned().insert_axis(ndarray::Axis(0));
+        let token_activity_storage = token_head_activity.map(|v| [v]);
+        let token_activity_slice = token_activity_storage.as_ref().map(|v| &v[..]);
+        let out_2d = self.forward_with_head_features_and_token_activity(
+            &input_2d,
+            head_activity,
+            head_activity_vec,
+            token_activity_slice,
+        );
+        output.assign(&out_2d.row(0));
+    }
+
     /// Forward pass with optional Mixture-of-Heads activity signal.
     ///
     /// If head conditioning is enabled in the router config, a single scalar feature

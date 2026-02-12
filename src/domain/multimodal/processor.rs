@@ -526,7 +526,7 @@ mod tests {
             n_fft: 256,
             hop_length: 128,
             n_mels: 64,
-            temporal_patch_size: 63, // 63 time frames divides evenly
+            temporal_patch_size: 61, // 61 time frames divides evenly
             freq_patch_size: 8,
             embedding_dim: 128,
             ..Default::default()

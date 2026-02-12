@@ -1547,7 +1547,7 @@ impl LLM {
                     }
                     if let LayerEnum::TransformerBlock(block) = layer {
                         // Pull through MoH instrumentation from the temporal-mixing layer.
-                        match block.temporal_mixing_mut() {
+                        match &mut block.temporal_mixing_mut().temporal_mixing {
                             crate::domain::layers::components::common::TemporalMixingLayer::Attention(
                                 attn,
                             ) => {
@@ -1650,10 +1650,7 @@ impl LLM {
                         }
 
                         // Pull through MoE metrics when MoE is used inside the block.
-                        if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(
-                            moe,
-                        ) = block.feedforward()
-                        {
+                        if let Some(moe) = block.feedforward().as_moe() {
                         let layer_avg_active_experts = moe.config.get_avg_active_experts();
                         let layer_significant_experts = moe.config.get_avg_significant_experts();
                         let layer_routing_entropy = moe.config.get_routing_entropy();
@@ -1669,10 +1666,7 @@ impl LLM {
                     }
                     if let LayerEnum::DiffusionBlock(block) = layer {
                         // Pull through MoE metrics when MoE is used inside the diffusion block.
-                        if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(
-                        moe,
-                    ) = &block.feedforward
-                    {
+                        if let Some(moe) = block.feedforward.as_moe() {
                         let layer_avg_active_experts = moe.config.get_avg_active_experts();
                         let layer_significant_experts = moe.config.get_avg_significant_experts();
                         let layer_routing_entropy = moe.config.get_routing_entropy();
@@ -1715,9 +1709,7 @@ impl LLM {
                         let guard = lrm.block.read().unwrap();
                         match &*guard {
                         crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
-                            if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) =
-                                b.feedforward()
-                            {
+                            if let Some(moe) = b.feedforward().as_moe() {
                                 let layer_avg_active_experts = moe.config.get_avg_active_experts();
                                 let layer_significant_experts = moe.config.get_avg_significant_experts();
                                 let layer_routing_entropy = moe.config.get_routing_entropy();
@@ -1732,9 +1724,7 @@ impl LLM {
                             }
                         }
                         crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                            if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) =
-                                &b.feedforward
-                            {
+                            if let Some(moe) = b.feedforward.as_moe() {
                                 let layer_avg_active_experts = moe.config.get_avg_active_experts();
                                 let layer_significant_experts = moe.config.get_avg_significant_experts();
                                 let layer_routing_entropy = moe.config.get_routing_entropy();
@@ -2050,17 +2040,17 @@ impl LLM {
                     if let LayerEnum::TransformerBlock(tb) = layer
                         && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(
                             attn,
-                        ) = tb.temporal_mixing_mut()
+                        ) = &mut tb.temporal_mixing_mut().temporal_mixing
                     {
                         attn.adapt_degree(&metrics);
                     }
-                    if let LayerEnum::DiffusionBlock(db) = layer
-                        && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(
-                            attn,
-                        ) = &mut db.temporal_mixing
-                    {
-                        attn.adapt_degree(&metrics);
-                    }
+                if let LayerEnum::DiffusionBlock(db) = layer
+                    && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(
+                        attn,
+                        ) = &mut db.temporal_mixing.temporal_mixing
+                {
+                    attn.adapt_degree(&metrics);
+                }
                     if let LayerEnum::PolyAttention(pa) = layer {
                         pa.adapt_degree(&metrics);
                     }
@@ -2582,14 +2572,14 @@ impl LLM {
                     let guard = lrm.block.read().unwrap();
                     match &*guard {
                         crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
-                            if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = b.feedforward() {
+                            if let Some(moe) = b.feedforward().as_moe() {
                                 moe.last_aux_loss()
                             } else {
                                 0.0
                             }
                         }
                         crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                            if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                            if let Some(moe) = b.feedforward.as_moe() {
                                 moe.last_aux_loss()
                             } else {
                                 0.0
@@ -3698,14 +3688,14 @@ impl LLM {
                         let guard = lrm.block.read().unwrap();
                         match &*guard {
                             crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
-                                if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = b.feedforward() {
+                                if let Some(moe) = b.feedforward().as_moe() {
                                     moe.last_aux_loss()
                                 } else {
                                     0.0
                                 }
                             }
                             crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                                if let crate::domain::layers::components::common::FeedForwardVariant::MixtureOfExperts(moe) = &b.feedforward {
+                                if let Some(moe) = b.feedforward.as_moe() {
                                     moe.last_aux_loss()
                                 } else {
                                     0.0
@@ -5036,14 +5026,14 @@ impl LLM {
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer
                     && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        tb.temporal_mixing_mut()
+                        &mut tb.temporal_mixing_mut().temporal_mixing
                 {
                     tau_range = attn.take_tau_metrics();
                     pred_norm_rms = attn.take_pred_norm();
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer
                     && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut db.temporal_mixing
+                        &mut db.temporal_mixing.temporal_mixing
                 {
                     tau_range = attn.take_tau_metrics();
                     pred_norm_rms = attn.take_pred_norm();
@@ -5065,13 +5055,13 @@ impl LLM {
             for layer in &mut self.network {
                 if let LayerEnum::TransformerBlock(tb) = layer
                     && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        tb.temporal_mixing_mut()
+                        &mut tb.temporal_mixing_mut().temporal_mixing
                 {
                     attn.adapt_degree(&metrics);
                 }
                 if let LayerEnum::DiffusionBlock(db) = layer
                     && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut db.temporal_mixing
+                        &mut db.temporal_mixing.temporal_mixing
                 {
                     attn.adapt_degree(&metrics);
                 }

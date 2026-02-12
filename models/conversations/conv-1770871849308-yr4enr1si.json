@@ -1,0 +1,78 @@
+{
+  "id": "conv-1770871849308-yr4enr1si",
+  "created_at": "2026-02-12T04:50:57.204136Z",
+  "last_activity": "2026-02-12T04:52:13.010748100Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T04:50:57.204278400Z"
+    },
+    {
+      "role": "assistant",
+      "content": "I ' s up ? Assistant : Not much , just here to help ! What is _ mut on Earth </s>",
+      "timestamp": "2026-02-12T04:50:57.266991600Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T04:51:12.677264300Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me a joke",
+      "timestamp": "2026-02-12T04:51:12.677270600Z"
+    },
+    {
+      "role": "assistant",
+      "content": "\" ) to help ! . Assistant : \" , just \" hi \" + x \" + x \" + x \" + x \" + x \" + x \" hi \" + b ) + b = \" + b | = \" ) + b | = 1 \" + b | = 1 \" + b | = 1 . \" , b = 1 . 1 . 1 . 42 ) . + + 1 \" . + 42 ) . + + ( ) . + + 42 ) . + + 42 ) . + 42 ) . + 42 ) . + x + = 1 \" ) . + = 1 , _ + ) . + = 1 , _ + ) . + = t . + = 1 , _ | . + = t . + std _ = 1 \" , _ | = 1 \" ] = q , _ 1 , _ 1 , _ 1 , _ 1 \" , | = for . + = for . + = for . + filter . or _ 1 \" , . or _ 1 \" , . or _ 1 \" , . x . ( ) . x . ( ) . \" , . x . + ( 1 x \" , _ ( , \" , \" , \" , \" , \" , \" , _ \" , \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" ] . filter \" ] . filter \" ] . filter \" , _ \" , _ \" , 0 . filter \" , _ \" , 0 . filter \" , _ \" , 0 . filter | 2 . filter | 2 . filter | 2 . filter | 2 . filter | 2 . filter | 2 . filter | 2 ) . collect , _ \" , 0 . filter | 2 ) . ( , 0 . collect , _ \" , _ \" , 0 . filter | 2 ) . method . method . method . </s>",
+      "timestamp": "2026-02-12T04:51:26.220565100Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T04:51:49.220475100Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me a joke",
+      "timestamp": "2026-02-12T04:51:49.220602500Z"
+    },
+    {
+      "role": "user",
+      "content": "2+2=?",
+      "timestamp": "2026-02-12T04:51:49.220800700Z"
+    },
+    {
+      "role": "assistant",
+      "content": "_ } . x . ( , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , _ \" , 0 . method \" , 0 . method \" , _ \" , _ \" . method . method . method . method . method . method . </s>",
+      "timestamp": "2026-02-12T04:51:57.535002300Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T04:52:11.630981900Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me a joke",
+      "timestamp": "2026-02-12T04:52:11.630993500Z"
+    },
+    {
+      "role": "user",
+      "content": "2+2=?",
+      "timestamp": "2026-02-12T04:52:11.631632800Z"
+    },
+    {
+      "role": "user",
+      "content": "how are mountains formed",
+      "timestamp": "2026-02-12T04:52:11.631641400Z"
+    },
+    {
+      "role": "assistant",
+      "content": ", | , | , | , | ) . </s>",
+      "timestamp": "2026-02-12T04:52:13.010745300Z"
+    }
+  ],
+  "model_name": "rustgpt"
+}

@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use rayon::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::mamba::Mamba;
+use super::mamba::{AMatrixType, Mamba};
 use crate::domain::{
     mixtures::{HeadSelectionStrategy, MoHGating, moh_gating::MoHStreamingWorkspace},
     network::Layer,
@@ -61,7 +61,8 @@ impl<'de> Deserialize<'de> for Mamba2 {
     where
         D: Deserializer<'de>,
     {
-        let inner = Mamba::deserialize(deserializer)?;
+        let mut inner = Mamba::deserialize(deserializer)?;
+        inner.set_a_matrix_type(AMatrixType::BlockDiagonal);
         Ok(Self { inner })
     }
 }
@@ -72,9 +73,9 @@ impl Mamba2 {
     }
 
     pub fn new_with_kernel(embed_dim: usize, conv_kernel: usize) -> Self {
-        Self {
-            inner: Mamba::new_with_kernel(embed_dim, conv_kernel),
-        }
+        let mut inner = Mamba::new_with_kernel(embed_dim, conv_kernel);
+        inner.set_a_matrix_type(AMatrixType::BlockDiagonal);
+        Self { inner }
     }
 
     pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
@@ -190,7 +191,8 @@ impl MoHMamba2 {
             ws.head_out_buffer = Array1::zeros(self.head_dim);
         }
 
-        self.moh.forward_weights_into(input, &mut ws.moh);
+        let gate_input = self.moh.gate_input_view(input);
+        self.moh.forward_weights_into(&gate_input, &mut ws.moh);
         
         output.fill(0.0);
         
@@ -212,12 +214,11 @@ impl MoHMamba2 {
             }
         }
 
-        // Update activity stats
-        // ws.moh.m contains the weights
-        let active_heads = ws.moh.m.iter().filter(|&&w| w > 0.0).count() as f32;
+        // Update activity stats from shared MoH streaming summarizer.
+        let (active_heads, head_vec, token_vec) = MoHGating::summarize_streaming_weights(&ws.moh.m);
         self.last_avg_active_heads = Some(active_heads);
-        self.last_head_activity_vec = Some(ws.moh.m.to_vec());
-        self.last_token_head_activity_vec = Some(ws.moh.m.to_vec());
+        self.last_head_activity_vec = Some(head_vec);
+        self.last_token_head_activity_vec = Some(token_vec);
     }
 
     pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
@@ -293,8 +294,8 @@ impl Layer for MoHMamba2 {
 
         self.cached_input = Some(input.clone());
 
-        let gd = self.moh.w_g.nrows().min(d);
-        let gate_input = input.slice(s![.., 0..gd]);
+        let input_view = input.view();
+        let gate_input = self.moh.gate_input_view2(&input_view);
         let eff = self.moh.forward_weights_view(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 

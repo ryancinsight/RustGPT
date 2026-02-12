@@ -499,6 +499,55 @@ impl MoHGating {
         self.verification_overrides = overrides;
     }
 
+    /// Compute a token-level activity scalar from per-head weights.
+    ///
+    /// The scalar is the mean positive head weight in [0, 1].
+    #[inline]
+    pub fn token_activity_scalar_from_iter<I>(weights: I) -> f32
+    where
+        I: IntoIterator<Item = f32>,
+    {
+        let mut sum = 0.0f32;
+        let mut count = 0usize;
+        for w in weights {
+            sum += w.max(0.0);
+            count += 1;
+        }
+        if count == 0 {
+            0.0
+        } else {
+            (sum / count as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Build shared streaming MoH metrics from current per-head weights.
+    ///
+    /// Returns:
+    /// 1. active-head count (used by avg-active-heads tracking)
+    /// 2. per-head activity vector
+    /// 3. per-token activity vector (single-token streaming => len 1)
+    #[inline]
+    pub fn summarize_streaming_weights(weights: &Array1<f32>) -> (f32, Vec<f32>, Vec<f32>) {
+        let active_heads = weights.iter().filter(|&&w| w > 0.0).count() as f32;
+        let head_vec = weights.to_vec();
+        let token_scalar = Self::token_activity_scalar_from_iter(weights.iter().copied());
+        (active_heads, head_vec, vec![token_scalar])
+    }
+
+    /// Returns the zero-copy gate input prefix expected by `w_g` for a single token.
+    #[inline]
+    pub fn gate_input_view<'a>(&self, input: &'a ArrayView1<f32>) -> ArrayView1<'a, f32> {
+        let gd = self.w_g.nrows().min(input.len());
+        input.slice(s![0..gd])
+    }
+
+    /// Returns the zero-copy gate input prefix expected by `w_g` for a token batch.
+    #[inline]
+    pub fn gate_input_view2<'a>(&self, input: &'a ArrayView2<f32>) -> ArrayView2<'a, f32> {
+        let gd = self.w_g.nrows().min(input.ncols());
+        input.slice(s![.., 0..gd])
+    }
+
     /// Compute per-token per-head weights (tokens x heads) and update MoH metrics.
     ///
     /// Returns weights in [0,1] (not necessarily summing to 1).
@@ -1173,6 +1222,18 @@ impl MoHGating {
         workspace: &mut MoHStreamingWorkspace,
     ) {
         let num_heads = self.w_g.ncols();
+
+        // Ensure workspace buffers are correctly sized for zero-allocation
+        // streaming callers that may reuse default-initialized workspaces.
+        if workspace.xw.len() != num_heads {
+            workspace.xw = Array1::zeros(num_heads);
+        }
+        if workspace.g.len() != num_heads {
+            workspace.g = Array1::zeros(num_heads);
+        }
+        if workspace.m.len() != num_heads {
+            workspace.m = Array1::zeros(num_heads);
+        }
         
         // 1. Projection: xw = input * w_g
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_g.t(), input, 0.0, &mut workspace.xw);
@@ -1193,35 +1254,44 @@ impl MoHGating {
         let g_view = workspace.g.view();
         let g_view_2d = g_view.to_shape((1, num_heads)).unwrap();
         
-        let cfg = RoutingConfig {
-            algorithm: if self.head_selection_config.gating.use_soft_top_p {
-                SelectionAlgorithm::SoftTopP {
+        if self.head_selection_config.gating.use_soft_top_p {
+            let cfg = RoutingConfig {
+                algorithm: SelectionAlgorithm::SoftTopP {
                     top_p: self.head_selection_config.gating.top_p,
-                }
-            } else {
-                SelectionAlgorithm::TopK {
+                },
+                use_learned_predictor: false,
+                num_active: self.head_selection_config.gating.num_active.max(1),
+                temperature: 1.0,
+                soft_top_p_alpha: self.head_selection_config.gating.soft_top_p_alpha,
+            };
+            let mut weights_2d = apply_selection_algorithm(&g_view_2d.view(), &cfg);
+
+            let activation_scale = self.head_selection_config.max_heads.max(1) as f32;
+            weights_2d.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
+
+            let m_val = self.head_selection_config.threshold_modulation.value(self.training_progress);
+            weights_2d.mapv_inplace(|v| (v * m_val).clamp(0.0, 1.0));
+
+            workspace.m.assign(&weights_2d.row(0));
+        } else if self.head_selection_config.gating.use_learned_predictor {
+            // Streaming predictor fallback: keep allocation-free Top-K approximation.
+            let cfg = RoutingConfig {
+                algorithm: SelectionAlgorithm::TopK {
                     k: self.head_selection_config.gating.num_active.max(1),
-                }
-            },
-            use_learned_predictor: false, // Optimizing for streaming, predictor allocation avoided for now
-            num_active: self.head_selection_config.gating.num_active.max(1),
-            temperature: 1.0,
-            soft_top_p_alpha: self.head_selection_config.gating.soft_top_p_alpha,
-        };
-        
-        let mut weights_2d = apply_selection_algorithm(&g_view_2d.view(), &cfg);
-        
-        // Apply activation scaling
-        let activation_scale = self.head_selection_config.max_heads.max(1) as f32;
-        weights_2d.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
-        
-        // Apply threshold modulation
-        let m_val = self.head_selection_config.threshold_modulation.value(self.training_progress);
-        weights_2d.mapv_inplace(|v| (v * m_val).clamp(0.0, 1.0));
-        
-        // Assign to workspace mask
-        workspace.m.assign(&weights_2d.row(0));
-        
+                },
+                use_learned_predictor: false,
+                num_active: self.head_selection_config.gating.num_active.max(1),
+                temperature: 1.0,
+                soft_top_p_alpha: self.head_selection_config.gating.soft_top_p_alpha,
+            };
+            let weights_2d = apply_selection_algorithm(&g_view_2d.view(), &cfg);
+            workspace.m.assign(&weights_2d.row(0));
+        } else {
+            // Fixed/non-predictor path matches `forward_weights_view` semantics:
+            // start with all ones then enforce min/max against gate scores.
+            workspace.m.fill(1.0);
+        }
+
         // 4. Enforce Min/Max Heads
         let m_view = workspace.m.view_mut();
         let mut m_view_2d = m_view.to_shape((1, num_heads)).unwrap();
@@ -1233,6 +1303,12 @@ impl MoHGating {
             &self.head_selection_config.always_on_heads,
             None,
         );
+
+        // 5. Convert selection mask to effective weights (match batch path: eff = g * m).
+        for h in 0..num_heads {
+            let v = workspace.g[h] * workspace.m[h];
+            workspace.m[h] = if v.is_finite() { v.max(0.0) } else { 0.0 };
+        }
     }
 
     pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::common::errors::Result<()> {

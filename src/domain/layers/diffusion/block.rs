@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ndarray::{Array1, Array2, Axis, parallel::prelude::*, s};
+use ndarray::{Array1, Array2, parallel::prelude::*};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +15,12 @@ use crate::{
         layers::{
             components::{
                 adaptive_residuals::AdaptiveResiduals,
+                attention_context::SharedAttentionContext,
+                conditioning::{SharedFilmModulation, TimeConditioner, TimeEmbedding},
+                feedforward::SharedFeedforward,
+                temporal_processing::SharedTemporalProcessing,
                 common::{
-                    CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
+                    CommonLayerConfig, CommonLayers, TemporalMixingLayer,
                     TitanMemoryWorkspace, apply_adaptive_gradients, sanitize_and_clip_gradients,
                 },
             },
@@ -24,7 +28,10 @@ use crate::{
             transformer::TransformerBlockConfig,
         },
         mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
-        models::config::{DiffusionTimestepStrategy, TemporalMixingType, TitanMemoryConfig},
+        models::config::{
+            DiffusionTimestepStrategy,
+            TemporalMixingType, TitanMemoryConfig,
+        },
         network::Layer,
         richards::RichardsNorm,
     },
@@ -536,200 +543,13 @@ impl NoiseScheduler {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub(crate) struct TimeEmbedding {
-    pub b: Array1<f32>,
-}
-
-impl TimeEmbedding {
-    pub fn new(embed_dim: usize) -> Self {
-        let b = Array1::zeros(embed_dim);
-        Self { b }
-    }
-
-    pub fn forward(&self, t: usize, max_t: usize) -> Array1<f32> {
-        // Standard transformer-style sinusoidal embedding with log-spaced frequencies.
-        // Uses a normalized timestep in [0,1] to make embeddings stable across different T.
-        let dim = self.b.len();
-        let mut emb = Array1::zeros(dim);
-        let half_dim = dim / 2;
-        if half_dim == 0 {
-            return emb;
-        }
-        let t_norm = if max_t > 1 {
-            t as f32 / (max_t - 1) as f32
-        } else {
-            0.0
-        };
-        let base: f32 = 10_000.0;
-        for i in 0..half_dim {
-            let exponent = (i as f32) / (half_dim as f32);
-            let inv_freq = base.powf(-exponent);
-            let arg = t_norm * inv_freq;
-            emb[2 * i] = arg.sin();
-            if 2 * i + 1 < dim {
-                emb[2 * i + 1] = arg.cos();
-            }
-        }
-        emb
-    }
-}
-
-/// MLP for processing time embeddings into FiLM modulation parameters
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TimeConditioner {
-    pub w1: Array2<f32>,
-    pub b1: Array2<f32>,
-    pub w2: Array2<f32>,
-    pub b2: Array2<f32>,
-    #[serde(skip_serializing, skip_deserializing)]
-    pub opt_w1: Option<crate::infrastructure::optimizer::adam::Adam>,
-    #[serde(skip_serializing, skip_deserializing)]
-    pub opt_b1: Option<crate::infrastructure::optimizer::adam::Adam>,
-    #[serde(skip_serializing, skip_deserializing)]
-    pub opt_w2: Option<crate::infrastructure::optimizer::adam::Adam>,
-    #[serde(skip_serializing, skip_deserializing)]
-    pub opt_b2: Option<crate::infrastructure::optimizer::adam::Adam>,
-    pub ema_w1: Array2<f32>,
-    pub ema_b1: Array2<f32>,
-    pub ema_w2: Array2<f32>,
-    pub ema_b2: Array2<f32>,
-}
-
-impl TimeConditioner {
-    pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
-        let mut rng = get_rng();
-        let w1 = Array2::from_shape_fn((input_dim, hidden_dim), |_| {
-            Normal::new(0.0, (1.0 / input_dim as f32).sqrt())
-                .unwrap()
-                .sample(&mut rng)
-        });
-        let b1 = Array2::zeros((hidden_dim, 1));
-        let w2 = Array2::from_shape_fn((hidden_dim, output_dim), |_| {
-            Normal::new(0.0, (1.0 / hidden_dim as f32).sqrt())
-                .unwrap()
-                .sample(&mut rng)
-        });
-        let b2 = Array2::zeros((output_dim, 1));
-
-        Self {
-            ema_w1: w1.clone(),
-            ema_b1: b1.clone(),
-            ema_w2: w2.clone(),
-            ema_b2: b2.clone(),
-            opt_w1: Some(crate::infrastructure::optimizer::adam::Adam::new_adamw((input_dim, hidden_dim), 0.01)),
-            opt_b1: Some(crate::infrastructure::optimizer::adam::Adam::new_adamw((hidden_dim, 1), 0.01)),
-            opt_w2: Some(crate::infrastructure::optimizer::adam::Adam::new_adamw((hidden_dim, output_dim), 0.01)),
-            opt_b2: Some(crate::infrastructure::optimizer::adam::Adam::new_adamw((output_dim, 1), 0.01)),
-            w1,
-            b1,
-            w2,
-            b2,
-        }
-    }
-
-    pub fn forward(&self, input: &Array1<f32>, use_ema: bool) -> (Array2<f32>, Array2<f32>) {
-        let (w1, b1, w2, b2) = if use_ema {
-            (&self.ema_w1, &self.ema_b1, &self.ema_w2, &self.ema_b2)
-        } else {
-            (&self.w1, &self.b1, &self.w2, &self.b2)
-        };
-
-        let h_pre = input.view().to_shape((1, input.len())).unwrap().dot(w1) + b1.t();
-
-        let mut h = h_pre;
-        {
-            let tanh = crate::domain::richards::RichardsCurve::tanh(false);
-            h.mapv_inplace(|x| tanh.forward_scalar_f32(x));
-        }
-
-        let output = h.dot(w2) + b2.t();
-        (output, h)
-    }
-
-    pub fn backward(
-        &self,
-        grad_output: &Array2<f32>,
-        h: &Array2<f32>,
-        input: &Array1<f32>,
-    ) -> (Array1<f32>, Vec<Array2<f32>>) {
-        // grad_output: (1, output_dim)
-        // h: (1, hidden_dim)
-        // input: (input_dim)
-
-        // dL/dW2 = h^T * grad_output
-        let grad_w2 = h.t().dot(grad_output);
-        // dL/db2 = grad_output^T (sum over batch, here batch=1)
-        let grad_b2 = grad_output.t().to_owned();
-
-        // dL/dh = grad_output * W2^T
-        let mut grad_h = grad_output.dot(&self.w2.t());
-
-        // dL/dh_pre = dL/dh * (1 - h^2)
-        // h is already tanh(h_pre)
-        grad_h.zip_mut_with(h, |g, &val| *g *= 1.0 - val * val);
-
-        // dL/dW1 = input^T * grad_h
-        let input_view = input.view();
-        let input_mat = input_view.to_shape((1, input.len())).unwrap();
-        let grad_w1 = input_mat.t().dot(&grad_h);
-
-        // dL/db1 = grad_h^T
-        let grad_b1 = grad_h.t().to_owned();
-
-        // dL/dInput = grad_h * W1^T
-        let grad_input_mat = grad_h.dot(&self.w1.t());
-        let grad_input = grad_input_mat.row(0).to_owned();
-
-        (grad_input, vec![grad_w2, grad_b2, grad_w1, grad_b1])
-    }
-
-    pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32, ema_decay: f32) {
-        if grads.len() != 4 {
-            return;
-        }
-        let g_w2 = &grads[0];
-        let g_b2 = &grads[1];
-        let g_w1 = &grads[2];
-        let g_b1 = &grads[3];
-
-        if let Some(opt) = &mut self.opt_w2 {
-            opt.step(&mut self.w2, g_w2, lr);
-        }
-        if let Some(opt) = &mut self.opt_b2 {
-            opt.step(&mut self.b2, g_b2, lr);
-        }
-        if let Some(opt) = &mut self.opt_w1 {
-            opt.step(&mut self.w1, g_w1, lr);
-        }
-        if let Some(opt) = &mut self.opt_b1 {
-            opt.step(&mut self.b1, g_b1, lr);
-        }
-
-        // Update EMA
-        let d = ema_decay;
-        self.ema_w2
-            .zip_mut_with(&self.w2, |e, &w| *e = d * *e + (1.0 - d) * w);
-        self.ema_b2
-            .zip_mut_with(&self.b2, |e, &w| *e = d * *e + (1.0 - d) * w);
-        self.ema_w1
-            .zip_mut_with(&self.w1, |e, &w| *e = d * *e + (1.0 - d) * w);
-        self.ema_b1
-            .zip_mut_with(&self.b1, |e, &w| *e = d * *e + (1.0 - d) * w);
-    }
-
-    pub fn weight_norm(&self) -> f32 {
-        (self.w1.iter().map(|&w| w * w).sum::<f32>() + self.w2.iter().map(|&w| w * w).sum::<f32>())
-            .sqrt()
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct DiffusionCachedIntermediates {
     pub input_original: Arc<Array2<f32>>,
     pub input_used: Arc<Array2<f32>>,
     pub time_embed: Arc<Array1<f32>>,
-    pub gamma_beta: Arc<Array2<f32>>,
+    pub gamma_beta: Arc<Array1<f32>>,
     pub norm1_out: Arc<Array2<f32>>,
     pub norm1_mod: Arc<Array2<f32>>,
     pub attn_out: Arc<Array2<f32>>,
@@ -793,8 +613,8 @@ impl DiffusionParamPartitions {
 pub struct DiffusionBlock {
     pub config: DiffusionBlockConfig,
     #[serde(alias = "attention")]
-    pub temporal_mixing: TemporalMixingLayer,
-    pub feedforward: FeedForwardVariant,
+    pub temporal_mixing: SharedTemporalProcessing,
+    pub feedforward: SharedFeedforward,
     pub pre_attention_norm: RichardsNorm,
     pub pre_ffn_norm: RichardsNorm,
     pub(crate) time_embedding: TimeEmbedding,
@@ -814,8 +634,6 @@ pub struct DiffusionBlock {
     pub adaptive_window_on: bool,
     pub enable_dropout: bool,
     pub dropout_rate: f32,
-    pub film_scale_gamma: f32,
-    pub film_scale_beta: f32,
     pub use_ema_for_sampling: bool,
     pub ema_decay: f32,
     pub current_timestep: usize,
@@ -830,19 +648,13 @@ pub struct DiffusionBlock {
     #[serde(default = "default_similarity_context_strength")]
     similarity_context_strength: Array2<f32>,
     #[serde(skip_serializing, skip_deserializing)]
-    opt_similarity_context_strength: Adam,
-    #[serde(skip_serializing, skip_deserializing)]
     similarity_update_rate: f32,
     #[serde(skip)]
-    film_gamma_beta_tanh_scratch: Vec<f32>,
+    pub context: SharedAttentionContext,
     #[serde(skip)]
-    film_gamma_attn_vec: Array2<f32>,
+    pub opt_similarity_context_strength: Adam,
     #[serde(skip)]
-    film_beta_attn_vec: Array2<f32>,
-    #[serde(skip)]
-    film_gamma_ffn_vec: Array2<f32>,
-    #[serde(skip)]
-    film_beta_ffn_vec: Array2<f32>,
+    pub film_modulation: SharedFilmModulation,
     #[serde(skip)]
     titan_memory_workspace: TitanMemoryWorkspace,
 }
@@ -886,12 +698,26 @@ impl DiffusionBlock {
             None
         };
 
-        let similarity_context_strength = Array2::zeros((1, 1));
+        let mut context = SharedAttentionContext::new();
+        context.similarity_context_strength = default_similarity_context_strength();
+        context.similarity_update_rate = 0.01;
+
+        let temporal_mixing = SharedTemporalProcessing::new(
+            layers.temporal_mixing,
+            config.window_size,
+            config.use_adaptive_window,
+        );
+
         let opt_similarity_context_strength = Adam::new((1, 1));
+
+        let mut film_modulation = SharedFilmModulation::new(config.embed_dim);
+        film_modulation.scale_gamma = 0.1;
+        film_modulation.scale_beta = 0.1;
+
         Self {
             config: config.clone(),
-            temporal_mixing: layers.temporal_mixing,
-            feedforward: layers.feedforward,
+            temporal_mixing,
+            feedforward: SharedFeedforward::new(layers.feedforward),
             pre_attention_norm: layers.pre_attention_norm,
             pre_ffn_norm: layers.pre_ffn_norm,
             time_embedding,
@@ -909,8 +735,6 @@ impl DiffusionBlock {
             adaptive_window_on: config.use_adaptive_window,
             enable_dropout: false,
             dropout_rate: 0.0,
-            film_scale_gamma: 0.1,
-            film_scale_beta: 0.1,
             use_ema_for_sampling: false,
             ema_decay: 0.999,
             current_timestep: 0,
@@ -924,14 +748,11 @@ impl DiffusionBlock {
             },
             activation_similarity_matrix: Array2::zeros((config.embed_dim, config.embed_dim)),
             incoming_similarity_context: None,
-            similarity_context_strength,
-            opt_similarity_context_strength,
+            similarity_context_strength: default_similarity_context_strength(),
             similarity_update_rate: 0.01,
-            film_gamma_beta_tanh_scratch: Vec::new(),
-            film_gamma_attn_vec: Array2::zeros((1, config.embed_dim)),
-            film_beta_attn_vec: Array2::zeros((1, config.embed_dim)),
-            film_gamma_ffn_vec: Array2::zeros((1, config.embed_dim)),
-            film_beta_ffn_vec: Array2::zeros((1, config.embed_dim)),
+            context,
+            opt_similarity_context_strength,
+            film_modulation,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
         }
     }
@@ -941,27 +762,27 @@ impl DiffusionBlock {
     }
 
     pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
-        &self.activation_similarity_matrix
+        self.context.get_outgoing_context()
     }
 
     pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
         if let Some(ctx) = context {
             if ctx.nrows() != self.config.embed_dim || ctx.ncols() != self.config.embed_dim {
-                self.incoming_similarity_context = None;
+                self.context.incoming_context = None;
                 return;
             }
 
-            if let Some(existing) = self.incoming_similarity_context.as_mut() {
+            if let Some(existing) = self.context.incoming_context.as_mut() {
                 if existing.dim() == ctx.dim() {
                     existing.assign(ctx);
                 } else {
                     *existing = ctx.clone();
                 }
             } else {
-                self.incoming_similarity_context = Some(ctx.clone());
+                self.context.incoming_context = Some(ctx.clone());
             }
         } else {
-            self.incoming_similarity_context = None;
+            self.context.incoming_context = None;
         }
     }
 
@@ -1040,85 +861,6 @@ impl DiffusionBlock {
         self.config.discrete_masked
     }
 
-    #[inline]
-    fn update_activation_similarity_matrix(&mut self, input: &Array2<f32>, output: &Array2<f32>) {
-        let rate = self.similarity_update_rate.clamp(0.0, 1.0);
-        if rate <= 0.0 {
-            return;
-        }
-
-        let seq_len = input.nrows().min(output.nrows());
-        let embed_dim = input
-            .ncols()
-            .min(output.ncols())
-            .min(self.config.embed_dim);
-        if seq_len == 0 || embed_dim == 0 {
-            return;
-        }
-
-        let sample = seq_len.min(32);
-        let step = (seq_len / sample).max(1);
-
-        let mut nx = vec![0.0f64; embed_dim];
-        let mut ny = vec![0.0f64; embed_dim];
-        for seq_idx in (0..seq_len).step_by(step).take(sample) {
-            for j in 0..embed_dim {
-                let x = input[[seq_idx, j]];
-                let y = output[[seq_idx, j]];
-                let xs = if x.is_finite() { x as f64 } else { 0.0 };
-                let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                nx[j] += xs * xs;
-                ny[j] += ys * ys;
-            }
-        }
-
-        let tanh = crate::domain::richards::RichardsCurve::tanh(false);
-        for i in 0..embed_dim {
-            for j in 0..embed_dim {
-                let mut dot = 0.0f64;
-                for seq_idx in (0..seq_len).step_by(step).take(sample) {
-                    let x = input[[seq_idx, i]];
-                    let y = output[[seq_idx, j]];
-                    let xs = if x.is_finite() { x as f64 } else { 0.0 };
-                    let ys = if y.is_finite() { y as f64 } else { 0.0 };
-                    dot += xs * ys;
-                }
-                let denom = (nx[i] * ny[j]).sqrt().max(1e-12);
-                let sim = if denom > 0.0 { (dot / denom) as f32 } else { 0.0 };
-                let sim = if sim.is_finite() {
-                    tanh.forward_scalar_f32(sim)
-                } else {
-                    0.0
-                };
-
-                let prev = self.activation_similarity_matrix[[i, j]];
-                self.activation_similarity_matrix[[i, j]] = (1.0 - rate) * prev + rate * sim;
-            }
-        }
-    }
-
-    #[inline]
-    fn apply_similarity_context(&self, input: &Array2<f32>, context: &Array2<f32>) -> Array2<f32> {
-        let strength = self.similarity_context_strength[[0, 0]];
-        let strength = if strength.is_finite() { strength } else { 0.0 };
-        if strength == 0.0 {
-            return input.clone();
-        }
-
-        if input.ncols() != context.nrows() || context.nrows() != context.ncols() {
-            return input.clone();
-        }
-
-        let d = input.ncols().max(1) as f32;
-        let k = strength / d;
-        let mut out = input.dot(context);
-        out.zip_mut_with(input, |o, &x| {
-            let ms = if o.is_finite() { *o } else { 0.0 };
-            let xs = if x.is_finite() { x } else { 0.0 };
-            *o = xs + k * ms;
-        });
-        out
-    }
 
     pub fn mask_token_id(&self) -> Option<usize> {
         self.config.mask_token_id
@@ -1139,33 +881,6 @@ impl DiffusionBlock {
 
     fn sanitize_tensor(_name: &str, tensor: &mut Array2<f32>) {
         tensor.mapv_inplace(|x| if x.is_finite() { x } else { 0.0 });
-    }
-
-    fn apply_film(input: &Array2<f32>, gamma: &Array2<f32>, beta: &Array2<f32>) -> Array2<f32> {
-        // input: (seq_len, dim), gamma: (1, dim), beta: (1, dim)
-        // output = input * gamma + beta
-        input * gamma + beta
-    }
-
-    fn film_backward(
-        grad_output: &Array2<f32>,
-        input: &Array2<f32>,
-        gamma: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
-        // grad_output: (seq_len, dim)
-        // input: (seq_len, dim)
-        // gamma: (1, dim)
-
-        // dL/dInput = grad_output * gamma
-        let grad_input = grad_output * gamma;
-
-        // dL/dGamma = sum(grad_output * input, axis=0)
-        let grad_gamma = (grad_output * input).sum_axis(Axis(0)).insert_axis(Axis(0));
-
-        // dL/dBeta = sum(grad_output, axis=0)
-        let grad_beta = grad_output.sum_axis(Axis(0)).insert_axis(Axis(0));
-
-        (grad_input, grad_gamma, grad_beta)
     }
 
     fn apply_dropout_inplace(input: &mut Array2<f32>, rate: f32) {
@@ -1231,57 +946,13 @@ impl DiffusionBlock {
         if self.current_window_size != self.config.window_size {
             self.config.window_size = self.current_window_size;
         }
-        if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
-            attn.set_window_size(self.current_window_size);
-        }
         let time_embed = self.time_embedding.forward(t, self.config.num_timesteps);
         let (gamma_beta, h) = self
             .time_conditioner
             .forward(&time_embed, self.use_ema_for_sampling);
 
-        let embed = self.config.embed_dim;
-        let tanh = crate::domain::richards::RichardsCurve::tanh(false);
-        if self.film_gamma_attn_vec.raw_dim() != ndarray::Dim([1, embed]) {
-            self.film_gamma_attn_vec = Array2::zeros((1, embed));
-        }
-        if self.film_beta_attn_vec.raw_dim() != ndarray::Dim([1, embed]) {
-            self.film_beta_attn_vec = Array2::zeros((1, embed));
-        }
-        if self.film_gamma_ffn_vec.raw_dim() != ndarray::Dim([1, embed]) {
-            self.film_gamma_ffn_vec = Array2::zeros((1, embed));
-        }
-        if self.film_beta_ffn_vec.raw_dim() != ndarray::Dim([1, embed]) {
-            self.film_beta_ffn_vec = Array2::zeros((1, embed));
-        }
-        if let (Some(gb), Some(ga), Some(ba), Some(gf), Some(bf)) = (
-            gamma_beta.as_slice(),
-            self.film_gamma_attn_vec.as_slice_mut(),
-            self.film_beta_attn_vec.as_slice_mut(),
-            self.film_gamma_ffn_vec.as_slice_mut(),
-            self.film_beta_ffn_vec.as_slice_mut(),
-        ) {
-            self.film_gamma_beta_tanh_scratch.resize(gb.len(), 0.0);
-            tanh.forward_into_f32(gb, &mut self.film_gamma_beta_tanh_scratch);
-            for j in 0..embed {
-                ga[j] = 1.0 + self.film_scale_gamma * self.film_gamma_beta_tanh_scratch[j];
-                ba[j] = self.film_scale_beta * self.film_gamma_beta_tanh_scratch[embed + j];
-                gf[j] =
-                    1.0 + self.film_scale_gamma * self.film_gamma_beta_tanh_scratch[2 * embed + j];
-                bf[j] = self.film_scale_beta * self.film_gamma_beta_tanh_scratch[3 * embed + j];
-            }
-        } else {
-            for j in 0..embed {
-                let g_attn = tanh.forward_scalar_f32(gamma_beta[[0, j]]);
-                let b_attn = tanh.forward_scalar_f32(gamma_beta[[0, embed + j]]);
-                let g_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 2 * embed + j]]);
-                let b_ffn = tanh.forward_scalar_f32(gamma_beta[[0, 3 * embed + j]]);
-
-                self.film_gamma_attn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_attn;
-                self.film_beta_attn_vec[[0, j]] = self.film_scale_beta * b_attn;
-                self.film_gamma_ffn_vec[[0, j]] = 1.0 + self.film_scale_gamma * g_ffn;
-                self.film_beta_ffn_vec[[0, j]] = self.film_scale_beta * b_ffn;
-            }
-        }
+        // Update FiLM modulation parameters using the shared component
+        self.film_modulation.update(gamma_beta.as_slice().unwrap(), self.config.embed_dim);
 
         let (x_model_in, c_skip, c_out, edm_on) =
             if self.config.prediction_target == DiffusionPredictionTarget::EdmX0 {
@@ -1292,20 +963,37 @@ impl DiffusionBlock {
             };
 
         let input_original = x_model_in;
-        let input_used = if let Some(ctx) = self.incoming_similarity_context.as_ref() {
-            self.apply_similarity_context(&input_original, ctx)
-        } else {
-            input_original.clone()
-        };
+        let input_used = self.context.apply_context(&input_original).into_owned();
 
         let norm1_out = self.pre_attention_norm.forward(&input_used);
-        let norm1_mod =
-            Self::apply_film(&norm1_out, &self.film_gamma_attn_vec, &self.film_beta_attn_vec);
+        
+        // Use shared FiLM modulation
+        let norm1_mod = self.film_modulation.apply_attn_conditioning(&norm1_out);
+        
+        // Update window size if needed
+        self.temporal_mixing.set_window_size(self.current_window_size);
+
+        // Forward with conditioning (although Attention might not use it directly in this variant,
+        // we use the film-modulated input).
+        // For SharedTemporalProcessing, we can pass None for conditioning if we already modulated the input,
+        // OR we can pass the modulation vectors if the layer supports internal modulation.
+        // Given we manually modulated `norm1_mod` above, we pass that as input.
+        // However, `SharedTemporalProcessing`'s `forward_with_film` might be cleaner if we remove the manual modulation above.
+        // Let's stick to the existing pattern: Manual modulation -> Layer.
+        // But wait, the goal is to use `SharedTemporalProcessing`.
+        // Let's check `SharedTemporalProcessing`. It has `forward` and `forward_with_film`.
+        // If we use `forward_with_film`, it expects `gamma` and `beta`.
+        // The previous code did: norm1_mod = apply_film(norm1_out, gamma, beta); attn_out = temporal_mixing.forward(norm1_mod)
+        // So we will keep that pattern for now to match the "Manual Modulation" style of DiffusionBlock,
+        // unless we want to push modulation *into* the layer.
+        // For now, let's keep manual modulation using the helper, then call the layer.
+        
         let mut attn_out = self
             .temporal_mixing
             .forward_with_causal(&norm1_mod, self.config.causal_attention);
+            
         if !matches!(
-            self.temporal_mixing,
+            self.temporal_mixing.temporal_mixing,
             TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
         ) {
             self.config.titan_memory.apply_into_out_with_workspace(
@@ -1317,91 +1005,16 @@ impl DiffusionBlock {
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
         }
-        self.update_activation_similarity_matrix(&input_used, &attn_out);
-        let head_activity_ratio = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => {
-                if let Some(avg) = attn.last_avg_active_heads {
-                    let denom = attn.num_heads as f32;
-                    let r = avg / denom.max(1.0);
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            TemporalMixingLayer::RgLruMoH(rglru) => {
-                if let Some(avg) = rglru.last_avg_active_heads {
-                    let denom = rglru.num_heads as f32;
-                    let r = avg / denom.max(1.0);
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            TemporalMixingLayer::MambaMoH(m) => {
-                if let Some(avg) = m.last_avg_active_heads {
-                    let denom = m.num_heads as f32;
-                    let r = avg / denom.max(1.0);
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            TemporalMixingLayer::Mamba2MoH(m) => {
-                if let Some(avg) = m.last_avg_active_heads {
-                    let denom = m.num_heads as f32;
-                    let r = avg / denom.max(1.0);
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            TemporalMixingLayer::Titans(mac) => {
-                if let Some(avg) = mac.core.last_avg_active_heads {
-                    let denom = mac.core.num_heads as f32;
-                    let r = avg / denom.max(1.0);
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            _ => 1.0,
-        };
-        let head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::MambaMoH(m) => m.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::Mamba2MoH(m) => m.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::Titans(mac) => mac.core.last_head_activity_vec.as_deref(),
-            _ => None,
-        };
-        let token_head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.as_deref(),
-            TemporalMixingLayer::MambaMoH(m) => m.last_token_head_activity_vec.as_deref(),
-            TemporalMixingLayer::Mamba2MoH(m) => m.last_token_head_activity_vec.as_deref(),
-            TemporalMixingLayer::Titans(mac) => mac.core.last_token_head_activity_vec.as_deref(),
-            _ => None,
-        };
+        self.context.update_outgoing_context(
+            &input_used.view(),
+            &attn_out.view(),
+            self.config.embed_dim,
+        );
+        
+        let (head_ratio_opt, head_vec_opt) = self.temporal_mixing.get_head_activity_metrics();
+        let head_activity_ratio = head_ratio_opt.unwrap_or(1.0);
+        let head_activity_vec = head_vec_opt;
+        let token_head_activity_vec = self.temporal_mixing.get_token_head_activity_vec();
         let residual1 = if let Some(ref mut adaptive_residuals) = self.adaptive_residuals {
             adaptive_residuals.apply_attention_residual_with_moh(
                 &input_used,
@@ -1413,18 +1026,28 @@ impl DiffusionBlock {
             &input_used + &attn_out
         };
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
-        let norm2_mod =
-            Self::apply_film(&norm2_out, &self.film_gamma_ffn_vec, &self.film_beta_ffn_vec);
-        let mut ffn_out = match &mut self.feedforward {
-            FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_mod),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer
-                .forward_with_head_features_and_token_activity(
-                    &norm2_mod,
-                    Some(head_activity_ratio),
-                    head_activity_vec,
-                    token_head_activity_vec,
-                ),
-        };
+        
+        // FFN Modulation
+        // We can use the new `forward_with_film` in `SharedFeedforward`!
+        // But first let's see if we want to modulate *before* passing or pass parameters.
+        // SharedFeedforward::forward(input) just runs the FFN.
+        // If we want FiLM, we should use `forward_with_film` OR modulate manually.
+        // The previous code did manual modulation: `norm2_mod = apply_film(...)`.
+        // Let's switch to using `SharedFeedforward::forward_with_film` if possible, 
+        // OR just keep manual modulation + standard forward for consistency with Attention.
+        // Actually, `SharedFeedforward` has `forward_with_film`.
+        // However, `SharedTemporalProcessing` does NOT have `forward_with_film` exposed in the same way (it delegates).
+        // To be consistent, let's do manual modulation here using `SharedFilmModulation` helper, then standard forward.
+        
+        let norm2_mod = self.film_modulation.apply_ffn_conditioning(&norm2_out);
+        
+        let mut ffn_out = self.feedforward.forward_with_token_head_activity(
+            &norm2_mod,
+            Some(head_activity_ratio),
+            head_activity_vec,
+            token_head_activity_vec,
+        );
+            
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut ffn_out, self.dropout_rate);
         }
@@ -1459,10 +1082,10 @@ impl DiffusionBlock {
             norm2_out: Arc::new(norm2_out),
             norm2_mod: Arc::new(norm2_mod),
             h_vec: Arc::new(h_vec),
-            gamma_attn: Arc::new(self.film_gamma_attn_vec.clone()),
-            beta_attn: Arc::new(self.film_beta_attn_vec.clone()),
-            gamma_ffn: Arc::new(self.film_gamma_ffn_vec.clone()),
-            beta_ffn: Arc::new(self.film_beta_ffn_vec.clone()),
+            gamma_attn: Arc::new(self.film_modulation.gamma_attn.clone()),
+            beta_attn: Arc::new(self.film_modulation.beta_attn.clone()),
+            gamma_ffn: Arc::new(self.film_modulation.gamma_ffn.clone()),
+            beta_ffn: Arc::new(self.film_modulation.beta_ffn.clone()),
             gamma_beta: Arc::new(gamma_beta),
             attn_out: Arc::new(attn_out),
             ffn_out: Arc::new(ffn_out),
@@ -1470,7 +1093,7 @@ impl DiffusionBlock {
             timestep: t,
         });
         if self.adaptive_window_on
-            && let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing
+            && let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing.temporal_mixing
             && let Some(pn) = attn.last_pred_norm
         {
             let mut ws = self.current_window_size.unwrap_or(self.win_max);
@@ -2054,17 +1677,11 @@ impl Layer for DiffusionBlock {
             // Both branches receive the same upstream grads; avoid cloning.
 
             // Get feedforward gradients
-            let (ffn_input_grad_mod, ffn_param_grads) = match &self.feedforward {
-                FeedForwardVariant::RichardsGlu(layer) => {
-                    layer.compute_gradients(norm2_mod, &safe_scaled_grads)
-                }
-                FeedForwardVariant::MixtureOfExperts(layer) => {
-                    layer.compute_gradients(norm2_mod, &safe_scaled_grads)
-                }
-            };
+            let (ffn_input_grad_mod, ffn_param_grads) =
+                self.feedforward.backward(norm2_mod, &safe_scaled_grads);
 
-            let (norm2_grad, grad_gamma_ffn, grad_beta_ffn) =
-                Self::film_backward(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec);
+            let (norm2_grad, grad_gamma_ffn_1d, grad_beta_ffn_1d) =
+                self.film_modulation.film_backward(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec);
 
             let (residual1_from_ffn, pre_ffn_param_grads) =
                 self.pre_ffn_norm.compute_gradients(residual1, &norm2_grad);
@@ -2079,7 +1696,7 @@ impl Layer for DiffusionBlock {
                 .temporal_mixing
                 .compute_gradients(norm1_mod, attn_out_grads);
             if !matches!(
-                self.temporal_mixing,
+                &self.temporal_mixing.temporal_mixing,
                 TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
             ) {
                 self.config
@@ -2091,7 +1708,7 @@ impl Layer for DiffusionBlock {
             }
 
             let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
-                Self::film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);
+                self.film_modulation.film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);
 
             let (input_from_norm, pre_attn_param_grads) = self
                 .pre_attention_norm
@@ -2101,7 +1718,7 @@ impl Layer for DiffusionBlock {
             let final_input_used_grads = &residual1_total_grads + &input_from_norm;
 
             let mut similarity_strength_grad = Array2::zeros((1, 1));
-            if let Some(ctx) = self.incoming_similarity_context.as_ref()
+            if let Some(ctx) = self.context.incoming_context.as_ref()
                 && ctx.nrows() == self.config.embed_dim
                 && ctx.ncols() == self.config.embed_dim
             {
@@ -2117,12 +1734,12 @@ impl Layer for DiffusionBlock {
             }
 
             let mut final_input_grads = final_input_used_grads;
-            if let Some(ctx) = self.incoming_similarity_context.as_ref()
+            if let Some(ctx) = self.context.incoming_context.as_ref()
                 && ctx.nrows() == self.config.embed_dim
                 && ctx.ncols() == self.config.embed_dim
             {
                 let d = (self.config.embed_dim.max(1)) as f32;
-                let s = self.similarity_context_strength[[0, 0]];
+                let s = self.context.similarity_context_strength[[0, 0]];
                 let s = if s.is_finite() { s } else { 0.0 };
                 let k = s / d;
                 if k != 0.0 {
@@ -2158,47 +1775,24 @@ impl Layer for DiffusionBlock {
             all_param_grads.push(similarity_strength_grad);
 
             let embed = self.config.embed_dim;
-            let g_t_attn = gamma_attn_vec.mapv(|x| {
-                let z = (x - 1.0) / self.film_scale_gamma;
-                z.clamp(-1.0, 1.0)
-            });
-            let b_t_attn = beta_attn_vec.mapv(|x| {
-                let z = x / self.film_scale_beta;
-                z.clamp(-1.0, 1.0)
-            });
-            let g_t_ffn = gamma_ffn_vec.mapv(|x| {
-                let z = (x - 1.0) / self.film_scale_gamma;
-                z.clamp(-1.0, 1.0)
-            });
-            let b_t_ffn = beta_ffn_vec.mapv(|x| {
-                let z = x / self.film_scale_beta;
-                z.clamp(-1.0, 1.0)
-            });
-            let d_g_attn_raw = grad_gamma_attn.mapv(|x| x * self.film_scale_gamma)
-                * (1.0 - g_t_attn.mapv(|x| x * x));
-            let d_b_attn_raw = grad_beta_attn.mapv(|x| x * self.film_scale_beta)
-                * (1.0 - b_t_attn.mapv(|x| x * x));
-            let d_g_ffn_raw = grad_gamma_ffn.mapv(|x| x * self.film_scale_gamma)
-                * (1.0 - g_t_ffn.mapv(|x| x * x));
-            let d_b_ffn_raw =
-                grad_beta_ffn.mapv(|x| x * self.film_scale_beta) * (1.0 - b_t_ffn.mapv(|x| x * x));
-
-            let mut grad_gamma_beta = Array2::<f32>::zeros((1, embed * 4));
-            {
-                let mut view = grad_gamma_beta.row_mut(0);
-                view.slice_mut(s![0..embed]).assign(&d_g_attn_raw.row(0));
-                view.slice_mut(s![embed..2 * embed])
-                    .assign(&d_b_attn_raw.row(0));
-                view.slice_mut(s![2 * embed..3 * embed])
-                    .assign(&d_g_ffn_raw.row(0));
-                view.slice_mut(s![3 * embed..4 * embed])
-                    .assign(&d_b_ffn_raw.row(0));
-            }
+            
+            // Calculate backprop for FiLM MLP using SharedFilmModulation helper
+            let grad_gamma_beta_1d = self.film_modulation.compute_mlp_gradients(
+                &grad_gamma_attn,
+                &grad_beta_attn,
+                &grad_gamma_ffn_1d,
+                &grad_beta_ffn_1d,
+                gamma_attn_vec,
+                beta_attn_vec,
+                gamma_ffn_vec,
+                beta_ffn_vec,
+                embed
+            );
 
             let h_mat = h_vec.view().to_shape((1, h_vec.len())).unwrap().to_owned();
             let (_, time_grads) =
                 self.time_conditioner
-                    .backward(&grad_gamma_beta, &h_mat, time_embed);
+                    .backward(&grad_gamma_beta_1d, &h_mat, time_embed);
             all_param_grads.extend(time_grads);
 
             let adaptive_param_grads = if let Some(residuals) = self.adaptive_residuals.as_ref() {
@@ -2332,15 +1926,21 @@ impl Layer for DiffusionBlock {
             && let Some(g) = sanitized.get(ctx_range.start)
         {
             self.opt_similarity_context_strength
-                .step(&mut self.similarity_context_strength, g, lr);
+                .step(&mut self.context.similarity_context_strength, g, lr);
         }
 
         // Time-conditioner gradients (expect 4 arrays)
         let time_range = next_range(partitions.time_conditioner);
         if time_range.len() == 4 {
             let time_grads = &sanitized[time_range];
+            let grads_tuple = (
+                time_grads[0].clone(),
+                time_grads[1].clone(),
+                time_grads[2].clone(),
+                time_grads[3].clone(),
+            );
             self.time_conditioner
-                .apply_gradients(time_grads, lr, self.ema_decay);
+                .apply_gradients(grads_tuple, lr, self.ema_decay);
         }
 
         let adaptive_range = next_range(
@@ -2618,9 +2218,10 @@ mod tests {
         let conditioner = TimeConditioner::new(input_dim, hidden_dim, output_dim);
 
         let input = Array1::zeros(input_dim);
-        let (output, _) = conditioner.forward(&input, false);
+        let (output, hidden) = conditioner.forward(&input, false);
 
-        assert_eq!(output.shape(), &[1, output_dim]);
+        assert_eq!(output.shape(), &[output_dim]);
+        assert_eq!(hidden.shape(), &[1, hidden_dim]);
     }
 
     #[test]

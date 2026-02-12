@@ -283,9 +283,11 @@ pub struct BlockPool {
     pages: Vec<KVPage>,
 
     /// Config
+    #[allow(dead_code)]
     config: PagedKVCacheConfig,
 
     /// Total pages allocated
+    #[allow(dead_code)]
     pages_allocated: usize,
 }
 

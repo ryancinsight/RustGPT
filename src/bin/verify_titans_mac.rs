@@ -3,7 +3,7 @@ use llm::domain::attention::position::config::{CoPEConfig, CoPEVariant};
 use llm::domain::memory::titans::NeuralMemory;
 use llm::domain::memory::titans::mac::TitansMAC;
 use llm::domain::network::Layer;
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 use rand::Rng;
 
 fn main() {

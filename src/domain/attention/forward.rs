@@ -250,8 +250,10 @@ pub fn compute_poly_attention_forward_into(
         
         for i in 0..n {
             let z = workspace.z_col[[i, 0]];
-            // Match streaming behavior: use base curve directly without dynamic scaling
-            workspace.g_col[[i, 0]] = ctx.gate.curve.forward_scalar_f32(z);
+            // Match streaming behavior: dynamic scaling per token
+            // Note: This effectively normalizes large inputs to +/- 1.0 range
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(z.abs() as f64);
+            workspace.g_col[[i, 0]] = gate_poly.forward_scalar_f32(z);
         }
 
         g_sq_sum_global += xw_col_view.iter().map(|&v| v * v).sum::<f32>();

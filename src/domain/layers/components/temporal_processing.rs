@@ -3,7 +3,7 @@
 //! This component provides a unified interface for temporal processing
 //! (attention, RG-LRU, Mamba) that can be used by multiple architectures.
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Shared temporal processing component
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SharedTemporalProcessing {
     /// The underlying temporal mixing layer
     pub temporal_mixing: TemporalMixingLayer,
@@ -44,16 +44,56 @@ impl SharedTemporalProcessing {
     /// Uses the Layer trait for zero-cost abstraction, eliminating
     /// redundant match statements across all temporal mixing variants.
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // Set window size if using adaptive window and it's attention-based
-        if self.use_adaptive_window
-            && let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing
-            && let Some(window_size) = self.window_size
-        {
-            attn.set_window_size(Some(window_size));
-        }
-
+        self.prepare_forward();
         // Use Layer trait method - zero-cost abstraction
         self.temporal_mixing.forward(input)
+    }
+
+    /// Forward pass with explicit causal masking control
+    pub fn forward_with_causal(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
+        self.prepare_forward();
+        self.temporal_mixing.forward_with_causal(input, causal)
+    }
+
+    /// Forward pass with FiLM conditioning and explicit causal masking
+    pub fn forward_with_film(
+        &mut self,
+        input: &Array2<f32>,
+        gamma: Option<&Array1<f32>>,
+        beta: Option<&Array1<f32>>,
+        causal: bool,
+    ) -> Array2<f32> {
+        if let (Some(g), Some(b)) = (gamma, beta) {
+            let mut modified = input.clone();
+            // Apply FiLM: x = x * (1 + gamma) + beta
+            // Note: g and b are broadcast across the sequence length (axis 0)
+            for mut row in modified.outer_iter_mut() {
+                // We use explicit loops or zip to avoid allocation if possible,
+                // but ndarray ops on views are efficient.
+                // row = row * (1 + g) + b
+                // 1 + g can be precomputed if reused, but here it's per-step usually.
+                // Optimization: Precompute (1+g) if possible, but here we just do it.
+                
+                // Using zip_mut_with for zero-allocation iteration
+                row.zip_mut_with(g, |x, &g_val| *x *= 1.0 + g_val);
+                row.zip_mut_with(b, |x, &b_val| *x += b_val);
+            }
+            self.forward_with_causal(&modified, causal)
+        } else {
+            self.forward_with_causal(input, causal)
+        }
+    }
+
+    /// Prepares the layer for a forward pass (e.g. setting window size)
+    fn prepare_forward(&mut self) {
+        // Set window size if using adaptive window and it's attention-based
+        if self.use_adaptive_window {
+            if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
+                if let Some(window_size) = self.window_size {
+                    attn.set_window_size(Some(window_size));
+                }
+            }
+        }
     }
 
     /// Backward pass through the temporal processing layer
@@ -94,6 +134,13 @@ impl SharedTemporalProcessing {
     /// Uses Layer trait method for zero-cost delegation.
     pub fn zero_gradients(&mut self) {
         self.temporal_mixing.zero_gradients()
+    }
+
+    /// Set training progress
+    /// 
+    /// Uses Layer trait method for zero-cost delegation.
+    pub fn set_training_progress(&mut self, progress: f64) {
+        self.temporal_mixing.set_training_progress(progress);
     }
 
     /// Get the layer type name
@@ -201,6 +248,52 @@ impl SharedTemporalProcessing {
             _ => None,
         }
     }
+
+    /// Forward step for streaming inference (token-by-token)
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
+        self.temporal_mixing.forward_step_into(input, output);
+    }
+
+    /// Compute gradients using the Layer trait
+    pub fn compute_gradients(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        self.temporal_mixing.compute_gradients(input, output_grads)
+    }
+
+    /// Get a reference to the underlying temporal mixing layer
+    /// 
+    /// This provides direct access for pattern matching and type-specific operations
+    pub fn inner(&self) -> &TemporalMixingLayer {
+        &self.temporal_mixing
+    }
+
+    /// Get a mutable reference to the underlying temporal mixing layer
+    /// 
+    /// This provides direct mutable access for type-specific operations
+    pub fn inner_mut(&mut self) -> &mut TemporalMixingLayer {
+        &mut self.temporal_mixing
+    }
+}
+
+impl crate::domain::layers::components::gradient_router::GradientRoutable for SharedTemporalProcessing {
+    fn gradient_count(&self) -> usize {
+        self.temporal_mixing.parameters()
+    }
+
+    fn weight_norm(&self) -> f32 {
+        self.temporal_mixing.weight_norm()
+    }
+
+    fn apply_gradients(&mut self, gradients: &[Array2<f32>], learning_rate: f32) -> crate::common::errors::Result<()> {
+        self.temporal_mixing.apply_gradients(gradients, learning_rate)
+    }
 }
 
 #[cfg(test)]
@@ -216,7 +309,7 @@ mod tests {
             embed_dim: 16,
             hidden_dim: 32,
             num_heads: 4,
-            poly_degree: 2,
+            poly_degree: 3,
             max_pos: 32,
             window_size: None,
             use_moe: false,
@@ -245,7 +338,7 @@ mod tests {
             embed_dim: 8,
             hidden_dim: 16,
             num_heads: 2,
-            poly_degree: 2,
+            poly_degree: 3,
             max_pos: 16,
             window_size: None,
             use_moe: false,

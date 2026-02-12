@@ -4,7 +4,7 @@
 //! by multiple architectures (Transformer, Diffusion).
 //! It encapsulates the logic for applying similarity-based context modulation.
 
-use ndarray::{Array1, Array2, Zip};
+use ndarray::{Array2, Zip, Axis};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -16,6 +16,12 @@ pub struct SharedAttentionContext {
     pub incoming_context: Option<Array2<f32>>,
     /// Current similarity context strength
     pub similarity_context_strength: Array2<f32>,
+    /// Outgoing similarity context (activation similarity matrix)
+    #[serde(skip)]
+    pub outgoing_context: Array2<f32>,
+    /// Update rate for outgoing context
+    #[serde(skip)]
+    pub similarity_update_rate: f32,
 }
 
 impl Default for SharedAttentionContext {
@@ -25,11 +31,115 @@ impl Default for SharedAttentionContext {
 }
 
 impl SharedAttentionContext {
+    /// Get outgoing similarity context
+    pub fn get_outgoing_context(&self) -> &Array2<f32> {
+        &self.outgoing_context
+    }
+
+    /// Set update rate for outgoing context
+    pub fn set_update_rate(&mut self, rate: f32) {
+        self.similarity_update_rate = rate;
+    }
+
+    /// Update outgoing similarity context (activation similarity matrix)
+    pub fn update_outgoing_context(
+        &mut self,
+        input: &ndarray::ArrayView2<f32>,
+        output: &ndarray::ArrayView2<f32>,
+        embed_dim_config: usize,
+    ) {
+        let rate = self.similarity_update_rate.clamp(0.0, 1.0);
+        if rate <= 0.0 {
+            return;
+        }
+
+        let seq_len = input.nrows().min(output.nrows());
+        let embed_dim = input.ncols().min(output.ncols()).min(embed_dim_config);
+        
+        if seq_len == 0 || embed_dim == 0 {
+            return;
+        }
+
+        // Initialize or resize outgoing context if needed
+        if self.outgoing_context.shape() != [embed_dim, embed_dim] {
+             self.outgoing_context = Array2::zeros((embed_dim, embed_dim));
+        }
+
+        let sample_size = seq_len.min(32);
+        let step = (seq_len / sample_size).max(1);
+        let indices: Vec<usize> = (0..seq_len).step_by(step).take(sample_size).collect();
+        let actual_sample_size = indices.len();
+
+        if actual_sample_size == 0 {
+            return;
+        }
+
+        // 1. Gather sampled data and handle non-finite values
+        let mut sub_x = Array2::<f32>::zeros((actual_sample_size, embed_dim));
+        let mut sub_y = Array2::<f32>::zeros((actual_sample_size, embed_dim));
+
+        for (i, &idx) in indices.iter().enumerate() {
+            let row_x = input.row(idx);
+            let row_y = output.row(idx);
+            
+            for j in 0..embed_dim {
+                let val_x = row_x[j];
+                sub_x[[i, j]] = if val_x.is_finite() { val_x } else { 0.0 };
+                
+                let val_y = row_y[j];
+                sub_y[[i, j]] = if val_y.is_finite() { val_y } else { 0.0 };
+            }
+        }
+
+        // 2. Compute means
+        let mean_x = sub_x.mean_axis(Axis(0)).unwrap();
+        let mean_y = sub_y.mean_axis(Axis(0)).unwrap();
+
+        // 3. Center data (broadcasting works: (S, D) - (D,))
+        sub_x -= &mean_x;
+        sub_y -= &mean_y;
+
+        // 4. Compute Norms (Sqrt of sum of squares)
+        let norm_x_sq = sub_x.mapv(|v| v * v).sum_axis(Axis(0));
+        let norm_y_sq = sub_y.mapv(|v| v * v).sum_axis(Axis(0));
+        
+        let norm_x = norm_x_sq.mapv(|v| v.sqrt());
+        let norm_y = norm_y_sq.mapv(|v| v.sqrt());
+
+        // 5. Covariance Matrix: X^T * Y -> (D, D)
+        let cov = sub_x.t().dot(&sub_y);
+
+        // 6. Denominator Matrix: Outer product of norms
+        let norm_x_col = norm_x.insert_axis(Axis(1));
+        let norm_y_row = norm_y.insert_axis(Axis(0));
+        let denom = norm_x_col.dot(&norm_y_row);
+
+        let tanh = crate::domain::richards::RichardsCurve::tanh(false);
+
+        // 7. Update with EMA (Parallelized)
+        Zip::from(&mut self.outgoing_context)
+            .and(&cov)
+            .and(&denom)
+            .par_for_each(|prev, &c, &d| {
+                let sim_raw = if d > 1e-12 { c / d } else { 0.0 };
+                let sim = if sim_raw.is_finite() {
+                     tanh.forward_scalar_f32(sim_raw)
+                } else {
+                     0.0
+                };
+                *prev = (1.0 - rate) * *prev + rate * sim;
+            });
+    }
+}
+
+impl SharedAttentionContext {
     /// Create a new shared attention context component
     pub fn new() -> Self {
         Self {
             incoming_context: None,
             similarity_context_strength: Array2::zeros((1, 1)),
+            outgoing_context: Array2::zeros((0, 0)),
+            similarity_update_rate: 0.01,
         }
     }
 

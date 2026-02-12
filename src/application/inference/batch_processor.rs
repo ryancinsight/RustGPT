@@ -28,7 +28,7 @@
 //! - Dynamic batch sizing for latency constraints
 
 use ndarray::Array2;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,7 @@ pub struct InferenceResponse {
 
 /// Batch item combining request with its position in the batch
 #[derive(Debug)]
+#[allow(dead_code)]
 struct BatchItem {
     request: Arc<InferenceRequest>,
     seq_id: u64,

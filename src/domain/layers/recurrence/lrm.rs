@@ -311,12 +311,12 @@ impl<'a> std::ops::Deref for PolyAttentionReadGuard<'a> {
 
     fn deref(&self) -> &Self::Target {
         match &*self.guard {
-            RecursiveBlockVariant::Transformer(b) => match b.temporal_mixing() {
-                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => attn,
+            RecursiveBlockVariant::Transformer(b) => match &b.temporal_mixing().temporal_mixing {
+                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => &**attn,
                 _ => panic!("LRM attention() called but TransformerBlock is not using attention"),
             },
-            RecursiveBlockVariant::Diffusion(b) => match &b.temporal_mixing {
-                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => attn,
+            RecursiveBlockVariant::Diffusion(b) => match &b.temporal_mixing.temporal_mixing {
+                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => &**attn,
                 _ => panic!("LRM attention() called but DiffusionBlock is not using attention"),
             },
         }
@@ -332,14 +332,14 @@ impl<'a> std::ops::Deref for PolyAttentionWriteGuard<'a> {
 
     fn deref(&self) -> &Self::Target {
         match &*self.guard {
-            RecursiveBlockVariant::Transformer(b) => match b.temporal_mixing() {
-                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => attn,
+            RecursiveBlockVariant::Transformer(b) => match &b.temporal_mixing().temporal_mixing {
+                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => &**attn,
                 _ => {
                     panic!("LRM attention_mut() called but TransformerBlock is not using attention")
                 }
             },
-            RecursiveBlockVariant::Diffusion(b) => match &b.temporal_mixing {
-                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => attn,
+            RecursiveBlockVariant::Diffusion(b) => match &b.temporal_mixing.temporal_mixing {
+                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => &**attn,
                 _ => panic!("LRM attention_mut() called but DiffusionBlock is not using attention"),
             },
         }
@@ -349,14 +349,14 @@ impl<'a> std::ops::Deref for PolyAttentionWriteGuard<'a> {
 impl<'a> std::ops::DerefMut for PolyAttentionWriteGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut *self.guard {
-            RecursiveBlockVariant::Transformer(b) => match b.temporal_mixing_mut() {
-                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => attn,
+            RecursiveBlockVariant::Transformer(b) => match &mut b.temporal_mixing_mut().temporal_mixing {
+                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => &mut **attn,
                 _ => {
                     panic!("LRM attention_mut() called but TransformerBlock is not using attention")
                 }
             },
-            RecursiveBlockVariant::Diffusion(b) => match &mut b.temporal_mixing {
-                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => attn,
+            RecursiveBlockVariant::Diffusion(b) => match &mut b.temporal_mixing.temporal_mixing {
+                crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) => &mut **attn,
                 _ => panic!("LRM attention_mut() called but DiffusionBlock is not using attention"),
             },
         }

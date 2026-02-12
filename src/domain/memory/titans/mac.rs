@@ -11,6 +11,7 @@ use crate::domain::{
 #[derive(Debug, Clone)]
 pub struct TitansMACStreamingWorkspace {
     pub context_input: Array2<f32>,
+    pub attention_input: Array2<f32>,
     pub h_t: Array1<f32>,
     pub neural_memory_workspace: NeuralMemoryStreamingWorkspace,
     pub poly_context_workspace: PolyAttentionContextWorkspace,
@@ -173,6 +174,7 @@ impl TitansMAC {
         if self.streaming_workspace.is_none() {
              self.streaming_workspace = Some(TitansMACStreamingWorkspace {
                 context_input: Array2::zeros((context_len, d)),
+                attention_input: Array2::zeros((context_len + 1, d)),
                 h_t: Array1::zeros(self.memory.val_dim),
                 neural_memory_workspace: NeuralMemoryStreamingWorkspace {
                      q: Array1::zeros(self.memory.key_dim),
@@ -201,6 +203,11 @@ impl TitansMAC {
         }
         
         let workspace = self.streaming_workspace.as_mut().unwrap();
+        if workspace.context_input.nrows() != context_len || workspace.context_input.ncols() != d {
+            workspace.context_input = Array2::zeros((context_len, d));
+            workspace.attention_input = Array2::zeros((context_len + 1, d));
+            workspace.poly_context_workspace = PolyAttentionContextWorkspace::new(context_len, d);
+        }
 
         // 1. Retrieve h_t from Memory using input as query
         self.memory.retrieve_step_into(input, &mut workspace.h_t, &mut workspace.neural_memory_workspace);
@@ -220,15 +227,14 @@ impl TitansMAC {
         // Copy h_t
         workspace.context_input.row_mut(p_len).assign(&workspace.h_t);
 
-        // 3. Pass to Attention with Explicit Context
-        // This calculates attention for 'input' attending to 'context_input' + itself.
-        // The sliding window cache is NOT used here because TitansMAC manages context explicitly.
-        self.core.forward_step_with_context_into(
-            input,
-            &workspace.context_input,
-            output,
-            &mut workspace.poly_context_workspace
-        );
+        // 3. Match batch path exactly: run detached attention on [Persistent | h_t | token].
+        workspace
+            .attention_input
+            .slice_mut(s![0..context_len, ..])
+            .assign(&workspace.context_input);
+        workspace.attention_input.row_mut(context_len).assign(input);
+        let (attn_out, _) = self.core.forward_detached(&workspace.attention_input, true);
+        output.assign(&attn_out.row(context_len));
 
         // 4. Buffer output for Segment-based Memory Update
         workspace.update_buffer.row_mut(workspace.buffer_idx).assign(&output.view());

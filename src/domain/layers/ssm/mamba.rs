@@ -590,6 +590,11 @@ impl Mamba {
         Self::new_with_config(embed_dim, conv_kernel, MambaConfig::default())
     }
 
+    #[inline]
+    pub fn set_a_matrix_type(&mut self, a_matrix_type: AMatrixType) {
+        self.a_matrix_type = a_matrix_type;
+    }
+
     /// Create Mamba layer with enhanced configuration
     pub fn new_with_config(embed_dim: usize, conv_kernel: usize, config: MambaConfig) -> Self {
         let d = embed_dim.max(1);
@@ -2407,7 +2412,8 @@ impl MoHMamba {
         
         // 1. Compute MoH gating weights
         // We use forward_weights_into to avoid allocation
-        self.moh.forward_weights_into(input, &mut ws.moh);
+        let gate_input = self.moh.gate_input_view(input);
+        self.moh.forward_weights_into(&gate_input, &mut ws.moh);
         
         // 2. Compute inner Mamba output
         self.inner.forward_step_into(input, output);
@@ -2434,6 +2440,11 @@ impl MoHMamba {
                 }
             }
         }
+
+        let (active_heads, head_vec, token_vec) = MoHGating::summarize_streaming_weights(&ws.moh.m);
+        self.last_avg_active_heads = Some(active_heads);
+        self.last_head_activity_vec = Some(head_vec);
+        self.last_token_head_activity_vec = Some(token_vec);
     }
 
     pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
@@ -2459,8 +2470,8 @@ impl Layer for MoHMamba {
 
         self.cached_input = Some(input.clone());
 
-        let gd = self.gating_embed_dim.min(d);
-        let gate_input = input.slice(s![.., 0..gd]);
+        let input_view = input.view();
+        let gate_input = self.moh.gate_input_view2(&input_view);
         let eff = self.moh.forward_weights_view(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 

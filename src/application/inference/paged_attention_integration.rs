@@ -28,6 +28,7 @@ pub struct CacheStats {
 #[derive(Clone)]
 pub struct PagedAttentionIntegration {
     cache: Arc<Mutex<PagedKVCache>>,
+    #[allow(dead_code)]
     config: PagedKVCacheConfig,
     next_handle: Arc<Mutex<u64>>,
 }

@@ -11,7 +11,7 @@
 //! - **SRP**: Cache handles only storage, computation is separate
 //! - **SOC**: Clear separation between allocation, access, and eviction
 
-use ndarray::{Array2, ArrayView1, ArrayView2, Zip, s};
+use ndarray::{Array2, ArrayView1, Zip, s};
 
 /// Cache for a single attention head storing Key and Value matrices.
 ///

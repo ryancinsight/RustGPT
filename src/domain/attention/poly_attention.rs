@@ -1174,6 +1174,24 @@ impl PolyAttention {
             );
         }
 
+        // Match batch `forward_detached` semantics: Titan memory is applied over
+        // the full sequence `[context..., input]`, and only the final row output
+        // is returned here.
+        if self.titan_memory.enabled {
+            let retain = 1.0 - self.titan_memory.decay;
+            let eta = self.titan_memory.eta;
+            let tm_scale = self.titan_memory.scale;
+
+            for j in 0..dim {
+                let mut acc = 0.0f32;
+                for i in 0..context_len {
+                    acc = retain * acc + eta * context[[i, j]];
+                }
+                acc = retain * acc + eta * input[j];
+                workspace.output[j] += tm_scale * acc;
+            }
+        }
+
         output.assign(&workspace.output);
     }
 

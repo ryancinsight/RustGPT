@@ -1,0 +1,53 @@
+{
+  "id": "conv-1770853752013-jkq6e1yp2",
+  "created_at": "2026-02-11T23:49:23.292765300Z",
+  "last_activity": "2026-02-11T23:50:01.618937500Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-11T23:49:23.292768200Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Good morning ! Assistant : Good morning ! Hope you ' re having a great day . Assistant : Example : Good morning ! Hope you ' re having a great day . How can I assist you ? </s>",
+      "timestamp": "2026-02-11T23:49:23.395292900Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-11T23:49:45.218711600Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-11T23:49:45.218716600Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Example : Good struct ; let a great day . How can I assist you ? </s>",
+      "timestamp": "2026-02-11T23:49:45.302822Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-11T23:50:01.489522600Z"
+    },
+    {
+      "role": "user",
+      "content": "test",
+      "timestamp": "2026-02-11T23:50:01.489528400Z"
+    },
+    {
+      "role": "user",
+      "content": "tell me a joke",
+      "timestamp": "2026-02-11T23:50:01.489537800Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Example : Example : Good ; let a great day . How can I assist you ? </s>",
+      "timestamp": "2026-02-11T23:50:01.618935300Z"
+    }
+  ],
+  "model_name": "rustgpt"
+}

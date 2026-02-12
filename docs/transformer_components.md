@@ -22,7 +22,7 @@ S_t = X_t · X_t^T / embed_dim          // Activation similarity matrix
 X'_t = X_t + (strength / embed_dim) * X_t · S_{t-1}  // Context-conditioned input
 ```
 
-### 2. FeedforwardProcessor
+### 2. SharedFeedforward
 
 **Purpose**: Encapsulates feedforward network processing with support for multiple variants.
 
@@ -36,7 +36,7 @@ X'_t = X_t + (strength / embed_dim) * X_t · S_{t-1}  // Context-conditioned inp
 - Automatic gradient routing to appropriate parameters
 - Performance monitoring and metrics collection
 
-### 3. NormalizationLayer
+### 3. RichardsNorm
 
 **Purpose**: Provides flexible normalization with Richards-based dynamic normalization.
 
@@ -51,17 +51,7 @@ X'_t = X_t + (strength / embed_dim) * X_t · S_{t-1}  // Context-conditioned inp
 y = tanh(α · (x - μ) / σ) ⊙ γ + β
 ```
 
-### 4. ResidualConnection
-
-**Purpose**: Manages residual connections with adaptive scaling and gradient handling.
-
-**Key Features**:
-- Adaptive residual scaling based on gradient norms
-- Pre-norm vs post-norm configuration support
-- Gradient accumulation and routing
-- Numerical stability checks
-
-### 5. TemporalMixingWrapper
+### 4. TemporalMixingLayer
 
 **Purpose**: Abstract wrapper for temporal mixing mechanisms (attention or RG-LRU).
 
@@ -71,7 +61,7 @@ y = tanh(α · (x - μ) / σ) ⊙ γ + β
 - Performance monitoring and metrics
 - Gradient routing to underlying mechanism
 
-### 6. WindowAdaptation
+### 5. WindowAdaptation
 
 **Purpose**: Dynamic window size adaptation for attention mechanisms.
 
@@ -87,12 +77,11 @@ The new `TransformerBlock` uses these components in a modular composition:
 
 ```
 TransformerBlock {
-    pre_attention_norm: NormalizationLayer,
-    temporal_mixing: TemporalMixingWrapper,  // Attention or RG-LRU
-    pre_ffn_norm: NormalizationLayer,
-    feedforward: FeedforwardProcessor,       // GLU, MoE, etc.
-    attention_context: AttentionContext,
-    residual_connections: [ResidualConnection; 2],
+    pre_attention_norm: RichardsNorm,
+    temporal_mixing: TemporalMixingLayer,    // Attention or RG-LRU
+    pre_ffn_norm: RichardsNorm,
+    feedforward: FeedForwardVariant,         // GLU, MoE, etc.
+    context: SharedAttentionContext,
     window_adaptation: WindowAdaptation,
 }
 ```

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     io::{BufRead, Seek},
     path::Path,
@@ -70,7 +71,7 @@ impl Dataset {
         chat_training_data_path: String,
         type_of_data: DatasetType,
     ) -> Result<Self> {
-        let pretraining_data: Vec<String>;
+        let mut pretraining_data: Vec<String>;
         let mut chat_training_data: Vec<String>;
         let is_json = matches!(type_of_data, DatasetType::JSON);
 
@@ -97,6 +98,9 @@ impl Dataset {
                 chat_training_data.extend(tool_data);
             }
         }
+
+        pretraining_data = normalize_and_dedup_text_data(pretraining_data);
+        chat_training_data = normalize_and_dedup_text_data(chat_training_data);
 
         Ok(Dataset {
             pretraining_data,
@@ -254,6 +258,44 @@ impl Dataset {
             || !self.video_training_data.is_empty()
             || !self.speech_training_data.is_empty()
     }
+}
+
+fn normalize_text_entry(raw: &str) -> Option<String> {
+    // Normalize whitespace and trim relaxed JSON artifacts.
+    let normalized = raw
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut text = normalized.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+
+    // Enforce sentence boundary token for consistency across corpora.
+    if !text.ends_with("</s>") {
+        text.push_str(" </s>");
+    }
+
+    Some(text)
+}
+
+fn normalize_and_dedup_text_data(data: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::with_capacity(data.len());
+
+    for item in data {
+        if let Some(text) = normalize_text_entry(&item) {
+            let key = text.to_lowercase();
+            if seen.insert(key) {
+                out.push(text);
+            }
+        }
+    }
+
+    out
 }
 
 #[derive(serde::Deserialize)]
@@ -563,5 +605,24 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert_eq!(data[0], "hello");
         assert_eq!(data[1], "world");
+    }
+
+    #[test]
+    fn test_normalize_text_entry_adds_eos_and_collapses_whitespace() {
+        let got = normalize_text_entry("  User: Hi\nAssistant: Hello   ").unwrap();
+        assert_eq!(got, "User: Hi Assistant: Hello </s>");
+    }
+
+    #[test]
+    fn test_normalize_and_dedup_text_data_preserves_first_entry() {
+        let data = vec![
+            "One line".to_string(),
+            " one   line </s> ".to_string(),
+            "Another".to_string(),
+        ];
+        let out = normalize_and_dedup_text_data(data);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], "One line </s>");
+        assert_eq!(out[1], "Another </s>");
     }
 }

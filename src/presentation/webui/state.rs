@@ -212,6 +212,7 @@ impl AppState {
     }
 
     /// Save a conversation to disk
+    #[allow(dead_code)]
     async fn save_conversation_to_disk(&self, conversation: &Conversation) -> std::io::Result<()> {
         let file_path = self.conversations_dir.join(format!("{}.json", conversation.id));
         let json = serde_json::to_string_pretty(conversation)
@@ -233,6 +234,7 @@ impl AppState {
     }
 
     /// Persist all conversations to disk
+    #[allow(dead_code)]
     async fn persist_all_conversations(&self) -> std::io::Result<()> {
         let guard = self.inner.read().await;
         for conv in guard.conversations.values() {

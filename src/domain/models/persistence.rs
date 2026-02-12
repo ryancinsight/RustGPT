@@ -343,7 +343,7 @@ impl LLM {
 
         for layer in &self.network {
             let tm = match layer {
-                LayerEnum::TransformerBlock(tb) => match tb.temporal_mixing() {
+                LayerEnum::TransformerBlock(tb) => match &tb.temporal_mixing().temporal_mixing {
                     crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
                         Some(TM::Attention)
                     }
@@ -369,7 +369,7 @@ impl LLM {
                         Some(TM::Titans)
                     }
                 },
-                LayerEnum::DiffusionBlock(db) => match &db.temporal_mixing {
+                LayerEnum::DiffusionBlock(db) => match &db.temporal_mixing.temporal_mixing {
                     crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
                         Some(TM::Attention)
                     }

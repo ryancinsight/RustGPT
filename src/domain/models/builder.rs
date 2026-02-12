@@ -293,7 +293,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     for (i, layer) in layers.iter().enumerate() {
         match layer {
             LayerEnum::TransformerBlock(tb) => {
-                let tm = match tb.temporal_mixing() {
+                let tm = match &tb.temporal_mixing().temporal_mixing {
                     crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
                         "Attention"
                     }
@@ -316,7 +316,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
             }
             LayerEnum::DiffusionBlock(db) => {
-                let tm = match &db.temporal_mixing {
+                let tm = match &db.temporal_mixing.temporal_mixing {
                     crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
                         "Attention"
                     }

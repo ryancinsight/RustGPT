@@ -78,7 +78,10 @@ impl AudioConfig {
     /// Calculate number of time frames in spectrogram
     pub fn num_time_frames(&self) -> usize {
         let max_samples = self.max_samples();
-        (max_samples / self.hop_length) + 1
+        if max_samples < self.n_fft {
+            return 1;
+        }
+        (max_samples - self.n_fft) / self.hop_length + 1
     }
 
     /// Calculate frequency dimension
@@ -771,7 +774,7 @@ mod tests {
             n_fft: 256,
             hop_length: 128,
             n_mels: 64, // 64 bins divides evenly by freq_patch_size of 8
-            temporal_patch_size: 63, // 63 time frames / 63 = 1
+            temporal_patch_size: 61, // 61 time frames / 61 = 1
             freq_patch_size: 8,
             embedding_dim: 64,
             ..Default::default()
@@ -809,7 +812,7 @@ mod tests {
     fn test_audio_encoder_creation() {
         // Config with compatible divisibility:
         // max_samples = 8000 * 1.0 = 8000
-        // num_time_frames = (8000 / 128) + 1 = 63
+        // num_time_frames = (8000 - 256) / 128 + 1 = 7744 / 128 + 1 = 60 + 1 = 61
         // freq_dim = n_fft / 2 + 1 = 129 (without mel)
         // Use n_mels = 64 which divides evenly by freq_patch_size = 8
         let config = AudioConfig {
@@ -818,7 +821,7 @@ mod tests {
             n_fft: 256,
             hop_length: 128,
             n_mels: 64, // Use mel scale so freq_dim = 64, which divides by 8
-            temporal_patch_size: 63, // 63 time frames divides by 63
+            temporal_patch_size: 61, // 61 time frames divides by 61
             freq_patch_size: 8,
             embedding_dim: 64,
             ..Default::default()
@@ -831,16 +834,16 @@ mod tests {
     #[test]
     fn test_spectrogram_computation() {
         // max_samples = 8000 * 0.5 = 4000
-        // num_time_frames = (4000 / 128) + 1 = 31 + 1 = 32
+        // num_time_frames = (4000 - 256) / 128 + 1 = 3744 / 128 + 1 = 29.25 -> 29 + 1 = 30
         // For mel spectrogram: freq_dim = n_mels = 64
-        // We need freq_dim (64) to divide by freq_patch_size (8), and time_frames (32) by temporal_patch_size
+        // We need freq_dim (64) to divide by freq_patch_size (8), and time_frames (30) by temporal_patch_size
         let config = AudioConfig {
             max_duration: 0.5,
             sample_rate: 8000,
             n_fft: 256,
             hop_length: 128,
             n_mels: 64, // Use mel scale: freq_dim = 64, divides by 8
-            temporal_patch_size: 32, // 32 time frames divides by 32
+            temporal_patch_size: 30, // 30 time frames divides by 30
             freq_patch_size: 8,
             embedding_dim: 32,
             ..Default::default()

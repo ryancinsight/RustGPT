@@ -6,7 +6,7 @@
 pub mod adaptive_residuals;
 pub mod attention_context;
 pub mod common;
+pub mod conditioning;
 pub mod feedforward;
-pub mod normalization;
-pub mod residual_connection;
+pub mod gradient_router;
 pub mod temporal_processing;

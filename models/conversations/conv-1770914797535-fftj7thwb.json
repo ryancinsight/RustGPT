@@ -1,0 +1,33 @@
+{
+  "id": "conv-1770914797535-fftj7thwb",
+  "created_at": "2026-02-12T16:46:48.924575700Z",
+  "last_activity": "2026-02-12T16:47:08.059691500Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T16:46:48.924579300Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Good morning ! Assistant : Good morning ! Hope you ' re having a great day . How in oceans </s>",
+      "timestamp": "2026-02-12T16:46:48.985417900Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T16:47:08.003248600Z"
+    },
+    {
+      "role": "user",
+      "content": "how are mountains formed",
+      "timestamp": "2026-02-12T16:47:08.003254500Z"
+    },
+    {
+      "role": "assistant",
+      "content": "Example : fn first . How can I assist you Most of assistance ? </s>",
+      "timestamp": "2026-02-12T16:47:08.059689100Z"
+    }
+  ],
+  "model_name": "RustGPT"
+}

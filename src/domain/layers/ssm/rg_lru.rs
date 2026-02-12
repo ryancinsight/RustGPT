@@ -277,7 +277,8 @@ impl MoHRgLru {
         }
 
         // 1. Compute MoH gating weights
-        self.moh.forward_weights_into(input, &mut ws.moh_workspace);
+        let gate_input = self.moh.gate_input_view(input);
+        self.moh.forward_weights_into(&gate_input, &mut ws.moh_workspace);
         let eff_weights = &ws.moh_workspace.m;
 
         // 2. Process heads
@@ -298,7 +299,13 @@ impl MoHRgLru {
                  ndarray::Zip::from(&mut out_slice).and(&ws.head_output_buffer).for_each(|o, &v| *o += w * v);
             }
         }
-        
+
+        let (active_heads, head_vec, token_vec) =
+            MoHGating::summarize_streaming_weights(&ws.moh_workspace.m);
+        self.last_avg_active_heads = Some(active_heads);
+        self.last_head_activity_vec = Some(head_vec);
+        self.last_token_head_activity_vec = Some(token_vec);
+
         output.assign(&ws.output_buffer);
     }
 
@@ -945,8 +952,8 @@ impl Layer for MoHRgLru {
         // Cache input for backward.
         self.cached_input = Some(input.clone());
 
-        let gd = self.moh.w_g.nrows().min(d);
-        let gate_input = input.slice(s![.., 0..gd]);
+        let input_view = input.view();
+        let gate_input = self.moh.gate_input_view2(&input_view);
         let eff = self.moh.forward_weights_view(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 

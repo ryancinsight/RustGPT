@@ -62,7 +62,7 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
     });
 
     // Capture MoH overrides from batch run (for SSMs)
-    let moh_overrides = match block_batch.temporal_mixing() {
+    let moh_overrides = match &block_batch.temporal_mixing().temporal_mixing {
         TemporalMixingLayer::RgLruMoH(rglru) => rglru.get_last_max_abs_z(),
         TemporalMixingLayer::MambaMoH(mamba) => mamba.get_last_max_abs_z(),
         _ => None,
@@ -137,4 +137,3 @@ fn test_transformer_block_streaming_consistency_mamba2_moh() {
 fn test_transformer_block_streaming_consistency_titans() {
     run_consistency_test(TemporalMixingType::Titans, false, 1e-4);
 }
-

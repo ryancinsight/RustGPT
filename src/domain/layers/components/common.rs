@@ -84,12 +84,12 @@ impl TitanMemoryConfig {
         }
         // Note: We do NOT reset workspace.acc here for streaming persistence.
         // Batch callers must call workspace.reset() explicitly before processing a sequence.
-        
+
         // Optimized loop with Zip and cache-friendly iteration
         for i in 0..n {
             let input_row = input.row(i);
             let mut out_row = out.row_mut(i);
-            
+
             Zip::from(&mut workspace.acc)
                 .and(&input_row)
                 .and(&mut out_row)
@@ -146,12 +146,12 @@ impl TitanMemoryConfig {
 
         let retain = 1.0 - self.decay;
         let mut input_grads = Array2::<f32>::zeros(output_grads.raw_dim());
-        
+
         let mut b = Array1::<f32>::zeros(d);
         for i in (0..n).rev() {
             let g_row = output_grads.row(i);
             let mut in_g_row = input_grads.row_mut(i);
-            
+
             Zip::from(&mut b)
                 .and(&g_row)
                 .and(&mut in_g_row)
@@ -183,12 +183,12 @@ impl TitanMemoryConfig {
 
         let retain = 1.0 - self.decay;
         let coeff = self.scale * self.eta;
-        
+
         let mut b = Array1::<f32>::zeros(d);
         for i in (0..n).rev() {
             let g_row = output_grads.row(i);
             let mut in_g_row = input_grads.row_mut(i);
-            
+
             Zip::from(&mut b)
                 .and(&g_row)
                 .and(&mut in_g_row)
@@ -213,6 +213,14 @@ macro_rules! delegate_layer_method {
             TemporalMixingLayer::Titans(layer) => layer.$method($($arg),*),
         }
     };
+}
+
+macro_rules! new_moh_temporal_layer {
+    ($ctor:expr, $threshold_modulation:expr) => {{
+        let mut layer = $ctor;
+        layer.moh.head_selection_config.threshold_modulation = $threshold_modulation.clone();
+        layer
+    }};
 }
 
 impl Layer for TemporalMixingLayer {
@@ -264,51 +272,28 @@ impl Layer for TemporalMixingLayer {
 impl TemporalMixingLayer {
     /// Streaming forward step for token-by-token inference.
     ///
-    /// Currently only implemented for PolyAttention.
+    /// Implemented for all temporal mixing variants.
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
         let mut output = ndarray::Array1::zeros(input.raw_dim());
         self.forward_step_into(&input.view(), &mut output);
         output
     }
 
-    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
-        match self {
-            TemporalMixingLayer::Attention(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::RgLru(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::Mamba(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::MambaMoH(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::Mamba2(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward_step_into(input, output),
-            TemporalMixingLayer::Titans(layer) => layer.forward_step_into(input, output),
-        }
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
+        delegate_layer_method!(self, forward_step_into, input, output)
     }
 
     #[inline]
     pub fn forward_with_causal(&mut self, input: &Array2<f32>, causal: bool) -> Array2<f32> {
         match self {
             TemporalMixingLayer::Attention(layer) => layer.forward_impl(input, causal),
-            TemporalMixingLayer::RgLruMoH(layer) => layer.forward(input),
-            TemporalMixingLayer::RgLru(layer) => layer.forward(input),
-            TemporalMixingLayer::MambaMoH(layer) => {
-                let _ = causal;
-                layer.forward(input)
-            }
-            TemporalMixingLayer::Mamba(layer) => {
-                let _ = causal;
-                layer.forward(input)
-            }
-            TemporalMixingLayer::Mamba2MoH(layer) => {
-                let _ = causal;
-                layer.forward(input)
-            }
-            TemporalMixingLayer::Mamba2(layer) => {
-                let _ = causal;
-                layer.forward(input)
-            }
-            TemporalMixingLayer::Titans(layer) => {
-                let _ = causal; // TitansMAC implies causal
-                layer.forward(input)
+            other => {
+                let _ = causal; // Non-attention variants ignore explicit causal flag.
+                other.forward(input)
             }
         }
     }
@@ -509,13 +494,17 @@ mod tests {
         cfg.apply_into_out(&mut y_fresh, &x);
 
         // Initialize workspace with correct size (matching input dimension) and reset it
-        let mut ws = TitanMemoryWorkspace { acc: vec![0.0; x.ncols()] };
+        let mut ws = TitanMemoryWorkspace {
+            acc: vec![0.0; x.ncols()],
+        };
         ws.reset(); // Ensure clean state
         let mut y_ws1 = Array2::<f32>::zeros(x.raw_dim());
         cfg.apply_into_out_with_workspace(&mut y_ws1, &x, &mut ws);
 
         // For second call, need fresh workspace (batch callers must reset explicitly)
-        let mut ws2 = TitanMemoryWorkspace { acc: vec![0.0; x.ncols()] };
+        let mut ws2 = TitanMemoryWorkspace {
+            acc: vec![0.0; x.ncols()],
+        };
         ws2.reset();
         let mut y_ws2 = Array2::<f32>::zeros(x.raw_dim());
         cfg.apply_into_out_with_workspace(&mut y_ws2, &x, &mut ws2);
@@ -579,12 +568,34 @@ pub enum FeedForwardVariant {
     MixtureOfExperts(Box<MixtureOfExperts>),
 }
 
-impl FeedForwardVariant {
-    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.forward(input),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward(input),
+macro_rules! delegate_ffn_method {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            FeedForwardVariant::RichardsGlu(layer) => layer.$method($($arg),*),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer.$method($($arg),*),
         }
+    };
+}
+
+impl FeedForwardVariant {
+    #[inline]
+    pub fn as_moe(&self) -> Option<&MixtureOfExperts> {
+        match self {
+            FeedForwardVariant::MixtureOfExperts(layer) => Some(layer),
+            FeedForwardVariant::RichardsGlu(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_moe_mut(&mut self) -> Option<&mut MixtureOfExperts> {
+        match self {
+            FeedForwardVariant::MixtureOfExperts(layer) => Some(layer),
+            FeedForwardVariant::RichardsGlu(_) => None,
+        }
+    }
+
+    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        delegate_ffn_method!(self, forward, input)
     }
 
     /// Streaming forward step for token-by-token inference.
@@ -594,18 +605,16 @@ impl FeedForwardVariant {
         output
     }
 
-    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.forward_step_into(input, output),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward_step_into(input, output),
-        }
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
+        delegate_ffn_method!(self, forward_step_into, input, output)
     }
 
     pub fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.backward(grads, lr),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.backward(grads, lr),
-        }
+        delegate_ffn_method!(self, backward, grads, lr)
     }
 
     pub fn compute_gradients(
@@ -613,12 +622,7 @@ impl FeedForwardVariant {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.compute_gradients(input, output_grads),
-            FeedForwardVariant::MixtureOfExperts(layer) => {
-                layer.compute_gradients(input, output_grads)
-            }
-        }
+        delegate_ffn_method!(self, compute_gradients, input, output_grads)
     }
 
     pub fn apply_gradients(
@@ -626,23 +630,37 @@ impl FeedForwardVariant {
         param_grads: &[Array2<f32>],
         lr: f32,
     ) -> crate::common::errors::Result<()> {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.apply_gradients(param_grads, lr),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.apply_gradients(param_grads, lr),
-        }
+        delegate_ffn_method!(self, apply_gradients, param_grads, lr)
     }
 
-    pub fn parameters(&self) -> usize {
-        match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.parameters(),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.parameters(),
-        }
+    pub fn zero_gradients(&mut self) {
+        delegate_ffn_method!(self, zero_gradients)
     }
 
     pub fn weight_norm(&self) -> f32 {
+        delegate_ffn_method!(self, weight_norm)
+    }
+
+    pub fn parameters(&self) -> usize {
+        delegate_ffn_method!(self, parameters)
+    }
+
+    pub fn forward_with_token_head_activity(
+        &mut self,
+        input: &Array2<f32>,
+        head_activity_ratio: Option<f32>,
+        head_activity_vec: Option<&[f32]>,
+        token_head_activity_vec: Option<&[f32]>,
+    ) -> Array2<f32> {
         match self {
-            FeedForwardVariant::RichardsGlu(layer) => layer.weight_norm(),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer.weight_norm(),
+            FeedForwardVariant::RichardsGlu(layer) => layer.forward(input),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer
+                .forward_with_head_features_and_token_activity(
+                    input,
+                    head_activity_ratio,
+                    head_activity_vec,
+                    token_head_activity_vec,
+                ),
         }
     }
 }
@@ -667,6 +685,26 @@ pub struct CommonLayerConfig {
     pub temporal_mixing: TemporalMixingType,
 }
 
+impl CommonLayerConfig {
+    #[inline]
+    fn build_standard_attention(&self) -> PolyAttention {
+        let cope_config = CoPEConfig {
+            variant: CoPEVariant::Standard,
+            max_pos: self.max_pos,
+            window_size: self.window_size,
+        };
+        let mut attention = PolyAttention::new(
+            self.embed_dim,
+            self.num_heads,
+            self.poly_degree,
+            cope_config,
+        );
+        attention.set_titan_memory_config(self.titan_memory.clone());
+        attention.set_head_selection_config(&self.head_selection);
+        attention
+    }
+}
+
 /// Common layers shared between TransformerBlock and DiffusionBlock
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CommonLayers {
@@ -680,96 +718,63 @@ impl CommonLayers {
     pub fn new(config: &CommonLayerConfig) -> Self {
         let pre_attention_norm = RichardsNorm::new(config.embed_dim);
 
-        let temporal_mixing =
-            match config.temporal_mixing {
-                TemporalMixingType::Attention => {
-                    let cope_config = CoPEConfig {
-                        variant: CoPEVariant::Standard,
-                        max_pos: config.max_pos,
-                        window_size: config.window_size,
-                    };
-                    let mut attention = PolyAttention::new(
-                        config.embed_dim,
-                        config.num_heads,
-                        config.poly_degree,
-                        cope_config,
-                    );
-                    attention.set_titan_memory_config(config.titan_memory.clone());
-                    attention.set_head_selection_config(&config.head_selection);
-                    attention.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
-                    TemporalMixingLayer::Attention(Box::new(attention))
+        let temporal_mixing = match config.temporal_mixing {
+            TemporalMixingType::Attention => {
+                let mut attention = config.build_standard_attention();
+                attention.moh.head_selection_config.threshold_modulation =
+                    config.moh_threshold_modulation.clone();
+                TemporalMixingLayer::Attention(Box::new(attention))
+            }
+            TemporalMixingType::RgLru => {
+                if config.use_moe {
+                    TemporalMixingLayer::RgLruMoH(Box::new(new_moh_temporal_layer!(
+                        MoHRgLru::new(config.embed_dim, config.num_heads, &config.head_selection),
+                        config.moh_threshold_modulation
+                    )))
+                } else {
+                    TemporalMixingLayer::RgLru(Box::new(RgLru::new(config.embed_dim)))
                 }
-                TemporalMixingType::RgLru => {
-                    if config.use_moe {
-                        TemporalMixingLayer::RgLruMoH(Box::new({
-                            let mut layer = MoHRgLru::new(config.embed_dim, config.num_heads, &config.head_selection);
-                            layer.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
-                            layer
-                        }))
-                    } else {
-                        TemporalMixingLayer::RgLru(Box::new(RgLru::new(
-                            config.embed_dim,
-                        )))
-                    }
+            }
+            TemporalMixingType::Mamba => {
+                if config.use_moe {
+                    TemporalMixingLayer::MambaMoH(Box::new(new_moh_temporal_layer!(
+                        MoHMamba::new(config.embed_dim, config.num_heads, &config.head_selection),
+                        config.moh_threshold_modulation
+                    )))
+                } else {
+                    TemporalMixingLayer::Mamba(Box::new(Mamba::new(config.embed_dim)))
                 }
-                TemporalMixingType::Mamba => {
-                    if config.use_moe {
-                        TemporalMixingLayer::MambaMoH(Box::new({
-                            let mut layer = MoHMamba::new(config.embed_dim, config.num_heads, &config.head_selection);
-                            layer.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
-                            layer
-                        }))
-                    } else {
-                        TemporalMixingLayer::Mamba(Box::new(Mamba::new(
-                            config.embed_dim,
-                        )))
-                    }
+            }
+            TemporalMixingType::Mamba2 => {
+                if config.use_moe {
+                    TemporalMixingLayer::Mamba2MoH(Box::new(new_moh_temporal_layer!(
+                        MoHMamba2::new(config.embed_dim, config.num_heads, &config.head_selection),
+                        config.moh_threshold_modulation
+                    )))
+                } else {
+                    TemporalMixingLayer::Mamba2(Box::new(Mamba2::new(config.embed_dim)))
                 }
-                TemporalMixingType::Mamba2 => {
-                    if config.use_moe {
-                        TemporalMixingLayer::Mamba2MoH(Box::new({
-                            let mut layer = MoHMamba2::new(config.embed_dim, config.num_heads, &config.head_selection);
-                            layer.moh.head_selection_config.threshold_modulation = config.moh_threshold_modulation.clone();
-                            layer
-                        }))
-                    } else {
-                        TemporalMixingLayer::Mamba2(Box::new(Mamba2::new(
-                            config.embed_dim,
-                        )))
-                    }
-                }
-                TemporalMixingType::Titans => {
-                    let cope_config = CoPEConfig {
-                        variant: CoPEVariant::Standard,
-                        max_pos: config.max_pos,
-                        window_size: config.window_size,
-                    };
-                    let mut attention = PolyAttention::new(
-                        config.embed_dim,
-                        config.num_heads,
-                        config.poly_degree,
-                        cope_config,
-                    );
-                    attention.set_titan_memory_config(config.titan_memory.clone());
-                    attention.set_head_selection_config(&config.head_selection);
+            }
+            TemporalMixingType::Titans => {
+                let attention = config.build_standard_attention();
 
-                    let memory = NeuralMemory::new(
-                        config.embed_dim,
-                        config.embed_dim,
-                        config.embed_dim,
-                        config.titan_memory.hidden_dim,
-                    );
+                let memory = NeuralMemory::new(
+                    config.embed_dim,
+                    config.embed_dim,
+                    config.embed_dim,
+                    config.titan_memory.hidden_dim,
+                );
 
-                    let mac = TitansMAC::new(
-                        attention,
-                        memory,
-                        config.titan_memory.persistent_len,
-                        config.titan_memory.segment_len,
-                    );
+                let mac = TitansMAC::new(
+                    attention,
+                    memory,
+                    config.titan_memory.persistent_len,
+                    config.titan_memory.segment_len,
+                );
 
-                    TemporalMixingLayer::Titans(Box::new(mac))
-                }
-            };
+                TemporalMixingLayer::Titans(Box::new(mac))
+            }
+        };
 
         let pre_ffn_norm = RichardsNorm::new(config.embed_dim);
 

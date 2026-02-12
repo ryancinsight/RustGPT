@@ -65,6 +65,10 @@ fn test_long_context_streaming_consistency() {
         if diff > max_diff {
             max_diff = diff;
         }
+        if diff > 1e-5 {
+             println!("Row {}: Batch {:?} vs Stream {:?}", i, batch_row, stream_row);
+             println!("Diff: {}", diff);
+        }
     }
 
     assert!(max_diff < 1e-5, "Streaming output diverged from batch output. Max diff: {}", max_diff);

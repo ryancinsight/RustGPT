@@ -18,6 +18,8 @@ use crate::{
             components::{
                 adaptive_residuals::AdaptiveResiduals,
                 attention_context::SharedAttentionContext,
+                feedforward::SharedFeedforward,
+                temporal_processing::SharedTemporalProcessing,
                 common::{
                     CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
                     TitanMemoryWorkspace, apply_adaptive_gradients,
@@ -77,13 +79,13 @@ pub struct TransformerBlock {
     pre_attention_norm: RichardsNorm,
 
     /// Temporal mixing mechanism (attention or RG-LRU)
-    temporal_mixing: TemporalMixingLayer,
+    temporal_mixing: SharedTemporalProcessing,
 
     /// Pre-feedforward layer normalization
     pre_ffn_norm: RichardsNorm,
 
     /// Feedforward network (RichardsGlu or MixtureOfExperts)
-    feedforward: FeedForwardVariant,
+    pub feedforward: SharedFeedforward,
 
     /// Configuration for this block
     config: TransformerBlockConfig,
@@ -100,23 +102,12 @@ pub struct TransformerBlock {
     #[serde(skip_serializing, skip_deserializing)]
     window_entropy_ema: f32,
 
-    /// Activation-derived similarity representation (embed_dim × embed_dim).
-    ///
-    /// This is updated each forward pass and can be passed to the next layer
-    /// as a context signal (positive focus + negative contrast).
-    #[serde(skip_serializing, skip_deserializing)]
-    activation_similarity_matrix: Array2<f32>,
-
     /// Shared attention context for managing similarity-based modulation
     #[serde(flatten)]
     context: SharedAttentionContext,
 
     #[serde(skip_serializing, skip_deserializing)]
     opt_similarity_context_strength: Adam,
-
-    /// EMA update rate for the activation similarity matrix.
-    #[serde(skip_serializing, skip_deserializing)]
-    similarity_update_rate: f32,
 
     /// Adaptive residuals component for similarity-based residual connections
     #[serde(skip_serializing, skip_deserializing)]
@@ -131,27 +122,35 @@ pub struct TransformerBlock {
 
     #[serde(skip_serializing, skip_deserializing)]
     streaming_workspace: Option<TransformerBlockStreamingWorkspace>,
+
+    /// Pre-allocated workspace for batch forward passes to reduce allocations.
+    /// Uses generational buffer pattern for efficient buffer reuse.
+    #[serde(skip_serializing, skip_deserializing)]
+    batch_workspace: Option<TransformerWorkspace>,
 }
 
 impl Clone for TransformerBlock {
     fn clone(&self) -> Self {
         Self {
             pre_attention_norm: self.pre_attention_norm.clone(),
-            temporal_mixing: self.temporal_mixing.clone(),
+            temporal_mixing: SharedTemporalProcessing::new(
+                self.temporal_mixing.temporal_mixing.clone(),
+                self.temporal_mixing.window_size,
+                self.temporal_mixing.use_adaptive_window,
+            ),
             pre_ffn_norm: self.pre_ffn_norm.clone(),
             feedforward: self.feedforward.clone(),
             config: self.config.clone(),
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
             window_entropy_ema: self.window_entropy_ema,
-            activation_similarity_matrix: self.activation_similarity_matrix.clone(),
             context: self.context.clone(),
             opt_similarity_context_strength: self.opt_similarity_context_strength.clone(),
-            similarity_update_rate: self.similarity_update_rate,
             adaptive_residuals: self.adaptive_residuals.clone(),
             eprop_adaptor: self.eprop_adaptor.clone(),
             titan_memory_workspace: self.titan_memory_workspace.clone(),
             streaming_workspace: self.streaming_workspace.clone(),
+            batch_workspace: None, // Start fresh for cloned block
         }
     }
 }
@@ -165,23 +164,41 @@ impl<'de> Deserialize<'de> for TransformerBlock {
     {
         #[derive(Deserialize)]
         #[serde(untagged)]
+        enum FeedforwardSerdeCompat {
+            Variant(FeedForwardVariant),
+            Shared(SharedFeedforward),
+        }
+
+        impl FeedforwardSerdeCompat {
+            fn into_shared(self) -> SharedFeedforward {
+                match self {
+                    Self::Variant(variant) => SharedFeedforward::new(variant),
+                    Self::Shared(shared) => shared,
+                }
+            }
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
         #[allow(clippy::large_enum_variant)]
         enum TransformerBlockSerdeCompat {
+            // V1: pre-wrapper format with standalone attention field.
             V1 {
                 pre_attention_norm: RichardsNorm,
                 attention: Box<PolyAttention>,
                 pre_ffn_norm: RichardsNorm,
-                feedforward: FeedForwardVariant,
+                feedforward: FeedforwardSerdeCompat,
                 config: TransformerBlockConfig,
 
                 #[serde(default = "default_similarity_context_strength")]
                 similarity_context_strength: Array2<f32>,
             },
+            // V2: temporal mixing serialized directly as TemporalMixingLayer.
             V2 {
                 pre_attention_norm: RichardsNorm,
                 temporal_mixing: Box<TemporalMixingLayer>,
                 pre_ffn_norm: RichardsNorm,
-                feedforward: FeedForwardVariant,
+                feedforward: FeedforwardSerdeCompat,
                 config: TransformerBlockConfig,
 
                 #[serde(default = "default_similarity_context_strength")]
@@ -190,12 +207,12 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 #[serde(default)]
                 eprop_adaptor: Option<EPropAdaptor>,
             },
-            // V3: Current format with UnifiedCoPE in TemporalMixingLayer
+            // V3: temporal mixing serialized as SharedTemporalProcessing wrapper.
             V3 {
                 pre_attention_norm: RichardsNorm,
-                temporal_mixing: Box<TemporalMixingLayer>,
+                temporal_mixing: SharedTemporalProcessing,
                 pre_ffn_norm: RichardsNorm,
-                feedforward: FeedForwardVariant,
+                feedforward: FeedforwardSerdeCompat,
                 config: TransformerBlockConfig,
 
                 #[serde(default = "default_similarity_context_strength")]
@@ -224,9 +241,13 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 similarity_context_strength,
             } => (
                 pre_attention_norm,
-                TemporalMixingLayer::Attention(attention),
+                SharedTemporalProcessing::new(
+                    TemporalMixingLayer::Attention(attention),
+                    config.window_size,
+                    config.use_adaptive_window,
+                ),
                 pre_ffn_norm,
-                feedforward,
+                feedforward.into_shared(),
                 config,
                 similarity_context_strength,
                 None,
@@ -241,9 +262,13 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 eprop_adaptor,
             } => (
                 pre_attention_norm,
-                *temporal_mixing,
+                SharedTemporalProcessing::new(
+                    *temporal_mixing,
+                    config.window_size,
+                    config.use_adaptive_window,
+                ),
                 pre_ffn_norm,
-                feedforward,
+                feedforward.into_shared(),
                 config,
                 similarity_context_strength,
                 eprop_adaptor,
@@ -258,9 +283,9 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 eprop_adaptor,
             } => (
                 pre_attention_norm,
-                *temporal_mixing,
+                temporal_mixing,
                 pre_ffn_norm,
-                feedforward,
+                feedforward.into_shared(),
                 config,
                 similarity_context_strength,
                 eprop_adaptor,
@@ -291,10 +316,8 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
             window_entropy_ema: 0.0,
-            activation_similarity_matrix: Array2::zeros((embed_dim, embed_dim)),
             context,
             opt_similarity_context_strength: Adam::new((1, 1)),
-            similarity_update_rate: 0.01,
             adaptive_residuals: if use_advanced_adaptive_residuals {
                 Some(AdaptiveResiduals::new_minimal(embed_dim))
             } else {
@@ -303,6 +326,7 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
             streaming_workspace: None,
+            batch_workspace: None, // Allocated on first use with correct dimensions
         })
     }
 }
@@ -316,7 +340,6 @@ struct ParamPartitions {
     context: usize,
     adaptive_residuals: usize,
     eprop_adaptor: usize,
-    similarity_context_strength: usize,
 }
 
 /// Configuration for a transformer block
@@ -381,14 +404,37 @@ pub struct TransformerBlockConfig {
 
 /// Pre-allocated workspace for transformer block operations.
 /// Enables buffer reuse across forward/backward passes to reduce allocations.
-#[derive(Debug, Default, Clone)]
+/// 
+/// # Design
+/// Uses a generational buffer pattern where buffers are resized only when
+/// dimensions change, avoiding repeated allocations during training.
+#[derive(Debug, Clone)]
 pub struct TransformerWorkspace {
     /// Expected sequence length for capacity planning
     seq_len: usize,
     /// Expected embedding dimension for capacity planning
     embed_dim: usize,
+    /// Reusable scratch buffer for normalization outputs
+    norm_scratch: Array2<f32>,
+    /// Reusable scratch buffer for temporal mixing outputs
+    mix_scratch: Array2<f32>,
+    /// Reusable scratch buffer for residual connections
+    residual_scratch: Array2<f32>,
     /// Reusable scratch buffer for FFN output
-    ffn_scratch: Option<Array2<f32>>,
+    ffn_scratch: Array2<f32>,
+}
+
+impl Default for TransformerWorkspace {
+    fn default() -> Self {
+        Self {
+            seq_len: 0,
+            embed_dim: 0,
+            norm_scratch: Array2::zeros((0, 0)),
+            mix_scratch: Array2::zeros((0, 0)),
+            residual_scratch: Array2::zeros((0, 0)),
+            ffn_scratch: Array2::zeros((0, 0)),
+        }
+    }
 }
 
 impl TransformerWorkspace {
@@ -397,25 +443,62 @@ impl TransformerWorkspace {
         Self {
             seq_len,
             embed_dim,
-            ffn_scratch: Some(Array2::zeros((seq_len, embed_dim))),
+            norm_scratch: Array2::zeros((seq_len, embed_dim)),
+            mix_scratch: Array2::zeros((seq_len, embed_dim)),
+            residual_scratch: Array2::zeros((seq_len, embed_dim)),
+            ffn_scratch: Array2::zeros((seq_len, embed_dim)),
         }
     }
 
-    /// Ensure workspace has capacity for given dimensions, reallocating if needed.
+    /// Ensure workspace has capacity for given dimensions, reallocating only when necessary.
+    /// Uses zero-copy resize when possible (when dimensions match, just zeros existing buffer).
     #[inline]
     pub fn ensure_capacity(&mut self, seq_len: usize, embed_dim: usize) {
         if self.seq_len != seq_len || self.embed_dim != embed_dim {
             self.seq_len = seq_len;
             self.embed_dim = embed_dim;
-            self.ffn_scratch = Some(Array2::zeros((seq_len, embed_dim)));
+            // Reallocate only when dimensions change
+            self.norm_scratch = Array2::zeros((seq_len, embed_dim));
+            self.mix_scratch = Array2::zeros((seq_len, embed_dim));
+            self.residual_scratch = Array2::zeros((seq_len, embed_dim));
+            self.ffn_scratch = Array2::zeros((seq_len, embed_dim));
+        } else {
+            // Zero existing buffers for reuse (no allocation)
+            self.norm_scratch.fill(0.0);
+            self.mix_scratch.fill(0.0);
+            self.residual_scratch.fill(0.0);
+            self.ffn_scratch.fill(0.0);
         }
     }
 
-    /// Get mutable reference to FFN scratch buffer, resizing if needed.
+    /// Get mutable reference to normalization scratch buffer.
+    /// # Panics
+    /// Panics if ensure_capacity has not been called with valid dimensions.
     #[inline]
-    pub fn get_ffn_scratch(&mut self, seq_len: usize, embed_dim: usize) -> &mut Array2<f32> {
-        self.ensure_capacity(seq_len, embed_dim);
-        self.ffn_scratch.as_mut().unwrap()
+    #[must_use]
+    pub fn norm_buffer(&mut self) -> &mut Array2<f32> {
+        &mut self.norm_scratch
+    }
+
+    /// Get mutable reference to temporal mixing scratch buffer.
+    #[inline]
+    #[must_use]
+    pub fn mix_buffer(&mut self) -> &mut Array2<f32> {
+        &mut self.mix_scratch
+    }
+
+    /// Get mutable reference to residual scratch buffer.
+    #[inline]
+    #[must_use]
+    pub fn residual_buffer(&mut self) -> &mut Array2<f32> {
+        &mut self.residual_scratch
+    }
+
+    /// Get mutable reference to FFN scratch buffer.
+    #[inline]
+    #[must_use]
+    pub fn ffn_buffer(&mut self) -> &mut Array2<f32> {
+        &mut self.ffn_scratch
     }
 }
 
@@ -467,18 +550,20 @@ impl TransformerBlock {
 
         Self {
             pre_attention_norm: layers.pre_attention_norm,
-            temporal_mixing: layers.temporal_mixing,
+            temporal_mixing: SharedTemporalProcessing::new(
+                layers.temporal_mixing,
+                config.window_size,
+                config.use_adaptive_window,
+            ),
             pre_ffn_norm: layers.pre_ffn_norm,
-            feedforward: layers.feedforward,
+            feedforward: SharedFeedforward::new(layers.feedforward),
             config,
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
             window_entropy_ema: 0.0,
 
-            activation_similarity_matrix: Array2::zeros((embed_dim, embed_dim)),
             context,
             opt_similarity_context_strength,
-            similarity_update_rate: 0.01,
             adaptive_residuals: if use_advanced_adaptive_residuals {
                 Some(AdaptiveResiduals::new_minimal(embed_dim))
             } else {
@@ -487,6 +572,7 @@ impl TransformerBlock {
             eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
             streaming_workspace: None,
+            batch_workspace: None, // Allocated on first use with correct dimensions
         }
     }
 
@@ -495,7 +581,7 @@ impl TransformerBlock {
     }
 
     pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
-        &self.activation_similarity_matrix
+        self.context.get_outgoing_context()
     }
 
     /// Get reference to pre-attention normalization layer
@@ -512,13 +598,13 @@ impl TransformerBlock {
 
     /// Get reference to temporal mixing layer
     #[inline]
-    pub fn temporal_mixing(&self) -> &TemporalMixingLayer {
+    pub fn temporal_mixing(&self) -> &SharedTemporalProcessing {
         &self.temporal_mixing
     }
 
     /// Get mutable reference to temporal mixing layer
     #[inline]
-    pub fn temporal_mixing_mut(&mut self) -> &mut TemporalMixingLayer {
+    pub fn temporal_mixing_mut(&mut self) -> &mut SharedTemporalProcessing {
         &mut self.temporal_mixing
     }
 
@@ -537,13 +623,13 @@ impl TransformerBlock {
     /// Get reference to feedforward layer
     #[inline]
     pub fn feedforward(&self) -> &FeedForwardVariant {
-        &self.feedforward
+        self.feedforward.variant()
     }
 
     /// Get mutable reference to feedforward layer
     #[inline]
     pub fn feedforward_mut(&mut self) -> &mut FeedForwardVariant {
-        &mut self.feedforward
+        self.feedforward.variant_mut()
     }
 
     pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
@@ -558,95 +644,13 @@ impl TransformerBlock {
     }
 
     pub fn set_training_mode(&mut self, is_training: bool) {
-        if let FeedForwardVariant::MixtureOfExperts(ref mut moe) = self.feedforward {
+        if let Some(moe) = self.feedforward.as_moe_mut() {
             moe.set_training_mode(is_training);
         }
     }
 
     #[inline]
-    fn update_activation_similarity_matrix(&mut self, input: &ndarray::ArrayView2<f32>, output: &ndarray::ArrayView2<f32>) {
-        // Match the adaptive_residuals representation update: channel-to-channel cosine similarity
-        // across (sampled) sequence positions, bounded smoothly into [-1, 1], EMA updated.
-        let rate = self.similarity_update_rate.clamp(0.0, 1.0);
-        if rate <= 0.0 {
-            return;
-        }
 
-        let seq_len = input.nrows().min(output.nrows());
-        let embed_dim = input.ncols().min(output.ncols()).min(self.config.embed_dim);
-        if seq_len == 0 || embed_dim == 0 {
-            return;
-        }
-
-        let sample_size = seq_len.min(32);
-        let step = (seq_len / sample_size).max(1);
-        let indices: Vec<usize> = (0..seq_len).step_by(step).take(sample_size).collect();
-        let actual_sample_size = indices.len();
-
-        if actual_sample_size == 0 {
-            return;
-        }
-
-        // 1. Gather sampled data and handle non-finite values
-        let mut sub_x = Array2::<f32>::zeros((actual_sample_size, embed_dim));
-        let mut sub_y = Array2::<f32>::zeros((actual_sample_size, embed_dim));
-
-        // Use parallel iterator for row gathering if sample size is large, but for 32 it's negligible.
-        // Sequential is fine here to avoid overhead.
-        for (i, &idx) in indices.iter().enumerate() {
-            let row_x = input.row(idx);
-            let row_y = output.row(idx);
-            
-            for j in 0..embed_dim {
-                let val_x = row_x[j];
-                sub_x[[i, j]] = if val_x.is_finite() { val_x } else { 0.0 };
-                
-                let val_y = row_y[j];
-                sub_y[[i, j]] = if val_y.is_finite() { val_y } else { 0.0 };
-            }
-        }
-
-        // 2. Compute means
-        let mean_x = sub_x.mean_axis(ndarray::Axis(0)).unwrap();
-        let mean_y = sub_y.mean_axis(ndarray::Axis(0)).unwrap();
-
-        // 3. Center data (broadcasting works: (S, D) - (D,))
-        sub_x -= &mean_x;
-        sub_y -= &mean_y;
-
-        // 4. Compute Norms (Sqrt of sum of squares)
-        let norm_x_sq = sub_x.mapv(|v| v * v).sum_axis(ndarray::Axis(0));
-        let norm_y_sq = sub_y.mapv(|v| v * v).sum_axis(ndarray::Axis(0));
-        
-        let norm_x = norm_x_sq.mapv(|v| v.sqrt());
-        let norm_y = norm_y_sq.mapv(|v| v.sqrt());
-
-        // 5. Covariance Matrix: X^T * Y -> (D, D)
-        // Optimized matrix multiplication
-        let cov = sub_x.t().dot(&sub_y);
-
-        // 6. Denominator Matrix: Outer product of norms
-        // (D, 1) * (1, D) -> (D, D)
-        let norm_x_col = norm_x.insert_axis(ndarray::Axis(1));
-        let norm_y_row = norm_y.insert_axis(ndarray::Axis(0));
-        let denom = norm_x_col.dot(&norm_y_row);
-
-        let tanh = crate::domain::richards::RichardsCurve::tanh(false);
-
-        // 7. Update with EMA (Parallelized)
-        ndarray::Zip::from(&mut self.activation_similarity_matrix)
-            .and(&cov)
-            .and(&denom)
-            .par_for_each(|prev, &c, &d| {
-                let sim_raw = if d > 1e-12 { c / d } else { 0.0 };
-                let sim = if sim_raw.is_finite() {
-                     tanh.forward_scalar_f32(sim_raw)
-                } else {
-                     0.0
-                };
-                *prev = (1.0 - rate) * *prev + rate * sim;
-            });
-    }
 
     /// Streaming forward step for token-by-token inference (Zero-Allocation).
     pub fn forward_step_into(
@@ -700,7 +704,7 @@ impl TransformerBlock {
         // 2. Temporal Mixing
         // Apply overrides if available
         if let Some(overrides) = moh_overrides {
-            match &mut self.temporal_mixing {
+            match &mut self.temporal_mixing.temporal_mixing {
                 TemporalMixingLayer::RgLruMoH(rglru) => rglru.set_verification_overrides(Some(overrides)),
                 TemporalMixingLayer::MambaMoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
                 TemporalMixingLayer::Mamba2MoH(mamba) => mamba.set_verification_overrides(Some(overrides)),
@@ -712,7 +716,7 @@ impl TransformerBlock {
         
         // Titan Memory Integration
         if !matches!(
-            self.temporal_mixing,
+            self.temporal_mixing.temporal_mixing,
             TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
         ) {
             let _mix_out_processed = workspace.mix_out.clone(); // Temporary clone for logic flow, optimized below
@@ -739,32 +743,11 @@ impl TransformerBlock {
         let input_used_2d = input_used_view.insert_axis(ndarray::Axis(0));
         let mix_out_2d = mix_out_view.insert_axis(ndarray::Axis(0));
         
-        self.update_activation_similarity_matrix(&input_used_2d, &mix_out_2d);
+        self.context.update_outgoing_context(&input_used_2d, &mix_out_2d, self.config.embed_dim);
         
         // Head activity ratio logic...
-        let head_activity_ratio = match &self.temporal_mixing {
-             TemporalMixingLayer::Attention(attn) => {
-                if let Some(avg) = attn.last_avg_active_heads {
-                    let denom = (self.config.num_heads.max(1)) as f32;
-                    let r = avg / denom;
-                    if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
-                } else { 1.0 }
-            }
-            TemporalMixingLayer::RgLruMoH(rglru) => {
-                if let Some(avg) = rglru.last_avg_active_heads {
-                    let denom = (self.config.num_heads.max(1)) as f32;
-                    let r = avg / denom;
-                    if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 }
-                } else { 1.0 }
-            }
-             _ => 1.0
-        };
-
-        let head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
-            _ => None,
-        };
+        let (head_activity_ratio, head_activity_vec) = self.temporal_mixing.get_head_activity_metrics();
+        let head_activity_ratio = head_activity_ratio.unwrap_or(1.0);
 
         // Adaptive Residuals
         let alpha = 1.0;
@@ -792,7 +775,18 @@ impl TransformerBlock {
         let norm2_out_view = workspace.norm2_out.view();
 
         // 4. Feedforward
-        self.feedforward.forward_step_into(&norm2_out_view, &mut workspace.ffn_out);
+        let token_head_activity = self
+            .temporal_mixing
+            .get_token_head_activity_vec()
+            .and_then(|v| v.first().copied());
+            
+        self.feedforward.forward_step_into(
+            &norm2_out_view,
+            &mut workspace.ffn_out,
+            Some(head_activity_ratio),
+            head_activity_vec,
+            token_head_activity,
+        );
         
         // Final Residual: output = residual + ffn_out
         if let Some(ref mut residuals) = self.adaptive_residuals {
@@ -947,7 +941,6 @@ impl ParamPartitions {
             + self.context
             + self.adaptive_residuals
             + self.eprop_adaptor
-            + self.similarity_context_strength
     }
 }
 
@@ -990,7 +983,7 @@ impl Layer for TransformerBlock {
             let min_w = self.config.min_window_size.max(1);
             let max_w = self.config.max_window_size.max(min_w);
             // Adaptive window is attention-specific; skip when not using attention.
-            if matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_)) {
+            if matches!(self.temporal_mixing.temporal_mixing, TemporalMixingLayer::Attention(_)) {
                 match self.config.window_adaptation_strategy {
                     WindowAdaptationStrategy::Fixed => {
                         dynamic_w = base_w.min(seq_len.max(1));
@@ -1001,19 +994,7 @@ impl Layer for TransformerBlock {
                     }
                     WindowAdaptationStrategy::AttentionEntropy => {
                         let alpha = self.config.entropy_ema_alpha.clamp(0.0, 1.0);
-                        let (tau_span, pred_rms) = match &self.temporal_mixing {
-                            TemporalMixingLayer::Attention(attn) => {
-                                let tau_span = if let Some((tmin, tmax)) = attn.last_tau_metrics {
-                                    (tmax - tmin).abs().max(0.0)
-                                } else {
-                                    0.0
-                                };
-                                let pred_rms = attn.last_pred_norm.unwrap_or(0.0).max(0.0);
-                                (tau_span, pred_rms)
-                            }
-                            _ => (0.0, 0.0),
-                        };
-                        let signal = (0.7 * tau_span + 0.3 * pred_rms).clamp(0.0, 1.0);
+                        let signal = self.temporal_mixing.get_window_entropy().unwrap_or(0.0);
                         self.window_entropy_ema =
                             alpha * signal + (1.0 - alpha) * self.window_entropy_ema;
                         let w = min_w as f32
@@ -1030,14 +1011,12 @@ impl Layer for TransformerBlock {
         }
 
         // Push window-size to attention only (no-op for RG-LRU).
-        if let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing {
-            attn.set_window_size(Some(dynamic_w));
-        }
+        self.temporal_mixing.set_window_size(Some(dynamic_w));
 
         // Temporal mixing forward
         let mut mix_out = self.temporal_mixing.forward(&norm1_out);
         if !matches!(
-            self.temporal_mixing,
+            self.temporal_mixing.temporal_mixing,
             TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
         ) {
             self.config.titan_memory.apply_into_out_with_workspace(
@@ -1048,49 +1027,12 @@ impl Layer for TransformerBlock {
         }
 
         // Update per-layer similarity representation matrix (input→mix-output channel similarity).
-        self.update_activation_similarity_matrix(&input_used_arc.as_ref().view(), &mix_out.view());
+        self.context.update_outgoing_context(&input_used_arc.as_ref().view(), &mix_out.view(), self.config.embed_dim);
 
         // Head activity ratio from MoH (avg active heads / num_heads).
-        let head_activity_ratio = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => {
-                if let Some(avg) = attn.last_avg_active_heads {
-                    let denom = (self.config.num_heads.max(1)) as f32;
-                    let r = avg / denom;
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            TemporalMixingLayer::RgLruMoH(rglru) => {
-                if let Some(avg) = rglru.last_avg_active_heads {
-                    let denom = (self.config.num_heads.max(1)) as f32;
-                    let r = avg / denom;
-                    if r.is_finite() {
-                        r.clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    1.0
-                }
-            }
-            _ => 1.0,
-        };
-
-        let head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_head_activity_vec.as_deref(),
-            _ => None,
-        };
-        let token_head_activity_vec: Option<&[f32]> = match &self.temporal_mixing {
-            TemporalMixingLayer::Attention(attn) => attn.last_token_head_activity_vec.as_deref(),
-            TemporalMixingLayer::RgLruMoH(rglru) => rglru.last_token_head_activity_vec.as_deref(),
-            _ => None,
-        };
+        let (head_activity_ratio_opt, head_activity_vec) = self.temporal_mixing.get_head_activity_metrics();
+        let head_activity_ratio = head_activity_ratio_opt.unwrap_or(1.0);
+        let token_head_activity_vec = self.temporal_mixing.get_token_head_activity_vec();
 
         // In-place residual connection: use adaptive residuals if available
         let residual1 = if let Some(ref mut residuals) = self.adaptive_residuals {
@@ -1111,16 +1053,12 @@ impl Layer for TransformerBlock {
         let norm2_out = self.pre_ffn_norm.forward(&residual1);
 
         // Feedforward with residual connection
-        let mut ffn_out = match &mut self.feedforward {
-            FeedForwardVariant::RichardsGlu(layer) => layer.forward(&norm2_out),
-            FeedForwardVariant::MixtureOfExperts(layer) => layer
-                .forward_with_head_features_and_token_activity(
-                    &norm2_out,
-                    Some(head_activity_ratio),
-                    head_activity_vec,
-                    token_head_activity_vec,
-                ),
-        };
+        let mut ffn_out = self.feedforward.forward_with_token_head_activity(
+            &norm2_out,
+            Some(head_activity_ratio),
+            head_activity_vec,
+            token_head_activity_vec,
+        );
 
         // Cache FFN output *before* the residual addition.
         let ffn_out_arc = if let Some(mut arc) = reuse_ffn_out_cache {
@@ -1228,14 +1166,8 @@ impl Layer for TransformerBlock {
             let residual1_grads = &grads_at_ffn_sum;
 
             // Get feedforward gradients
-            let (ffn_input_grad, ffn_param_grads) = match &self.feedforward {
-                FeedForwardVariant::RichardsGlu(layer) => {
-                    layer.compute_gradients(norm2_out, ffn_grads)
-                }
-                FeedForwardVariant::MixtureOfExperts(layer) => {
-                    layer.compute_gradients(norm2_out, ffn_grads)
-                }
-            };
+            let (ffn_input_grad, ffn_param_grads) =
+                self.feedforward.backward(norm2_out, ffn_grads);
 
             let (residual1_from_ffn, pre_ffn_param_grads) = self
                 .pre_ffn_norm
@@ -1252,7 +1184,7 @@ impl Layer for TransformerBlock {
                 .temporal_mixing
                 .compute_gradients(norm1_out, &residual1_total_grads);
             if !matches!(
-                self.temporal_mixing,
+                self.temporal_mixing.temporal_mixing,
                 TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
             ) {
                 self.config
@@ -1300,7 +1232,6 @@ impl Layer for TransformerBlock {
                 context: 1,
                 adaptive_residuals: adaptive_grad_count,
                 eprop_adaptor: eprop_param_grads.len(),
-                similarity_context_strength: self.context.similarity_context_strength.len(),
             };
             // Release read lock before acquiring write lock
             drop(guard);
@@ -2367,7 +2298,7 @@ mod tests {
         let out = block.forward(&input);
         assert_eq!(out.shape(), input.shape());
 
-        let TemporalMixingLayer::Attention(attn) = &block.temporal_mixing else {
+        let TemporalMixingLayer::Attention(attn) = &block.temporal_mixing.temporal_mixing else {
             panic!("expected attention temporal mixing");
         };
         assert!(attn.last_tau_metrics.is_some());

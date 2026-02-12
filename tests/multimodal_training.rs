@@ -88,7 +88,9 @@ fn test_audio_encoding() {
     // num_time_frames = (16000 / 160) = 100 (must be divisible by temporal_patch_size=16)
     let config = AudioConfig {
         sample_rate: 16000,
-        max_duration: 1.0,
+        // Adjusted duration to ensure num_time_frames is divisible by temporal_patch_size
+        // (16000 * 0.975 - 400) / 160 + 1 = 96 frames. 96 % 16 == 0.
+        max_duration: 0.975,
         n_fft: 400,
         hop_length: 160,
         n_mels: 64,
@@ -131,7 +133,7 @@ fn test_multimodal_processor() {
             n_fft: 256,
             hop_length: 128,
             n_mels: 64,
-            temporal_patch_size: 63,
+            temporal_patch_size: 61,
             freq_patch_size: 8,
             embedding_dim: 64,
             ..Default::default()
