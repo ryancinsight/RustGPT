@@ -1,12 +1,12 @@
 use llm::domain::{
-    network::Layer,
     layers::{
         diffusion::{DiffusionBlock, DiffusionBlockConfig},
         transformer::{TransformerBlock, TransformerBlockConfig},
     },
     mixtures::HeadSelectionStrategy,
+    models::config::{TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy},
+    network::Layer,
     richards::AdaptiveScalar,
-    models::config::{TemporalMixingType, WindowAdaptationStrategy, TitanMemoryConfig},
 };
 use ndarray::Array2;
 
@@ -26,12 +26,10 @@ fn main() {
         use_adaptive_window: false,
         min_window_size: 512,
         max_window_size: 4096,
-        window_adaptation_strategy:
-            WindowAdaptationStrategy::SequenceLengthBased,
+        window_adaptation_strategy: WindowAdaptationStrategy::SequenceLengthBased,
         entropy_ema_alpha: 0.2,
         use_advanced_adaptive_residuals: true,
         titan_memory: TitanMemoryConfig::default(),
-        eprop_adaptor: None,
     };
     let mut tblock = TransformerBlock::new(tcfg.clone());
 

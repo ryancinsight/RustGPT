@@ -184,16 +184,19 @@ impl ContinualLearningManager {
     /// Set the current user
     pub fn set_user(&mut self, user_id: &str) {
         self.current_user = Some(user_id.to_string());
-        
+
         // Initialize user memory if not exists
         if !self.user_memories.contains_key(user_id) {
-            self.user_memories.insert(user_id.to_string(), UserMemory {
-                user_id: user_id.to_string(),
-                conversations: VecDeque::with_capacity(self.config.max_user_memory_size),
-                preferences: UserPreferences::default(),
-                fisher_information: None,
-                old_params: None,
-            });
+            self.user_memories.insert(
+                user_id.to_string(),
+                UserMemory {
+                    user_id: user_id.to_string(),
+                    conversations: VecDeque::with_capacity(self.config.max_user_memory_size),
+                    preferences: UserPreferences::default(),
+                    fisher_information: None,
+                    old_params: None,
+                },
+            );
         }
     }
 
@@ -262,18 +265,23 @@ impl ContinualLearningManager {
             return Ok(0.0);
         }
 
-        let user_id = self.current_user.as_ref()
+        let user_id = self
+            .current_user
+            .as_ref()
             .ok_or_else(|| ModelError::InvalidInput {
                 message: "No user set for continual learning".to_string(),
             })?;
 
-        let memory = self.user_memories.get(user_id)
+        let memory = self
+            .user_memories
+            .get(user_id)
             .ok_or_else(|| ModelError::InvalidInput {
                 message: "User memory not found".to_string(),
             })?;
 
         // Find interactions with feedback
-        let feedback_interactions: Vec<&UserInteraction> = memory.conversations
+        let feedback_interactions: Vec<&UserInteraction> = memory
+            .conversations
             .iter()
             .filter(|i| i.feedback.is_some())
             .collect();
@@ -315,7 +323,11 @@ impl ContinualLearningManager {
 
         self.update_count += 1;
 
-        Ok(if num_updates > 0 { total_loss / num_updates as f32 } else { 0.0 })
+        Ok(if num_updates > 0 {
+            total_loss / num_updates as f32
+        } else {
+            0.0
+        })
     }
 
     /// Compute gradient from a single feedback interaction
@@ -326,7 +338,7 @@ impl ContinualLearningManager {
         feedback: &UserFeedback,
     ) -> Result<f32> {
         let reward = feedback.to_reward();
-        
+
         // Skip if reward is too small
         if reward.abs() < 0.1 {
             return Ok(0.0);
@@ -365,7 +377,7 @@ impl ContinualLearningManager {
             .collect::<Vec<_>>()
             .choose(&mut rng)
             .copied()?;
-        
+
         self.replay_buffer.get(index).cloned()
     }
 
@@ -401,12 +413,14 @@ impl ContinualLearningManager {
             if let Some(memory) = self.user_memories.get(user_id) {
                 if self.config.ewc_lambda > 0.0 {
                     if let (Some(fisher), Some(old_params)) =
-                        (&memory.fisher_information, &memory.old_params) {
+                        (&memory.fisher_information, &memory.old_params)
+                    {
                         // Add EWC penalty to gradients
                         for (_i, (grad, (fisher_mat, old_param))) in averaged_gradients
                             .iter_mut()
                             .zip(fisher.iter().zip(old_params.iter()))
-                            .enumerate() {
+                            .enumerate()
+                        {
                             // EWC penalty: λ * F * (θ - θ_old)
                             // Need to convert to owned arrays for subtraction
                             let diff = grad.to_owned() - old_param;
@@ -420,7 +434,7 @@ impl ContinualLearningManager {
 
         // Apply gradients to model
         // In a full implementation, this would call llm.apply_gradients()
-        
+
         // Clear buffer
         self.gradient_buffer.clear();
 
@@ -433,19 +447,23 @@ impl ContinualLearningManager {
             return Ok(());
         }
 
-        let user_id = self.current_user.as_ref()
+        let user_id = self
+            .current_user
+            .as_ref()
             .ok_or_else(|| ModelError::InvalidInput {
                 message: "No user set".to_string(),
             })?;
 
-        let memory = self.user_memories.get_mut(user_id)
-            .ok_or_else(|| ModelError::InvalidInput {
-                message: "User memory not found".to_string(),
-            })?;
+        let memory =
+            self.user_memories
+                .get_mut(user_id)
+                .ok_or_else(|| ModelError::InvalidInput {
+                    message: "User memory not found".to_string(),
+                })?;
 
         // Compute Fisher Information using past interactions
         // F = E[(∇log p(y|x,θ))^2]
-        
+
         let fisher_accumulator: Vec<Array2<f32>> = Vec::new();
         let num_samples = memory.conversations.len().min(100);
 
@@ -457,7 +475,7 @@ impl ContinualLearningManager {
 
         // Average and store Fisher Information
         memory.fisher_information = Some(fisher_accumulator);
-        
+
         // Store current parameters
         // memory.old_params = Some(llm.get_parameters());
 
@@ -471,14 +489,17 @@ impl ContinualLearningManager {
 
     /// Update user preferences based on interaction patterns
     pub fn update_preferences(&mut self, user_id: &str) -> Result<()> {
-        let memory = self.user_memories.get_mut(user_id)
-            .ok_or_else(|| ModelError::InvalidInput {
-                message: "User not found".to_string(),
-            })?;
+        let memory =
+            self.user_memories
+                .get_mut(user_id)
+                .ok_or_else(|| ModelError::InvalidInput {
+                    message: "User not found".to_string(),
+                })?;
 
         // Analyze conversation topics
-        let mut topic_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        
+        let mut topic_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
         for interaction in &memory.conversations {
             // Simple topic extraction (would use NLP in production)
             let words: Vec<&str> = interaction.user_input.split_whitespace().collect();
@@ -497,8 +518,11 @@ impl ContinualLearningManager {
 
     /// Save user memories to disk
     pub fn save_memories(&self, path: &str) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.user_memories)
-            .map_err(|e| ModelError::Serialization { source: Box::new(e) })?;
+        let json = serde_json::to_string_pretty(&self.user_memories).map_err(|e| {
+            ModelError::Serialization {
+                source: Box::new(e),
+            }
+        })?;
         std::fs::write(path, json).map_err(ModelError::from)?;
         Ok(())
     }
@@ -506,8 +530,10 @@ impl ContinualLearningManager {
     /// Load user memories from disk
     pub fn load_memories(&mut self, path: &str) -> Result<()> {
         let json = std::fs::read_to_string(path).map_err(ModelError::from)?;
-        self.user_memories = serde_json::from_str(&json)
-            .map_err(|e| ModelError::Serialization { source: Box::new(e) })?;
+        self.user_memories =
+            serde_json::from_str(&json).map_err(|e| ModelError::Serialization {
+                source: Box::new(e),
+            })?;
         Ok(())
     }
 }
@@ -516,12 +542,17 @@ impl ContinualLearningManager {
 pub trait ContinualLearning {
     /// Perform an online update from user feedback
     fn online_update(&mut self, feedback: &UserFeedback, target: Option<&str>) -> Result<f32>;
-    
+
     /// Get importance weights for EWC
     fn compute_importance(&self) -> Vec<Array2<f32>>;
-    
+
     /// Apply gradients with EWC regularization
-    fn apply_continual_gradients(&mut self, gradients: &[Array2<f32>], ewc_penalty: &[Array2<f32>], lr: f32) -> Result<()>;
+    fn apply_continual_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        ewc_penalty: &[Array2<f32>],
+        lr: f32,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -543,14 +574,11 @@ mod tests {
         let mut manager = ContinualLearningManager::new(config);
 
         manager.set_user("test_user");
-        
+
         // Record an interaction
-        manager.record_interaction(
-            "Hello",
-            "Hi there!",
-            vec![1, 2, 3],
-            None,
-        ).unwrap();
+        manager
+            .record_interaction("Hello", "Hi there!", vec![1, 2, 3], None)
+            .unwrap();
 
         // Record feedback
         manager.record_feedback(UserFeedback::Positive).unwrap();
@@ -570,12 +598,14 @@ mod tests {
 
         // Add interactions
         for i in 0..5 {
-            manager.record_interaction(
-                &format!("Input {}", i),
-                &format!("Output {}", i),
-                vec![i],
-                None,
-            ).unwrap();
+            manager
+                .record_interaction(
+                    &format!("Input {}", i),
+                    &format!("Output {}", i),
+                    vec![i],
+                    None,
+                )
+                .unwrap();
         }
 
         // Buffer should only have last 3

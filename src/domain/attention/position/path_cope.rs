@@ -2,9 +2,9 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
-use super::traits::PositionEmbedding;
 use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
+use super::traits::PositionEmbedding;
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gradients for PathCoPE
 #[derive(Clone, Debug)]
@@ -114,14 +114,16 @@ impl PositionEmbedding for PathCoPE {
                 // Full path transformation
                 self.compute_path_transform(q, query_pos, key_pos, inp)
             } else {
-                 // Simplified approximation (single Householder step)
-                 if relative_pos >= self.max_seq_len {
-                     Array1::zeros(self.embed_dim)
-                 } else {
-                     let w_key = self.w_householder.row(relative_pos.min(self.max_seq_len - 1));
-                     let beta_approx = 1.0;
-                     self.apply_householder(q, &w_key, beta_approx)
-                 }
+                // Simplified approximation (single Householder step)
+                if relative_pos >= self.max_seq_len {
+                    Array1::zeros(self.embed_dim)
+                } else {
+                    let w_key = self
+                        .w_householder
+                        .row(relative_pos.min(self.max_seq_len - 1));
+                    let beta_approx = 1.0;
+                    self.apply_householder(q, &w_key, beta_approx)
+                }
             }
         } else {
             q.to_owned()
@@ -152,168 +154,172 @@ impl PositionEmbedding for PathCoPE {
         if query_pos > self.max_seq_len || key_pos > query_pos {
             return (Array1::zeros(q.dim()), Array1::zeros(k.dim()));
         }
-        
+
         let relative_pos = query_pos - key_pos;
 
         // 1. Gradients for Base CoPE
         let mut d_q_base = Array1::zeros(q.dim());
-        
+
         if relative_pos < self.max_seq_len {
             let idx = relative_pos.min(self.max_seq_len - 1);
             let cope_vec = self.base_cope.row(idx);
             let cope_contrib = q.dot(&cope_vec);
-            
+
             // dL/dAlphaCope = dL/dS * cope_contrib
             grads.alpha_cope_grad += d_s_ij * cope_contrib;
-            
+
             // dL/dBaseCope = dL/dS * alpha_cope * q
             let d_cope_vec = d_s_ij * self.alpha_cope;
             if let Some(base_grads) = &mut grads.base_cope_grads {
-                 let mut row = base_grads.row_mut(idx);
-                 // row += q * d_cope_vec
-                 for (r, &q_val) in row.iter_mut().zip(q.iter()) {
-                     *r += q_val * d_cope_vec;
-                 }
+                let mut row = base_grads.row_mut(idx);
+                // row += q * d_cope_vec
+                for (r, &q_val) in row.iter_mut().zip(q.iter()) {
+                    *r += q_val * d_cope_vec;
+                }
             }
-            
+
             // dL/dQ_base = dL/dS * alpha_cope * cope_vec
             // d_q_base += cope_vec * d_cope_vec (which is d_s_ij * alpha_cope)
-             for (d, &c_val) in d_q_base.iter_mut().zip(cope_vec.iter()) {
-                 *d += c_val * d_cope_vec;
-             }
+            for (d, &c_val) in d_q_base.iter_mut().zip(cope_vec.iter()) {
+                *d += c_val * d_cope_vec;
+            }
         }
 
         // 2. Gradients for Path CoPE
         let mut d_q_path = Array1::zeros(q.dim());
         let mut d_k_path = Array1::zeros(k.dim());
-        
+
         if let Some(inp) = inputs {
-             // Recompute forward path to get intermediate states
-             // We need y_s for s in key_pos..=query_pos
-             // y_query_pos = q
-             // But wait, the transform is applied to q_i (from inputs) in compute_path_transform?
-             // Looking at compute_path_transform:
-             // let q_i = inputs.row(query_pos).to_owned();
-             // transformed = q_i;
-             // for s in (key_pos + 1)..=query_pos: transformed = H_s * transformed
-             
-             // Wait, the input `q` to `contribution` is passed as argument. 
-             // In `compute_path_transform`, it uses `inputs.row(query_pos)`.
-             // This is an inconsistency in the original code?
-             // `path_cope_contribution` calls `compute_path_transform` which uses `inputs.row(query_pos)`.
-             // But `path_cope_contribution` ALSO takes `q` as argument.
-             // And it uses `q` for the Base CoPE part: `q.dot(...)`.
-             // But for the Path part, it ignores the passed `q` and uses `inputs.row(query_pos)` inside `compute_path_transform`.
-             // This seems like a potential bug or design choice in the original code.
-             // I should probably use the passed `q` instead of `inputs.row(query_pos)` to be consistent with the trait which assumes `q` is the query.
-             
-             // I will modify `compute_path_transform` to take `q` vector instead of extracting it from inputs.
-             // This is safer and cleaner.
-             
-             let q_vec = q.to_owned();
-             let mut states = Vec::with_capacity(query_pos - key_pos + 1);
-             states.push(q_vec.clone());
-             
-             let mut transformed = q_vec.clone();
-             
-             // Forward pass reconstruction
-             for s in (key_pos + 1)..=query_pos {
-                 if s >= self.max_seq_len { break; }
-                 let w_s = self.w_householder.row(s);
-                 let x_s = inp.row(s);
-                 let beta_s = self.compute_beta(&x_s);
-                 transformed = self.apply_householder(&transformed.view(), &w_s, beta_s);
-                 states.push(transformed.clone());
-             }
-             
-             let path_transformed_q = transformed;
-             let path_contrib = k.dot(&path_transformed_q);
-             
-             grads.alpha_path_grad += d_s_ij * path_contrib;
-             
-             // dL/d_path_transformed_q = dL/dS * alpha_path * k
-             let mut d_y = k.mapv(|x| x * d_s_ij * self.alpha_path);
-             
-             // dL/dK = dL/dS * alpha_path * path_transformed_q
-             d_k_path = path_transformed_q.mapv(|x| x * d_s_ij * self.alpha_path);
-             
-             // Backprop through Householder layers
-             // s goes from query_pos down to key_pos + 1
-             // states[i] corresponds to output after i-th step. 
-             // states[0] is initial q.
-             // Loop index needs to match states index.
-             // states has (query_pos - key_pos + 1) elements.
-             // Step s corresponds to transition from states[s - (key_pos + 1)] to states[s - key_pos].
-             
-             for s in ((key_pos + 1)..=query_pos).rev() {
-                 if s >= self.max_seq_len { continue; }
-                 
-                 let input_idx = s - (key_pos + 1);
-                 let y_prev = &states[input_idx]; // y_{s-1}
-                 
-                 let w_s = self.w_householder.row(s);
-                 let x_s = inp.row(s);
-                 let beta_s = self.compute_beta(&x_s);
-                 
-                 // Gradients for this layer
-                 // y_curr = y_prev - beta * w * (w^T * y_prev)
-                 
-                 // dL/d_y_prev = H_s * d_y (since H is symmetric)
-                 // We can reuse apply_householder logic!
-                 let d_y_prev = self.apply_householder(&d_y.view(), &w_s, beta_s);
-                 
-                 // dL/d_w
-                 // dL/dw = - beta * (y_prev * (w^T d_y) + d_y * (w^T y_prev))
-                 let w_dot_dy = w_s.dot(&d_y);
-                 let w_dot_yprev = w_s.dot(y_prev);
-                 
-                 let term1 = y_prev.mapv(|x| x * w_dot_dy);
-                 let term2 = d_y.mapv(|x| x * w_dot_yprev);
-                 let d_w = (term1 + term2).mapv(|x| -beta_s * x);
-                 
-                 if let Some(w_grads) = &mut grads.w_householder_grads {
-                     let mut row = w_grads.row_mut(s);
-                     for (r, &val) in row.iter_mut().zip(d_w.iter()) {
-                         *r += val;
-                     }
-                 }
-                 
-                 // dL/d_beta
-                 // dL/d_beta = - (d_y . (w * (w^T * y_prev)))
-                 //           = - (d_y . (w * w_dot_yprev))
-                 //           = - w_dot_yprev * (d_y . w)
-                 //           = - w_dot_yprev * w_dot_dy
-                 let d_beta = -w_dot_yprev * w_dot_dy;
-                 
-                 // dL/d_logit = dL/d_beta * d_beta/d_logit
-                 // beta = 2 * sigmoid(logit)
-                 // d_beta/d_logit = 2 * sigmoid * (1 - sigmoid) = beta * (1 - sigmoid) ? No.
-                 // sigmoid(x) = 1/(1+exp(-x))
-                 // d(2sig)/dx = 2 * sig * (1-sig)
-                 let logit = x_s.dot(&self.u_beta.column(0)) + self.b_beta[[0, 0]];
-                 let sig = sigmoid_stable(logit);
-                 let d_beta_d_logit = 2.0 * sig * (1.0 - sig);
-                 let d_logit = d_beta * d_beta_d_logit;
-                 
-                 // dL/d_u = d_logit * x_s
-                 if let Some(u_grads) = &mut grads.u_beta_grads {
-                     let mut col = u_grads.column_mut(0);
-                     for (u, &val) in col.iter_mut().zip(x_s.iter()) {
-                         *u += val * d_logit;
-                     }
-                 }
-                 
-                 // dL/d_b = d_logit
-                 if let Some(b_grads) = &mut grads.b_beta_grads {
-                     b_grads[[0, 0]] += d_logit;
-                 }
-                 
-                 // Update d_y for next step (going backwards)
-                 d_y = d_y_prev;
-             }
-             
-             // The final d_y is dL/dq_path (gradient at the start of the chain, which is q)
-             d_q_path = d_y;
+            // Recompute forward path to get intermediate states
+            // We need y_s for s in key_pos..=query_pos
+            // y_query_pos = q
+            // But wait, the transform is applied to q_i (from inputs) in compute_path_transform?
+            // Looking at compute_path_transform:
+            // let q_i = inputs.row(query_pos).to_owned();
+            // transformed = q_i;
+            // for s in (key_pos + 1)..=query_pos: transformed = H_s * transformed
+
+            // Wait, the input `q` to `contribution` is passed as argument.
+            // In `compute_path_transform`, it uses `inputs.row(query_pos)`.
+            // This is an inconsistency in the original code?
+            // `path_cope_contribution` calls `compute_path_transform` which uses `inputs.row(query_pos)`.
+            // But `path_cope_contribution` ALSO takes `q` as argument.
+            // And it uses `q` for the Base CoPE part: `q.dot(...)`.
+            // But for the Path part, it ignores the passed `q` and uses `inputs.row(query_pos)` inside `compute_path_transform`.
+            // This seems like a potential bug or design choice in the original code.
+            // I should probably use the passed `q` instead of `inputs.row(query_pos)` to be consistent with the trait which assumes `q` is the query.
+
+            // I will modify `compute_path_transform` to take `q` vector instead of extracting it from inputs.
+            // This is safer and cleaner.
+
+            let q_vec = q.to_owned();
+            let mut states = Vec::with_capacity(query_pos - key_pos + 1);
+            states.push(q_vec.clone());
+
+            let mut transformed = q_vec.clone();
+
+            // Forward pass reconstruction
+            for s in (key_pos + 1)..=query_pos {
+                if s >= self.max_seq_len {
+                    break;
+                }
+                let w_s = self.w_householder.row(s);
+                let x_s = inp.row(s);
+                let beta_s = self.compute_beta(&x_s);
+                transformed = self.apply_householder(&transformed.view(), &w_s, beta_s);
+                states.push(transformed.clone());
+            }
+
+            let path_transformed_q = transformed;
+            let path_contrib = k.dot(&path_transformed_q);
+
+            grads.alpha_path_grad += d_s_ij * path_contrib;
+
+            // dL/d_path_transformed_q = dL/dS * alpha_path * k
+            let mut d_y = k.mapv(|x| x * d_s_ij * self.alpha_path);
+
+            // dL/dK = dL/dS * alpha_path * path_transformed_q
+            d_k_path = path_transformed_q.mapv(|x| x * d_s_ij * self.alpha_path);
+
+            // Backprop through Householder layers
+            // s goes from query_pos down to key_pos + 1
+            // states[i] corresponds to output after i-th step.
+            // states[0] is initial q.
+            // Loop index needs to match states index.
+            // states has (query_pos - key_pos + 1) elements.
+            // Step s corresponds to transition from states[s - (key_pos + 1)] to states[s - key_pos].
+
+            for s in ((key_pos + 1)..=query_pos).rev() {
+                if s >= self.max_seq_len {
+                    continue;
+                }
+
+                let input_idx = s - (key_pos + 1);
+                let y_prev = &states[input_idx]; // y_{s-1}
+
+                let w_s = self.w_householder.row(s);
+                let x_s = inp.row(s);
+                let beta_s = self.compute_beta(&x_s);
+
+                // Gradients for this layer
+                // y_curr = y_prev - beta * w * (w^T * y_prev)
+
+                // dL/d_y_prev = H_s * d_y (since H is symmetric)
+                // We can reuse apply_householder logic!
+                let d_y_prev = self.apply_householder(&d_y.view(), &w_s, beta_s);
+
+                // dL/d_w
+                // dL/dw = - beta * (y_prev * (w^T d_y) + d_y * (w^T y_prev))
+                let w_dot_dy = w_s.dot(&d_y);
+                let w_dot_yprev = w_s.dot(y_prev);
+
+                let term1 = y_prev.mapv(|x| x * w_dot_dy);
+                let term2 = d_y.mapv(|x| x * w_dot_yprev);
+                let d_w = (term1 + term2).mapv(|x| -beta_s * x);
+
+                if let Some(w_grads) = &mut grads.w_householder_grads {
+                    let mut row = w_grads.row_mut(s);
+                    for (r, &val) in row.iter_mut().zip(d_w.iter()) {
+                        *r += val;
+                    }
+                }
+
+                // dL/d_beta
+                // dL/d_beta = - (d_y . (w * (w^T * y_prev)))
+                //           = - (d_y . (w * w_dot_yprev))
+                //           = - w_dot_yprev * (d_y . w)
+                //           = - w_dot_yprev * w_dot_dy
+                let d_beta = -w_dot_yprev * w_dot_dy;
+
+                // dL/d_logit = dL/d_beta * d_beta/d_logit
+                // beta = 2 * sigmoid(logit)
+                // d_beta/d_logit = 2 * sigmoid * (1 - sigmoid) = beta * (1 - sigmoid) ? No.
+                // sigmoid(x) = 1/(1+exp(-x))
+                // d(2sig)/dx = 2 * sig * (1-sig)
+                let logit = x_s.dot(&self.u_beta.column(0)) + self.b_beta[[0, 0]];
+                let sig = sigmoid_stable(logit);
+                let d_beta_d_logit = 2.0 * sig * (1.0 - sig);
+                let d_logit = d_beta * d_beta_d_logit;
+
+                // dL/d_u = d_logit * x_s
+                if let Some(u_grads) = &mut grads.u_beta_grads {
+                    let mut col = u_grads.column_mut(0);
+                    for (u, &val) in col.iter_mut().zip(x_s.iter()) {
+                        *u += val * d_logit;
+                    }
+                }
+
+                // dL/d_b = d_logit
+                if let Some(b_grads) = &mut grads.b_beta_grads {
+                    b_grads[[0, 0]] += d_logit;
+                }
+
+                // Update d_y for next step (going backwards)
+                d_y = d_y_prev;
+            }
+
+            // The final d_y is dL/dq_path (gradient at the start of the chain, which is q)
+            d_q_path = d_y;
         }
 
         (d_q_base + d_q_path, d_k_path)
@@ -336,7 +342,7 @@ impl PositionEmbedding for PathCoPE {
         if let Some(cg) = &grads.base_cope_grads {
             self.opt_base_cope.step(&mut self.base_cope, cg, lr);
         }
-        
+
         // Update alphas manually (simple SGD)
         self.alpha_path -= lr * grads.alpha_path_grad;
         self.alpha_cope -= lr * grads.alpha_cope_grad;
@@ -359,7 +365,8 @@ impl PositionEmbedding for PathCoPE {
         let u_norm: f32 = self.u_beta.iter().map(|x| x * x).sum();
         let b_norm: f32 = self.b_beta.iter().map(|x| x * x).sum();
         let base_norm: f32 = self.base_cope.iter().map(|x| x * x).sum();
-        (w_norm + u_norm + b_norm + base_norm + self.alpha_path.powi(2) + self.alpha_cope.powi(2)).sqrt()
+        (w_norm + u_norm + b_norm + base_norm + self.alpha_path.powi(2) + self.alpha_cope.powi(2))
+            .sqrt()
     }
 }
 

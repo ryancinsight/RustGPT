@@ -9,9 +9,9 @@ fn versioned_model_binary_roundtrip_smoke() {
         "rustgpt_versioned_roundtrip_{}_{}.rgpt",
         std::process::id(),
         std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let path_str = path.to_str().expect("temp path should be valid UTF-8");
 

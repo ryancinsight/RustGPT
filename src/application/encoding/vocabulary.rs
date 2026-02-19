@@ -187,8 +187,18 @@ impl Vocab {
     /// Default words for testing and initialization
     pub fn default_words() -> Vec<&'static str> {
         vec![
-            "hello", "world", "this", "is", "rust", "</s>", "<unk>", "<mask>", "<tool_call>",
-            "</tool_call>", "<tool_result>", "</tool_result>",
+            "hello",
+            "world",
+            "this",
+            "is",
+            "rust",
+            "</s>",
+            "<unk>",
+            "<mask>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_result>",
+            "</tool_result>",
         ]
     }
 

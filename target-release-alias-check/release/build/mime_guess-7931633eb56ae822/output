@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=D:\RustGPT\target-release-alias-check\release\build\mime_guess-7931633eb56ae822\out\mime_types_generated.rs

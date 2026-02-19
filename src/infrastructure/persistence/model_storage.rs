@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use crate::domain::models::llm::LLM;
 use crate::common::errors::Result;
+use crate::domain::models::llm::LLM;
 
 /// Trait for model storage backends
 ///
@@ -151,13 +151,13 @@ impl ModelStorage for FileModelStorage {
                 }
             }
         }
-        
+
         // Try JSON format if binary doesn't exist
         let json_path = self.model_path_with_ext(name, "json");
         if json_path.exists() {
             return LLM::load_json(&json_path.to_string_lossy());
         }
-        
+
         // Try auto-detect format from any extension
         if let Ok(entries) = std::fs::read_dir(&self.base_dir) {
             for entry in entries.flatten() {
@@ -174,7 +174,7 @@ impl ModelStorage for FileModelStorage {
                 }
             }
         }
-        
+
         Err(crate::common::errors::ModelError::Generic(format!(
             "Model not found: {}. Looked for {}.bin and {}.json",
             name, name, name
@@ -204,27 +204,26 @@ impl ModelStorage for FileModelStorage {
     }
 
     fn exists(&self, name: &str) -> bool {
-        self.model_path(name).exists() || 
-        self.model_path_with_ext(name, "json").exists()
+        self.model_path(name).exists() || self.model_path_with_ext(name, "json").exists()
     }
 
     fn delete(&self, name: &str) -> Result<bool> {
         let mut deleted = false;
-        
+
         // Try to delete binary version
         let bin_path = self.model_path(name);
         if bin_path.exists() {
             std::fs::remove_file(&bin_path)?;
             deleted = true;
         }
-        
+
         // Try to delete JSON version
         let json_path = self.model_path_with_ext(name, "json");
         if json_path.exists() {
             std::fs::remove_file(&json_path)?;
             deleted = true;
         }
-        
+
         Ok(deleted)
     }
 
@@ -250,13 +249,17 @@ impl ModelStorage for FileModelStorage {
             .created()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| chrono::DateTime::UNIX_EPOCH + chrono::Duration::from_std(d).unwrap_or_default());
+            .map(|d| {
+                chrono::DateTime::UNIX_EPOCH + chrono::Duration::from_std(d).unwrap_or_default()
+            });
 
         let modified_at = metadata
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| chrono::DateTime::UNIX_EPOCH + chrono::Duration::from_std(d).unwrap_or_default());
+            .map(|d| {
+                chrono::DateTime::UNIX_EPOCH + chrono::Duration::from_std(d).unwrap_or_default()
+            });
 
         Ok(ModelMetadata {
             name: name.to_string(),

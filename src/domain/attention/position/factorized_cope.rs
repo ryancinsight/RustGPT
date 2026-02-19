@@ -2,9 +2,9 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
-use super::traits::PositionEmbedding;
 use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
+use super::traits::PositionEmbedding;
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gradients container for FactorizedCoPE
 #[derive(Clone, Debug)]
@@ -108,11 +108,11 @@ impl PositionEmbedding for FactorizedCoPE {
         // Recompute forward pass intermediates
         let mut vq = Array1::zeros(self.rank);
         ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj, q, 0.0, &mut vq);
-        
+
         let up_row = self.up_proj.row(pos);
         let raw = up_row.dot(&vq);
         let scaled = raw / self.temperature;
-        
+
         // Derivative of output w.r.t raw
         // y = T * log(1 + exp(x/T))
         // dy/dx = sigmoid(x/T)
@@ -129,10 +129,10 @@ impl PositionEmbedding for FactorizedCoPE {
         // Gradients for up_proj (only for row 'pos')
         // d_up_row = d_raw * vq
         if let Some(up_grads) = &mut grads.up_proj_grads {
-             let mut d_up_row = vq.clone();
-             d_up_row *= d_raw;
-             let mut row_grad = up_grads.row_mut(pos);
-             row_grad += &d_up_row;
+            let mut d_up_row = vq.clone();
+            d_up_row *= d_raw;
+            let mut row_grad = up_grads.row_mut(pos);
+            row_grad += &d_up_row;
         }
 
         // Gradients for down_proj
@@ -140,13 +140,13 @@ impl PositionEmbedding for FactorizedCoPE {
         // d_down_proj = d_vq.outer(q)
         let mut d_vq = up_row.to_owned();
         d_vq *= d_raw;
-        
+
         if let Some(down_grads) = &mut grads.down_proj_grads {
-             // Use general_mat_mul for outer product accumulation
-             // d_vq: (rank, 1), q: (1, embed_dim)
-             let d_vq_2d = d_vq.view().into_shape_with_order((self.rank, 1)).unwrap();
-             let q_2d = q.view().into_shape_with_order((1, self.embed_dim)).unwrap();
-             ndarray::linalg::general_mat_mul(1.0, &d_vq_2d, &q_2d, 1.0, down_grads);
+            // Use general_mat_mul for outer product accumulation
+            // d_vq: (rank, 1), q: (1, embed_dim)
+            let d_vq_2d = d_vq.view().into_shape_with_order((self.rank, 1)).unwrap();
+            let q_2d = q.view().into_shape_with_order((1, self.embed_dim)).unwrap();
+            ndarray::linalg::general_mat_mul(1.0, &d_vq_2d, &q_2d, 1.0, down_grads);
         }
 
         // Gradient w.r.t q

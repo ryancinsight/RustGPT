@@ -11,17 +11,18 @@ use serde::{Deserialize, Serialize};
 use crate::{
     common::{errors::Result, rng::get_rng},
     domain::{
+        compute_backend::{ComputeBackend, resolve_compute_backend_strict_auto_gpu},
         layers::{
             components::{
                 adaptive_residuals::AdaptiveResiduals,
                 attention_context::SharedAttentionContext,
-                common::{
-                    CommonLayerConfig, CommonLayers, TemporalMixingLayer, TitanMemoryWorkspace,
-                },
+                block_core::build_shared_block_core,
+                common::{CommonLayerConfig, FeedForwardVariant, TitanMemoryWorkspace},
                 conditioning::{SharedFilmModulation, TimeConditioner, TimeEmbedding},
                 feedforward::SharedFeedforward,
                 gradient_router::GradientRouter,
                 temporal_processing::SharedTemporalProcessing,
+                unified_layer_workspace::UnifiedLayerWorkspace,
             },
             diffusion::edm,
             transformer::TransformerBlockConfig,
@@ -140,6 +141,25 @@ pub struct DiffusionBlockConfig {
     /// step count.
     #[serde(default)]
     pub ddim_steps_policy: crate::domain::layers::diffusion::DdimStepsPolicy,
+}
+
+impl From<&DiffusionBlockConfig> for CommonLayerConfig {
+    fn from(config: &DiffusionBlockConfig) -> Self {
+        Self {
+            embed_dim: config.embed_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.num_heads,
+            poly_degree: config.poly_degree,
+            max_pos: config.max_pos,
+            window_size: config.window_size,
+            use_moe: config.use_moe,
+            moe_config: config.moe_config.clone(),
+            head_selection: config.head_selection.clone(),
+            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
+            temporal_mixing: config.temporal_mixing,
+            titan_memory: config.titan_memory.clone(),
+        }
+    }
 }
 
 fn default_min_guidance() -> f32 {
@@ -654,41 +674,37 @@ pub struct DiffusionBlock {
     pub film_modulation: SharedFilmModulation,
     #[serde(skip)]
     titan_memory_workspace: TitanMemoryWorkspace,
+    #[serde(skip)]
+    unified_workspace: UnifiedLayerWorkspace,
+    #[serde(skip, default)]
+    compute_backend: ComputeBackend,
 }
 
 impl DiffusionBlock {
     pub fn new(config: DiffusionBlockConfig) -> Self {
-        let common_config = CommonLayerConfig {
-            embed_dim: config.embed_dim,
-            hidden_dim: config.hidden_dim,
-            num_heads: config.num_heads,
-            poly_degree: config.poly_degree,
-            max_pos: config.max_pos,
-            window_size: config.window_size,
-            use_moe: config.use_moe,
-            moe_config: config.moe_config.clone(),
-            head_selection: config.head_selection.clone(),
-            moh_threshold_modulation: config.moh_threshold_modulation.clone(),
-            temporal_mixing: config.temporal_mixing,
-            titan_memory: config.titan_memory.clone(),
-        };
-        let layers = CommonLayers::new(&common_config);
+        let embed_dim = config.embed_dim;
+        let hidden_dim = config.hidden_dim;
+        let time_embed_dim = config.time_embed_dim;
+        let num_timesteps = config.num_timesteps;
+        let max_pos = config.max_pos;
+        let window_size = config.window_size;
+        let use_adaptive_window = config.use_adaptive_window;
+        let use_advanced_adaptive_residuals = config.use_advanced_adaptive_residuals;
+        let noise_schedule = config.noise_schedule.clone();
 
-        let time_embedding = TimeEmbedding::new(config.time_embed_dim);
+        let common_config = CommonLayerConfig::from(&config);
+        let core_layers = build_shared_block_core(&common_config, window_size, use_adaptive_window);
+
+        let time_embedding = TimeEmbedding::new(time_embed_dim);
         // Output dim of time conditioner = 4 * embed_dim (gamma_attn, beta_attn, gamma_ffn,
         // beta_ffn)
-        let time_conditioner = TimeConditioner::new(
-            config.time_embed_dim,
-            config.hidden_dim,
-            config.embed_dim * 4,
-        );
-        let noise_scheduler =
-            NoiseScheduler::new(config.noise_schedule.clone(), config.num_timesteps);
+        let time_conditioner = TimeConditioner::new(time_embed_dim, hidden_dim, embed_dim * 4);
+        let noise_scheduler = NoiseScheduler::new(noise_schedule, num_timesteps);
 
         let discrete_scheduler = if config.discrete_masked {
             Some(
                 crate::domain::layers::diffusion::discrete::DiscreteMaskScheduler::new(
-                    config.num_timesteps,
+                    num_timesteps,
                 ),
             )
         } else {
@@ -699,51 +715,45 @@ impl DiffusionBlock {
         context.similarity_context_strength = default_similarity_context_strength();
         context.similarity_update_rate = 0.01;
 
-        let temporal_mixing = SharedTemporalProcessing::new(
-            layers.temporal_mixing,
-            config.window_size,
-            config.use_adaptive_window,
-        );
-
         let opt_similarity_context_strength = Adam::new((1, 1));
 
-        let mut film_modulation = SharedFilmModulation::new(config.embed_dim);
+        let mut film_modulation = SharedFilmModulation::new(embed_dim);
         film_modulation.scale_gamma = 0.1;
         film_modulation.scale_beta = 0.1;
 
         Self {
-            config: config.clone(),
-            temporal_mixing,
-            feedforward: SharedFeedforward::new(layers.feedforward),
-            pre_attention_norm: layers.pre_attention_norm,
-            pre_ffn_norm: layers.pre_ffn_norm,
+            config,
+            temporal_mixing: core_layers.temporal_mixing,
+            feedforward: core_layers.feedforward,
+            pre_attention_norm: core_layers.pre_attention_norm,
+            pre_ffn_norm: core_layers.pre_ffn_norm,
             time_embedding,
             time_conditioner,
             noise_scheduler,
             cached_intermediates: RwLock::new(None),
             discrete_scheduler,
-            current_window_size: config.window_size,
-            win_max: config.max_pos,
+            current_window_size: window_size,
+            win_max: max_pos,
             win_min: 16,
             win_step_up: 16,
             win_step_down: 16,
             pred_up: 1.2,
             pred_down: 0.8,
-            adaptive_window_on: config.use_adaptive_window,
+            adaptive_window_on: use_adaptive_window,
             enable_dropout: false,
             dropout_rate: 0.0,
             use_ema_for_sampling: false,
             ema_decay: 0.999,
             current_timestep: 0,
             param_partitions: RwLock::new(None),
-            adaptive_residuals: if config.use_advanced_adaptive_residuals {
-                let mut residuals = AdaptiveResiduals::new_minimal(config.embed_dim);
-                residuals.max_seq_len = config.num_timesteps.min(2048);
+            adaptive_residuals: if use_advanced_adaptive_residuals {
+                let mut residuals = AdaptiveResiduals::new_minimal(embed_dim);
+                residuals.max_seq_len = num_timesteps.min(2048);
                 Some(residuals)
             } else {
                 None
             },
-            activation_similarity_matrix: Array2::zeros((config.embed_dim, config.embed_dim)),
+            activation_similarity_matrix: Array2::zeros((embed_dim, embed_dim)),
             incoming_similarity_context: None,
             similarity_context_strength: default_similarity_context_strength(),
             similarity_update_rate: 0.01,
@@ -751,6 +761,13 @@ impl DiffusionBlock {
             opt_similarity_context_strength,
             film_modulation,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
+            unified_workspace: {
+                let mut ws = UnifiedLayerWorkspace::new();
+                // Enable diffusion-specific buffers (time embedding, FiLM parameters, etc.)
+                ws.set_diffusion_buffers_enabled(true);
+                ws
+            },
+            compute_backend: ComputeBackend::Cpu,
         }
     }
 
@@ -758,29 +775,13 @@ impl DiffusionBlock {
         self.config.max_pos.saturating_add(1)
     }
 
-    pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
+    pub fn activation_similarity_matrix(&self) -> Option<&Array2<f32>> {
         self.context.get_outgoing_context()
     }
 
     pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
-        if let Some(ctx) = context {
-            if ctx.nrows() != self.config.embed_dim || ctx.ncols() != self.config.embed_dim {
-                self.context.incoming_context = None;
-                return;
-            }
-
-            if let Some(existing) = self.context.incoming_context.as_mut() {
-                if existing.dim() == ctx.dim() {
-                    existing.assign(ctx);
-                } else {
-                    *existing = ctx.clone();
-                }
-            } else {
-                self.context.incoming_context = Some(ctx.clone());
-            }
-        } else {
-            self.context.incoming_context = None;
-        }
+        self.context
+            .set_incoming_context_checked_reuse(context, self.config.embed_dim);
     }
 
     /// Get the cached intermediates
@@ -803,6 +804,77 @@ impl DiffusionBlock {
 
     pub fn set_causal_attention(&mut self, causal: bool) {
         self.config.causal_attention = causal;
+    }
+
+    /// Get reference to temporal mixing layer.
+    #[inline]
+    pub fn temporal_mixing(&self) -> &SharedTemporalProcessing {
+        &self.temporal_mixing
+    }
+
+    /// Get mutable reference to temporal mixing layer.
+    #[inline]
+    pub fn temporal_mixing_mut(&mut self) -> &mut SharedTemporalProcessing {
+        &mut self.temporal_mixing
+    }
+
+    /// Get reference to feedforward layer.
+    #[inline]
+    pub fn feedforward(&self) -> &FeedForwardVariant {
+        self.feedforward.variant()
+    }
+
+    /// Get mutable reference to feedforward layer.
+    #[inline]
+    pub fn feedforward_mut(&mut self) -> &mut FeedForwardVariant {
+        self.feedforward.variant_mut()
+    }
+
+    pub fn set_training_mode(&mut self, is_training: bool) {
+        if let Some(moe) = self.feedforward_mut().as_moe_mut() {
+            moe.set_training_mode(is_training);
+        }
+    }
+
+    /// Set runtime compute backend for this block and shared components.
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        self.set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set DiffusionBlock backend '{}': {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
+    }
+
+    /// Set runtime compute backend with strict validation.
+    ///
+    /// When a GPU backend is selected this eagerly validates shared component
+    /// GPU readiness, surfacing unsupported GPU variants immediately.
+    pub fn set_compute_backend_checked(&mut self, compute_backend: ComputeBackend) -> Result<()> {
+        self.compute_backend = compute_backend;
+        self.unified_workspace.set_compute_backend(compute_backend);
+        self.temporal_mixing
+            .set_compute_backend_checked(compute_backend)?;
+        self.feedforward
+            .set_compute_backend_checked(compute_backend)?;
+        Ok(())
+    }
+
+    /// Resolve and apply strict auto-GPU backend preference.
+    ///
+    /// Uses automatic GPU detection with strict no-fallback behavior when a GPU
+    /// is detected but not usable for the selected layer variants.
+    pub fn enable_gpu_auto_detect(&mut self) -> Result<()> {
+        let backend = resolve_compute_backend_strict_auto_gpu()?;
+        self.set_compute_backend_checked(backend)
+    }
+
+    /// Get runtime compute backend.
+    #[inline]
+    pub fn compute_backend(&self) -> ComputeBackend {
+        self.compute_backend
     }
 
     pub fn min_snr_weight(&self, t: usize, gamma: f32) -> f32 {
@@ -939,6 +1011,13 @@ impl DiffusionBlock {
     /// Returns the model prediction in the configured parameterization
     /// (`Epsilon`, `VPrediction`, `Sample`, or `EdmX0`).
     pub fn forward_with_timestep(&mut self, x_t: &Array2<f32>, t: usize) -> Array2<f32> {
+        // GPU execution is handled by sub-components (temporal_mixing, feedforward)
+        // which have their own GPU forward paths.
+        self.unified_workspace.ensure_exact_execution_capacity(
+            x_t.nrows(),
+            x_t.ncols(),
+            self.config.embed_dim,
+        );
         if self.current_window_size != self.config.window_size {
             self.config.window_size = self.current_window_size;
         }
@@ -959,13 +1038,59 @@ impl DiffusionBlock {
                 (x_t.clone(), 0.0, 1.0, false)
             };
 
-        let input_original = x_model_in;
-        let input_used = self.context.apply_context(&input_original).into_owned();
+        let input_original_arc = Arc::new(x_model_in);
+        let input_used_arc: Arc<Array2<f32>> = if self.context.has_context() {
+            let input_used_buf = self
+                .unified_workspace
+                .residual1_mut()
+                .expect("residual1 workspace buffer must be allocated");
+            let applied = self
+                .context
+                .apply_context_into(input_original_arc.as_ref(), input_used_buf)
+                .unwrap_or_else(|err| {
+                    panic!("DiffusionBlock context apply_context_into failed: {err}")
+                });
+            if applied {
+                Arc::new(input_used_buf.clone())
+            } else {
+                input_original_arc.clone()
+            }
+        } else {
+            input_original_arc.clone()
+        };
 
-        let norm1_out = self.pre_attention_norm.forward(&input_used);
+        // Pre-attention norm into workspace buffer.
+        {
+            let norm1_out_buf = self
+                .unified_workspace
+                .norm1_out_mut()
+                .expect("norm1_out workspace buffer must be allocated");
+            self.pre_attention_norm
+                .normalize_into(input_used_arc.as_ref(), norm1_out_buf);
+        }
+        let norm1_out = self
+            .unified_workspace
+            .norm1_out()
+            .expect("norm1_out workspace buffer must be allocated")
+            .clone();
 
-        // Use shared FiLM modulation
-        let norm1_mod = self.film_modulation.apply_attn_conditioning(&norm1_out);
+        // FiLM attention conditioning into reusable workspace buffer.
+        {
+            let norm1_mod_buf = self
+                .unified_workspace
+                .ffn_intermediate_mut()
+                .expect("ffn_intermediate workspace buffer must be allocated");
+            self.film_modulation
+                .apply_attn_conditioning_into(&norm1_out, norm1_mod_buf)
+                .unwrap_or_else(|err| {
+                    panic!("DiffusionBlock FiLM attn conditioning failed: {err}")
+                });
+        }
+        let norm1_mod = self
+            .unified_workspace
+            .ffn_intermediate()
+            .expect("ffn_intermediate workspace buffer must be allocated")
+            .clone();
 
         // Update window size if needed
         self.temporal_mixing
@@ -986,44 +1111,61 @@ impl DiffusionBlock {
         // unless we want to push modulation *into* the layer.
         // For now, let's keep manual modulation using the helper, then call the layer.
 
-        let mut attn_out = self
-            .temporal_mixing
-            .forward_with_causal(&norm1_mod, self.config.causal_attention);
-
-        if !matches!(
-            self.temporal_mixing.temporal_mixing,
-            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
-        ) {
-            self.config.titan_memory.apply_into_out_with_workspace(
-                &mut attn_out,
-                &norm1_mod,
-                &mut self.titan_memory_workspace,
-            );
+        {
+            let attn_out_buf = self
+                .unified_workspace
+                .temporal_out_mut()
+                .expect("temporal_out workspace buffer must be allocated");
+            self.temporal_mixing
+                .forward_with_titan_fusion_into(
+                    &norm1_mod,
+                    attn_out_buf,
+                    self.config.causal_attention,
+                    &self.config.titan_memory,
+                    &mut self.titan_memory_workspace,
+                )
+                .unwrap_or_else(|err| panic!("DiffusionBlock temporal forward_into failed: {err}"));
         }
+        let mut attn_out = self
+            .unified_workspace
+            .temporal_out()
+            .expect("temporal_out workspace buffer must be allocated")
+            .clone();
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut attn_out, self.dropout_rate);
         }
         self.context.update_outgoing_context(
-            &input_used.view(),
+            &input_used_arc.as_ref().view(),
             &attn_out.view(),
             self.config.embed_dim,
         );
 
-        let (head_ratio_opt, head_vec_opt) = self.temporal_mixing.get_head_activity_metrics();
-        let head_activity_ratio = head_ratio_opt.unwrap_or(1.0);
-        let head_activity_vec = head_vec_opt;
-        let token_head_activity_vec = self.temporal_mixing.get_token_head_activity_vec();
+        let head_activity = self.temporal_mixing.head_activity_summary();
+        let head_activity_ratio = head_activity.ratio;
+        let head_activity_vec = head_activity.head_activity;
+        let token_head_activity_vec = head_activity.token_head_activity;
         let residual1 = if let Some(ref mut adaptive_residuals) = self.adaptive_residuals {
             adaptive_residuals.apply_attention_residual_with_moh(
-                &input_used,
+                input_used_arc.as_ref(),
                 &attn_out,
                 Some(head_activity_ratio),
                 head_activity_vec,
             )
         } else {
-            &input_used + &attn_out
+            input_used_arc.as_ref() + &attn_out
         };
-        let norm2_out = self.pre_ffn_norm.forward(&residual1);
+        {
+            let norm2_out_buf = self
+                .unified_workspace
+                .norm2_out_mut()
+                .expect("norm2_out workspace buffer must be allocated");
+            self.pre_ffn_norm.normalize_into(&residual1, norm2_out_buf);
+        }
+        let norm2_out = self
+            .unified_workspace
+            .norm2_out()
+            .expect("norm2_out workspace buffer must be allocated")
+            .clone();
 
         // FFN Modulation
         // We can use the new `forward_with_film` in `SharedFeedforward`!
@@ -1037,14 +1179,43 @@ impl DiffusionBlock {
         // However, `SharedTemporalProcessing` does NOT have `forward_with_film` exposed in the same way (it delegates).
         // To be consistent, let's do manual modulation here using `SharedFilmModulation` helper, then standard forward.
 
-        let norm2_mod = self.film_modulation.apply_ffn_conditioning(&norm2_out);
+        {
+            let norm2_mod_buf = self
+                .unified_workspace
+                .residual1_mut()
+                .expect("residual1 workspace buffer must be allocated");
+            self.film_modulation
+                .apply_ffn_conditioning_into(&norm2_out, norm2_mod_buf)
+                .unwrap_or_else(|err| panic!("DiffusionBlock FiLM ffn conditioning failed: {err}"));
+        }
+        let norm2_mod = self
+            .unified_workspace
+            .residual1()
+            .expect("residual1 workspace buffer must be allocated")
+            .clone();
 
-        let mut ffn_out = self.feedforward.forward_with_token_head_activity(
-            &norm2_mod,
-            Some(head_activity_ratio),
-            head_activity_vec,
-            token_head_activity_vec,
-        );
+        {
+            let ffn_out_buf = self
+                .unified_workspace
+                .ffn_out_mut()
+                .expect("ffn_out workspace buffer must be allocated");
+            self.feedforward
+                .forward_with_token_head_activity_into(
+                    &norm2_mod,
+                    ffn_out_buf,
+                    Some(head_activity_ratio),
+                    head_activity_vec,
+                    token_head_activity_vec,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("DiffusionBlock feedforward forward_into failed: {err}")
+                });
+        }
+        let mut ffn_out = self
+            .unified_workspace
+            .ffn_out()
+            .expect("ffn_out workspace buffer must be allocated")
+            .clone();
 
         if self.enable_dropout && self.dropout_rate > 0.0 {
             Self::apply_dropout_inplace(&mut ffn_out, self.dropout_rate);
@@ -1067,12 +1238,12 @@ impl DiffusionBlock {
         }
 
         // Store intermediates Arc-backed so cache clones are shallow (important for LRM replay).
-        let h_vec = Array1::from_vec(h.row(0).to_vec());
+        let h_vec = h.row(0).to_owned();
         let cached_output = prediction.clone();
 
         *self.cached_intermediates.write().unwrap() = Some(DiffusionCachedIntermediates {
-            input_original: Arc::new(input_original),
-            input_used: Arc::new(input_used),
+            input_original: input_original_arc,
+            input_used: input_used_arc,
             time_embed: Arc::new(time_embed),
             norm1_out: Arc::new(norm1_out),
             norm1_mod: Arc::new(norm1_mod),
@@ -1090,18 +1261,19 @@ impl DiffusionBlock {
             output: Arc::new(cached_output),
             timestep: t,
         });
-        if self.adaptive_window_on
-            && let TemporalMixingLayer::Attention(attn) = &mut self.temporal_mixing.temporal_mixing
-            && let Some(pn) = attn.last_pred_norm
-        {
-            let mut ws = self.current_window_size.unwrap_or(self.win_max);
-            if pn > self.pred_up {
-                ws = (ws + self.win_step_up).min(self.win_max);
-            } else if pn < self.pred_down {
-                ws = ws.saturating_sub(self.win_step_down).max(self.win_min);
+        if self.adaptive_window_on {
+            let current = self.current_window_size.unwrap_or(self.win_max);
+            if let Some(ws) = self.temporal_mixing.update_attention_window_from_pred_norm(
+                current,
+                self.win_min,
+                self.win_max,
+                self.win_step_up,
+                self.win_step_down,
+                self.pred_up,
+                self.pred_down,
+            ) {
+                self.current_window_size = Some(ws);
             }
-            self.current_window_size = Some(ws);
-            attn.set_window_size(self.current_window_size);
         }
         prediction
     }
@@ -1697,10 +1869,7 @@ impl Layer for DiffusionBlock {
             let (mut attn_input_grad_mod, attn_param_grads) = self
                 .temporal_mixing
                 .compute_gradients(norm1_mod, attn_out_grads);
-            if !matches!(
-                &self.temporal_mixing.temporal_mixing,
-                TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
-            ) {
+            if self.temporal_mixing.needs_external_titan_memory() {
                 self.config
                     .titan_memory
                     .add_input_grads_from_output_grads_into(
@@ -1912,14 +2081,8 @@ impl Layer for DiffusionBlock {
         )?;
 
         router.route_exact_ref_to_closure::<4, _>(partitions.time_conditioner, |grads| {
-            let grads_tuple = (
-                grads[0].as_ref(),
-                grads[1].as_ref(),
-                grads[2].as_ref(),
-                grads[3].as_ref(),
-            );
             self.time_conditioner
-                .apply_gradients(grads_tuple, lr, self.ema_decay);
+                .apply_gradients(grads.as_slice(), lr, self.ema_decay);
             Ok(())
         })?;
 
@@ -1991,6 +2154,30 @@ impl From<TransformerBlockConfig> for DiffusionBlockConfig {
             max_guidance_scale: default_max_guidance(),
             ddim_steps_policy: Default::default(),
         }
+    }
+}
+
+// Unified workspace management for memory optimization
+impl crate::domain::layers::components::workspace_managed::WorkspaceManaged for DiffusionBlock {
+    /// Ensure workspace buffers are allocated with correct capacity.
+    ///
+    /// This consolidates the diffusion-specific buffer allocation patterns (time embeddings,
+    /// FiLM parameters, input/output caches) into a single unified interface.
+    fn ensure_capacity(&mut self, batch_size: usize, seq_len: usize, embed_dim: usize) {
+        self.unified_workspace
+            .ensure_capacity(batch_size, seq_len, embed_dim);
+    }
+
+    /// Clear all workspace buffers to free memory.
+    fn clear_workspace(&mut self) {
+        self.unified_workspace.clear_workspace();
+    }
+
+    /// Get memory statistics for all managed buffers.
+    fn workspace_stats(
+        &self,
+    ) -> crate::domain::layers::components::workspace_managed::WorkspaceStats {
+        self.unified_workspace.workspace_stats()
     }
 }
 
@@ -2361,6 +2548,20 @@ mod tests {
         let mut block = DiffusionBlock::new(config);
         let out = block.sample_with_guidance((4, 8), None, None, None);
         assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_diffusion_block_set_compute_backend_checked_cpu() {
+        let mut block = make_test_diffusion_block(DiffusionPredictionTarget::Epsilon);
+
+        block
+            .set_compute_backend_checked(crate::domain::compute_backend::ComputeBackend::Cpu)
+            .expect("CPU backend should always be accepted");
+
+        assert_eq!(
+            block.compute_backend(),
+            crate::domain::compute_backend::ComputeBackend::Cpu
+        );
     }
 }
 

@@ -3,14 +3,14 @@
 //! Tests the complete pipeline from data loading through multimodal processing.
 
 use llm::domain::multimodal::{
-    image::{ImageConfig, ImageEncoder, ImageSample},
     audio::{AudioConfig, AudioEncoder, AudioSample},
-    processor::{Modality, MultiModalProcessor, MultiModalExample},
+    image::{ImageConfig, ImageEncoder, ImageSample},
+    processor::{Modality, MultiModalExample, MultiModalProcessor},
 };
 use llm::infrastructure::persistence::{
-    mnist_loader::{load_mnist_training_data, MNIST_IMAGE_SIZE},
-    speech_loader::{load_speech_training_data, SPEECH_COMMANDS},
     dataset::{Dataset, DatasetType},
+    mnist_loader::{MNIST_IMAGE_SIZE, load_mnist_training_data},
+    speech_loader::{SPEECH_COMMANDS, load_speech_training_data},
 };
 
 /// Test MNIST data loading and image encoding
@@ -26,8 +26,11 @@ fn test_mnist_image_loading_and_encoding() {
         }
     };
 
-    assert!(!examples.is_empty(), "Should load at least some MNIST examples");
-    
+    assert!(
+        !examples.is_empty(),
+        "Should load at least some MNIST examples"
+    );
+
     // Create image encoder
     let config = ImageConfig {
         image_height: MNIST_IMAGE_SIZE,
@@ -38,17 +41,21 @@ fn test_mnist_image_loading_and_encoding() {
         use_cls_token: true,
         ..Default::default()
     };
-    
+
     let encoder = ImageEncoder::new(config).expect("Failed to create image encoder");
-    
+
     // Test encoding
     let pixels = vec![0.5f32; MNIST_IMAGE_SIZE * MNIST_IMAGE_SIZE];
     let sample = ImageSample::new(pixels, MNIST_IMAGE_SIZE, MNIST_IMAGE_SIZE, 1);
-    
+
     let embeddings = encoder.encode(&sample).expect("Failed to encode image");
-    
+
     // 28x28 with 7x7 patches = 4x4 = 16 patches + 1 CLS = 17
-    assert_eq!(embeddings.nrows(), 17, "Should have 17 embeddings (16 patches + CLS)");
+    assert_eq!(
+        embeddings.nrows(),
+        17,
+        "Should have 17 embeddings (16 patches + CLS)"
+    );
     assert_eq!(embeddings.ncols(), 64, "Embedding dimension should be 64");
 }
 
@@ -56,7 +63,7 @@ fn test_mnist_image_loading_and_encoding() {
 #[test]
 fn test_speech_commands_loading() {
     let speech_dir = "data/speech_commands";
-    
+
     let examples = match load_speech_training_data(speech_dir, Some(5)) {
         Ok(examples) => examples,
         Err(_) => {
@@ -64,19 +71,22 @@ fn test_speech_commands_loading() {
             return;
         }
     };
-    
-    assert!(!examples.is_empty(), "Should load at least some speech examples");
-    
+
+    assert!(
+        !examples.is_empty(),
+        "Should load at least some speech examples"
+    );
+
     // Check that we have examples from expected commands
-    let commands_found: std::collections::HashSet<_> = examples
-        .iter()
-        .map(|ex| ex.transcript.clone())
-        .collect();
-    
+    let commands_found: std::collections::HashSet<_> =
+        examples.iter().map(|ex| ex.transcript.clone()).collect();
+
     println!("Commands found: {:?}", commands_found);
-    
+
     // Should have at least one of the expected commands
-    let has_expected = SPEECH_COMMANDS.iter().any(|cmd| commands_found.contains(*cmd));
+    let has_expected = SPEECH_COMMANDS
+        .iter()
+        .any(|cmd| commands_found.contains(*cmd));
     assert!(has_expected, "Should have at least one expected command");
 }
 
@@ -99,15 +109,15 @@ fn test_audio_encoding() {
         embedding_dim: 64,
         ..Default::default()
     };
-    
+
     let encoder = AudioEncoder::new(config).expect("Failed to create audio encoder");
-    
+
     // Create synthetic audio sample matching the expected duration
     let waveform = vec![0.1f32; 16000]; // 1 second at 16kHz
     let sample = AudioSample::new(waveform, 16000);
-    
+
     let embeddings = encoder.encode(&sample).expect("Failed to encode audio");
-    
+
     assert!(embeddings.nrows() > 0, "Should have audio embeddings");
     assert_eq!(embeddings.ncols(), 64, "Embedding dimension should be 64");
 }
@@ -138,35 +148,35 @@ fn test_multimodal_processor() {
             embedding_dim: 64,
             ..Default::default()
         }),
-    ).expect("Failed to create multimodal processor");
-    
+    )
+    .expect("Failed to create multimodal processor");
+
     // Test text example
     let text_example = MultiModalExample::Text {
         tokens: vec![1, 2, 3, 4, 5],
         label: None,
     };
-    
+
     assert_eq!(text_example.primary_modality(), Modality::Text);
     assert!(text_example.has_modality(Modality::Text));
     assert!(!text_example.has_modality(Modality::Image));
-    
+
     // Test image example
-    let image_sample = ImageSample::new(
-        vec![0.5f32; 28 * 28],
-        28,
-        28,
-        1,
-    );
-    let image_example = MultiModalExample::Image { sample: image_sample };
-    
+    let image_sample = ImageSample::new(vec![0.5f32; 28 * 28], 28, 28, 1);
+    let image_example = MultiModalExample::Image {
+        sample: image_sample,
+    };
+
     assert_eq!(image_example.primary_modality(), Modality::Image);
-    
+
     // Test audio example
     let audio_sample = AudioSample::new(vec![0.1f32; 8000], 8000);
-    let audio_example = MultiModalExample::Audio { sample: audio_sample };
-    
+    let audio_example = MultiModalExample::Audio {
+        sample: audio_sample,
+    };
+
     assert_eq!(audio_example.primary_modality(), Modality::Audio);
-    
+
     // Verify processor supports correct modalities
     assert!(processor.supports_modality(Modality::Text));
     assert!(processor.supports_modality(Modality::Image));
@@ -181,10 +191,10 @@ fn test_dataset_with_real_multimodal_data() {
         "data/pretraining_data.json".to_string(),
         "data/chat_training_data.json".to_string(),
         DatasetType::JSON,
-        Some(100),    // Max 100 MNIST samples
-        Some(5),      // Max 5 per speech class
+        Some(100), // Max 100 MNIST samples
+        Some(5),   // Max 5 per speech class
     );
-    
+
     match dataset {
         Ok(dataset) => {
             println!(
@@ -192,20 +202,23 @@ fn test_dataset_with_real_multimodal_data() {
                 dataset.image_training_data.len(),
                 dataset.speech_training_data.len()
             );
-            
+
             // Check if we got multimodal data
             let has_images = !dataset.image_training_data.is_empty();
             let has_speech = !dataset.speech_training_data.is_empty();
-            
+
             if has_images || has_speech {
                 println!("Successfully loaded multimodal data");
-                
+
                 // Test getting all text data
                 let all_text = dataset.get_all_text_data();
                 assert!(!all_text.is_empty(), "Should have some text data");
-                
+
                 // Test multimodal check
-                assert!(dataset.has_multimodal_data(), "Should detect multimodal data");
+                assert!(
+                    dataset.has_multimodal_data(),
+                    "Should detect multimodal data"
+                );
             } else {
                 println!("No multimodal data found (data directories may not exist)");
             }
@@ -221,7 +234,7 @@ fn test_dataset_with_real_multimodal_data() {
 #[test]
 fn test_multimodal_batch_processing() {
     let processor = MultiModalProcessor::text_only(64);
-    
+
     // Create batch of text examples
     let examples = vec![
         MultiModalExample::Text {
@@ -233,12 +246,14 @@ fn test_multimodal_batch_processing() {
             label: None,
         },
     ];
-    
-    let batch = processor.process_batch(&examples).expect("Failed to process batch");
-    
+
+    let batch = processor
+        .process_batch(&examples)
+        .expect("Failed to process batch");
+
     assert_eq!(batch.batch_size, 2);
     assert!(!batch.embeddings.is_empty());
-    
+
     // Check sequence length calculation
     let total_len = batch.total_sequence_length();
     assert_eq!(total_len, 7, "Total sequence length should be 3 + 4 = 7");
@@ -248,24 +263,25 @@ fn test_multimodal_batch_processing() {
 #[test]
 fn test_image_normalization() {
     use llm::domain::multimodal::image::ImageNormRange;
-    
+
     // Test [-1, 1] normalization with known input range [0, 255]
-    let mut sample = ImageSample::new(
-        vec![0.0f32, 127.5, 255.0],
-        1,
-        3,
-        1,
-    );
+    let mut sample = ImageSample::new(vec![0.0f32, 127.5, 255.0], 1, 3, 1);
     sample.normalize(ImageNormRange::NegOneToOne);
-    
+
     // 0 -> -1, 127.5 -> 0, 255 -> 1
-    assert!((sample.pixels[0] - (-1.0)).abs() < 1e-5, "0 should map to -1");
+    assert!(
+        (sample.pixels[0] - (-1.0)).abs() < 1e-5,
+        "0 should map to -1"
+    );
     assert!(sample.pixels[1].abs() < 1e-5, "127.5 should map to ~0");
     assert!((sample.pixels[2] - 1.0).abs() < 1e-5, "255 should map to 1");
-    
+
     // Verify max is 1.0 after normalization
     let max_val = sample.pixels.iter().fold(f32::MIN, |a, &b| a.max(b));
-    assert!((max_val - 1.0).abs() < 1e-5, "Max should be ~1.0 after normalization");
+    assert!(
+        (max_val - 1.0).abs() < 1e-5,
+        "Max should be ~1.0 after normalization"
+    );
 }
 
 /// Test audio preprocessing operations
@@ -275,24 +291,35 @@ fn test_audio_preprocessing() {
         (0..16000).map(|i| (i as f32 / 16000.0).sin()).collect(),
         16000,
     );
-    
+
     // Test normalization
     sample.normalize();
     let max_abs = sample.waveform.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-    assert!((max_abs - 1.0).abs() < 1e-5 || max_abs == 0.0, "Max abs should be ~1.0 after normalization");
-    
+    assert!(
+        (max_abs - 1.0).abs() < 1e-5 || max_abs == 0.0,
+        "Max abs should be ~1.0 after normalization"
+    );
+
     // Test pad/truncate
     sample.pad_or_truncate(8000);
     assert_eq!(sample.waveform.len(), 8000);
-    
+
     // Test resampling - from 16000 to 8000 Hz, should give half the samples
     let original_sample = AudioSample::new(vec![0.0f32, 0.5, 1.0, 0.5, 0.0], 16000);
     let resampled = original_sample.resample(8000);
     // 5 samples at 16000 Hz downsampled to 8000 Hz should give 2 samples (5 * 8000/16000 = 2.5 -> 2)
-    assert_eq!(resampled.len(), 2, "Half sample rate should give approximately half samples");
-    
+    assert_eq!(
+        resampled.len(),
+        2,
+        "Half sample rate should give approximately half samples"
+    );
+
     // Test with a longer sample for more accurate resampling check
     let long_sample = AudioSample::new(vec![0.1f32; 16000], 16000);
     let resampled_long = long_sample.resample(8000);
-    assert_eq!(resampled_long.len(), 8000, "16000 samples at 16000Hz downsampled to 8000Hz should give 8000 samples");
+    assert_eq!(
+        resampled_long.len(),
+        8000,
+        "16000 samples at 16000Hz downsampled to 8000Hz should give 8000 samples"
+    );
 }

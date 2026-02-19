@@ -1,5 +1,7 @@
 pub use crate::domain::memory::EngramMemory;
-pub use crate::domain::memory::titans::{NeuralMemory, TitansMAC, TitansMAG, TitansMAL, TitansMemory};
+pub use crate::domain::memory::titans::{
+    NeuralMemory, TitansMAC, TitansMAG, TitansMAL, TitansMemory,
+};
 
 pub mod memory {
     pub use crate::domain::memory::EngramMemory;

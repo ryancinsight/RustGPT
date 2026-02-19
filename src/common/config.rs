@@ -308,6 +308,9 @@ mod tests {
 
     #[test]
     fn test_config_singleton() {
-        assert_eq!(TrainingConstants::LR_MIN_RATIO, TrainingConstants::LR_MIN_RATIO);
+        assert_eq!(
+            TrainingConstants::LR_MIN_RATIO,
+            TrainingConstants::LR_MIN_RATIO
+        );
     }
 }

@@ -36,8 +36,42 @@ pub enum ModelError {
         message: String,
     },
 
+    #[error("Backend error: {message}")]
+    Backend { message: String },
+
+    #[error("GPU device not found: {message}")]
+    GpuDeviceNotFound { message: String },
+
+    #[error("GPU initialization failed: {message}")]
+    GpuInitializationError { message: String },
+
+    #[error("GPU memory allocation failed: {message}")]
+    GpuMemoryAllocation { message: String },
+
+    #[error("GPU shader compilation failed: {message}")]
+    GpuShaderCompilation { message: String },
+
+    #[error("Feature not implemented: {0}")]
+    NotImplemented(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
+
+    #[error("Dimension mismatch: {message}")]
+    DimensionMismatch { message: String },
+
+    #[error("Dimension mismatch: expected {expected}, got {got}")]
+    DimensionMismatchDetailed { expected: String, got: String },
+}
+
+impl From<ndarray::ShapeError> for ModelError {
+    fn from(err: ndarray::ShapeError) -> Self {
+        ModelError::ShapeMismatch {
+            expected: vec![],
+            actual: vec![],
+            message: format!("{:?}", err),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;

@@ -1,6 +1,7 @@
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView1};
 
 use crate::domain::pade::PadeExp;
+use crate::domain::richards::RichardsCurve;
 
 /// Smoothly saturate values to ±limit using tanh.
 ///
@@ -62,6 +63,80 @@ pub fn smooth_saturate_01(x: f32) -> f32 {
     // while remaining smooth.
     let beta = 10.0f32;
     x - softplus_beta(x - 1.0, beta) + softplus_beta(-x, beta)
+}
+
+/// Dynamic bilinear low-rank attention scale.
+/// Kept conservative so it augments dot-product attention without dominating it.
+pub const DYNAMIC_BLR_BASE_SCALE: f32 = 0.15;
+
+/// Choose a dynamic low-rank dimension from head dimension.
+/// Uses sqrt(d_h) with practical caps for stability and efficiency.
+#[inline]
+pub fn dynamic_blr_rank(head_dim: usize) -> usize {
+    let r = (head_dim as f32).sqrt().round() as usize;
+    r.clamp(2, 16).min(head_dim.max(1))
+}
+
+/// Low-rank bilinear scaling factor for the chosen rank.
+#[inline]
+pub fn dynamic_blr_scale(rank: usize) -> f32 {
+    DYNAMIC_BLR_BASE_SCALE / (rank.max(1) as f32).sqrt()
+}
+
+/// Compute chunk bounds for low-rank compression.
+/// Returns `[start, end)` indices for component `comp_idx`.
+#[inline]
+pub fn dynamic_blr_chunk_bounds(head_dim: usize, rank: usize, comp_idx: usize) -> (usize, usize) {
+    let rank = rank.max(1).min(head_dim.max(1));
+    let base = head_dim / rank;
+    let rem = head_dim % rank;
+
+    let extra_before = comp_idx.min(rem);
+    let start = comp_idx * base + extra_before;
+    let len = base + usize::from(comp_idx < rem);
+    (start, start + len.max(1))
+}
+
+/// Compute mean-pooled low-rank components for a head vector.
+#[inline]
+pub fn dynamic_blr_components(vec: &ArrayView1<'_, f32>, rank: usize, out: &mut [f32]) {
+    let head_dim = vec.len();
+    let rank = rank.min(head_dim.max(1));
+    assert!(out.len() >= rank);
+
+    for (m, slot) in out.iter_mut().enumerate().take(rank) {
+        let (s, e) = dynamic_blr_chunk_bounds(head_dim, rank, m);
+        let len = (e - s).max(1) as f32;
+        let mut sum = 0.0f32;
+        for idx in s..e {
+            let v = vec[idx];
+            if v.is_finite() {
+                sum += v;
+            }
+        }
+        *slot = sum / len;
+    }
+}
+
+/// Compute query-adaptive low-rank bilinear coefficients with learnable Richards gating:
+/// `h_m = u_m * g(u_m)` and `dh_du_m = g(u_m) + u_m * g'(u_m)`.
+#[inline]
+pub fn dynamic_blr_query_coeffs(
+    q_comp: &[f32],
+    gate_curve: &RichardsCurve,
+    h_out: &mut [f32],
+    dh_du_out: &mut [f32],
+) {
+    assert!(h_out.len() >= q_comp.len());
+    assert!(dh_du_out.len() >= q_comp.len());
+
+    for (i, &u_raw) in q_comp.iter().enumerate() {
+        let u = if u_raw.is_finite() { u_raw } else { 0.0 };
+        let g = gate_curve.forward_scalar_f32(u);
+        let dg_du = gate_curve.derivative_scalar_f32(u);
+        h_out[i] = u * g;
+        dh_du_out[i] = g + u * dg_du;
+    }
 }
 
 /// Attention utility functions for common operations

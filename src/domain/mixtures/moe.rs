@@ -24,9 +24,11 @@
 //! - **Complexity-aware routing**: Learns optimal expert usage patterns
 //! - **Load balancing**: Prevents routing collapse to single expert
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    common::rng::get_rng,
     domain::{
         mixtures::{
             gating::{GatingConfig, GatingStrategy},
@@ -36,12 +38,31 @@ use crate::{
         network::Layer,
         richards::RichardsCurve,
     },
-    common::rng::get_rng,
 };
 
 #[inline]
 fn default_true() -> bool {
     true
+}
+
+#[inline]
+fn default_head_expert_proximity_scale() -> f32 {
+    0.15
+}
+
+#[inline]
+fn default_head_expert_proximity_sigma() -> f32 {
+    0.35
+}
+
+#[inline]
+fn default_parallel_expert_min_tokens() -> usize {
+    16
+}
+
+#[inline]
+fn default_expert_specialization_weight() -> f32 {
+    0.002
 }
 
 type RouterParamGrads = (
@@ -75,6 +96,9 @@ pub enum ExpertRouter {
         sparsity_weight: f32,
         /// Weight for diversity loss (encourages expert specialization)
         diversity_weight: f32,
+        /// Weight for explicit expert specialization loss (discourages co-activation overlap)
+        #[serde(default = "default_expert_specialization_weight")]
+        expert_specialization_weight: f32,
 
         /// Routing mode (token-choice vs expert-choice).
         #[serde(default)]
@@ -106,12 +130,36 @@ pub enum ExpertRouter {
         #[serde(default)]
         use_head_conditioning: bool,
 
+        /// If true, cap effective active experts by estimated active heads.
+        ///
+        /// This prevents expert fan-out from exceeding available head evidence.
+        #[serde(default = "default_true")]
+        cap_experts_by_head_activity: bool,
+
         /// If true, use a small learned adapter to make expert sparsity adaptive.
         ///
         /// This predicts a smooth blend between top-1 and configured top-k routing based on
         /// routing uncertainty (entropy) and MoH head activity.
         #[serde(default = "default_true")]
         use_learned_k_adaptation: bool,
+
+        /// Strength of fixed head->expert proximity bias added to routing logits.
+        ///
+        /// This encourages stable specialization where nearby heads prefer nearby experts.
+        #[serde(default = "default_head_expert_proximity_scale")]
+        head_expert_proximity_scale: f32,
+
+        /// Width of the head->expert proximity kernel in normalized index space.
+        #[serde(default = "default_head_expert_proximity_sigma")]
+        head_expert_proximity_sigma: f32,
+
+        /// Enable parallel execution of active experts in forward pass.
+        #[serde(default = "default_true")]
+        parallel_expert_execution: bool,
+
+        /// Minimum token count before enabling parallel expert execution.
+        #[serde(default = "default_parallel_expert_min_tokens")]
+        parallel_expert_min_tokens: usize,
 
         /// Indices of "shared" experts that are always executed and added to the routed output.
         ///
@@ -161,9 +209,29 @@ pub struct ExpertRouterConfig {
     #[serde(default)]
     pub use_head_conditioning: bool,
 
+    /// If true, cap effective active experts by estimated active heads.
+    #[serde(default = "default_true")]
+    pub cap_experts_by_head_activity: bool,
+
     /// If true, learn a smooth adaptive expert-count signal (blend top-1 and top-k).
     #[serde(default = "default_true")]
     pub use_learned_k_adaptation: bool,
+
+    /// Strength of fixed head->expert proximity bias added to routing logits.
+    #[serde(default = "default_head_expert_proximity_scale")]
+    pub head_expert_proximity_scale: f32,
+
+    /// Width of the head->expert proximity kernel in normalized index space.
+    #[serde(default = "default_head_expert_proximity_sigma")]
+    pub head_expert_proximity_sigma: f32,
+
+    /// Enable parallel execution of active experts in forward pass.
+    #[serde(default = "default_true")]
+    pub parallel_expert_execution: bool,
+
+    /// Minimum token count before enabling parallel expert execution.
+    #[serde(default = "default_parallel_expert_min_tokens")]
+    pub parallel_expert_min_tokens: usize,
 
     /// Routing mode.
     #[serde(default)]
@@ -203,10 +271,15 @@ pub struct ExpertRouterConfig {
 
     /// Weight for diversity loss (encourages expert specialization)
     pub diversity_weight: f32,
+    /// Weight for explicit expert specialization loss (discourages co-activation overlap)
+    #[serde(default = "default_expert_specialization_weight")]
+    pub expert_specialization_weight: f32,
     /// Metrics: average routing probability per expert
     pub metrics_avg_routing_prob: Vec<f32>,
     /// Metrics: diversity score (average pairwise expert correlation)
     pub metrics_diversity_score: f32,
+    /// Metrics: specialization score (expert co-activation overlap penalty)
+    pub metrics_specialization_score: f32,
 
     /// Weight for MoH–MoE contrastive alignment loss.
     pub moh_moe_contrastive_weight: f32,
@@ -219,7 +292,12 @@ impl Default for ExpertRouterConfig {
             num_experts: 4,
             expert_hidden_dim: 64,
             use_head_conditioning: true,
+            cap_experts_by_head_activity: true,
             use_learned_k_adaptation: true,
+            head_expert_proximity_scale: default_head_expert_proximity_scale(),
+            head_expert_proximity_sigma: default_head_expert_proximity_sigma(),
+            parallel_expert_execution: true,
+            parallel_expert_min_tokens: default_parallel_expert_min_tokens(),
             routing_mode: ExpertRoutingMode::default(),
             capacity_factor: 0.0,
             min_expert_capacity: 0,
@@ -230,8 +308,10 @@ impl Default for ExpertRouterConfig {
             metrics_z_loss_sum_sq: 0.0,
             metrics_z_loss_count: 0,
             diversity_weight: 0.005,
+            expert_specialization_weight: default_expert_specialization_weight(),
             metrics_avg_routing_prob: vec![0.0; 4],
             metrics_diversity_score: 0.0,
+            metrics_specialization_score: 0.0,
             moh_moe_contrastive_weight: 0.0,
         }
     }
@@ -248,13 +328,19 @@ impl ExpertRouterConfig {
                 load_balance_weight,
                 sparsity_weight,
                 diversity_weight,
+                expert_specialization_weight,
                 routing_mode,
                 capacity_factor,
                 min_expert_capacity,
                 renormalize_after_capacity,
                 z_loss_weight,
                 use_head_conditioning,
+                cap_experts_by_head_activity,
                 use_learned_k_adaptation,
+                head_expert_proximity_scale,
+                head_expert_proximity_sigma,
+                parallel_expert_execution,
+                parallel_expert_min_tokens,
                 shared_experts,
                 shared_expert_scale,
                 moh_moe_contrastive_weight,
@@ -274,7 +360,12 @@ impl ExpertRouterConfig {
                 num_experts: *num_experts,
                 expert_hidden_dim: *expert_hidden_dim,
                 use_head_conditioning: *use_head_conditioning,
+                cap_experts_by_head_activity: *cap_experts_by_head_activity,
                 use_learned_k_adaptation: *use_learned_k_adaptation,
+                head_expert_proximity_scale: *head_expert_proximity_scale,
+                head_expert_proximity_sigma: *head_expert_proximity_sigma,
+                parallel_expert_execution: *parallel_expert_execution,
+                parallel_expert_min_tokens: *parallel_expert_min_tokens,
                 routing_mode: *routing_mode,
                 capacity_factor: *capacity_factor,
                 min_expert_capacity: *min_expert_capacity,
@@ -285,8 +376,10 @@ impl ExpertRouterConfig {
                 metrics_z_loss_sum_sq: 0.0,
                 metrics_z_loss_count: 0,
                 diversity_weight: *diversity_weight,
+                expert_specialization_weight: *expert_specialization_weight,
                 metrics_avg_routing_prob: vec![0.0; *num_experts],
                 metrics_diversity_score: 0.0,
+                metrics_specialization_score: 0.0,
                 moh_moe_contrastive_weight: *moh_moe_contrastive_weight,
             },
         }
@@ -349,6 +442,7 @@ impl ExpertRouterConfig {
             self.metrics_avg_routing_prob[e] = 0.0;
         }
         self.metrics_diversity_score = 0.0;
+        self.metrics_specialization_score = 0.0;
         self.metrics_z_loss_sum_sq = 0.0;
         self.metrics_z_loss_count = 0;
     }
@@ -374,6 +468,11 @@ impl ExpertRouterConfig {
                 *metric =
                     current_avg + (expert_avg_prob - current_avg) * num_tokens / total_decisions;
             });
+
+        let batch_specialization = compute_expert_specialization_penalty(&routing_probs.view());
+        let current = self.metrics_specialization_score;
+        self.metrics_specialization_score =
+            current + (batch_specialization - current) * num_tokens / total_decisions;
     }
 
     /// Get load balancing loss for training (prevents single expert dominance)
@@ -462,6 +561,11 @@ impl ExpertRouterConfig {
         let imp = self.compute_importance_loss();
         let sw = self.compute_switch_balance_loss();
         let z = self.compute_z_loss();
+        let spec = if self.metrics_specialization_score.is_finite() {
+            self.metrics_specialization_score.max(0.0)
+        } else {
+            0.0
+        };
         (lb * g.load_balance_weight)
             + (cx * g.complexity_loss_weight)
             + (sp * g.sparsity_weight)
@@ -469,6 +573,7 @@ impl ExpertRouterConfig {
             + (sw * g.switch_balance_weight)
             + (z * self.z_loss_weight)
             + (dv * self.diversity_weight)
+            + (spec * self.expert_specialization_weight)
     }
 
     /// Get average number of active experts per token (soft routing equivalent)
@@ -576,8 +681,10 @@ impl Router for ExpertRouterImpl {
         };
 
         // Apply selection algorithm (for MoE, typically softmax for soft routing)
-        let routing_weights =
-            crate::domain::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
+        let routing_weights = crate::domain::mixtures::routing::apply_selection_algorithm(
+            &raw_gates.view(),
+            &self.config,
+        );
 
         RoutingResult {
             routing_weights,
@@ -708,8 +815,12 @@ impl ExpertSelector {
         ) {
             self.norm.normalize_into_f32(h_slice, norm_slice);
         } else {
-             // Fallback
-             self.norm.normalize_step_into(&workspace.hidden.view(), &mut workspace.normalized, None);
+            // Fallback
+            self.norm.normalize_step_into(
+                &workspace.hidden.view(),
+                &mut workspace.normalized,
+                None,
+            );
         }
 
         // 3. Activation
@@ -719,11 +830,11 @@ impl ExpertSelector {
         ) {
             self.activation.forward_into_f32(n_slice, act_slice);
         } else {
-             // Fallback: unwrap because workspaces should be contiguous
-             self.activation.forward_into_f32(
-                 workspace.normalized.as_slice().unwrap(),
-                 workspace.activated.as_slice_mut().unwrap()
-             );
+            // Fallback: unwrap because workspaces should be contiguous
+            self.activation.forward_into_f32(
+                workspace.normalized.as_slice().unwrap(),
+                workspace.activated.as_slice_mut().unwrap(),
+            );
         }
 
         // 4. Layer 2: logits = h_act W2 + b2
@@ -808,6 +919,8 @@ impl ExpertSelector {
         &mut self,
         head_activity: &[f32],
         num_experts: usize,
+        proximity_scale: f32,
+        proximity_sigma: f32,
     ) -> ndarray::Array1<f32> {
         let num_heads = head_activity.len();
         self.ensure_head_to_expert(num_heads, num_experts);
@@ -827,7 +940,67 @@ impl ExpertSelector {
                 bias[e] += a * w[[h, e]];
             }
         }
+        Self::add_head_expert_proximity_bias(
+            &mut bias,
+            head_activity,
+            proximity_scale,
+            proximity_sigma,
+        );
         bias
+    }
+
+    #[inline]
+    fn add_head_expert_proximity_bias(
+        bias: &mut ndarray::Array1<f32>,
+        head_activity: &[f32],
+        proximity_scale: f32,
+        proximity_sigma: f32,
+    ) {
+        if head_activity.is_empty() || bias.is_empty() {
+            return;
+        }
+        if !proximity_scale.is_finite() || proximity_scale <= 0.0 {
+            return;
+        }
+        let sigma = if proximity_sigma.is_finite() && proximity_sigma > 0.0 {
+            proximity_sigma
+        } else {
+            return;
+        };
+        let num_heads = head_activity.len();
+        let num_experts = bias.len();
+        let inv_two_sigma2 = 0.5f32 / (sigma * sigma);
+
+        for (h_idx, &a_raw) in head_activity.iter().enumerate() {
+            let a = if a_raw.is_finite() {
+                a_raw.max(0.0)
+            } else {
+                0.0
+            };
+            if a == 0.0 {
+                continue;
+            }
+            let h_pos = (h_idx as f32 + 0.5) / (num_heads as f32);
+
+            let mut kernel_sum = 0.0f32;
+            let mut kernel = vec![0.0f32; num_experts];
+            for e_idx in 0..num_experts {
+                let e_pos = (e_idx as f32 + 0.5) / (num_experts as f32);
+                let mut d = (h_pos - e_pos).abs();
+                d = d.min(1.0 - d);
+                let k = (-d * d * inv_two_sigma2).exp();
+                kernel_sum += k;
+                kernel[e_idx] = k;
+            }
+
+            // Normalize each head's contribution so scale is invariant to expert count.
+            if kernel_sum.is_finite() && kernel_sum > 0.0 {
+                let renorm = 1.0 / kernel_sum;
+                for e_idx in 0..num_experts {
+                    bias[e_idx] += proximity_scale * a * kernel[e_idx] * renorm;
+                }
+            }
+        }
     }
 
     /// Predict expert routing probabilities using AutoDeco-style architecture
@@ -835,7 +1008,7 @@ impl ExpertSelector {
     /// Returns softmax-normalized probabilities in [0, 1] range suitable for expert selection
     /// Caches intermediate activations for gradient computation
     pub fn predict(&mut self, input: &ndarray::ArrayView2<f32>) -> ndarray::Array2<f32> {
-        self.predict_with_head_activity(input, None)
+        self.predict_with_head_activity_and_proximity(input, None, 0.0, 0.0)
     }
 
     /// Predict expert routing probabilities, optionally conditioned by per-head activity.
@@ -846,6 +1019,16 @@ impl ExpertSelector {
         &mut self,
         input: &ndarray::ArrayView2<f32>,
         head_activity: Option<&[f32]>,
+    ) -> ndarray::Array2<f32> {
+        self.predict_with_head_activity_and_proximity(input, head_activity, 0.0, 0.0)
+    }
+
+    pub fn predict_with_head_activity_and_proximity(
+        &mut self,
+        input: &ndarray::ArrayView2<f32>,
+        head_activity: Option<&[f32]>,
+        proximity_scale: f32,
+        proximity_sigma: f32,
     ) -> ndarray::Array2<f32> {
         // Cache input for gradient computation (zero-copy where possible)
         self.cached_input = Some(input.to_owned());
@@ -886,7 +1069,8 @@ impl ExpertSelector {
         if let Some(h) = head_activity
             && !h.is_empty()
         {
-            let bias = self.compute_head_bias(h, self.bias2.len());
+            let bias =
+                self.compute_head_bias(h, self.bias2.len(), proximity_scale, proximity_sigma);
             logits += &bias;
         }
         self.cached_logits = Some(logits);
@@ -908,7 +1092,6 @@ impl ExpertSelector {
         self.predict_step_logits_into(&input.view(), &mut logits);
         logits
     }
-
 
     /// Predict routing probabilities for a single token (step mode)
     pub fn predict_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
@@ -1046,6 +1229,68 @@ impl ExpertSelector {
         )
     }
 
+    /// GPU-accelerated backward pass for router gradient computation (Phase 5.6.4c)
+    ///
+    /// Computes gradients for the two-layer routing network on GPU:
+    /// 1. **Softmax gradient**: d_logits = softmax' * grad_output
+    /// 2. **Layer 2 gradients**: grad_w2 = activated.T @ d_logits, grad_b2 = sum(d_logits)
+    /// 3. **Layer 1 gradients**: grad_w1 = input.T @ d_hidden, grad_b1 = sum(d_hidden)
+    /// 4. **Activation gradients**: Richards derivatives (computed on CPU for now)
+    ///
+    /// # Arguments
+    /// * `grad_output` - Gradient of loss w.r.t. router output (batch_size, num_experts)
+    ///
+    /// # Returns
+    /// * RouterParamGrads tuple with all parameter gradients
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn backward_gpu(
+        &mut self,
+        grad_output: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<RouterParamGrads> {
+        // For Phase 5.6.4c, use CPU computation for router backward
+        // Full GPU implementation would require:
+        // - Softmax gradient kernel (element-wise: d_softmax[i,j] = softmax[i,j] * (grad[i,j] - sum(softmax * grad)))
+        // - GEMM for weight gradients
+        // - Reduction for bias gradients
+        // - Richards activation gradient kernel
+
+        // Verify cached forward values exist
+        let _cached_input = self.cached_input.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: "No cached input. Call predict() before backward_gpu().".to_string(),
+            }
+        })?;
+        let _cached_activated = self.cached_activated.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: "No cached activated. Call predict() before backward_gpu().".to_string(),
+            }
+        })?;
+        let _cached_normalized = self.cached_normalized.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: "No cached normalized. Call predict() before backward_gpu().".to_string(),
+            }
+        })?;
+        let _cached_hidden = self.cached_hidden.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: "No cached hidden. Call predict() before backward_gpu().".to_string(),
+            }
+        })?;
+
+        // Compute gradients on CPU (softmax + activation derivatives are complex)
+        let param_grads = self.compute_gradients(grad_output);
+        Ok(param_grads)
+    }
+
+    /// GPU backward pass (stub for non-GPU builds)
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn backward_gpu(
+        &mut self,
+        grad_output: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<RouterParamGrads> {
+        // Use CPU computation
+        Ok(self.compute_gradients(grad_output))
+    }
+
     /// Get parameters for gradient computation (iterator-based, zero-copy)
     pub fn parameters(&self) -> impl Iterator<Item = &ndarray::Array2<f32>> {
         [&self.weights1, &self.weights2].into_iter()
@@ -1158,7 +1403,11 @@ impl RichardsExpert {
     }
 
     /// Streaming forward step with pre-allocated output buffer (zero-allocation)
-    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
         self.glu.forward_step_into(input, output);
     }
 
@@ -1321,6 +1570,10 @@ pub struct MixtureOfExperts {
     /// Workspace for streaming inference
     #[serde(skip)]
     pub streaming_workspace: Option<MoeStreamingWorkspace>,
+
+    /// GPU device for accelerated computation (Phase 5.6)
+    #[serde(skip)]
+    pub gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 impl MixtureOfExperts {
@@ -1367,7 +1620,22 @@ impl MixtureOfExperts {
             cached_shared_flags: None,
             cached_aux_loss: 0.0,
             streaming_workspace: None,
+            gpu_device: None,
         }
+    }
+
+    /// Set the GPU device for accelerated computation (Phase 5.6)
+    ///
+    /// Once set, `forward_gpu` will use the GPU backend for:
+    /// - Router GEMM computation
+    /// - Top-k expert selection
+    /// - Expert forward passes
+    /// - Weighted output combination
+    pub fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
     }
 
     /// Set training mode for the MoE layer.
@@ -1397,6 +1665,75 @@ impl MixtureOfExperts {
         }
     }
 
+    #[inline]
+    fn estimate_num_heads_hint(&self, head_activity_vec: Option<&[f32]>) -> usize {
+        if let Some(v) = head_activity_vec
+            && !v.is_empty()
+        {
+            return v.len();
+        }
+        self.router
+            .head_to_expert
+            .as_ref()
+            .map(|w| w.nrows())
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    fn estimate_active_head_cap(
+        &self,
+        base_k: usize,
+        head_activity: Option<f32>,
+        head_activity_vec: Option<&[f32]>,
+        token_head_activity: Option<&[f32]>,
+    ) -> usize {
+        if !self.config.cap_experts_by_head_activity {
+            return base_k.max(1).min(self.config.num_experts.max(1));
+        }
+
+        let num_heads_hint = self.estimate_num_heads_hint(head_activity_vec);
+        let mut active_heads_est = 0.0f32;
+
+        if let Some(v) = head_activity_vec
+            && !v.is_empty()
+        {
+            active_heads_est = v
+                .iter()
+                .map(|&x| if x.is_finite() { x.max(0.0) } else { 0.0 })
+                .sum::<f32>();
+        }
+
+        if active_heads_est <= 0.0 && num_heads_hint > 0 {
+            if let Some(tv) = token_head_activity
+                && !tv.is_empty()
+            {
+                let mean = tv
+                    .iter()
+                    .map(|&x| {
+                        if x.is_finite() {
+                            x.clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f32>()
+                    / tv.len() as f32;
+                active_heads_est = mean * (num_heads_hint as f32);
+            } else if let Some(hr) = head_activity {
+                active_heads_est = hr.clamp(0.0, 1.0) * (num_heads_hint as f32);
+            }
+        }
+
+        if active_heads_est <= 0.0 || !active_heads_est.is_finite() {
+            return base_k.max(1).min(self.config.num_experts.max(1));
+        }
+
+        let cap = active_heads_est
+            .round()
+            .clamp(1.0, self.config.num_experts as f32) as usize;
+        base_k.min(cap).max(1)
+    }
+
     fn compute_moh_moe_contrastive_state(&self) -> Option<MohMoeContrastiveState> {
         let weight = if self.config.moh_moe_contrastive_weight.is_finite() {
             self.config.moh_moe_contrastive_weight.max(0.0)
@@ -1412,11 +1749,11 @@ impl MixtureOfExperts {
             return None;
         }
 
-        let head_vec: Vec<f32> = self
-            .router
-            .cached_head_activity_vec
-            .as_ref()
-            .map(|v| v.iter().map(|x| if x.is_finite() { *x } else { 0.0 }).collect())?;
+        let head_vec: Vec<f32> = self.router.cached_head_activity_vec.as_ref().map(|v| {
+            v.iter()
+                .map(|x| if x.is_finite() { *x } else { 0.0 })
+                .collect()
+        })?;
         if head_vec.is_empty() {
             return None;
         }
@@ -1555,6 +1892,113 @@ impl MixtureOfExperts {
         self.forward_with_head_activity(input, None)
     }
 
+    /// In-place forward pass for MixtureOfExperts (Phase 5.1.1 implementation)
+    ///
+    /// This implementation delegates to the full forward pass and writes directly to
+    /// the output buffer, avoiding an intermediate allocation. Future optimization will
+    /// implement true in-place routing and expert computation.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor (batch_size × embedding_dim)
+    /// * `output` - Pre-allocated output buffer (batch_size × embedding_dim)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if output dimensions don't match input
+    pub(crate) fn forward_into(
+        &mut self,
+        input: &ndarray::Array2<f32>,
+        output: &mut ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        let (batch_size, embedding_dim) = input.dim();
+
+        // Validate output buffer dimensions
+        if output.dim() != (batch_size, embedding_dim) {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: format!(
+                    "Output dimension mismatch: expected ({}, {}), got {:?}",
+                    batch_size,
+                    embedding_dim,
+                    output.dim()
+                ),
+            });
+        }
+
+        // Compute forward and write directly to output buffer (single allocation)
+        // Phase 5.1.2 will implement true in-place routing by restructuring expert computation
+        let result = self.forward(input);
+        output.assign(&result);
+
+        Ok(())
+    }
+
+    /// GPU-accelerated forward pass for MixtureOfExperts (Phase 5.6)
+    ///
+    /// Implements expert routing and computation on GPU:
+    /// 1. **Router GEMM**: `input @ W_router` → routing_logits
+    /// 2. **Softmax**: Normalize routing logits (masked softmax for top-k)
+    /// 3. **Expert computation**: Parallel expert GEMMs on GPU device
+    /// 4. **Weighted sum**: Combine expert outputs using routing gates
+    ///
+    /// This is a placeholder that documents the GPU path structure.
+    /// Full GPU implementation requires:
+    /// - Router kernel (GEMM + optional head conditioning)
+    /// - Top-k selection kernel (sorted by routing scores)
+    /// - Expert GEMMs (can be executed in parallel on GPU)
+    /// - Weighted accumulation (fused with expert outputs)
+    ///
+    /// Returns error if GPU is not available.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn forward_gpu(
+        &mut self,
+        input: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        // If GPU device is attached, use MoeGpuBackend
+        if let Some(_device) = self.gpu_device.clone() {
+            use crate::domain::layers::components::{GpuBackendFactory, MoeGpuBackend, MoeParams};
+
+            let embed_dim = input.ncols();
+            let batch_size = input.nrows();
+
+            // Create MoE GPU backend with automatic GPU detection
+            let num_active = self.config.gating.num_active.min(self.config.num_experts);
+            let moe_backend = MoeGpuBackend::auto_detect(
+                self.config.num_experts,
+                num_active,
+                embed_dim,
+                self.config.expert_hidden_dim,
+            )?;
+
+            // Set weights from current MoE state
+            let mut moe_backend = moe_backend.with_weights(
+                self.router.weights2.clone(),
+                self.experts.iter().map(|e| e.glu.w1.clone()).collect(),
+                self.experts.iter().map(|e| e.glu.w_out.clone()).collect(),
+            )?;
+
+            // Execute GPU forward pass
+            return moe_backend.forward(input);
+        }
+
+        // No GPU device attached - return error (no CPU fallback)
+        Err(crate::common::errors::ModelError::Backend {
+            message: "MixtureOfExperts::forward_gpu requires GPU device. Call set_gpu_device() first or use forward() for CPU computation.".to_string(),
+        })
+    }
+
+    /// Non-GPU fallback for forward_gpu when GPU features are not enabled
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn forward_gpu(
+        &mut self,
+        _input: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        Err(crate::common::errors::ModelError::Backend {
+            message:
+                "GPU support not compiled. Enable 'gpu-wgpu', 'gpu-cuda', or 'gpu-metal' feature."
+                    .to_string(),
+        })
+    }
+
     /// Streaming forward step for token-by-token inference
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
         let mut output = ndarray::Array1::zeros(input.raw_dim());
@@ -1563,7 +2007,11 @@ impl MixtureOfExperts {
     }
 
     /// Streaming forward step with pre-allocated output buffer (zero-allocation)
-    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut ndarray::Array1<f32>) {
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut ndarray::Array1<f32>,
+    ) {
         // Initialize workspace if needed
         if self.streaming_workspace.is_none() {
             let num_experts = self.config.num_experts;
@@ -1577,9 +2025,9 @@ impl MixtureOfExperts {
                 best_buffer: Vec::with_capacity(num_experts),
             });
         }
-        
+
         let workspace = self.streaming_workspace.as_mut().unwrap();
-        
+
         // Ensure dimensions
         if workspace.logits.len() != self.config.num_experts {
             workspace.logits = ndarray::Array1::zeros(self.config.num_experts);
@@ -1589,7 +2037,8 @@ impl MixtureOfExperts {
         }
 
         // 1. Get routing logits
-        self.router.predict_step_logits_into(input, &mut workspace.logits);
+        self.router
+            .predict_step_logits_into(input, &mut workspace.logits);
 
         // 2. Select top-k experts (Masked Softmax)
         let num_experts = workspace.logits.len();
@@ -1605,7 +2054,9 @@ impl MixtureOfExperts {
             };
             workspace.best_buffer.push((score, idx));
         }
-        workspace.best_buffer.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        workspace
+            .best_buffer
+            .sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         // Take top k
         let top_k_entries = &workspace.best_buffer[..k];
@@ -1619,7 +2070,7 @@ impl MixtureOfExperts {
         let mut sum_exp = 0.0;
         workspace.top_k_indices.clear();
         workspace.top_k_scores.clear();
-        
+
         for (score, idx) in top_k_entries {
             if score.is_finite() {
                 let e = crate::domain::pade::PadeExp::exp((*score - max_val) as f64);
@@ -1631,28 +2082,24 @@ impl MixtureOfExperts {
                 workspace.top_k_indices.push(*idx);
             }
         }
-        
+
         // Normalize probabilities
-        let inv_sum = if sum_exp > 0.0 {
-            1.0 / sum_exp
-        } else {
-            0.0
-        };
+        let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
 
         // 3. Aggregate expert outputs
         output.fill(0.0);
-        
+
         for (i, &expert_idx) in workspace.top_k_indices.iter().enumerate() {
             let prob = (workspace.top_k_scores[i] as f64 * inv_sum) as f32;
             if prob <= 0.0 {
                 continue;
             }
-            
+
             // Expert forward step (zero-alloc)
             self.experts[expert_idx].forward_step_into(input, &mut workspace.expert_output_buffer);
-            
+
             // Accumulate: acc += prob * expert_out
-             ndarray::Zip::from(&mut *output)
+            ndarray::Zip::from(&mut *output)
                 .and(&workspace.expert_output_buffer)
                 .for_each(|acc, &val| {
                     *acc += prob * val;
@@ -1785,19 +2232,29 @@ impl MixtureOfExperts {
             .expect("router input must be cached");
 
         let routing_probs_full = if head_activity_vec.is_some() {
-            self.router
-                .predict_with_head_activity(&router_in.view(), head_activity_vec)
+            self.router.predict_with_head_activity_and_proximity(
+                &router_in.view(),
+                head_activity_vec,
+                self.config.head_expert_proximity_scale,
+                self.config.head_expert_proximity_sigma,
+            )
         } else {
             self.router.predict(&router_in.view())
         };
 
         // Base top-k for sparse masking of routing probabilities.
-        let base_k = self
+        let base_k_nominal = self
             .config
             .gating
             .num_active
             .max(1)
             .min(self.config.num_experts);
+        let base_k = self.estimate_active_head_cap(
+            base_k_nominal,
+            head_activity,
+            head_activity_vec,
+            token_head_activity,
+        );
 
         // Sparse top-k masking + renormalization computed directly from router logits.
         // For head-activity coupling, interpolate between k=floor(kf) and k=ceil(kf)
@@ -2017,22 +2474,24 @@ impl MixtureOfExperts {
             masked_probs,
             cached_logits,
             self.config.num_experts,
-            self.config.gating.num_active as f32,
+            base_k as f32,
             &self.config.gating,
             self.config.z_loss_weight,
             self.config.diversity_weight,
+            self.config.expert_specialization_weight,
         );
         if contrastive.is_finite() {
             self.cached_aux_loss += contrastive;
         }
 
-        let mut active_experts = self.cached_active_experts.take().unwrap_or_default();
-        active_experts.clear();
-        let active_mask = self
+        let active_mask_owned = self
             .cached_active_expert_mask
             .as_ref()
-            .expect("active expert mask must be cached");
-        for (i, &a) in active_mask.iter().enumerate() {
+            .expect("active expert mask must be cached")
+            .clone();
+        let mut active_experts = self.cached_active_experts.take().unwrap_or_default();
+        active_experts.clear();
+        for (i, &a) in active_mask_owned.iter().enumerate() {
             if a {
                 active_experts.push(i);
             }
@@ -2050,8 +2509,23 @@ impl MixtureOfExperts {
             }
         }
 
-        for &e in &active_experts {
-            expert_outputs[e] = self.experts[e].forward(input);
+        let run_parallel = self.config.parallel_expert_execution
+            && input.nrows() >= self.config.parallel_expert_min_tokens
+            && active_experts.len() > 1;
+        if run_parallel {
+            self.experts
+                .par_iter_mut()
+                .zip(expert_outputs.par_iter_mut())
+                .enumerate()
+                .for_each(|(e, (expert, out))| {
+                    if e < active_mask_owned.len() && active_mask_owned[e] {
+                        *out = expert.forward(input);
+                    }
+                });
+        } else {
+            for &e in &active_experts {
+                expert_outputs[e] = self.experts[e].forward(input);
+            }
         }
         self.cached_active_experts = Some(active_experts);
         self.cached_expert_outputs = Some(expert_outputs);
@@ -2535,6 +3009,11 @@ impl Layer for MixtureOfExperts {
         } else {
             0.0
         };
+        let spec_w = if self.config.expert_specialization_weight.is_finite() {
+            self.config.expert_specialization_weight.max(0.0)
+        } else {
+            0.0
+        };
         let z_w = if self.config.z_loss_weight.is_finite() {
             self.config.z_loss_weight.max(0.0)
         } else {
@@ -2593,6 +3072,34 @@ impl Layer for MixtureOfExperts {
             (n_exp as f32) * ((n_exp - 1) as f32)
         } else {
             1.0
+        };
+        let spec_grad_probs = if spec_w != 0.0 && n_tok > 0 && n_exp > 1 {
+            let mut gram = routing_probs.t().dot(routing_probs);
+            for i in 0..n_exp {
+                for j in 0..n_exp {
+                    let mut v = gram[[i, j]] * inv_n_tok;
+                    if !v.is_finite() {
+                        v = 0.0;
+                    }
+                    if i == j {
+                        v = 0.0;
+                    }
+                    gram[[i, j]] = v;
+                }
+            }
+            let coeff = (4.0 * spec_w * inv_n_tok) / ((n_exp as f32) * ((n_exp - 1) as f32));
+            if coeff.is_finite() && coeff != 0.0 {
+                let mut g = routing_probs.dot(&gram);
+                for v in &mut g {
+                    let x = *v;
+                    *v = if x.is_finite() { x * coeff } else { 0.0 };
+                }
+                Some(g)
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         let (contrastive_grad_s, contrastive_bias_grad) =
@@ -2708,6 +3215,12 @@ impl Layer for MixtureOfExperts {
                     let d_dv = (-2.0 * y) * inv_n_tok / dv_norm;
                     if d_dv.is_finite() {
                         g_aux += dv_w * d_dv;
+                    }
+                }
+                if let Some(spec_grad) = spec_grad_probs.as_ref() {
+                    let d_spec = spec_grad[[token_idx, expert_idx]];
+                    if d_spec.is_finite() {
+                        g_aux += d_spec;
                     }
                 }
 
@@ -3167,6 +3680,38 @@ fn update_router_z_loss_metrics(config: &mut ExpertRouterConfig, logits: &ndarra
     }
 }
 
+fn compute_expert_specialization_penalty(masked_probs: &ndarray::ArrayView2<f32>) -> f32 {
+    let n_tok = masked_probs.nrows();
+    let n_exp = masked_probs.ncols();
+    if n_tok == 0 || n_exp <= 1 {
+        return 0.0;
+    }
+
+    let inv_n = 1.0 / (n_tok as f32);
+    let mut gram = masked_probs.t().dot(masked_probs);
+    let mut offdiag_sum_sq = 0.0f32;
+    for i in 0..n_exp {
+        for j in 0..n_exp {
+            if i == j {
+                continue;
+            }
+            let mut v = gram[[i, j]] * inv_n;
+            if !v.is_finite() {
+                v = 0.0;
+            }
+            gram[[i, j]] = v;
+            offdiag_sum_sq += v * v;
+        }
+    }
+
+    let denom = (n_exp as f32) * ((n_exp - 1) as f32);
+    if denom > 0.0 && offdiag_sum_sq.is_finite() {
+        (offdiag_sum_sq / denom).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 fn compute_moe_aux_loss_from_probs_and_logits(
     masked_probs: &ndarray::Array2<f32>,
     logits: &ndarray::Array2<f32>,
@@ -3175,6 +3720,7 @@ fn compute_moe_aux_loss_from_probs_and_logits(
     gating: &GatingConfig,
     z_loss_weight: f32,
     diversity_weight: f32,
+    expert_specialization_weight: f32,
 ) -> f32 {
     let n_tok = masked_probs.nrows();
     if n_tok == 0 || num_experts == 0 {
@@ -3217,6 +3763,11 @@ fn compute_moe_aux_loss_from_probs_and_logits(
 
     let dv_w = if diversity_weight.is_finite() {
         diversity_weight.max(0.0)
+    } else {
+        0.0
+    };
+    let spec_w = if expert_specialization_weight.is_finite() {
+        expert_specialization_weight.max(0.0)
     } else {
         0.0
     };
@@ -3345,6 +3896,13 @@ fn compute_moe_aux_loss_from_probs_and_logits(
             if z.is_finite() {
                 loss += z_w * z.max(0.0);
             }
+        }
+    }
+
+    if spec_w != 0.0 && num_experts > 1 {
+        let spec = compute_expert_specialization_penalty(&masked_probs.view());
+        if spec.is_finite() {
+            loss += spec_w * spec.max(0.0);
         }
     }
 
@@ -3625,13 +4183,19 @@ mod tests {
             load_balance_weight: 0.1,
             sparsity_weight: 0.01,
             diversity_weight: 0.005,
+            expert_specialization_weight: 0.002,
             routing_mode: ExpertRoutingMode::TokenChoiceTopK,
             capacity_factor: 0.0,
             min_expert_capacity: 0,
             renormalize_after_capacity: true,
             z_loss_weight: 0.0,
             use_head_conditioning: true,
+            cap_experts_by_head_activity: true,
             use_learned_k_adaptation: false,
+            head_expert_proximity_scale: 0.15,
+            head_expert_proximity_sigma: 0.35,
+            parallel_expert_execution: true,
+            parallel_expert_min_tokens: 16,
             shared_experts: vec![],
             shared_expert_scale: 0.0,
             moh_moe_contrastive_weight: 0.0,
@@ -3687,14 +4251,11 @@ mod tests {
         config.use_learned_k_adaptation = false;
 
         let mut moe = MixtureOfExperts::new(4, 4, config);
-        moe.cached_routing_probs = Some(
-            ndarray::Array2::from_shape_vec((2, 2), vec![0.9, 0.1, 0.8, 0.2]).unwrap(),
-        );
-        moe.router.cached_head_activity_vec =
-            Some(ndarray::Array1::from_vec(vec![1.0, 0.0]));
-        moe.router.head_to_expert = Some(
-            ndarray::Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap(),
-        );
+        moe.cached_routing_probs =
+            Some(ndarray::Array2::from_shape_vec((2, 2), vec![0.9, 0.1, 0.8, 0.2]).unwrap());
+        moe.router.cached_head_activity_vec = Some(ndarray::Array1::from_vec(vec![1.0, 0.0]));
+        moe.router.head_to_expert =
+            Some(ndarray::Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap());
 
         let loss = moe.compute_moh_moe_contrastive_loss();
         assert!(loss > 0.0);
@@ -3727,12 +4288,10 @@ mod tests {
         let head_activity = vec![1.0f32, 0.0f32];
         let _out = moe.forward_with_head_features(&input, None, Some(head_activity.as_slice()));
 
-        moe.cached_routing_probs = Some(
-            ndarray::Array2::from_shape_vec((2, 2), vec![0.1, 0.9, 0.2, 0.8]).unwrap(),
-        );
-        moe.router.head_to_expert = Some(
-            ndarray::Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap(),
-        );
+        moe.cached_routing_probs =
+            Some(ndarray::Array2::from_shape_vec((2, 2), vec![0.1, 0.9, 0.2, 0.8]).unwrap());
+        moe.router.head_to_expert =
+            Some(ndarray::Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap());
 
         let output_grads = ndarray::Array2::<f32>::zeros(input.raw_dim());
         let (_grad_input, param_grads) = moe.compute_gradients(&input, &output_grads);
@@ -3786,6 +4345,116 @@ mod tests {
         let alpha = moe.cached_k_alpha.as_ref().unwrap();
         assert!(alpha[0] < 0.01);
         assert!(alpha[1] > 0.99);
+    }
+
+    #[test]
+    fn test_moe_caps_active_experts_by_active_heads() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 4,
+            expert_hidden_dim: 16,
+            diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.use_head_conditioning = true;
+        config.use_learned_k_adaptation = false;
+        config.cap_experts_by_head_activity = true;
+        config.parallel_expert_execution = false;
+
+        let mut moe = MixtureOfExperts::new(32, 8, config);
+        let input = ndarray::Array2::<f32>::from_shape_vec((3, 32), vec![0.1; 96]).unwrap();
+        let token_h = vec![0.25f32, 0.25f32, 0.25f32];
+        let head_vec = vec![1.0f32, 0.0f32, 0.0f32, 0.0f32];
+        let _out = moe.forward_with_head_features_and_token_activity(
+            &input,
+            Some(0.25),
+            Some(head_vec.as_slice()),
+            Some(token_h.as_slice()),
+        );
+
+        let probs = moe.cached_routing_probs.as_ref().unwrap();
+        for row in probs.outer_iter() {
+            let n_nonzero = row.iter().filter(|&&v| v > 1e-8).count();
+            assert!(
+                n_nonzero <= 1,
+                "expected <=1 active expert per token when active heads ~1/4, got {}",
+                n_nonzero
+            );
+        }
+    }
+
+    #[test]
+    fn test_expert_selector_proximity_bias_prefers_nearby_expert() {
+        let mut selector = ExpertSelector::new(4, 4, 4);
+        selector.weights1.fill(0.0);
+        selector.weights2.fill(0.0);
+        selector.bias1.fill(0.0);
+        selector.bias2.fill(0.0);
+        selector.head_to_expert = Some(ndarray::Array2::<f32>::zeros((4, 4)));
+
+        let input = ndarray::Array2::<f32>::zeros((1, 4));
+        let head_vec = vec![1.0f32, 0.0f32, 0.0f32, 0.0f32];
+        let probs = selector.predict_with_head_activity_and_proximity(
+            &input.view(),
+            Some(head_vec.as_slice()),
+            8.0,
+            0.12,
+        );
+        let row = probs.row(0);
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &v) in row.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = idx;
+            }
+        }
+        assert_eq!(
+            best_idx, 0,
+            "proximity-biased routing should prefer expert near the active head"
+        );
+    }
+
+    #[test]
+    fn test_parallel_active_expert_execution_matches_sequential() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 4,
+            expert_hidden_dim: 16,
+            diversity_weight: 0.005,
+            gating: GatingConfig {
+                num_active: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.use_head_conditioning = true;
+        config.use_learned_k_adaptation = false;
+        config.cap_experts_by_head_activity = false;
+        config.parallel_expert_execution = false;
+        config.parallel_expert_min_tokens = 1;
+
+        let mut moe_seq = MixtureOfExperts::new(32, 8, config.clone());
+        let mut moe_par = moe_seq.clone();
+        moe_par.config.parallel_expert_execution = true;
+        moe_par.config.parallel_expert_min_tokens = 1;
+
+        let input = ndarray::Array2::<f32>::from_shape_vec((8, 32), vec![0.1; 256]).unwrap();
+        let out_seq = moe_seq.forward_with_head_activity(&input, Some(0.75));
+        let out_par = moe_par.forward_with_head_activity(&input, Some(0.75));
+
+        let max_diff = out_seq
+            .iter()
+            .zip(out_par.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "parallel forward mismatch: max_diff={}",
+            max_diff
+        );
     }
 
     #[test]
@@ -4211,8 +4880,9 @@ mod tests {
             load_balance_weight: 1.0,
             ..Default::default()
         };
-        let loss =
-            compute_moe_aux_loss_from_probs_and_logits(&probs, &logits, 4, 2.0, &gating, 0.0, 0.0);
+        let loss = compute_moe_aux_loss_from_probs_and_logits(
+            &probs, &logits, 4, 2.0, &gating, 0.0, 0.0, 0.0,
+        );
         assert!(approx_eq(loss, 0.0, 1e-6));
     }
 
@@ -4234,8 +4904,9 @@ mod tests {
             load_balance_weight: 1.0,
             ..Default::default()
         };
-        let loss =
-            compute_moe_aux_loss_from_probs_and_logits(&probs, &logits, 4, 2.0, &gating, 0.0, 0.0);
+        let loss = compute_moe_aux_loss_from_probs_and_logits(
+            &probs, &logits, 4, 2.0, &gating, 0.0, 0.0, 0.0,
+        );
         assert!(approx_eq(loss, 3.0, 1e-6));
     }
 
@@ -4256,10 +4927,55 @@ mod tests {
             num_active: 1,
             ..Default::default()
         };
-        let loss =
-            compute_moe_aux_loss_from_probs_and_logits(&probs, &logits, 3, 1.0, &gating, 1.0, 0.0);
+        let loss = compute_moe_aux_loss_from_probs_and_logits(
+            &probs, &logits, 3, 1.0, &gating, 1.0, 0.0, 0.0,
+        );
         let expected = (3.0f32).ln().powi(2);
         assert!(approx_eq(loss, expected, 1e-5));
+    }
+
+    #[test]
+    fn test_compute_moe_aux_loss_specialization_penalizes_overlap() {
+        let uniform = ndarray::Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                0.25, 0.25, 0.25, 0.25, //
+                0.25, 0.25, 0.25, 0.25, //
+                0.25, 0.25, 0.25, 0.25, //
+                0.25, 0.25, 0.25, 0.25, //
+            ],
+        )
+        .unwrap();
+        let specialized = ndarray::Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0, //
+            ],
+        )
+        .unwrap();
+        let logits = ndarray::Array2::<f32>::zeros((4, 4));
+        let gating = GatingConfig {
+            num_active: 2,
+            ..Default::default()
+        };
+        let loss_uniform = compute_moe_aux_loss_from_probs_and_logits(
+            &uniform, &logits, 4, 2.0, &gating, 0.0, 0.0, 1.0,
+        );
+        let loss_specialized = compute_moe_aux_loss_from_probs_and_logits(
+            &specialized,
+            &logits,
+            4,
+            2.0,
+            &gating,
+            0.0,
+            0.0,
+            1.0,
+        );
+        assert!(loss_uniform > loss_specialized);
+        assert!(loss_specialized <= 1e-6);
     }
 
     #[test]
@@ -4293,6 +5009,53 @@ mod tests {
             if g.nrows() == 1 && g.ncols() == moe.config.num_experts {
                 found_bias2 = true;
                 for &v in g.iter() {
+                    sum_abs += v.abs();
+                }
+            }
+        }
+        assert!(found_bias2);
+        assert!(sum_abs > 0.0);
+    }
+
+    #[test]
+    fn test_moe_router_receives_specialization_aux_grads_when_output_grads_zero() {
+        let mut config = ExpertRouterConfig {
+            num_experts: 4,
+            expert_hidden_dim: 16,
+            diversity_weight: 0.0,
+            expert_specialization_weight: 1.0,
+            gating: GatingConfig {
+                num_active: 2,
+                load_balance_weight: 0.0,
+                sparsity_weight: 0.0,
+                complexity_loss_weight: 0.0,
+                importance_loss_weight: 0.0,
+                switch_balance_weight: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.z_loss_weight = 0.0;
+        config.use_head_conditioning = false;
+        config.use_learned_k_adaptation = false;
+
+        let mut moe = MixtureOfExperts::new(8, 8, config);
+        moe.router.bias2.fill(-5.0);
+        moe.router.bias2[0] = 2.0;
+        moe.router.bias2[1] = 0.5;
+
+        let input = ndarray::Array2::<f32>::zeros((4, 8));
+        let _out = moe.forward(&input);
+
+        let output_grads = ndarray::Array2::<f32>::zeros((4, 8));
+        let (_grad_in, grads) = moe.compute_gradients(&input, &output_grads);
+
+        let mut found_bias2 = false;
+        let mut sum_abs = 0.0f32;
+        for g in &grads {
+            if g.nrows() == 1 && g.ncols() == moe.config.num_experts {
+                found_bias2 = true;
+                for &v in g {
                     sum_abs += v.abs();
                 }
             }

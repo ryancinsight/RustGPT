@@ -1,6 +1,6 @@
 use llm::infrastructure::persistence::loader::DatasetLoader;
-use llm::infrastructure::persistence::speech_loader::{SpeechLoader, SpeechConfig};
-use llm::infrastructure::persistence::mnist_loader::{MnistLoader, MnistDatasetType};
+use llm::infrastructure::persistence::mnist_loader::{MnistDatasetType, MnistLoader};
+use llm::infrastructure::persistence::speech_loader::{SpeechConfig, SpeechLoader};
 use std::path::PathBuf;
 
 #[test]

@@ -3,13 +3,10 @@
 //! Provides reusable projection layers and linear transformations
 //! for state space models with optimized memory management.
 
-use ndarray::{Array1, Array2, Axis};
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    infrastructure::optimizer::adam::Adam,
-    domain::eprop::{EPropError, context::EpropContext, utils::outer_product_into},
-};
+use crate::infrastructure::optimizer::adam::Adam;
 
 /// Projection layer configuration
 #[derive(Debug, Clone, Copy)]
@@ -111,37 +108,6 @@ impl LinearProjection {
                 .insert_axis(ndarray::Axis(0));
             opt_bias.step(bias, &bias_grad, lr);
         }
-    }
-
-    pub fn apply_eprop_gradients(
-        &mut self,
-        layer_idx: usize,
-        learning_signal: &Array1<f32>,
-        lr: f32,
-    ) -> crate::domain::eprop::Result<()> {
-        let (modulated_eps_f, eps_x) =
-            EpropContext::compute_layer_gradients(layer_idx, learning_signal)?;
-
-        let input_dim = self.weight.nrows();
-        let output_dim = self.weight.ncols();
-
-        if eps_x.len() != input_dim || modulated_eps_f.len() != output_dim {
-            return Err(EPropError::ShapeMismatch {
-                expected: format!("({}, {})", input_dim, output_dim),
-                got: format!("({}, {})", eps_x.len(), modulated_eps_f.len()),
-            });
-        }
-
-        let mut weight_grad = Array2::zeros(self.weight.raw_dim());
-        outer_product_into(&mut weight_grad, &eps_x, &modulated_eps_f);
-        self.opt_weight.step(&mut self.weight, &weight_grad, lr);
-
-        if let (Some(bias), Some(opt_bias)) = (&mut self.bias, &mut self.opt_bias) {
-            let bias_grad = modulated_eps_f.insert_axis(Axis(0));
-            opt_bias.step(bias, &bias_grad, lr);
-        }
-
-        Ok(())
     }
 
     /// Get parameter count

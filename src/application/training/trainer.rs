@@ -10,6 +10,7 @@ pub struct DiffusionCeTrainConfig {
     pub epochs: usize,
     pub lr: f32,
     pub batch_size: usize,
+    pub gradient_accumulation_steps: usize,
     pub ce_weight: AdaptiveScalar,
     pub validation_ratio: f32,
     pub min_snr_gamma: AdaptiveScalar,
@@ -52,28 +53,24 @@ impl Trainer {
         llm.train_with_warmup(data, epochs, target_lr, batch_size, warmup_epochs)
     }
 
-    /// Train TRM model for autoencoding
-    pub fn train_trm_autoencoding(
+    /// Train with learning rate warmup and gradient accumulation.
+    pub fn train_with_warmup_with_accumulation(
         llm: &mut LLM,
         data: Vec<&str>,
         epochs: usize,
-        lr: f32,
-        batch_size: usize,
-    ) -> Result<()> {
-        llm.train_trm_autoencoding(data, epochs, lr, batch_size)
-    }
-
-    /// Complete TRM training (autoencoding + generation)
-    pub fn train_trm_complete(
-        llm: &mut LLM,
-        data: Vec<&str>,
-        chat_data: Vec<&str>,
-        epochs: usize,
-        lr: f32,
+        target_lr: f32,
         batch_size: usize,
         warmup_epochs: usize,
+        gradient_accumulation_steps: usize,
     ) -> Result<()> {
-        llm.train_trm_complete(data, chat_data, epochs, batch_size, lr, warmup_epochs)
+        llm.train_with_warmup_with_accumulation(
+            data,
+            epochs,
+            target_lr,
+            batch_size,
+            warmup_epochs,
+            gradient_accumulation_steps,
+        )
     }
 
     /// Train diffusion model with cross-entropy loss
@@ -87,6 +84,27 @@ impl Trainer {
             config.epochs,
             config.lr,
             config.batch_size,
+            config.ce_weight,
+            config.validation_ratio,
+            config.min_snr_gamma,
+            config.checkpoint_every,
+            config.checkpoint_dir,
+            config.checkpoint_stage,
+        )
+    }
+
+    /// Train diffusion model with cross-entropy loss and gradient accumulation
+    pub fn train_diffusion_ce_with_accumulation(
+        llm: &mut LLM,
+        data: Vec<&str>,
+        config: DiffusionCeTrainConfig,
+    ) -> Result<()> {
+        llm.train_diffusion_ce_with_accumulation(
+            data,
+            config.epochs,
+            config.lr,
+            config.batch_size,
+            config.gradient_accumulation_steps,
             config.ce_weight,
             config.validation_ratio,
             config.min_snr_gamma,

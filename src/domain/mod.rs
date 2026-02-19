@@ -1,6 +1,7 @@
 pub mod attention;
+pub mod compute;
+pub mod compute_backend;
 pub mod embeddings;
-pub mod eprop;
 pub mod layers;
 pub mod loss;
 pub mod memory;

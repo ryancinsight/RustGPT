@@ -2,9 +2,9 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
-use super::traits::PositionEmbedding;
 use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
+use super::traits::PositionEmbedding;
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gradients for OptimizedCoPE
 #[derive(Clone, Debug)]
@@ -161,7 +161,7 @@ impl PositionEmbedding for OptimizedCoPE {
         }
 
         // --- Recompute Forward Pass ---
-        
+
         // 1. vq = Down @ q
         let mut vq = Array1::zeros(self.rank);
         ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj, q, 0.0, &mut vq);
@@ -174,7 +174,7 @@ impl PositionEmbedding for OptimizedCoPE {
         let mut gate_input = Array1::zeros(self.embed_dim * 2);
         gate_input.slice_mut(s![0..self.embed_dim]).assign(q);
         gate_input.slice_mut(s![self.embed_dim..]).assign(k);
-        
+
         let gate_logit = gate_input.dot(&self.w_gate.column(0)) + self.b_gate[[0, 0]];
         let gate_scaled = gate_logit / self.temperature;
         let gate = self.smooth_gate(gate_scaled);
@@ -218,12 +218,12 @@ impl PositionEmbedding for OptimizedCoPE {
         // dLogit/dGateInput = W_gate
         let w_gate_col = self.w_gate.column(0);
         let d_gate_input = &w_gate_col * d_logit;
-        
+
         let d_q_gate = d_gate_input.slice(s![0..self.embed_dim]);
         let d_k_gate = d_gate_input.slice(s![self.embed_dim..]);
 
         // Gradients for Factorized Embeddings
-        
+
         // dCopeRaw/dUp[pos] = vq
         if let Some(ug) = &mut grads.up_proj_grads {
             let mut row = ug.row_mut(pos);
@@ -250,7 +250,13 @@ impl PositionEmbedding for OptimizedCoPE {
 
         // dVq/dq = Down^T * d_vq
         let mut d_q_content = Array1::zeros(self.embed_dim);
-        ndarray::linalg::general_mat_vec_mul(1.0, &self.down_proj.t(), &d_vq, 0.0, &mut d_q_content);
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &self.down_proj.t(),
+            &d_vq,
+            0.0,
+            &mut d_q_content,
+        );
 
         // Total Gradients
         let d_q = &d_q_content + &d_q_gate;

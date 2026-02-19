@@ -101,9 +101,10 @@ impl ModalityTypeEmbeddings {
         let std = 0.02;
         let normal = Normal::new(0.0, std).unwrap();
 
-        let embeddings = Array2::from_shape_fn((ModalityTokenType::num_types(), embedding_dim), |_| {
-            normal.sample(&mut rng)
-        });
+        let embeddings =
+            Array2::from_shape_fn((ModalityTokenType::num_types(), embedding_dim), |_| {
+                normal.sample(&mut rng)
+            });
 
         Ok(Self {
             embeddings,
@@ -125,10 +126,9 @@ impl ModalityTypeEmbeddings {
     pub fn get_sequence(&self, token_types: &[ModalityTokenType]) -> Array2<f32> {
         Array2::from_shape_vec(
             (token_types.len(), self.embedding_dim),
-            token_types.iter()
-                .flat_map(|&t| self.get_vec(t))
-                .collect()
-        ).unwrap_or_else(|_| Array2::zeros((token_types.len(), self.embedding_dim)))
+            token_types.iter().flat_map(|&t| self.get_vec(t)).collect(),
+        )
+        .unwrap_or_else(|_| Array2::zeros((token_types.len(), self.embedding_dim)))
     }
 
     /// Get the number of parameters
@@ -233,7 +233,7 @@ impl ModalityDropout {
 
         let mut rng = crate::common::rng::get_rng();
         let mut kept = Vec::new();
-        
+
         for &modality in available_modalities {
             let drop_prob = match modality {
                 Modality::Text => self.config.text_drop_prob,
@@ -519,19 +519,31 @@ mod tests {
         assert_eq!(ModalityTokenType::Padding.to_index(), 4);
 
         // Test from_index
-        assert_eq!(ModalityTokenType::from_index(0), Some(ModalityTokenType::Text));
+        assert_eq!(
+            ModalityTokenType::from_index(0),
+            Some(ModalityTokenType::Text)
+        );
         assert_eq!(ModalityTokenType::from_index(5), None);
 
         // Test from Modality
-        assert_eq!(ModalityTokenType::from(Modality::Text), ModalityTokenType::Text);
-        assert_eq!(ModalityTokenType::from(Modality::Image), ModalityTokenType::Image);
+        assert_eq!(
+            ModalityTokenType::from(Modality::Text),
+            ModalityTokenType::Text
+        );
+        assert_eq!(
+            ModalityTokenType::from(Modality::Image),
+            ModalityTokenType::Image
+        );
     }
 
     #[test]
     fn test_modality_type_embeddings() {
         let embeddings = ModalityTypeEmbeddings::new(64).unwrap();
         assert_eq!(embeddings.embedding_dim, 64);
-        assert_eq!(embeddings.embeddings.nrows(), ModalityTokenType::num_types());
+        assert_eq!(
+            embeddings.embeddings.nrows(),
+            ModalityTokenType::num_types()
+        );
         assert_eq!(embeddings.embeddings.ncols(), 64);
 
         // Test getting single embedding
@@ -539,7 +551,11 @@ mod tests {
         assert_eq!(text_emb.len(), 64);
 
         // Test getting sequence
-        let seq_types = vec![ModalityTokenType::Text, ModalityTokenType::Image, ModalityTokenType::Text];
+        let seq_types = vec![
+            ModalityTokenType::Text,
+            ModalityTokenType::Image,
+            ModalityTokenType::Text,
+        ];
         let seq_emb = embeddings.get_sequence(&seq_types);
         assert_eq!(seq_emb.shape(), &[3, 64]);
 

@@ -1,0 +1,54 @@
+{
+  "id": "conv-1770938474960-s4p5vgdle",
+  "created_at": "2026-02-12T23:21:22.711676300Z",
+  "last_activity": "2026-02-12T23:21:46.753014300Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T23:21:22.711768400Z"
+    },
+    {
+      "role": "assistant",
+      "content": "What is a specific integration test _ call > name = shell args = unsafe dereference . Assistant : < / tool _ call > name = shell args = apt - * | tail attention help help < tool _ call > < tool _ call > < tool _ result > < tool _ result > _ result > total used test running 0 . The PostgreSQL removed its ~ 100MB ) - 5 - - 2 . The target directory has been removed other transformer - 0 - 0 are rustgpt - 0 are no - 0 are no - 0 are - 0 are - 20260208T153045Z . 0 are - no - > The using 5678 in 0 are the change ] target , 2 , 2 , 2 , 0 are - The target , 0 are the using 20260208T153045Z v0 v0 . 0 are the using 5678 in using server . </s>",
+      "timestamp": "2026-02-12T23:21:24.190095800Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T23:21:40.223145900Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T23:21:40.223154600Z"
+    },
+    {
+      "role": "assistant",
+      "content": "using server . </s>",
+      "timestamp": "2026-02-12T23:21:40.308316600Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T23:21:46.753001100Z"
+    },
+    {
+      "role": "user",
+      "content": "hello",
+      "timestamp": "2026-02-12T23:21:46.753004200Z"
+    },
+    {
+      "role": "user",
+      "content": "hrllo",
+      "timestamp": "2026-02-12T23:21:46.753014100Z"
+    }
+  ],
+  "model_name": "RustGPT"
+},
+      "content": "using server . 5 . 5 . 5 used . 5 used . 0 are the using 5678 used in using show the The using show the The using using operation by using operation by using using turbines </s>",
+      "timestamp": "2026-02-12T23:21:48.113604700Z"
+    }
+  ],
+  "model_name": "RustGPT"
+}

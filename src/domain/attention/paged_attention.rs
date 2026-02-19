@@ -688,7 +688,7 @@ mod tests {
         let positions = cache.append(seq_id, &keys.view(), &values.view()).unwrap();
         assert_eq!(positions.len(), 1);
 
-        let (retrieved_k, retrieved_v) = cache.get(seq_id, &[0]).unwrap();
+        let (retrieved_k, _retrieved_v) = cache.get(seq_id, &[0]).unwrap();
         assert_eq!(retrieved_k.shape(), &[1, 64]);
     }
 

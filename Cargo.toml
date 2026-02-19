@@ -4,6 +4,20 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
+[features]
+default = ["cpu"]
+cpu = []
+# GPU backends - each enables specific hardware acceleration
+gpu-cuda = ["cudarc", "cuda-12000"]
+gpu-metal = ["dep:metal"]
+gpu-wgpu = ["wgpu"]
+# CUDA versions
+cuda-11060 = ["cudarc/cuda-11060"]
+cuda-12000 = ["cudarc/cuda-12000"]
+cuda-12020 = ["cudarc/cuda-12020"]
+# Convenience feature for all GPU backends
+gpu-all = ["gpu-cuda", "gpu-metal", "gpu-wgpu"]
+
 [dependencies]
 bincode = { version = "2.0.1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -22,12 +36,25 @@ tracing = "0.1"
 clap = { version = "4.0", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rkyv = { version = "0.7", features = ["validation"] }
+sysinfo = "0.37"
 
 # Web UI dependencies
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
+
+# GPU backend dependencies (optional)
+# CUDA support via cudarc
+cudarc = { version = "0.12", optional = true }
+# Cross-platform GPU via WebGPU
+wgpu = { version = "24.0", optional = true }
+# Safe casting for GPU buffer operations
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Metal support (macOS only)
+metal = { version = "0.28", optional = true }
 
 [dev-dependencies]
 proptest = "1.5"
@@ -88,8 +115,15 @@ harness = false
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+lto = "off"
+codegen-units = 16
+incremental = true
+
+[profile.release-fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
 
 [profile.bench]
 inherits = "release"

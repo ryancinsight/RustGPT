@@ -4,7 +4,13 @@ use ndarray::{Array1, Array2, Axis, Zip, s};
 use rand::distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::network::Layer;
+use crate::{
+    common::errors::Result,
+    domain::layers::components::workspace_managed::{
+        StreamingWorkspaceManaged, WorkspaceManaged, WorkspaceStats,
+    },
+    domain::network::Layer,
+};
 
 #[derive(Debug, Clone)]
 struct AttentionCache {
@@ -55,6 +61,12 @@ impl SlidingWindowCache {
         self.v_cache.fill(0.0);
         self.step = 0;
         self.titan_memory_state = None;
+    }
+
+    /// Clear the cache (alias for reset for consistency with workspace trait)
+    #[inline]
+    pub fn clear(&mut self) {
+        self.reset();
     }
 
     /// Check if cache dimensions match expected (for validation).
@@ -421,5 +433,66 @@ impl Layer for SlidingWindowAttention {
 
     fn zero_gradients(&mut self) {
         // No stateful gradients to zero
+    }
+}
+
+/// Workspace management for SlidingWindowAttention streaming inference
+impl WorkspaceManaged for SlidingWindowAttention {
+    /// Ensure workspace buffers have capacity for the given dimensions
+    fn ensure_capacity(&mut self, _batch_size: usize, _seq_len: usize, embed_dim: usize) {
+        if let Some(cache) = &mut self.streaming_cache {
+            // Reallocate only if dimensions changed
+            if !cache.is_compatible(self.window_size, embed_dim) {
+                *cache = SlidingWindowCache::new(self.window_size, embed_dim);
+            }
+        }
+    }
+
+    /// Clear all workspace buffers
+    fn clear_workspace(&mut self) {
+        self.streaming_cache = None;
+        self.cache = None;
+    }
+
+    /// Return memory statistics for streaming workspace
+    fn workspace_stats(&self) -> WorkspaceStats {
+        let mut buffer_count = 0;
+        let mut total_bytes = 0;
+
+        if let Some(cache) = &self.streaming_cache {
+            // k_cache and v_cache
+            buffer_count = 2;
+            let cache_bytes =
+                cache.cached_window_size * cache.cached_embed_dim * std::mem::size_of::<f32>();
+            total_bytes = cache_bytes * 2; // k_cache and v_cache
+        }
+
+        WorkspaceStats {
+            total_bytes,
+            buffer_count,
+            expected_shape: Some((self.window_size, self.embed_dim)),
+        }
+    }
+}
+
+/// Streaming state management for SlidingWindowAttention
+impl StreamingWorkspaceManaged for SlidingWindowAttention {
+    /// Initialize streaming state for inference with step-by-step processing
+    fn init_streaming(&mut self, _batch_size: usize, embed_dim: usize) -> Result<()> {
+        // Allocate streaming cache with proper dimensions
+        self.streaming_cache = Some(SlidingWindowCache::new(self.window_size, embed_dim));
+        Ok(())
+    }
+
+    /// Reset streaming state between sequences
+    fn reset_streaming_state(&mut self) {
+        if let Some(cache) = &mut self.streaming_cache {
+            cache.reset();
+        }
+    }
+
+    /// Check if streaming state is active
+    fn is_streaming(&self) -> bool {
+        self.streaming_cache.is_some()
     }
 }

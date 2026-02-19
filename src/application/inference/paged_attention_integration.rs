@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn test_create_sequence() {
         let integration = PagedAttentionIntegration::with_defaults();
-        let handle = integration.create_sequence();
+        let _handle = integration.create_sequence();
         assert_eq!(integration.num_sequences(), 1);
     }
 
@@ -157,7 +157,7 @@ mod tests {
 
         integration.append(handle, &keys, &values).unwrap();
 
-        let (retrieved_k, retrieved_v) = integration.get(handle, &[0, 1, 2]).unwrap();
+        let (retrieved_k, _retrieved_v) = integration.get(handle, &[0, 1, 2]).unwrap();
         assert_eq!(retrieved_k.shape()[0], 3);
     }
 

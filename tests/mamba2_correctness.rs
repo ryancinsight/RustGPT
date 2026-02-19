@@ -1,8 +1,8 @@
-use ndarray::{Array1, Array2, Axis};
-use llm::domain::network::Layer;
 use llm::domain::layers::ssm::{
-    Mamba2ScanInput, Mamba2ScanBackwardInput, SelectiveScanner, SelectiveScanConfig
+    Mamba2ScanBackwardInput, Mamba2ScanInput, SelectiveScanConfig, SelectiveScanner,
 };
+use llm::domain::network::Layer;
+use ndarray::{Array1, Array2, Axis};
 
 #[test]
 fn test_mamba2_fused_scan_correctness() {
@@ -14,9 +14,15 @@ fn test_mamba2_fused_scan_correctness() {
 
     // Create inputs
     let u = Array2::<f32>::from_shape_fn((t, d), |(i, j)| (i as f32 + j as f32) * 0.1);
-    let a = Array2::<f32>::from_shape_fn((t, num_heads), |(i, h)| 0.9 + (i as f32 * 0.01) + (h as f32 * 0.01));
-    let b = Array2::<f32>::from_shape_fn((t, num_heads * n), |(i, k)| 0.5 + (i as f32 * 0.01) - (k as f32 * 0.01));
-    let c = Array2::<f32>::from_shape_fn((t, num_heads * n), |(i, k)| 0.5 - (i as f32 * 0.01) + (k as f32 * 0.01));
+    let a = Array2::<f32>::from_shape_fn((t, num_heads), |(i, h)| {
+        0.9 + (i as f32 * 0.01) + (h as f32 * 0.01)
+    });
+    let b = Array2::<f32>::from_shape_fn((t, num_heads * n), |(i, k)| {
+        0.5 + (i as f32 * 0.01) - (k as f32 * 0.01)
+    });
+    let c = Array2::<f32>::from_shape_fn((t, num_heads * n), |(i, k)| {
+        0.5 - (i as f32 * 0.01) + (k as f32 * 0.01)
+    });
     let d_skip = Array1::<f32>::from_elem(d, 0.1);
 
     // Run fused scan
@@ -52,21 +58,21 @@ fn test_mamba2_fused_scan_correctness() {
                 let j = h * head_dim + j_local;
                 let u_val = u[[ti, j]];
                 let d_val = d_skip[j];
-                
+
                 let mut z_val = d_val * u_val;
-                
+
                 for k in 0..n {
                     let idx = j * n + k;
                     let b_idx = h * n + k;
-                    
+
                     let s_prev = s[idx];
                     let b_val = b[[ti, b_idx]];
                     let c_val = c[[ti, b_idx]];
-                    
+
                     let s_new = a_val * s_prev + b_val * u_val;
                     s[idx] = s_new;
                     state_ref[[ti, idx]] = s_new;
-                    
+
                     z_val += c_val * s_new;
                 }
                 z_ref[[ti, j]] = z_val;
@@ -88,23 +94,26 @@ fn test_mamba2_fused_scan_correctness() {
 #[test]
 fn test_mamba2_backward_shapes() {
     use llm::domain::layers::ssm::{Mamba, MambaConfig};
-    
+
     let d_model = 16;
     let seq_len = 10;
-    
+
     let config = MambaConfig::enhanced();
     let mut mamba = Mamba::new_with_config(d_model, 4, config);
-    
+
     let input = Array2::<f32>::zeros((seq_len, d_model));
     let output = mamba.forward_mamba2(&input);
-    
+
     assert_eq!(output.dim(), (seq_len, d_model));
-    
+
     let grads = Array2::<f32>::ones((seq_len, d_model));
     // backward() calls compute_gradients() which checks cached_kind
     // forward_mamba2 sets cached_kind = Mamba2
     let input_grads = mamba.backward(&grads, 0.001);
-    
+
     assert_eq!(input_grads.dim(), (seq_len, d_model));
-    assert!(!input_grads.iter().any(|x: &f32| x.is_nan()), "NaN in grads");
+    assert!(
+        !input_grads.iter().any(|x: &f32| x.is_nan()),
+        "NaN in grads"
+    );
 }

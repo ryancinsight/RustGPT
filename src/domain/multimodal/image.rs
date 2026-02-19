@@ -68,11 +68,7 @@ impl ImageConfig {
     /// Calculate the sequence length (patches + optional CLS token)
     pub fn sequence_length(&self) -> usize {
         let base = self.num_patches();
-        if self.use_cls_token {
-            base + 1
-        } else {
-            base
-        }
+        if self.use_cls_token { base + 1 } else { base }
     }
 
     /// Calculate the flattened patch dimension
@@ -405,9 +401,9 @@ impl ImageAugmentation {
 
         // Brightness
         if self.config.brightness_jitter > 0.0 {
-            let delta = self.rng.random_range(
-                -self.config.brightness_jitter..self.config.brightness_jitter
-            );
+            let delta = self
+                .rng
+                .random_range(-self.config.brightness_jitter..self.config.brightness_jitter);
             for pixel in &mut result {
                 *pixel = (*pixel + delta * 255.0).clamp(0.0, 255.0);
             }
@@ -416,9 +412,9 @@ impl ImageAugmentation {
         // Contrast
         if self.config.contrast_jitter > 0.0 {
             let mean: f32 = result.iter().sum::<f32>() / result.len() as f32;
-            let factor = self.rng.random_range(
-                1.0 - self.config.contrast_jitter..1.0 + self.config.contrast_jitter
-            );
+            let factor = self
+                .rng
+                .random_range(1.0 - self.config.contrast_jitter..1.0 + self.config.contrast_jitter);
             for pixel in &mut result {
                 *pixel = (mean + (*pixel - mean) * factor).clamp(0.0, 255.0);
             }
@@ -427,7 +423,7 @@ impl ImageAugmentation {
         // Saturation (for RGB images)
         if c == 3 && self.config.saturation_jitter > 0.0 {
             let factor = self.rng.random_range(
-                1.0 - self.config.saturation_jitter..1.0 + self.config.saturation_jitter
+                1.0 - self.config.saturation_jitter..1.0 + self.config.saturation_jitter,
             );
             for y in 0..h {
                 for x in 0..w {
@@ -503,7 +499,10 @@ impl ImageEncoder {
 
         let position_embeddings = if config.use_position_embeddings {
             let seq_len = config.sequence_length();
-            Some(Self::init_position_embeddings(seq_len, config.embedding_dim))
+            Some(Self::init_position_embeddings(
+                seq_len,
+                config.embedding_dim,
+            ))
         } else {
             None
         };
@@ -554,9 +553,11 @@ impl ImageEncoder {
         // Add CLS token if enabled
         if let Some(ref cls) = self.cls_token {
             let cls_emb = cls.view().insert_axis(Axis(0));
-            embeddings = ndarray::concatenate(Axis(0), &[cls_emb, embeddings.view()])
-                .map_err(|e| crate::common::errors::ModelError::InvalidInput {
-                    message: format!("Failed to concatenate CLS token: {}", e),
+            embeddings =
+                ndarray::concatenate(Axis(0), &[cls_emb, embeddings.view()]).map_err(|e| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: format!("Failed to concatenate CLS token: {}", e),
+                    }
                 })?;
         }
 
@@ -615,7 +616,12 @@ impl ImageEncoder {
     }
 
     /// Resize image to target dimensions using bilinear interpolation
-    pub fn resize(&self, sample: &ImageSample, target_height: usize, target_width: usize) -> ImageSample {
+    pub fn resize(
+        &self,
+        sample: &ImageSample,
+        target_height: usize,
+        target_width: usize,
+    ) -> ImageSample {
         let img = sample.to_array3();
         let c = sample.channels;
 

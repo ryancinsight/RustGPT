@@ -8,9 +8,7 @@ use crate::{
 /// Build a complete model configuration from CLI arguments
 pub fn build_model_config(args: &Args) -> ModelConfig {
     // Choose architecture based on CLI flags
-    let architecture = if args.trm {
-        ArchitectureType::TRM
-    } else if args.diffusion {
+    let architecture = if args.diffusion {
         ArchitectureType::Diffusion
     } else {
         ArchitectureType::Autoregressive
@@ -41,18 +39,6 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
     config.diffusion_min_snr_gamma = args.diffusion_min_snr_gamma.max(1e-6);
     config.diffusion_noise_schedule = args.diffusion_noise_schedule.into();
     config.diffusion_timestep_strategy = args.diffusion_timestep_strategy.into();
-    config.spiking_neuron_model = args.spiking.map(Into::into);
-
-    // Apply TRM-specific settings
-    if args.trm {
-        config.trm_use_diffusion = args.diffusion;
-        config.trm_num_recursions = args.trm_recursions;
-        config.trm_max_supervision_steps = args.trm_supervision_steps;
-        config.trm_max_inference_steps = args.trm_inference_steps;
-        config.trm_latent_moh_enabled = args.trm_latent_moh;
-        config.trm_latent_moh_top_p_min = Some(args.trm_latent_moh_top_p_min);
-        config.trm_latent_moh_top_p_max = Some(args.trm_latent_moh_top_p_max);
-    }
 
     // Apply modern LLM enhancements
     config.use_dynamic_tanh_norm = use_dynamic_tanh_norm;
@@ -68,6 +54,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
 
     // Select temporal mixing mechanism (attention vs SSM-style RG-LRU)
     config.temporal_mixing = args.temporal_mixing.into();
+    config.compute_backend = args.compute_backend.into();
 
     // Residual decorrelation auxiliary objective (redundancy reduction)
     config.residual_decorrelation_weight = args.residual_decorrelation_weight.max(0.0);
@@ -99,7 +86,7 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
         config.head_selection = crate::domain::mixtures::moh::HeadSelectionStrategy::Fixed {
             num_active: num_heads,
         };
-    } else if args.eprop && args.moe {
+    } else if args.moe {
         let num_active = num_heads.div_ceil(2).max(1);
         config.head_selection = crate::domain::mixtures::moh::HeadSelectionStrategy::Learned {
             num_active,
@@ -120,31 +107,25 @@ pub fn build_model_config(args: &Args) -> ModelConfig {
             load_balance_weight: 0.01,
             sparsity_weight: 0.001,
             diversity_weight: 0.005,
+            expert_specialization_weight: 0.002,
             routing_mode: crate::domain::mixtures::moe::ExpertRoutingMode::TokenChoiceTopK,
             capacity_factor: 0.0,
             min_expert_capacity: 0,
             renormalize_after_capacity: true,
             z_loss_weight: 0.0,
             use_head_conditioning: true,
+            cap_experts_by_head_activity: true,
             use_learned_k_adaptation: true,
+            head_expert_proximity_scale: 0.15,
+            head_expert_proximity_sigma: 0.35,
+            parallel_expert_execution: true,
+            parallel_expert_min_tokens: 16,
             shared_experts: vec![],
             shared_expert_scale: 0.0,
             moh_moe_contrastive_weight: 0.01,
         });
     } else {
         config.moe_router = None;
-    }
-
-    // Enable E-Prop if requested
-    if args.eprop {
-        config.eprop_enabled = true;
-        // If spiking model is specified, use it for eprop config
-        if let Some(spiking_cli) = args.spiking {
-            config.eprop_neuron_config = Some(spiking_cli.into());
-        } else {
-            // Default to LIF if not specified
-            config.eprop_neuron_config = Some(crate::domain::eprop::config::NeuronConfig::lif());
-        }
     }
 
     config

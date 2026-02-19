@@ -87,21 +87,18 @@ impl TitansMAC {
     }
 
     // Helper to retrieve and concat
-    fn process_segment(
-        &mut self,
-        segment: &Array2<f32>,
-    ) -> (Array2<f32>, Vec<PolyAttentionCache>) {
+    fn process_segment(&mut self, segment: &Array2<f32>) -> (Array2<f32>, Vec<PolyAttentionCache>) {
         // 1. Retrieve h_t from Memory using input context (segment) as query.
         let h_t = self.memory.retrieve(segment);
 
         if cfg!(debug_assertions) {
-             for i in 0..segment.nrows() {
-                  if i == segment.nrows() - 1 {
-                       println!("Batch Step {} (Last):", i);
-                       println!("  Retrieve Input (segment row): {:?}", segment.row(i));
-                       println!("  h_t: {:?}", h_t.row(i));
-                  }
-             }
+            for i in 0..segment.nrows() {
+                if i == segment.nrows() - 1 {
+                    println!("Batch Step {} (Last):", i);
+                    println!("  Retrieve Input (segment row): {:?}", segment.row(i));
+                    println!("  h_t: {:?}", h_t.row(i));
+                }
+            }
         }
 
         // 2. Process token-by-token to ensure correct causality (context = P + h_t[i])
@@ -120,7 +117,9 @@ impl TitansMAC {
             let total_len = p_len + 1 + 1;
             let mut input_seq = Array2::<f32>::zeros((total_len, d));
 
-            input_seq.slice_mut(s![0..p_len, ..]).assign(&self.persistent_memory);
+            input_seq
+                .slice_mut(s![0..p_len, ..])
+                .assign(&self.persistent_memory);
             input_seq.row_mut(p_len).assign(&current_h_t);
             input_seq.row_mut(p_len + 1).assign(&current_seg);
 
@@ -128,11 +127,11 @@ impl TitansMAC {
             let (attn_out, cache) = self.core.forward_detached(&input_seq, true);
 
             if cfg!(debug_assertions) {
-                 println!("Batch Step {}:", i);
-                 println!("  Input: {:?}", current_seg);
-                 println!("  h_t: {:?}", current_h_t);
-                 // Check context slice
-                 // input_seq row p_len is h_t
+                println!("Batch Step {}:", i);
+                println!("  Input: {:?}", current_seg);
+                println!("  h_t: {:?}", current_h_t);
+                // Check context slice
+                // input_seq row p_len is h_t
             }
 
             // Extract output for segment[i] (last row)
@@ -165,43 +164,47 @@ impl TitansMAC {
     }
 
     /// Process a single token step into output buffer (Zero Allocation)
-    pub fn forward_step_into(&mut self, input: &ndarray::ArrayView1<f32>, output: &mut Array1<f32>) {
+    pub fn forward_step_into(
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        output: &mut Array1<f32>,
+    ) {
         let p_len = self.persistent_len;
         let d = input.len();
         let context_len = p_len + 1; // Persistent + Memory
 
         // Initialize workspace if needed
         if self.streaming_workspace.is_none() {
-             self.streaming_workspace = Some(TitansMACStreamingWorkspace {
+            self.streaming_workspace = Some(TitansMACStreamingWorkspace {
                 context_input: Array2::zeros((context_len, d)),
                 attention_input: Array2::zeros((context_len + 1, d)),
                 h_t: Array1::zeros(self.memory.val_dim),
                 neural_memory_workspace: NeuralMemoryStreamingWorkspace {
-                     q: Array1::zeros(self.memory.key_dim),
-                     z_ret: Array1::zeros(self.memory.memory_hidden_dim),
-                     h_ret: Array1::zeros(self.memory.memory_hidden_dim),
-                     y_ret: Array1::zeros(self.memory.val_dim),
-                     
-                     k: Array1::zeros(self.memory.key_dim),
-                     v: Array1::zeros(self.memory.val_dim),
-                     z_upd: Array1::zeros(self.memory.memory_hidden_dim),
-                     h_upd: Array1::zeros(self.memory.memory_hidden_dim),
-                     v_pred: Array1::zeros(self.memory.val_dim),
-                     grad_output: Array1::zeros(self.memory.val_dim),
-                     grad_w2: Array2::zeros((self.memory.val_dim, self.memory.memory_hidden_dim)),
-                     grad_b2: Array1::zeros(self.memory.val_dim),
-                     grad_h: Array1::zeros(self.memory.memory_hidden_dim),
-                     grad_z: Array1::zeros(self.memory.memory_hidden_dim),
-                     grad_w1: Array2::zeros((self.memory.memory_hidden_dim, self.memory.key_dim)),
-                     grad_b1: Array1::zeros(self.memory.memory_hidden_dim),
+                    q: Array1::zeros(self.memory.key_dim),
+                    z_ret: Array1::zeros(self.memory.memory_hidden_dim),
+                    h_ret: Array1::zeros(self.memory.memory_hidden_dim),
+                    y_ret: Array1::zeros(self.memory.val_dim),
+
+                    k: Array1::zeros(self.memory.key_dim),
+                    v: Array1::zeros(self.memory.val_dim),
+                    z_upd: Array1::zeros(self.memory.memory_hidden_dim),
+                    h_upd: Array1::zeros(self.memory.memory_hidden_dim),
+                    v_pred: Array1::zeros(self.memory.val_dim),
+                    grad_output: Array1::zeros(self.memory.val_dim),
+                    grad_w2: Array2::zeros((self.memory.val_dim, self.memory.memory_hidden_dim)),
+                    grad_b2: Array1::zeros(self.memory.val_dim),
+                    grad_h: Array1::zeros(self.memory.memory_hidden_dim),
+                    grad_z: Array1::zeros(self.memory.memory_hidden_dim),
+                    grad_w1: Array2::zeros((self.memory.memory_hidden_dim, self.memory.key_dim)),
+                    grad_b1: Array1::zeros(self.memory.memory_hidden_dim),
                 },
                 poly_context_workspace: PolyAttentionContextWorkspace::new(context_len, d),
                 update_buffer: Array2::zeros((self.segment_len, d)),
                 segment_input_buffer: Array2::zeros((self.segment_len, d)),
-                buffer_idx: 0
+                buffer_idx: 0,
             });
         }
-        
+
         let workspace = self.streaming_workspace.as_mut().unwrap();
         if workspace.context_input.nrows() != context_len || workspace.context_input.ncols() != d {
             workspace.context_input = Array2::zeros((context_len, d));
@@ -210,22 +213,30 @@ impl TitansMAC {
         }
 
         // 1. Retrieve h_t from Memory using input as query
-        self.memory.retrieve_step_into(input, &mut workspace.h_t, &mut workspace.neural_memory_workspace);
+        self.memory.retrieve_step_into(
+            input,
+            &mut workspace.h_t,
+            &mut workspace.neural_memory_workspace,
+        );
 
         if cfg!(debug_assertions) {
-             println!("Stream Step {}:", workspace.buffer_idx);
-             println!("  Input: {:?}", input);
-             println!("  h_t: {:?}", workspace.h_t);
+            println!("Stream Step {}:", workspace.buffer_idx);
+            println!("  Input: {:?}", input);
+            println!("  h_t: {:?}", workspace.h_t);
         }
 
         // 2. Construct Context [Persistent | h_t]
         // Copy persistent memory
-        workspace.context_input
+        workspace
+            .context_input
             .slice_mut(s![0..p_len, ..])
             .assign(&self.persistent_memory);
 
         // Copy h_t
-        workspace.context_input.row_mut(p_len).assign(&workspace.h_t);
+        workspace
+            .context_input
+            .row_mut(p_len)
+            .assign(&workspace.h_t);
 
         // 3. Match batch path exactly: run detached attention on [Persistent | h_t | token].
         workspace
@@ -237,15 +248,18 @@ impl TitansMAC {
         output.assign(&attn_out.row(context_len));
 
         // 4. Buffer output for Segment-based Memory Update
-        workspace.update_buffer.row_mut(workspace.buffer_idx).assign(&output.view());
+        workspace
+            .update_buffer
+            .row_mut(workspace.buffer_idx)
+            .assign(&output.view());
         workspace.buffer_idx += 1;
 
         // 5. Update Memory if segment is full
         if workspace.buffer_idx >= self.segment_len {
             for i in 0..self.segment_len {
                 self.memory.update_step_with_workspace(
-                    &workspace.update_buffer.row(i), 
-                    &mut workspace.neural_memory_workspace
+                    &workspace.update_buffer.row(i),
+                    &mut workspace.neural_memory_workspace,
                 );
             }
             workspace.buffer_idx = 0;
@@ -660,8 +674,9 @@ impl Layer for TitansMAC {
                 d_context_out.row_mut(total_len - 1).assign(&d_out_t);
 
                 let cache = &data.poly_caches[t];
-                let (d_context, core_pg) =
-                    self.core.compute_gradients_with_cache(cache, &d_context_out);
+                let (d_context, core_pg) = self
+                    .core
+                    .compute_gradients_with_cache(cache, &d_context_out);
 
                 // Accumulate core params
                 if core_param_grads_accum.is_empty() {
@@ -753,7 +768,11 @@ impl Layer for TitansMAC {
         (input_grads, all_grads)
     }
 
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], lr: f32) -> crate::common::errors::Result<()> {
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::common::errors::Result<()> {
         let core_params = self.core.parameters();
         let memory_params = 10;
         let persistent_params = 1;

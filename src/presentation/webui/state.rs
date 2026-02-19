@@ -164,8 +164,7 @@ impl AppState {
 
         // Update rolling average latency
         let n = guard.stats.successful_requests as f64;
-        guard.stats.avg_latency_ms =
-            (guard.stats.avg_latency_ms * (n - 1.0) + latency_ms) / n;
+        guard.stats.avg_latency_ms = (guard.stats.avg_latency_ms * (n - 1.0) + latency_ms) / n;
     }
 
     /// Record a failed request
@@ -181,11 +180,7 @@ impl AppState {
     }
 
     /// Get or create a conversation
-    pub async fn get_or_create_conversation(
-        &self,
-        id: &str,
-        model_name: &str,
-    ) -> Conversation {
+    pub async fn get_or_create_conversation(&self, id: &str, model_name: &str) -> Conversation {
         let mut guard = self.inner.write().await;
 
         if let Some(conv) = guard.conversations.get(id) {
@@ -214,7 +209,9 @@ impl AppState {
     /// Save a conversation to disk
     #[allow(dead_code)]
     async fn save_conversation_to_disk(&self, conversation: &Conversation) -> std::io::Result<()> {
-        let file_path = self.conversations_dir.join(format!("{}.json", conversation.id));
+        let file_path = self
+            .conversations_dir
+            .join(format!("{}.json", conversation.id));
         let json = serde_json::to_string_pretty(conversation)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         tokio::fs::write(&file_path, json).await
@@ -282,13 +279,13 @@ impl AppState {
     pub async fn delete_conversation(&self, id: &str) -> bool {
         let mut guard = self.inner.write().await;
         let removed = guard.conversations.remove(id).is_some();
-        
+
         // Also delete from disk
         if removed {
             let file_path = self.conversations_dir.join(format!("{}.json", id));
             let _ = tokio::fs::remove_file(&file_path).await;
         }
-        
+
         removed
     }
 

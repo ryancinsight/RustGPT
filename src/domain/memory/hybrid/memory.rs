@@ -200,11 +200,7 @@ impl HybridMemory {
     }
 
     fn softplus(x: f32) -> f32 {
-        if x > 20.0 {
-            x
-        } else {
-            (1.0 + x.exp()).ln()
-        }
+        if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
     }
 
     fn logit(x: f32) -> f32 {
@@ -246,9 +242,7 @@ impl HybridMemory {
         let mut surprise_scores = Vec::with_capacity(seq_len);
 
         self.ensure_dummy_token_ids(seq_len);
-        let engram_out = self
-            .engram_memory
-            .forward(input, &self.dummy_token_ids);
+        let engram_out = self.engram_memory.forward(input, &self.dummy_token_ids);
         let titans_out = self.titans_memory.forward(input);
 
         for t in 0..seq_len {
@@ -287,7 +281,6 @@ impl HybridMemory {
         }
         &self.cached_pos_encoding.as_ref().unwrap().1
     }
-
 
     pub fn get_cache_stats(&self) -> (f32, f32, usize, usize) {
         let (tier1_rate, tier2_rate) = self.engram_memory.cache.hit_rate();
@@ -333,9 +326,7 @@ impl Layer for HybridMemory {
         let seq_len = input.nrows();
 
         self.ensure_dummy_token_ids(seq_len);
-        let engram_out = self
-            .engram_memory
-            .forward(input, &self.dummy_token_ids);
+        let engram_out = self.engram_memory.forward(input, &self.dummy_token_ids);
         let titans_out = self.titans_memory.forward(input);
         let pos_encoding = self.pos_encoding(seq_len).to_owned();
         let mut surprise_scores = Vec::with_capacity(seq_len);
@@ -520,7 +511,9 @@ impl Layer for HybridMemory {
         let mut smoothed_titans = Vec::new();
 
         let prev_gates = self.cached_prev_gates.unwrap_or((0.5, 0.5));
-        let prev_cumulative = self.cached_prev_cumulative_surprise.unwrap_or(self.cumulative_surprise);
+        let prev_cumulative = self
+            .cached_prev_cumulative_surprise
+            .unwrap_or(self.cumulative_surprise);
 
         if self.config.use_adaptive_routing {
             let mut prev_engram = prev_gates.0;
@@ -616,8 +609,8 @@ impl Layer for HybridMemory {
                 let d_scaled_titans = d_engram_gate * (-scaled_engram) * inv_scaled_total_sq
                     + d_titans_gate * (scaled_engram + eps) * inv_scaled_total_sq;
 
-                d_ratio += d_scaled_engram * normalized_engram
-                    - d_scaled_titans * normalized_titans;
+                d_ratio +=
+                    d_scaled_engram * normalized_engram - d_scaled_titans * normalized_titans;
 
                 let d_norm_engram = d_scaled_engram * engram_ratio;
                 let d_norm_titans = d_scaled_titans * (1.0 - engram_ratio);
@@ -676,12 +669,20 @@ impl Layer for HybridMemory {
                 let d_g_titans = d_scaled_titans * (1.0 - engram_ratio) + d_prev_titans;
 
                 let w_t = engram_weights[t];
-                let g_prev_engram = if t == 0 { prev_gates.0 } else { smoothed_engram[t - 1] };
-                let g_prev_titans = if t == 0 { prev_gates.1 } else { smoothed_titans[t - 1] };
+                let g_prev_engram = if t == 0 {
+                    prev_gates.0
+                } else {
+                    smoothed_engram[t - 1]
+                };
+                let g_prev_titans = if t == 0 {
+                    prev_gates.1
+                } else {
+                    smoothed_titans[t - 1]
+                };
 
                 let d_w_t = (1.0 - forget_gate) * (d_g_engram - d_g_titans);
-                d_forget_gate += d_g_engram * (g_prev_engram - w_t)
-                    + d_g_titans * (g_prev_titans - (1.0 - w_t));
+                d_forget_gate +=
+                    d_g_engram * (g_prev_engram - w_t) + d_g_titans * (g_prev_titans - (1.0 - w_t));
 
                 d_prev_engram = d_g_engram * forget_gate;
                 d_prev_titans = d_g_titans * forget_gate;
@@ -690,7 +691,11 @@ impl Layer for HybridMemory {
                 d_threshold += d_z;
 
                 let d_c_t = d_c_next - d_z;
-                let c_prev = if t == 0 { prev_cumulative } else { cumulatives[t - 1] };
+                let c_prev = if t == 0 {
+                    prev_cumulative
+                } else {
+                    cumulatives[t - 1]
+                };
                 d_surprise_decay += d_c_t * (c_prev - surprises[t]);
                 let d_surprise = d_c_t * (1.0 - surprise_decay);
                 d_c_next = d_c_t * surprise_decay;
@@ -698,8 +703,16 @@ impl Layer for HybridMemory {
                 let input_norm = input_norms[t];
                 let engram_norm = engram_norms[t];
                 let titans_norm = titans_norms[t];
-                let sign_engram = if engram_norm - input_norm >= 0.0 { 1.0 } else { -1.0 };
-                let sign_titans = if titans_norm - input_norm >= 0.0 { 1.0 } else { -1.0 };
+                let sign_engram = if engram_norm - input_norm >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let sign_titans = if titans_norm - input_norm >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
 
                 let d_engram_norm = 0.5 * d_surprise * sign_engram;
                 let d_titans_norm = 0.5 * d_surprise * sign_titans;
@@ -735,13 +748,12 @@ impl Layer for HybridMemory {
             }
         }
 
-        let (engram_input_grads, engram_param_grads) = self.engram_memory.compute_gradients(
-            input,
-            &self.dummy_token_ids,
-            &engram_out_grads,
-        );
-        let (titans_input_grads, titans_param_grads) =
-            self.titans_memory.compute_gradients(input, &titans_out_grads);
+        let (engram_input_grads, engram_param_grads) =
+            self.engram_memory
+                .compute_gradients(input, &self.dummy_token_ids, &engram_out_grads);
+        let (titans_input_grads, titans_param_grads) = self
+            .titans_memory
+            .compute_gradients(input, &titans_out_grads);
 
         let mut input_grads = engram_input_grads + titans_input_grads;
         input_grads += &router_input_grads;

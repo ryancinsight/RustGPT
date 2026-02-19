@@ -60,8 +60,7 @@ impl<P: PositionEmbedding> PositionEmbedding for WindowAwareCoPE<P> {
                 return 0.0;
             }
         }
-        self.inner
-            .contribution(q, k, query_pos, key_pos, inputs)
+        self.inner.contribution(q, k, query_pos, key_pos, inputs)
     }
 
     fn backward(
@@ -167,7 +166,8 @@ mod tests {
 
         // Initially window is 16: positions 0-15 are valid, 16+ return 0
         assert!(
-            cope.contribution(&q.view(), &k.view(), 15, 0, None).is_finite(),
+            cope.contribution(&q.view(), &k.view(), 15, 0, None)
+                .is_finite(),
             "pos 15 should be in window"
         );
         assert_eq!(
@@ -178,9 +178,13 @@ mod tests {
 
         // Expand window to 32: positions 0-31 valid (pos < 32)
         cope.set_window_size(Some(32));
-        assert!(cope.contribution(&q.view(), &k.view(), 15, 0, None).is_finite());
         assert!(
-            cope.contribution(&q.view(), &k.view(), 31, 0, None).is_finite(),
+            cope.contribution(&q.view(), &k.view(), 15, 0, None)
+                .is_finite()
+        );
+        assert!(
+            cope.contribution(&q.view(), &k.view(), 31, 0, None)
+                .is_finite(),
             "pos 31 should be in window"
         );
         assert_eq!(
@@ -191,7 +195,10 @@ mod tests {
 
         // Disable window: all positions valid
         cope.set_window_size(None);
-        assert!(cope.contribution(&q.view(), &k.view(), 64, 0, None).is_finite());
+        assert!(
+            cope.contribution(&q.view(), &k.view(), 64, 0, None)
+                .is_finite()
+        );
     }
 
     #[test]

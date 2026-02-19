@@ -11,15 +11,15 @@
 //! - **Cross-Modal Attention Masks**: Builds attention masks for cross-modal attention.
 //! - **Data Augmentation**: Applies modality-specific augmentation during training.
 
-use ndarray::{concatenate, Array2, Axis};
+use ndarray::{Array2, Axis, concatenate};
 use serde::{Deserialize, Serialize};
 
 use crate::common::errors::Result;
 use crate::domain::multimodal::{
+    CrossModalMaskBuilder, ModalityTokenType, ModalityTypeEmbeddings,
     audio::{AudioConfig, AudioEncoder, AudioSample},
     image::{ImageConfig, ImageEncoder, ImageSample},
     video::{VideoConfig, VideoEncoder, VideoSample},
-    CrossModalMaskBuilder, ModalityTokenType, ModalityTypeEmbeddings,
 };
 
 /// Supported modalities
@@ -47,7 +47,10 @@ impl Modality {
 #[derive(Debug, Clone)]
 pub enum MultiModalExample {
     /// Text example with tokens
-    Text { tokens: Vec<usize>, label: Option<String> },
+    Text {
+        tokens: Vec<usize>,
+        label: Option<String>,
+    },
     /// Image example with pixels
     Image { sample: ImageSample },
     /// Video example with frames
@@ -159,7 +162,11 @@ impl MultiModalBatch {
         }
 
         // Concatenate all modalities along sequence dimension
-        concatenate(Axis(0), &results.iter().map(|a| a.view()).collect::<Vec<_>>()).ok()
+        concatenate(
+            Axis(0),
+            &results.iter().map(|a| a.view()).collect::<Vec<_>>(),
+        )
+        .ok()
     }
 
     /// Get the total sequence length across all modalities
@@ -213,7 +220,7 @@ impl MultiModalBatch {
         }
 
         let type_emb_array = type_embeddings.get_sequence(&token_types);
-        
+
         // Add type embeddings to each position
         for (i, mut row) in concatenated.rows_mut().into_iter().enumerate() {
             for (j, &val) in type_emb_array.row(i).iter().enumerate() {
@@ -315,7 +322,10 @@ impl MultiModalProcessor {
     }
 
     /// Process a single example and return embeddings
-    pub fn process_example(&self, example: &MultiModalExample) -> Result<Vec<(Modality, Array2<f32>)>> {
+    pub fn process_example(
+        &self,
+        example: &MultiModalExample,
+    ) -> Result<Vec<(Modality, Array2<f32>)>> {
         let mut results = Vec::new();
 
         match example {
@@ -355,7 +365,13 @@ impl MultiModalProcessor {
                     });
                 }
             }
-            MultiModalExample::Mixed { text, image, video, audio, ordering } => {
+            MultiModalExample::Mixed {
+                text,
+                image,
+                video,
+                audio,
+                ordering,
+            } => {
                 // Process each modality in the specified order
                 for modality in ordering {
                     match modality {
@@ -537,7 +553,8 @@ mod tests {
             Some(ImageConfig::default()),
             Some(VideoConfig::default()),
             Some(audio_config),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(processor.supports_modality(Modality::Text));
         assert!(processor.supports_modality(Modality::Image));
         assert!(processor.supports_modality(Modality::Video));
@@ -577,13 +594,7 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = MultiModalProcessor::new(
-            64,
-            Some(config),
-            None,
-            None,
-        )
-        .unwrap();
+        let processor = MultiModalProcessor::new(64, Some(config), None, None).unwrap();
 
         let mut sample = create_test_image();
         sample.normalize(ImageNormRange::ZeroToOne);
@@ -600,8 +611,12 @@ mod tests {
     #[test]
     fn test_multimodal_batch() {
         let mut batch = MultiModalBatch::new();
-        batch.embeddings.push((Modality::Text, Array2::zeros((10, 64))));
-        batch.embeddings.push((Modality::Image, Array2::zeros((5, 64))));
+        batch
+            .embeddings
+            .push((Modality::Text, Array2::zeros((10, 64))));
+        batch
+            .embeddings
+            .push((Modality::Image, Array2::zeros((5, 64))));
 
         assert_eq!(batch.total_sequence_length(), 15);
     }

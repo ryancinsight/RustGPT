@@ -3,21 +3,16 @@
 //! Defines all HTTP routes and their handlers using axum's router
 
 use axum::{
-    middleware,
+    Router, middleware,
     response::IntoResponse,
     routing::{delete, get, post},
-    Router,
 };
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
 
-use super::{
-    config::WebUiConfig,
-    handlers::*,
-    state::AppState,
-};
+use super::{config::WebUiConfig, handlers::*, state::AppState};
 
 /// Create the main router with all API routes
 pub fn create_router(state: AppState, config: &WebUiConfig) -> Router {
@@ -70,11 +65,7 @@ fn api_v1_routes(state: AppState) -> Router {
 }
 
 /// Create router with authentication middleware
-pub fn create_router_with_auth(
-    state: AppState,
-    config: &WebUiConfig,
-    api_key: String,
-) -> Router {
+pub fn create_router_with_auth(state: AppState, config: &WebUiConfig, api_key: String) -> Router {
     let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/", get(serve_static))
@@ -107,7 +98,7 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> impl axum::response::IntoResponse {
-    use axum::http::{header, StatusCode};
+    use axum::http::{StatusCode, header};
 
     // Check for Authorization header
     let auth_header = request

@@ -4,7 +4,7 @@
 //! and converts them to ImageSample for multimodal training.
 
 use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
@@ -50,10 +50,10 @@ impl DatasetLoader for MnistLoader {
 pub fn load_mnist_train<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>, Vec<u8>)> {
     let images_path = data_dir.as_ref().join("train-images.gz");
     let labels_path = data_dir.as_ref().join("train-labels.gz");
-    
+
     let images = load_mnist_images(&images_path)?;
     let labels = load_mnist_labels(&labels_path)?;
-    
+
     if images.len() != labels.len() {
         return Err(ModelError::InvalidInput {
             message: format!(
@@ -63,7 +63,7 @@ pub fn load_mnist_train<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>
             ),
         });
     }
-    
+
     Ok((images, labels))
 }
 
@@ -71,10 +71,10 @@ pub fn load_mnist_train<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>
 pub fn load_mnist_test<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>, Vec<u8>)> {
     let images_path = data_dir.as_ref().join("t10k-images.gz");
     let labels_path = data_dir.as_ref().join("t10k-labels.gz");
-    
+
     let images = load_mnist_images(&images_path)?;
     let labels = load_mnist_labels(&labels_path)?;
-    
+
     if images.len() != labels.len() {
         return Err(ModelError::InvalidInput {
             message: format!(
@@ -84,7 +84,7 @@ pub fn load_mnist_test<P: AsRef<Path>>(data_dir: P) -> Result<(Vec<ImageSample>,
             ),
         });
     }
-    
+
     Ok((images, labels))
 }
 
@@ -93,13 +93,15 @@ fn load_mnist_images<P: AsRef<Path>>(path: P) -> Result<Vec<ImageSample>> {
     let file = File::open(&path).map_err(ModelError::from)?;
     let decoder = GzDecoder::new(file);
     let mut reader = BufReader::new(decoder);
-    
+
     // Read header
     let mut header = [0u8; 16];
-    reader.read_exact(&mut header).map_err(|e| ModelError::InvalidInput {
-        message: format!("Failed to read MNIST image header: {}", e),
-    })?;
-    
+    reader
+        .read_exact(&mut header)
+        .map_err(|e| ModelError::InvalidInput {
+            message: format!("Failed to read MNIST image header: {}", e),
+        })?;
+
     // Verify magic number (0x00000803 for images)
     let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if magic != 0x00000803 {
@@ -107,36 +109,38 @@ fn load_mnist_images<P: AsRef<Path>>(path: P) -> Result<Vec<ImageSample>> {
             message: format!("Invalid MNIST image magic number: {}", magic),
         });
     }
-    
+
     let num_images = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     let num_rows = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
     let num_cols = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    
+
     tracing::info!(
         "Loading MNIST images: {} images, {}x{} pixels",
         num_images,
         num_rows,
         num_cols
     );
-    
+
     // Read image data
     let mut images = Vec::with_capacity(num_images);
     let mut buffer = vec![0u8; num_rows * num_cols];
-    
+
     for i in 0..num_images {
-        reader.read_exact(&mut buffer).map_err(|e| ModelError::InvalidInput {
-            message: format!("Failed to read MNIST image {}: {}", i, e),
-        })?;
-        
+        reader
+            .read_exact(&mut buffer)
+            .map_err(|e| ModelError::InvalidInput {
+                message: format!("Failed to read MNIST image {}: {}", i, e),
+            })?;
+
         // Convert to f32 and normalize to [0, 1]
         let pixels: Vec<f32> = buffer.iter().map(|&p| p as f32 / 255.0).collect();
-        
+
         let mut sample = ImageSample::new(pixels, num_rows, num_cols, 1);
         sample.label = Some(format!("mnist_digit_{}", i));
-        
+
         images.push(sample);
     }
-    
+
     Ok(images)
 }
 
@@ -145,13 +149,15 @@ fn load_mnist_labels<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
     let file = File::open(&path).map_err(ModelError::from)?;
     let decoder = GzDecoder::new(file);
     let mut reader = BufReader::new(decoder);
-    
+
     // Read header
     let mut header = [0u8; 8];
-    reader.read_exact(&mut header).map_err(|e| ModelError::InvalidInput {
-        message: format!("Failed to read MNIST label header: {}", e),
-    })?;
-    
+    reader
+        .read_exact(&mut header)
+        .map_err(|e| ModelError::InvalidInput {
+            message: format!("Failed to read MNIST label header: {}", e),
+        })?;
+
     // Verify magic number (0x00000801 for labels)
     let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if magic != 0x00000801 {
@@ -159,15 +165,17 @@ fn load_mnist_labels<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
             message: format!("Invalid MNIST label magic number: {}", magic),
         });
     }
-    
+
     let num_labels = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    
+
     // Read label data
     let mut labels = vec![0u8; num_labels];
-    reader.read_exact(&mut labels).map_err(|e| ModelError::InvalidInput {
-        message: format!("Failed to read MNIST labels: {}", e),
-    })?;
-    
+    reader
+        .read_exact(&mut labels)
+        .map_err(|e| ModelError::InvalidInput {
+            message: format!("Failed to read MNIST labels: {}", e),
+        })?;
+
     Ok(labels)
 }
 
@@ -181,7 +189,7 @@ pub fn mnist_to_image_examples(images: Vec<ImageSample>, labels: Vec<u8>) -> Vec
             let digit = label as usize;
             let caption = format!("A handwritten digit {}", digit);
             image.label = Some(caption.clone());
-            
+
             ImageExample {
                 image_id: format!("mnist_{:06}", idx),
                 caption,
@@ -202,9 +210,12 @@ pub fn mnist_to_image_examples(images: Vec<ImageSample>, labels: Vec<u8>) -> Vec
 }
 
 /// Load MNIST dataset and convert to training examples
-pub fn load_mnist_training_data(data_dir: &str, max_samples: Option<usize>) -> Result<Vec<ImageExample>> {
+pub fn load_mnist_training_data(
+    data_dir: &str,
+    max_samples: Option<usize>,
+) -> Result<Vec<ImageExample>> {
     let (images, labels) = load_mnist_train(data_dir)?;
-    
+
     let (images, labels) = match max_samples {
         Some(n) if n < images.len() => {
             let images: Vec<_> = images.into_iter().take(n).collect();
@@ -213,25 +224,25 @@ pub fn load_mnist_training_data(data_dir: &str, max_samples: Option<usize>) -> R
         }
         _ => (images, labels),
     };
-    
+
     tracing::info!("Loaded {} MNIST training samples", images.len());
-    
+
     Ok(mnist_to_image_examples(images, labels))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
     use tempfile::NamedTempFile;
-    
+
     #[test]
     fn test_mnist_header_parsing() {
         // Create a minimal MNIST image file (gzip compressed)
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        
+
         // Magic number (0x00000803)
         encoder.write_all(&[0x00, 0x00, 0x08, 0x03]).unwrap();
         // Number of images: 2
@@ -242,34 +253,34 @@ mod tests {
         encoder.write_all(&[0x00, 0x00, 0x00, 0x1c]).unwrap();
         // 2 images * 28 * 28 = 1568 bytes of pixel data
         encoder.write_all(&[128u8; 1568]).unwrap();
-        
+
         let compressed = encoder.finish().unwrap();
-        
+
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(&compressed).unwrap();
-        
+
         let path = file.path();
         let images = load_mnist_images(path).unwrap();
-        
+
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].height, 28);
         assert_eq!(images[0].width, 28);
         assert_eq!(images[0].channels, 1);
     }
-    
+
     #[test]
     fn test_mnist_to_examples() {
         let mut image1 = ImageSample::new(vec![0.5; 784], 28, 28, 1);
         image1.label = Some("test1".to_string());
-        
+
         let mut image2 = ImageSample::new(vec![0.7; 784], 28, 28, 1);
         image2.label = Some("test2".to_string());
-        
+
         let images = vec![image1, image2];
         let labels = vec![5u8, 3u8];
-        
+
         let examples = mnist_to_image_examples(images, labels);
-        
+
         assert_eq!(examples.len(), 2);
         assert_eq!(examples[0].objects, vec!["digit_5"]);
         assert_eq!(examples[1].objects, vec!["digit_3"]);

@@ -4,9 +4,7 @@ use rand_distr::{Distribution, Normal};
 use crate::{
     common::rng::get_rng,
     domain::{
-        attention::position::{
-            optimized_cope::OptimizedCoPE, unified::UnifiedCoPE,
-        },
+        attention::position::{optimized_cope::OptimizedCoPE, unified::UnifiedCoPE},
         mixtures::{
             moh::{HeadSelectionConfig, HeadSelectionStrategy},
             threshold::ThresholdPredictor,

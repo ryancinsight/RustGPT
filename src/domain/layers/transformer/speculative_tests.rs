@@ -9,7 +9,9 @@ mod tests {
             transformer::speculative::SpeculativeSamplingConfig,
         },
         domain::mixtures::HeadSelectionStrategy,
-        domain::models::config::{DiffusionTimestepStrategy, TemporalMixingType, TitanMemoryConfig},
+        domain::models::config::{
+            DiffusionTimestepStrategy, TemporalMixingType, TitanMemoryConfig,
+        },
     };
     fn create_dummy_block() -> DiffusionBlock {
         let config = DiffusionBlockConfig {

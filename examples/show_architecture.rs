@@ -1,10 +1,10 @@
+use llm::application::encoding::Vocab;
+use llm::domain::models::builder::{build_network, print_architecture_summary};
 /// Example: Display RustGPT Architecture Summary
 ///
 /// This example demonstrates the modern LLM architecture configurations
 /// available in RustGPT and displays detailed architecture summaries.
 use llm::domain::models::config::ModelConfig;
-use llm::application::encoding::Vocab;
-use llm::domain::models::builder::{build_network, print_architecture_summary};
 
 fn main() {
     println!("\n🦀 RustGPT Architecture Showcase\n");

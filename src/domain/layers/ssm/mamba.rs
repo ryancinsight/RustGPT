@@ -1,20 +1,34 @@
-use std::collections::VecDeque;
 use ndarray::{Array1, Array2, ArrayBase, ArrayView1, ArrayView2, Axis, Data, Ix2, Zip, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::VecDeque;
 
 use crate::{
-    infrastructure::optimizer::adam::Adam,
     common::{errors::Result, rng::get_rng, utils::ring_buffer::RingBuffer1D},
     domain::{
-        layers::ssm::components::selective_scan::{
-            Mamba2ScanBackwardInput, Mamba2ScanInput, MambaScanBackwardInput, MambaScanInput,
-            SelectiveScanConfig, SelectiveScanner,
+        compute_backend::{ComputeBackend, resolve_compute_backend_strict_auto_gpu},
+        layers::{
+            components::{
+                StreamingWorkspaceManaged, UnifiedLayerWorkspace, WorkspaceManaged, WorkspaceStats,
+            },
+            ssm::components::selective_scan::{
+                Mamba2ScanBackwardInput, Mamba2ScanInput, MambaScanBackwardInput, MambaScanInput,
+                SelectiveScanConfig, SelectiveScanner,
+            },
         },
         mixtures::{HeadSelectionStrategy, MoHGating, moh_gating::MoHStreamingWorkspace},
         network::Layer,
         richards::{RichardsActivation, RichardsCurve, RichardsGate},
     },
+    infrastructure::optimizer::adam::Adam,
+};
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use std::sync::{Arc, Mutex};
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::{
+    gpu_backend_variants::SsmGpuBackend, unified_gpu_kernels::SsmParams,
 };
 
 /// Configuration for Mamba layer with enhanced options
@@ -147,33 +161,32 @@ fn mamba_default_act() -> RichardsActivation {
 
 #[derive(Debug, Clone)]
 pub struct MambaStreamingWorkspace {
-    pub in2: Array1<f32>,       // 2*D
+    pub in2: Array1<f32>, // 2*D
     // u_pre, gate_logits are views of in2
-    
-    pub u_act: Array1<f32>,     // D
-    pub gate: Array1<f32>,      // D
-    pub dt: Array1<f32>,        // D
-    pub u_conv: Array1<f32>,    // D
-    
-    pub b_full: Array1<f32>,    // D
-    pub b_logits: Array1<f32>,  // N (Mamba1)
-    pub b_t: Array1<f32>,       // max(N, num_heads * N)
-    
-    pub c_full: Array1<f32>,    // D
-    pub c_logits: Array1<f32>,  // N (Mamba1)
-    pub c_t: Array1<f32>,       // max(N, num_heads * N)
-    
+    pub u_act: Array1<f32>,  // D
+    pub gate: Array1<f32>,   // D
+    pub dt: Array1<f32>,     // D
+    pub u_conv: Array1<f32>, // D
+
+    pub b_full: Array1<f32>,   // D
+    pub b_logits: Array1<f32>, // N (Mamba1)
+    pub b_t: Array1<f32>,      // max(N, num_heads * N)
+
+    pub c_full: Array1<f32>,   // D
+    pub c_logits: Array1<f32>, // N (Mamba1)
+    pub c_t: Array1<f32>,      // max(N, num_heads * N)
+
     pub a_logits_state: Array2<f32>, // D, N (Mamba1)
     pub a_scale_state: Array2<f32>,  // D, N (Mamba1)
-    
-    pub z: Array1<f32>,         // D
-    pub y_pre: Array1<f32>,     // D
-    pub out_pre: Array1<f32>,   // D
-    
+
+    pub z: Array1<f32>,       // D
+    pub y_pre: Array1<f32>,   // D
+    pub out_pre: Array1<f32>, // D
+
     // Mamba2 helpers
     pub b_h: Array1<f32>, // N (per head temp)
     pub c_h: Array1<f32>, // N (per head temp)
-    
+
     /// Unified ring buffer for convolution history (SSOT).
     /// Replaces manual ring buffer implementation with RingBuffer1D abstraction.
     /// Provides O(1) push/access with zero allocation after initialization.
@@ -334,6 +347,18 @@ pub struct Mamba {
     pub streaming_conv_queue: Option<VecDeque<Array1<f32>>>,
     #[serde(skip)]
     pub streaming_workspace: Option<Box<MambaStreamingWorkspace>>,
+
+    /// Unified workspace for batch forward passes (consolidates buffer management).
+    /// Replaces separate workspace pools with a single, coherent design.
+    #[serde(skip_serializing, skip_deserializing)]
+    unified_workspace: UnifiedLayerWorkspace,
+
+    #[serde(skip, default)]
+    compute_backend: ComputeBackend,
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[serde(skip, default)]
+    ssm_gpu_backend: Option<Arc<Mutex<SsmGpuBackend>>>,
 }
 
 impl<'de> Deserialize<'de> for Mamba {
@@ -444,6 +469,10 @@ impl<'de> Deserialize<'de> for Mamba {
             cached_a_scale_head: None,
             streaming_ssm_state: None,
             streaming_conv_queue: None,
+            unified_workspace: UnifiedLayerWorkspace::default(),
+            compute_backend: ComputeBackend::Cpu,
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            ssm_gpu_backend: None,
         })
     }
 }
@@ -595,6 +624,112 @@ impl Mamba {
         self.a_matrix_type = a_matrix_type;
     }
 
+    /// Set runtime compute backend.
+    #[inline]
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        self.set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set Mamba backend '{}': {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
+    }
+
+    /// Set runtime compute backend with strict validation.
+    #[inline]
+    pub fn set_compute_backend_checked(
+        &mut self,
+        compute_backend: ComputeBackend,
+    ) -> crate::common::errors::Result<()> {
+        if compute_backend.is_gpu() {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                // Eagerly validate backend availability in strict mode.
+                let _ = crate::domain::compute::GpuDevice::new(compute_backend)?;
+            }
+
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "Mamba requested GPU backend '{}' but this binary was built without GPU features.",
+                        compute_backend.as_str()
+                    ),
+                });
+            }
+        }
+
+        self.compute_backend = compute_backend;
+        self.unified_workspace.set_compute_backend(compute_backend);
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            self.ssm_gpu_backend = None;
+        }
+        Ok(())
+    }
+
+    /// Resolve and apply strict auto-GPU backend preference.
+    #[inline]
+    pub fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let backend = resolve_compute_backend_strict_auto_gpu()?;
+        self.set_compute_backend_checked(backend)
+    }
+
+    /// Get runtime compute backend.
+    #[inline]
+    pub fn compute_backend(&self) -> ComputeBackend {
+        self.compute_backend
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn desired_state_dim_runtime(&self) -> usize {
+        if self.a_matrix_type == AMatrixType::BlockDiagonal {
+            Self::desired_state_dim_mamba2(self.embed_dim)
+        } else {
+            Self::desired_state_dim(self.embed_dim)
+        }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn ensure_ssm_gpu_backend(
+        &mut self,
+        seq_len: usize,
+    ) -> crate::common::errors::Result<Arc<Mutex<SsmGpuBackend>>> {
+        let state_dim = self.desired_state_dim_runtime();
+
+        if self.ssm_gpu_backend.is_none() {
+            let backend = SsmGpuBackend::mamba_with_backend(
+                state_dim,
+                self.embed_dim,
+                seq_len,
+                1,
+                self.compute_backend,
+            )?;
+            self.ssm_gpu_backend = Some(Arc::new(Mutex::new(backend)));
+        }
+
+        let backend_arc = self
+            .ssm_gpu_backend
+            .as_ref()
+            .expect("SSM backend must exist after initialization")
+            .clone();
+
+        {
+            let mut backend =
+                backend_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to acquire Mamba cached GPU backend lock".to_string(),
+                    })?;
+            backend.set_params(SsmParams::new(state_dim, self.embed_dim, seq_len, 1));
+        }
+
+        Ok(backend_arc)
+    }
+
     /// Create Mamba layer with enhanced configuration
     pub fn new_with_config(embed_dim: usize, conv_kernel: usize, config: MambaConfig) -> Self {
         let d = embed_dim.max(1);
@@ -708,9 +843,12 @@ impl Mamba {
             cached_a_scale_head: None,
             streaming_ssm_state: None,
             streaming_conv_queue: None,
+            unified_workspace: UnifiedLayerWorkspace::default(),
+            compute_backend: ComputeBackend::Cpu,
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            ssm_gpu_backend: None,
         }
     }
-
 
     fn ensure_streaming_workspace(&mut self) {
         if self.streaming_workspace.is_some() && self.streaming_ssm_state.is_some() {
@@ -719,24 +857,24 @@ impl Mamba {
 
         let d = self.embed_dim;
         let k_conv = self.conv_kernel;
-        
+
         self.ensure_projections(d);
         if self.a_matrix_type == AMatrixType::BlockDiagonal {
-             self.ensure_projections_mamba2(d);
+            self.ensure_projections_mamba2(d);
         }
         let n = self.cached_state_dim;
-        
+
         if self.streaming_ssm_state.is_none() {
-             self.streaming_ssm_state = Some(Array2::zeros((d, n)));
+            self.streaming_ssm_state = Some(Array2::zeros((d, n)));
         }
 
         if self.streaming_workspace.is_none() {
             let num_heads = if self.a_matrix_type == AMatrixType::BlockDiagonal {
-                 let head_dim = Self::head_dim_mamba2(d);
-                 let head_offsets = Self::make_head_offsets(d, head_dim);
-                 head_offsets.len().saturating_sub(1).max(1)
+                let head_dim = Self::head_dim_mamba2(d);
+                let head_offsets = Self::make_head_offsets(d, head_dim);
+                head_offsets.len().saturating_sub(1).max(1)
             } else {
-                 1
+                1
             };
 
             let ws = MambaStreamingWorkspace {
@@ -765,13 +903,64 @@ impl Mamba {
         }
     }
 
+    /// GPU-accelerated forward pass for Mamba (Phase 5.6.4)
+    ///
+    /// Strictly fails if GPU is not available (no fallback).
+    /// Target: 20x speedup on selective scan operations.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn forward_gpu(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
+        use crate::common::errors::ModelError;
+
+        let (seq_len, embed_dim) = input.dim();
+        if embed_dim != self.embed_dim {
+            return Err(ModelError::InvalidInput {
+                message: format!(
+                    "Mamba GPU forward embed_dim mismatch: input={}, layer={}",
+                    embed_dim, self.embed_dim
+                ),
+            });
+        }
+        if seq_len == 0 || embed_dim == 0 {
+            return Ok(Array2::zeros((seq_len, embed_dim)));
+        }
+
+        if !self.compute_backend.is_gpu() {
+            return Err(ModelError::Backend {
+                message: "Mamba::forward_gpu called without a GPU backend selected. \
+                          Call set_compute_backend_checked(...) with a GPU backend first."
+                    .to_string(),
+            });
+        }
+
+        let backend_name = self.compute_backend.as_str().to_string();
+        let backend_arc = self.ensure_ssm_gpu_backend(seq_len)?;
+        let mut backend = backend_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to acquire Mamba cached GPU backend lock for forward dispatch"
+                .to_string(),
+        })?;
+        backend.forward(input).map_err(|err| ModelError::Backend {
+            message: format!(
+                "Mamba GPU forward failed on backend '{}': {}",
+                backend_name, err
+            ),
+        })
+    }
+
+    /// GPU-accelerated forward pass on non-GPU builds (strict no-fallback error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "Mamba GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
     pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         self.ensure_streaming_workspace();
-        
+
         if self.a_matrix_type == AMatrixType::BlockDiagonal {
-             self.forward_step_mamba2_into(input, output);
+            self.forward_step_mamba2_into(input, output);
         } else {
-             self.forward_step_mamba1_into(input, output);
+            self.forward_step_mamba1_into(input, output);
         }
     }
 
@@ -784,7 +973,7 @@ impl Mamba {
     fn forward_step_mamba1_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         let d = self.embed_dim;
         let n = self.cached_state_dim;
-        
+
         let ws = self.streaming_workspace.as_mut().unwrap();
         let proj_state = self.cached_proj_state.as_ref().unwrap();
         let proj_a = self.cached_proj_a.as_ref().unwrap();
@@ -800,12 +989,12 @@ impl Mamba {
         });
 
         // Use direct scalar access if possible, or forward_const fallback
-        // For zero-allocation, we need scalar access. 
+        // For zero-allocation, we need scalar access.
         // Assuming RichardsGate exposes curve and temperature via getters or public fields?
         // If not, we might be stuck with allocation or need to edit RichardsGate.
         // For now, let's use a temporary small allocation if needed, or better:
         // Assume we can compute it.
-        // Let's rely on RichardsGate being well behaved. 
+        // Let's rely on RichardsGate being well behaved.
         // If RichardsGate::forward_scalar_f32 doesn't exist, this will fail compilation,
         // and I will fix it.
         Zip::from(&mut ws.gate).and(&gate_logits).for_each(|y, &x| {
@@ -820,24 +1009,40 @@ impl Mamba {
         // b_t
         ws.b_full.assign(&self.b_b.row(0));
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_b.t(), input, 1.0, &mut ws.b_full);
-        
+
         ws.b_logits.fill(0.0);
-        ndarray::linalg::general_mat_vec_mul(1.0, &proj_state.t(), &ws.b_full, 0.0, &mut ws.b_logits);
-        
-        Zip::from(&mut ws.b_t.slice_mut(s![0..n])).and(&ws.b_logits).for_each(|y, &x| {
-             *y = self.richards_tanh.forward_scalar_f32(x);
-        });
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &proj_state.t(),
+            &ws.b_full,
+            0.0,
+            &mut ws.b_logits,
+        );
+
+        Zip::from(&mut ws.b_t.slice_mut(s![0..n]))
+            .and(&ws.b_logits)
+            .for_each(|y, &x| {
+                *y = self.richards_tanh.forward_scalar_f32(x);
+            });
 
         // c_t
         ws.c_full.assign(&self.b_c.row(0));
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_c.t(), input, 1.0, &mut ws.c_full);
-        
+
         ws.c_logits.fill(0.0);
-        ndarray::linalg::general_mat_vec_mul(1.0, &proj_state.t(), &ws.c_full, 0.0, &mut ws.c_logits);
-        
-        Zip::from(&mut ws.c_t.slice_mut(s![0..n])).and(&ws.c_logits).for_each(|y, &x| {
-             *y = self.richards_tanh.forward_scalar_f32(x);
-        });
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &proj_state.t(),
+            &ws.c_full,
+            0.0,
+            &mut ws.c_logits,
+        );
+
+        Zip::from(&mut ws.c_t.slice_mut(s![0..n]))
+            .and(&ws.c_logits)
+            .for_each(|y, &x| {
+                *y = self.richards_tanh.forward_scalar_f32(x);
+            });
 
         // A scale
         ws.a_logits_state.fill(0.0);
@@ -854,15 +1059,18 @@ impl Mamba {
         // 3. Convolution using unified RingBuffer1D (SSOT)
         // Push current u_act into the ring buffer
         ws.conv_ring.push(&ws.u_act.view());
-        
+
         // Compute convolution using weighted sum with conv_w rows as weights
         ws.u_conv.assign(&self.conv_b.row(0));
         for i in 0..ws.conv_ring.len() {
             if let Some(item) = ws.conv_ring.get(i) {
                 let w_row = self.conv_w.row(i);
-                Zip::from(&mut ws.u_conv).and(&w_row).and(&item).for_each(|y, &w, &x| {
-                    *y += w * x;
-                });
+                Zip::from(&mut ws.u_conv)
+                    .and(&w_row)
+                    .and(&item)
+                    .for_each(|y, &w, &x| {
+                        *y += w * x;
+                    });
             }
         }
 
@@ -889,9 +1097,12 @@ impl Mamba {
             ws.z[j] = zj;
         }
 
-        Zip::from(&mut ws.y_pre).and(&ws.gate).and(&ws.z).for_each(|y, &g, &z| {
-            *y = g * z;
-        });
+        Zip::from(&mut ws.y_pre)
+            .and(&ws.gate)
+            .and(&ws.z)
+            .for_each(|y, &g, &z| {
+                *y = g * z;
+            });
 
         output.assign(&self.b_dt.row(0));
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_dt.t(), &ws.y_pre, 1.0, output);
@@ -931,7 +1142,7 @@ impl Mamba {
         // B/C per head
         ws.b_full.assign(&self.b_b.row(0));
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_b.t(), input, 1.0, &mut ws.b_full);
-        
+
         ws.c_full.assign(&self.b_c.row(0));
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_c.t(), input, 1.0, &mut ws.c_full);
 
@@ -943,20 +1154,20 @@ impl Mamba {
             // ws.b_h = b_full[hs..he] . proj_state[hs..he, ..]
             ws.b_h.fill(0.0);
             ndarray::linalg::general_mat_vec_mul(
-                1.0, 
-                &proj_state.slice(s![hs..he, ..]).t(), 
-                &ws.b_full.slice(s![hs..he]), 
-                0.0, 
-                &mut ws.b_h
+                1.0,
+                &proj_state.slice(s![hs..he, ..]).t(),
+                &ws.b_full.slice(s![hs..he]),
+                0.0,
+                &mut ws.b_h,
             );
-            
+
             ws.c_h.fill(0.0);
             ndarray::linalg::general_mat_vec_mul(
-                1.0, 
-                &proj_state.slice(s![hs..he, ..]).t(), 
-                &ws.c_full.slice(s![hs..he]), 
-                0.0, 
-                &mut ws.c_h
+                1.0,
+                &proj_state.slice(s![hs..he, ..]).t(),
+                &ws.c_full.slice(s![hs..he]),
+                0.0,
+                &mut ws.c_h,
             );
 
             for k in 0..n {
@@ -968,15 +1179,18 @@ impl Mamba {
         // 3. Convolution using unified RingBuffer1D (SSOT)
         // Push current u_act into the ring buffer
         ws.conv_ring.push(&ws.u_act.view());
-        
+
         // Compute convolution using weighted sum with conv_w rows as weights
         ws.u_conv.assign(&self.conv_b.row(0));
         for i in 0..ws.conv_ring.len() {
             if let Some(item) = ws.conv_ring.get(i) {
                 let w_row = self.conv_w.row(i);
-                Zip::from(&mut ws.u_conv).and(&w_row).and(&item).for_each(|y, &w, &x| {
-                    *y += w * x;
-                });
+                Zip::from(&mut ws.u_conv)
+                    .and(&w_row)
+                    .and(&item)
+                    .for_each(|y, &w, &x| {
+                        *y += w * x;
+                    });
             }
         }
 
@@ -1024,10 +1238,13 @@ impl Mamba {
             }
         }
 
-        Zip::from(&mut ws.y_pre).and(&ws.gate).and(&ws.z).for_each(|y, &g, &z| {
-            *y = g * z;
-        });
-        
+        Zip::from(&mut ws.y_pre)
+            .and(&ws.gate)
+            .and(&ws.z)
+            .for_each(|y, &g, &z| {
+                *y = g * z;
+            });
+
         output.assign(&self.b_dt.row(0));
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_dt.t(), &ws.y_pre, 1.0, output);
     }
@@ -1183,8 +1400,6 @@ impl Mamba {
 
         out_pre
     }
-
-
 
     /// Block-diagonal A matrix computation
     fn compute_block_diagonal_a(
@@ -1448,7 +1663,8 @@ impl Mamba {
         for ti in 0..t {
             for h in 0..num_heads {
                 a_head[[ti, h]] =
-                    crate::domain::pade::exp(-dt_head[[ti, h]] * a_scale_head[[0, h]]).clamp(0.0, 1.0);
+                    crate::domain::pade::exp(-dt_head[[ti, h]] * a_scale_head[[0, h]])
+                        .clamp(0.0, 1.0);
             }
         }
 
@@ -1598,7 +1814,7 @@ impl Mamba {
                 d_gate_logits[[ti, j]] = (d_y_pre[[ti, j]] * z[[ti, j]]) * gt * (1.0 - gt);
             }
         }
-        
+
         // Prepare B_eff = b_t * kk
         let mut b_eff = b_t.clone();
         for ti in 0..t {
@@ -1633,24 +1849,24 @@ impl Mamba {
             head_dim: head_dim_val,
         };
         let scan_out = scanner.fused_mamba2_scan_backward(scan_input);
-        
+
         let d_u_conv = scan_out.d_u;
         let grad_d_skip = scan_out.d_d_skip.t().to_owned();
         let d_c = scan_out.d_c;
         let d_b_eff = scan_out.d_b;
         let d_a_scan = scan_out.d_a;
-        
+
         // Recover d_b_t, d_a_scale, d_dt
-        let mut d_b = Array2::<f32>::zeros(b_t.raw_dim()); 
+        let mut d_b = Array2::<f32>::zeros(b_t.raw_dim());
         let mut d_a_scale_head = Array1::<f32>::zeros(num_heads);
         let mut d_dt = Array2::<f32>::zeros((t, d));
-        
+
         for ti in 0..t {
             for h in 0..num_heads {
                 let a = a_head[[ti, h]];
                 let a_scale = a_scale_head[[0, h]];
                 let kk = (1.0 - a) / a_scale;
-                
+
                 let base = h * n;
                 let mut d_kk = 0.0f32;
                 for k in 0..n {
@@ -1658,19 +1874,19 @@ impl Mamba {
                     d_b[[ti, base + k]] = d_be * kk;
                     d_kk += d_be * b_t[[ti, base + k]];
                 }
-                
+
                 let d_a = d_a_scan[[ti, h]] - d_kk / a_scale;
-                
+
                 let term1 = -d_kk * (1.0 - a) / (a_scale * a_scale);
                 let term2 = -d_a * a * dt_head[[ti, h]];
                 d_a_scale_head[h] += term1 + term2;
-                
+
                 let d_dt_h = d_a * a * (-a_scale);
                 let hs = head_offsets[h];
                 let he = head_offsets[h + 1];
                 let denom = (he - hs).max(1) as f32;
                 for j in hs..he {
-                     d_dt[[ti, j]] = d_dt_h / denom;
+                    d_dt[[ti, j]] = d_dt_h / denom;
                 }
             }
         }
@@ -1830,6 +2046,70 @@ impl Mamba {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         self.compute_gradients_mamba2_impl(input, output_grads)
     }
+
+    /// Forward pass with in-place output (Zero Allocation Pattern).
+    ///
+    /// Computes selective scan with zero-copy output directly to the provided buffer.
+    /// Eliminates the intermediate allocation of the output array by reusing the buffer.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor (seq_len, embed_dim)
+    /// * `output` - Pre-allocated output buffer (seq_len, embed_dim)
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, error if output buffer has incorrect dimensions
+    pub fn forward_into(
+        &mut self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            let gpu_out = self.forward_gpu(input)?;
+            if output.raw_dim() == gpu_out.raw_dim() {
+                output.assign(&gpu_out);
+            } else {
+                *output = gpu_out;
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        if self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: format!(
+                    "Mamba configured for GPU backend '{}' but this binary has no GPU features enabled.",
+                    self.compute_backend.as_str()
+                ),
+            });
+        }
+
+        let (t, d) = input.dim();
+
+        // Validate output buffer dimensions
+        if output.dim() != (t, d) {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: format!(
+                    "Output dimension mismatch: expected ({}, {}), got {:?}",
+                    t,
+                    d,
+                    output.dim()
+                ),
+            });
+        }
+
+        // Compute forward pass
+        let result = self.forward_cached(input);
+
+        // Zero-copy assignment if dimensions match
+        if output.dim() == result.dim() {
+            output.assign(&result);
+        } else {
+            *output = result;
+        }
+
+        Ok(())
+    }
 }
 
 impl Layer for Mamba {
@@ -1838,6 +2118,11 @@ impl Layer for Mamba {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        if self.compute_backend.is_gpu() {
+            return self
+                .forward_gpu(input)
+                .unwrap_or_else(|err| panic!("Mamba GPU forward failed: {err}"));
+        }
         self.forward_cached(input)
     }
 
@@ -2287,6 +2572,106 @@ impl Layer for Mamba {
     }
 }
 
+impl WorkspaceManaged for Mamba {
+    /// Ensure workspace buffers are allocated with correct capacity.
+    fn ensure_capacity(&mut self, batch_size: usize, seq_len: usize, embed_dim: usize) {
+        self.unified_workspace
+            .ensure_capacity(batch_size, seq_len, embed_dim);
+    }
+
+    /// Clear all workspace buffers to free memory.
+    fn clear_workspace(&mut self) {
+        self.unified_workspace.clear_workspace();
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            self.ssm_gpu_backend = None;
+        }
+        // Also clear streaming state caches
+        self.cached_input = None;
+        self.cached_u_pre = None;
+        self.cached_u_act = None;
+        self.cached_gate = None;
+        self.cached_gate_logits = None;
+        self.cached_dt_logits = None;
+        self.cached_dt = None;
+        self.cached_b_logits = None;
+        self.cached_b_t = None;
+        self.cached_c_logits = None;
+        self.cached_c_t = None;
+        self.cached_a_logits_state = None;
+        self.cached_a_scale_state = None;
+        self.cached_a = None;
+        self.cached_u_conv = None;
+        self.cached_state_prev = None;
+        self.cached_state = None;
+        self.cached_z = None;
+        self.cached_y_pre = None;
+        self.cached_out_pre = None;
+    }
+
+    /// Get memory statistics for all managed buffers.
+    fn workspace_stats(&self) -> WorkspaceStats {
+        self.unified_workspace.workspace_stats()
+    }
+}
+
+impl StreamingWorkspaceManaged for Mamba {
+    /// Initialize streaming state for the given dimensions.
+    fn init_streaming(&mut self, batch_size: usize, _embed_dim: usize) -> Result<()> {
+        // Ensure unified workspace has capacity for streaming
+        self.unified_workspace
+            .ensure_capacity(batch_size, 1, self.embed_dim);
+
+        // Enable streaming state buffer in unified workspace
+        self.unified_workspace.set_streaming_state_enabled(true);
+
+        // Initialize Mamba streaming workspace
+        self.ensure_streaming_workspace();
+
+        Ok(())
+    }
+
+    /// Reset streaming state between sequences.
+    fn reset_streaming_state(&mut self) {
+        if let Some(ref mut ws) = self.streaming_workspace {
+            ws.in2.fill(0.0);
+            ws.u_act.fill(0.0);
+            ws.gate.fill(0.0);
+            ws.dt.fill(0.0);
+            ws.u_conv.fill(0.0);
+            ws.b_full.fill(0.0);
+            ws.b_logits.fill(0.0);
+            ws.b_t.fill(0.0);
+            ws.c_full.fill(0.0);
+            ws.c_logits.fill(0.0);
+            ws.c_t.fill(0.0);
+            ws.a_logits_state.fill(0.0);
+            ws.a_scale_state.fill(0.0);
+            ws.z.fill(0.0);
+            ws.y_pre.fill(0.0);
+            ws.out_pre.fill(0.0);
+            ws.b_h.fill(0.0);
+            ws.c_h.fill(0.0);
+            ws.conv_ring.clear();
+        }
+
+        // Reset SSM state
+        if let Some(ref mut state) = self.streaming_ssm_state {
+            state.fill(0.0);
+        }
+
+        // Reset conv queue
+        if let Some(ref mut queue) = self.streaming_conv_queue {
+            queue.clear();
+        }
+    }
+
+    /// Check if streaming state is active
+    fn is_streaming(&self) -> bool {
+        self.streaming_workspace.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MoHMambaStreamingWorkspace {
     pub moh: MoHStreamingWorkspace,
@@ -2306,6 +2691,13 @@ pub struct MoHMamba {
 
     #[serde(skip, default)]
     pub streaming_workspace: Option<Box<MoHMambaStreamingWorkspace>>,
+
+    #[serde(default)]
+    compute_backend: ComputeBackend,
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[serde(skip_serializing, skip_deserializing, default)]
+    ssm_gpu_backend: Option<Arc<Mutex<SsmGpuBackend>>>,
 
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>,
@@ -2356,6 +2748,9 @@ impl MoHMamba {
             moh,
             inner,
             streaming_workspace: None,
+            compute_backend: ComputeBackend::Cpu,
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            ssm_gpu_backend: None,
             cached_input: None,
             cached_eff: None,
             cached_inner_out: None,
@@ -2373,6 +2768,111 @@ impl MoHMamba {
         self.last_avg_active_heads = None;
         self.last_head_activity_vec = None;
         self.last_token_head_activity_vec = None;
+    }
+
+    /// Set runtime compute backend.
+    #[inline]
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        self.set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set MoHMamba backend '{}': {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
+    }
+
+    /// Set runtime compute backend with strict validation.
+    #[inline]
+    pub fn set_compute_backend_checked(
+        &mut self,
+        compute_backend: ComputeBackend,
+    ) -> crate::common::errors::Result<()> {
+        if compute_backend.is_gpu() {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                // Eagerly validate backend availability in strict mode.
+                let _ = crate::domain::compute::GpuDevice::new(compute_backend)?;
+            }
+
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "MoHMamba requested GPU backend '{}' but this binary was built without GPU features.",
+                        compute_backend.as_str()
+                    ),
+                });
+            }
+        }
+
+        self.compute_backend = compute_backend;
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            self.ssm_gpu_backend = None;
+        }
+        Ok(())
+    }
+
+    /// Resolve and apply strict auto-GPU backend preference.
+    #[inline]
+    pub fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let backend = resolve_compute_backend_strict_auto_gpu()?;
+        self.set_compute_backend_checked(backend)
+    }
+
+    /// Get runtime compute backend.
+    #[inline]
+    pub fn compute_backend(&self) -> ComputeBackend {
+        self.compute_backend
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn desired_state_dim(&self) -> usize {
+        if self.inner.a_matrix_type == AMatrixType::BlockDiagonal {
+            Mamba::desired_state_dim_mamba2(self.embed_dim)
+        } else {
+            Mamba::desired_state_dim(self.embed_dim)
+        }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn ensure_ssm_gpu_backend(
+        &mut self,
+        seq_len: usize,
+    ) -> crate::common::errors::Result<Arc<Mutex<SsmGpuBackend>>> {
+        let state_dim = self.desired_state_dim();
+
+        if self.ssm_gpu_backend.is_none() {
+            let backend = SsmGpuBackend::mamba_with_backend(
+                state_dim,
+                self.embed_dim,
+                seq_len,
+                1,
+                self.compute_backend,
+            )?;
+            self.ssm_gpu_backend = Some(Arc::new(Mutex::new(backend)));
+        }
+
+        let backend_arc = self
+            .ssm_gpu_backend
+            .as_ref()
+            .expect("SSM backend must exist after initialization")
+            .clone();
+
+        {
+            let mut backend =
+                backend_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to acquire MoHMamba cached GPU backend lock".to_string(),
+                    })?;
+            backend.set_params(SsmParams::new(state_dim, self.embed_dim, seq_len, 1));
+        }
+
+        Ok(backend_arc)
     }
 
     pub fn take_tau_metrics(&mut self) -> Option<(f32, f32)> {
@@ -2409,12 +2909,12 @@ impl MoHMamba {
     pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         self.ensure_streaming_workspace();
         let ws = self.streaming_workspace.as_mut().unwrap();
-        
+
         // 1. Compute MoH gating weights
         // We use forward_weights_into to avoid allocation
         let gate_input = self.moh.gate_input_view(input);
         self.moh.forward_weights_into(&gate_input, &mut ws.moh);
-        
+
         // 2. Compute inner Mamba output
         self.inner.forward_step_into(input, output);
 
@@ -2422,7 +2922,7 @@ impl MoHMamba {
         // ws.moh.m contains the effective weights for each head
         let head_dim = self.head_dim;
         let num_heads = self.num_heads;
-        
+
         for h in 0..num_heads {
             let weight = ws.moh.m[h];
             // Optimization: if weight is 0, zero out the block
@@ -2447,25 +2947,42 @@ impl MoHMamba {
         self.last_token_head_activity_vec = Some(token_vec);
     }
 
-    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        let mut out = Array1::zeros(input.len());
-        self.forward_step_into(&input.view(), &mut out);
-        out
-    }
-}
+    /// Forward pass with in-place output (Zero Allocation Pattern).
+    ///
+    /// Computes MoH routing and per-head selective scan, writing results directly to output buffer.
+    /// Eliminates intermediate allocations during head computation and aggregation.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor (seq_len, embed_dim)
+    /// * `output` - Pre-allocated output buffer (seq_len, embed_dim)
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, error if output buffer has incorrect dimensions
+    pub fn forward_into(
+        &mut self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        let (t, d) = input.dim();
+        let use_gpu = self.compute_backend.is_gpu();
 
-impl Layer for MoHMamba {
-    fn layer_type(&self) -> &str {
-        "MoHMamba"
-    }
+        // Validate output buffer dimensions
+        if output.dim() != (t, d) {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: format!(
+                    "Output dimension mismatch: expected ({}, {}), got {:?}",
+                    t,
+                    d,
+                    output.dim()
+                ),
+            });
+        }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        let t = input.nrows();
-        let d = input.ncols();
         if t == 0 || d == 0 || self.num_heads == 0 || self.head_dim == 0 {
             self.clear_caches();
             self.cached_input = Some(input.clone());
-            return Array2::<f32>::zeros((t, d));
+            output.fill(0.0);
+            return Ok(());
         }
 
         self.cached_input = Some(input.clone());
@@ -2475,10 +2992,42 @@ impl Layer for MoHMamba {
         let eff = self.moh.forward_weights_view(&gate_input, None, None);
         self.cached_eff = Some(eff.clone());
 
-        let y_inner = self.inner.forward(input);
-        self.cached_inner_out = Some(y_inner.clone());
+        if use_gpu {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                let backend_name = self.compute_backend.as_str().to_string();
+                let backend_arc = self.ensure_ssm_gpu_backend(t)?;
+                let mut backend =
+                    backend_arc
+                        .lock()
+                        .map_err(|_| crate::common::errors::ModelError::Backend {
+                            message: "Failed to acquire MoHMamba cached GPU backend lock"
+                                .to_string(),
+                        })?;
+                let y_inner = backend.forward(input).map_err(|err| {
+                    crate::common::errors::ModelError::Backend {
+                        message: format!(
+                            "MoHMamba inner GPU forward failed on backend '{}': {}",
+                            backend_name, err
+                        ),
+                    }
+                })?;
+                self.cached_inner_out = Some(y_inner.clone());
+                output.assign(&y_inner);
+            }
 
-        let mut out = y_inner;
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: "MoHMamba GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+                });
+            }
+        } else {
+            let y_inner = self.inner.forward(input);
+            self.cached_inner_out = Some(y_inner.clone());
+            output.assign(&y_inner);
+        }
+
         for h in 0..self.num_heads {
             let c0 = h * self.head_dim;
             let c1 = c0 + self.head_dim;
@@ -2487,7 +3036,7 @@ impl Layer for MoHMamba {
             let eff_col = eff_col
                 .broadcast((t, self.head_dim))
                 .expect("broadcast must succeed for (t, head_dim)");
-            let mut out_block = out.slice_mut(s![.., c0..c1]);
+            let mut out_block = output.slice_mut(s![.., c0..c1]);
             Zip::from(&mut out_block).and(eff_col).for_each(|o, &w| {
                 *o *= w;
             });
@@ -2519,7 +3068,52 @@ impl Layer for MoHMamba {
         }
         self.last_token_head_activity_vec = Some(tv);
 
+        Ok(())
+    }
+
+    pub fn forward_step(&mut self, input: &Array1<f32>) -> Array1<f32> {
+        let mut out = Array1::zeros(input.len());
+        self.forward_step_into(&input.view(), &mut out);
         out
+    }
+
+    /// GPU-accelerated forward pass for MoHMamba.
+    ///
+    /// Uses cached SSM GPU backend for the inner Mamba path with strict no-fallback behavior.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn forward_gpu(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "MoHMamba::forward_gpu called without a GPU backend selected. \
+                          Call set_compute_backend_checked(...) with a GPU backend first."
+                    .to_string(),
+            });
+        }
+
+        let mut output = Array2::zeros(input.raw_dim());
+        self.forward_into(input, &mut output)?;
+        Ok(output)
+    }
+
+    /// GPU forward on non-GPU builds (strict no-fallback error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "MoHMamba GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+}
+
+impl Layer for MoHMamba {
+    fn layer_type(&self) -> &str {
+        "MoHMamba"
+    }
+
+    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        let mut output = Array2::zeros(input.raw_dim());
+        self.forward_into(input, &mut output)
+            .unwrap_or_else(|err| panic!("MoHMamba forward failed: {err}"));
+        output
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
@@ -2765,7 +3359,11 @@ mod tests {
         let diff_mem = (&y_seq - &y_mem).mapv(|v| v.abs()).mean().unwrap();
 
         assert!(diff_par < 1e-4, "Parallel scan mismatch: {}", diff_par);
-        assert!(diff_mem < 1e-4, "Memory efficient scan mismatch: {}", diff_mem);
+        assert!(
+            diff_mem < 1e-4,
+            "Memory efficient scan mismatch: {}",
+            diff_mem
+        );
     }
 
     #[test]
@@ -2839,5 +3437,149 @@ mod tests {
         let delta: f32 = (&y1 - &y0).mapv(|v| v.abs()).sum();
         assert!(delta.is_finite());
         assert!(delta > 0.0);
+    }
+
+    #[test]
+    fn test_mamba_forward_into_dimension_validation() {
+        let mut mamba = Mamba::new(16);
+        let input = Array2::<f32>::from_elem((8, 16), 0.1);
+
+        // Wrong dimensions should fail
+        let mut output_wrong = Array2::zeros((7, 16));
+        let result = mamba.forward_into(&input, &mut output_wrong);
+        assert!(result.is_err());
+
+        // Correct dimensions should succeed
+        let mut output_correct = Array2::zeros((8, 16));
+        let result = mamba.forward_into(&input, &mut output_correct);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mamba_forward_into_basic() {
+        let mut mamba = Mamba::new(16);
+        let input = Array2::<f32>::from_elem((8, 16), 0.1);
+
+        // Should successfully compute and write to output
+        let mut output = Array2::zeros((8, 16));
+        let result = mamba.forward_into(&input, &mut output);
+
+        assert!(result.is_ok());
+        assert_eq!(output.dim(), (8, 16));
+        assert!(output.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_moh_mamba_forward_into_basic() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba::new(12, 3, &cfg);
+        let input = Array2::<f32>::from_elem((6, 12), 0.1);
+
+        // Should successfully compute and write to output
+        let mut output = Array2::zeros((6, 12));
+        let result = moh.forward_into(&input, &mut output);
+
+        assert!(result.is_ok());
+        assert_eq!(output.dim(), (6, 12));
+        assert!(output.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_moh_mamba_forward_into_dimension_validation() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba::new(12, 3, &cfg);
+        let input = Array2::<f32>::from_elem((6, 12), 0.1);
+
+        // Wrong dimensions should fail
+        let mut output_wrong = Array2::zeros((5, 12));
+        let result = moh.forward_into(&input, &mut output_wrong);
+        assert!(result.is_err());
+
+        // Correct dimensions should succeed
+        let mut output_correct = Array2::zeros((6, 12));
+        let result = moh.forward_into(&input, &mut output_correct);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_moh_mamba_set_compute_backend_checked_cpu() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba::new(12, 3, &cfg);
+        let result = moh.set_compute_backend_checked(ComputeBackend::Cpu);
+        assert!(result.is_ok());
+        assert_eq!(moh.compute_backend(), ComputeBackend::Cpu);
+    }
+
+    #[test]
+    fn test_moh_mamba_set_compute_backend_checked_gpu_is_strict_validation() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba::new(12, 3, &cfg);
+        let result = moh.set_compute_backend_checked(ComputeBackend::Vulkan);
+
+        match result {
+            Ok(()) => assert!(moh.compute_backend().is_gpu()),
+            Err(err) => {
+                let msg = format!("{}", err).to_lowercase();
+                assert!(
+                    msg.contains("without gpu features")
+                        || msg.contains("unavailable")
+                        || msg.contains("gpu")
+                        || msg.contains("backend"),
+                    "expected strict GPU validation error, got: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mamba_set_compute_backend_checked_cpu() {
+        let mut mamba = Mamba::new(12);
+        let result = mamba.set_compute_backend_checked(ComputeBackend::Cpu);
+        assert!(result.is_ok());
+        assert_eq!(mamba.compute_backend(), ComputeBackend::Cpu);
+    }
+
+    #[test]
+    fn test_mamba_set_compute_backend_checked_gpu_is_strict_validation() {
+        let mut mamba = Mamba::new(12);
+        let result = mamba.set_compute_backend_checked(ComputeBackend::Vulkan);
+        match result {
+            Ok(()) => assert!(mamba.compute_backend().is_gpu()),
+            Err(err) => {
+                let msg = format!("{}", err).to_lowercase();
+                assert!(
+                    msg.contains("without gpu features")
+                        || msg.contains("unavailable")
+                        || msg.contains("gpu")
+                        || msg.contains("backend"),
+                    "expected strict GPU validation error, got: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mamba_forward_gpu_requires_gpu_backend_selection() {
+        let mut mamba = Mamba::new(8);
+        let input = Array2::<f32>::zeros((2, 8));
+        let result = mamba.forward_gpu(&input);
+        assert!(
+            result.is_err(),
+            "forward_gpu without GPU backend selection must error"
+        );
+        let msg = result
+            .err()
+            .expect("error expected")
+            .to_string()
+            .to_ascii_lowercase();
+        assert!(
+            msg.contains("gpu backend selected")
+                || msg.contains("requires gpu features")
+                || msg.contains("gpu"),
+            "expected strict GPU-forward validation error, got: {}",
+            msg
+        );
     }
 }

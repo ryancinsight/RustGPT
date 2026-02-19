@@ -48,6 +48,13 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 
+use crate::{
+    common::errors::Result,
+    domain::layers::components::workspace_managed::{
+        StreamingWorkspaceManaged, WorkspaceManaged, WorkspaceStats,
+    },
+};
+
 /// Configuration for Ring Attention.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RingAttentionConfig {
@@ -85,21 +92,31 @@ impl RingAttentionConfig {
     }
 
     /// Validate configuration parameters.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<()> {
         if self.block_size == 0 {
-            return Err("block_size must be > 0".to_string());
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: "block_size must be > 0".to_string(),
+            });
         }
         if self.num_blocks == 0 {
-            return Err("num_blocks must be > 0".to_string());
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: "num_blocks must be > 0".to_string(),
+            });
         }
         if self.embed_dim == 0 {
-            return Err("embed_dim must be > 0".to_string());
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: "embed_dim must be > 0".to_string(),
+            });
         }
         if self.num_heads == 0 {
-            return Err("num_heads must be > 0".to_string());
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: "num_heads must be > 0".to_string(),
+            });
         }
         if self.embed_dim % self.num_heads != 0 {
-            return Err("embed_dim must be divisible by num_heads".to_string());
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: "embed_dim must be divisible by num_heads".to_string(),
+            });
         }
         Ok(())
     }
@@ -218,6 +235,11 @@ impl RingBuffer {
         }
         self.write_pos = 0;
         self.total_tokens = 0;
+    }
+
+    /// Clear the ring buffer (alias for reset)
+    pub fn clear(&mut self) {
+        self.reset();
     }
 
     /// Get the total number of tokens stored.
@@ -717,6 +739,84 @@ impl RingAttention {
             capacity: self.ring_buffer.capacity(),
             utilization: self.ring_buffer.len() as f32 / self.ring_buffer.capacity() as f32,
         }
+    }
+}
+
+/// Workspace management for RingAttention streaming inference
+impl WorkspaceManaged for RingAttention {
+    /// Ensure workspace buffers have capacity for the given dimensions
+    fn ensure_capacity(&mut self, _batch_size: usize, _seq_len: usize, embed_dim: usize) {
+        if let Some(ws) = &mut self.streaming_workspace {
+            // Reallocate only if dimensions changed
+            if ws.q.len() != embed_dim || ws.output.len() != embed_dim {
+                *ws = RingAttentionStreamingWorkspace::new(&self.config);
+            }
+        }
+    }
+
+    /// Clear all workspace buffers
+    fn clear_workspace(&mut self) {
+        self.streaming_workspace = None;
+        self.ring_buffer.clear();
+    }
+
+    /// Return memory statistics for streaming workspace
+    fn workspace_stats(&self) -> WorkspaceStats {
+        let mut buffer_count = 0;
+        let mut total_bytes = 0;
+
+        if let Some(ws) = &self.streaming_workspace {
+            // Count buffers: q, k, v, scores, head_out, output, kv_2d
+            buffer_count = 7;
+
+            let embed_dim = ws.q.len();
+            let block_size = ws.scores.len();
+            let head_dim = ws.head_out.len();
+
+            total_bytes += embed_dim * std::mem::size_of::<f32>() * 3; // q, k, v
+            total_bytes += block_size * std::mem::size_of::<f32>(); // scores
+            total_bytes += head_dim * std::mem::size_of::<f32>(); // head_out
+            total_bytes += embed_dim * std::mem::size_of::<f32>(); // output
+            total_bytes += ws.kv_2d.len() * std::mem::size_of::<f32>(); // kv_2d
+        }
+
+        WorkspaceStats {
+            total_bytes,
+            buffer_count,
+            expected_shape: Some((1, self.config.embed_dim)),
+        }
+    }
+}
+
+/// Streaming state management for RingAttention
+impl StreamingWorkspaceManaged for RingAttention {
+    /// Initialize streaming state for inference with step-by-step processing
+    fn init_streaming(&mut self, _batch_size: usize, embed_dim: usize) -> Result<()> {
+        if embed_dim != self.config.embed_dim {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: format!(
+                    "Dimension mismatch: expected {}, got {}",
+                    self.config.embed_dim, embed_dim
+                ),
+            });
+        }
+
+        // Allocate streaming workspace
+        self.streaming_workspace = Some(RingAttentionStreamingWorkspace::new(&self.config));
+        Ok(())
+    }
+
+    /// Reset streaming state between sequences
+    fn reset_streaming_state(&mut self) {
+        if let Some(ws) = &mut self.streaming_workspace {
+            ws.reset();
+        }
+        self.ring_buffer.clear();
+    }
+
+    /// Check if streaming state is active
+    fn is_streaming(&self) -> bool {
+        self.streaming_workspace.is_some()
     }
 }
 

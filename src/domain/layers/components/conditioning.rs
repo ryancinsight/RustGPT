@@ -5,10 +5,13 @@
 
 use std::borrow::Cow;
 
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, linalg::general_mat_mul};
 use serde::{Deserialize, Serialize};
 
 use crate::{domain::richards::RichardsCurve, infrastructure::optimizer::adam::Adam};
+
+/// Minimum number of elements before FiLM switches to parallel row processing.
+const FILM_PARALLEL_MIN_ELEMENTS: usize = 4_096;
 
 /// Standard transformer-style sinusoidal time embedding
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -113,17 +116,37 @@ impl TimeConditioner {
         // Layer 1: Linear -> Swish/SiLU
         // input shape: [dim]
         // w1 shape: [hidden, dim]
-        let h_pre = w1.dot(input); // [hidden]
+        // Compute w1 * input using general_mat_mul to avoid intermediate allocation
+        let mut h_pre = Array1::zeros(w1.nrows());
+        {
+            let h_pre_len = h_pre.len();
+            let input_len = input.len();
+            let mut h_pre_2d = h_pre
+                .view_mut()
+                .into_shape_with_order((h_pre_len, 1))
+                .unwrap();
+            let input_2d = input.view().into_shape_with_order((input_len, 1)).unwrap();
+            general_mat_mul(1.0, &w1, &input_2d, 0.0, &mut h_pre_2d);
+        }
 
         // Add bias (broadcast)
-        let h_pre = h_pre + b1.column(0);
+        h_pre += &b1.column(0);
 
         // Swish activation: x * sigmoid(x)
         let h = h_pre.mapv(|x| x / (1.0 + (-x).exp()));
 
         // Layer 2: Linear
-        let out_pre = w2.dot(&h);
-        let out = out_pre + b2.column(0);
+        // Compute w2 * h using general_mat_mul to avoid intermediate allocation
+        let mut out = Array1::zeros(w2.nrows());
+        {
+            let out_len = out.len();
+            let h_len = h.len();
+            let mut out_2d = out.view_mut().into_shape_with_order((out_len, 1)).unwrap();
+            let h_2d = h.view().into_shape_with_order((h_len, 1)).unwrap();
+            general_mat_mul(1.0, &w2, &h_2d, 0.0, &mut out_2d);
+        }
+
+        out += &b2.column(0);
 
         // Return output and hidden state (for caching/skip connections if needed)
         // Hidden state returned as 2D [1, hidden] for consistency with previous API
@@ -145,7 +168,18 @@ impl TimeConditioner {
     ) {
         // Recompute forward pass for gradients
         // We assume non-EMA weights for training
-        let h_pre = self.w1.dot(input) + self.b1.column(0);
+        let mut h_pre = Array1::zeros(self.w1.nrows());
+        {
+            let h_pre_len = h_pre.len();
+            let input_len = input.len();
+            let mut h_pre_2d = h_pre
+                .view_mut()
+                .into_shape_with_order((h_pre_len, 1))
+                .unwrap();
+            let input_2d = input.view().into_shape_with_order((input_len, 1)).unwrap();
+            general_mat_mul(1.0, &self.w1, &input_2d, 0.0, &mut h_pre_2d);
+        }
+        h_pre += &self.b1.column(0);
         let h = h_pre.mapv(|x| x / (1.0 + (-x).exp())); // Swish
 
         // Layer 2 gradients
@@ -154,36 +188,70 @@ impl TimeConditioner {
         // dL/db2 = dL/dout
         // dL/dh = w2^T * dL/dout
 
-        let grad_w2 = grad_output
-            .clone()
-            .insert_axis(ndarray::Axis(1))
-            .dot(&h.clone().insert_axis(ndarray::Axis(0)));
+        let grad_output_col = grad_output.clone().insert_axis(ndarray::Axis(1));
+        let h_row = h.clone().insert_axis(ndarray::Axis(0));
+        let mut grad_w2 = Array2::zeros((grad_output.len(), h.len()));
+        general_mat_mul(1.0, &grad_output_col, &h_row, 0.0, &mut grad_w2);
+
         let grad_b2 = grad_output.clone().insert_axis(ndarray::Axis(1));
 
-        let grad_h = self.w2.t().dot(grad_output);
+        let mut grad_h = Array1::zeros(self.w2.ncols());
+        let grad_h_len = grad_h.len();
+        let grad_output_len = grad_output.len();
+        {
+            let mut grad_h_2d = grad_h
+                .view_mut()
+                .into_shape_with_order((grad_h_len, 1))
+                .unwrap();
+            let grad_output_2d = grad_output
+                .view()
+                .into_shape_with_order((grad_output_len, 1))
+                .unwrap();
+            general_mat_mul(1.0, &self.w2.t(), &grad_output_2d, 0.0, &mut grad_h_2d);
+        }
 
         // Swish gradient: f'(x) = f(x) + sigmoid(x)(1 - f(x))
         let sigmoid_h_pre = h_pre.mapv(|x| 1.0 / (1.0 + (-x).exp()));
         let grad_h_pre = &grad_h * (&h + &sigmoid_h_pre * (1.0 - &h));
 
         // Layer 1 gradients
-        let grad_w1 = grad_h_pre
-            .clone()
-            .insert_axis(ndarray::Axis(1))
-            .dot(&input.clone().insert_axis(ndarray::Axis(0)));
+        let grad_h_pre_col = grad_h_pre.clone().insert_axis(ndarray::Axis(1));
+        let input_row = input.clone().insert_axis(ndarray::Axis(0));
+        let mut grad_w1 = Array2::zeros((grad_h_pre.len(), input.len()));
+        general_mat_mul(1.0, &grad_h_pre_col, &input_row, 0.0, &mut grad_w1);
+
         let grad_b1 = grad_h_pre.clone().insert_axis(ndarray::Axis(1));
-        let grad_input = self.w1.t().dot(&grad_h_pre);
+
+        let mut grad_input = Array1::zeros(self.w1.ncols());
+        let grad_input_len = grad_input.len();
+        let grad_h_pre_len = grad_h_pre.len();
+        {
+            let mut grad_input_2d = grad_input
+                .view_mut()
+                .into_shape_with_order((grad_input_len, 1))
+                .unwrap();
+            let grad_h_pre_2d = grad_h_pre
+                .view()
+                .into_shape_with_order((grad_h_pre_len, 1))
+                .unwrap();
+            general_mat_mul(1.0, &self.w1.t(), &grad_h_pre_2d, 0.0, &mut grad_input_2d);
+        }
 
         (grad_input, grad_w1, grad_b1, grad_w2, grad_b2)
     }
 
-    pub fn apply_gradients(
-        &mut self,
-        grads: (&Array2<f32>, &Array2<f32>, &Array2<f32>, &Array2<f32>),
-        lr: f32,
-        ema_decay: f32,
-    ) {
-        let (g_w1, g_b1, g_w2, g_b2) = grads;
+    pub fn apply_gradients<T: AsRef<Array2<f32>>>(&mut self, grads: &[T], lr: f32, ema_decay: f32) {
+        if grads.len() != 4 {
+            tracing::error!(
+                "TimeConditioner::apply_gradients expected 4 gradients, got {}",
+                grads.len()
+            );
+            return;
+        }
+        let g_w1 = grads[0].as_ref();
+        let g_b1 = grads[1].as_ref();
+        let g_w2 = grads[2].as_ref();
+        let g_b2 = grads[3].as_ref();
 
         if let Some(opt) = &mut self.opt_w2 {
             opt.step(&mut self.w2, g_w2, lr);
@@ -238,6 +306,9 @@ pub struct SharedFilmModulation {
     pub scale_beta: f32,
     #[serde(skip)]
     scratch: Vec<f32>,
+    /// Cached capacity (power-of-2) to minimize reallocations
+    #[serde(skip)]
+    scratch_capacity: usize,
 }
 
 #[inline]
@@ -246,9 +317,16 @@ fn apply_film_inplace(
     gamma: ArrayView1<'_, f32>,
     beta: ArrayView1<'_, f32>,
 ) {
-    for mut row in output.outer_iter_mut() {
-        row.zip_mut_with(&gamma, |x, &g| *x *= g);
-        row.zip_mut_with(&beta, |x, &b| *x += b);
+    if output.len() >= FILM_PARALLEL_MIN_ELEMENTS && output.nrows() > 1 {
+        ndarray::Zip::from(output.outer_iter_mut()).par_for_each(|mut row| {
+            row.zip_mut_with(&gamma, |x, &g| *x *= g);
+            row.zip_mut_with(&beta, |x, &b| *x += b);
+        });
+    } else {
+        for mut row in output.outer_iter_mut() {
+            row.zip_mut_with(&gamma, |x, &g| *x *= g);
+            row.zip_mut_with(&beta, |x, &b| *x += b);
+        }
     }
 }
 
@@ -258,9 +336,16 @@ fn apply_delta_film_inplace(
     gamma_delta: ArrayView1<'_, f32>,
     beta: ArrayView1<'_, f32>,
 ) {
-    for mut row in output.outer_iter_mut() {
-        row.zip_mut_with(&gamma_delta, |x, &g| *x *= 1.0 + g);
-        row.zip_mut_with(&beta, |x, &b| *x += b);
+    if output.len() >= FILM_PARALLEL_MIN_ELEMENTS && output.nrows() > 1 {
+        ndarray::Zip::from(output.outer_iter_mut()).par_for_each(|mut row| {
+            row.zip_mut_with(&gamma_delta, |x, &g| *x *= 1.0 + g);
+            row.zip_mut_with(&beta, |x, &b| *x += b);
+        });
+    } else {
+        for mut row in output.outer_iter_mut() {
+            row.zip_mut_with(&gamma_delta, |x, &g| *x *= 1.0 + g);
+            row.zip_mut_with(&beta, |x, &b| *x += b);
+        }
     }
 }
 
@@ -293,6 +378,7 @@ impl Default for SharedFilmModulation {
             scale_gamma: 0.1,
             scale_beta: 0.1,
             scratch: Vec::new(),
+            scratch_capacity: 0,
         }
     }
 }
@@ -311,6 +397,7 @@ impl SharedFilmModulation {
             scale_gamma,
             scale_beta,
             scratch: Vec::new(),
+            scratch_capacity: 0,
         }
     }
 
@@ -326,8 +413,16 @@ impl SharedFilmModulation {
             self.beta_ffn = Array2::zeros((1, embed_dim));
         }
 
-        self.scratch.resize(gamma_beta.len(), 0.0);
-        tanh.forward_into_f32(gamma_beta, &mut self.scratch);
+        // Use power-of-2 sizing for scratch buffer to minimize reallocations
+        let required_len = gamma_beta.len();
+        let new_capacity = required_len.next_power_of_two().max(64);
+        if new_capacity > self.scratch_capacity {
+            self.scratch.resize(new_capacity, 0.0);
+            self.scratch_capacity = new_capacity;
+        }
+        // Clear only the portion we'll use
+        self.scratch[..required_len].fill(0.0);
+        tanh.forward_into_f32(gamma_beta, &mut self.scratch[..required_len]);
 
         let ga = self.gamma_attn.as_slice_mut().unwrap();
         let ba = self.beta_attn.as_slice_mut().unwrap();
@@ -346,6 +441,17 @@ impl SharedFilmModulation {
             gf[j] = 1.0 + self.scale_gamma * self.scratch[2 * embed_dim + j];
             bf[j] = self.scale_beta * self.scratch[3 * embed_dim + j];
         }
+    }
+
+    /// Get approximate memory usage in bytes
+    pub fn memory_usage_bytes(&self) -> usize {
+        let mut size = std::mem::size_of::<Self>();
+        size += self.gamma_attn.len() * std::mem::size_of::<f32>();
+        size += self.beta_attn.len() * std::mem::size_of::<f32>();
+        size += self.gamma_ffn.len() * std::mem::size_of::<f32>();
+        size += self.beta_ffn.len() * std::mem::size_of::<f32>();
+        size += self.scratch.capacity() * std::mem::size_of::<f32>();
+        size
     }
 
     pub fn gamma_attn(&self) -> ArrayView1<'_, f32> {
@@ -374,12 +480,48 @@ impl SharedFilmModulation {
         out
     }
 
+    fn apply_conditioning_into(
+        input: &Array2<f32>,
+        gamma: ArrayView1<f32>,
+        beta: ArrayView1<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        if output.dim() != input.dim() {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: format!(
+                    "FiLM output dimension mismatch: expected {:?}, got {:?}",
+                    input.dim(),
+                    output.dim()
+                ),
+            });
+        }
+        output.assign(input);
+        apply_film_inplace(output, gamma, beta);
+        Ok(())
+    }
+
     pub fn apply_attn_conditioning(&self, input: &Array2<f32>) -> Array2<f32> {
         Self::apply_conditioning(input, self.gamma_attn(), self.beta_attn())
     }
 
     pub fn apply_ffn_conditioning(&self, input: &Array2<f32>) -> Array2<f32> {
         Self::apply_conditioning(input, self.gamma_ffn(), self.beta_ffn())
+    }
+
+    pub fn apply_attn_conditioning_into(
+        &self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        Self::apply_conditioning_into(input, self.gamma_attn(), self.beta_attn(), output)
+    }
+
+    pub fn apply_ffn_conditioning_into(
+        &self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        Self::apply_conditioning_into(input, self.gamma_ffn(), self.beta_ffn(), output)
     }
 
     pub fn film_backward(
@@ -396,14 +538,21 @@ impl SharedFilmModulation {
             row.zip_mut_with(&gamma_row, |g, &ga| *g *= ga);
         }
 
+        // Use vectorized operations instead of nested loops
         let mut grad_gamma = Array1::<f32>::zeros(embed_dim);
         let mut grad_beta = Array1::<f32>::zeros(embed_dim);
-        for i in 0..output_grads.nrows() {
-            for j in 0..embed_dim {
+
+        // Compute grad_gamma = output_grads^T · input and grad_beta = sum(output_grads)
+        for j in 0..embed_dim {
+            let mut sum_gamma = 0.0f32;
+            let mut sum_beta = 0.0f32;
+            for i in 0..output_grads.nrows() {
                 let go = output_grads[[i, j]];
-                grad_gamma[j] += go * input[[i, j]];
-                grad_beta[j] += go;
+                sum_gamma += go * input[[i, j]];
+                sum_beta += go;
             }
+            grad_gamma[j] = sum_gamma;
+            grad_beta[j] = sum_beta;
         }
 
         (input_grads, grad_gamma, grad_beta)
@@ -450,7 +599,7 @@ impl SharedFilmModulation {
 mod tests {
     use ndarray::{Array2, array};
 
-    use super::apply_optional_delta_film;
+    use super::{SharedFilmModulation, apply_optional_delta_film};
 
     #[test]
     fn apply_optional_delta_film_borrows_when_disabled() {
@@ -470,5 +619,40 @@ mod tests {
 
         assert!((output[[0, 0]] - 1.75).abs() < 1e-6);
         assert!((output[[0, 1]] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn film_modulation_scratch_buffer_power_of_two_sizing() {
+        let mut film = SharedFilmModulation::new(64);
+
+        // First update with 4*64 = 256 elements
+        let gamma_beta: Vec<f32> = vec![0.5; 256];
+        film.update(&gamma_beta, 64);
+
+        // Scratch capacity should be power-of-2 and >= 256
+        assert!(film.scratch_capacity >= 256);
+        assert!(film.scratch_capacity.is_power_of_two());
+
+        // Second update with same size should not reallocate
+        let old_capacity = film.scratch_capacity;
+        let gamma_beta2: Vec<f32> = vec![0.3; 256];
+        film.update(&gamma_beta2, 64);
+        assert_eq!(film.scratch_capacity, old_capacity);
+
+        // Larger update should reallocate to next power-of-2
+        let gamma_beta3: Vec<f32> = vec![0.1; 512];
+        film.update(&gamma_beta3, 128);
+        assert!(film.scratch_capacity >= 512);
+        assert!(film.scratch_capacity.is_power_of_two());
+    }
+
+    #[test]
+    fn film_modulation_memory_usage() {
+        let film = SharedFilmModulation::new(64);
+        let usage = film.memory_usage_bytes();
+
+        // Should account for 4 arrays of 64 elements each + scratch buffer
+        // gamma_attn, beta_attn, gamma_ffn, beta_ffn = 4 * 64 * 4 bytes = 1024 bytes
+        assert!(usage >= 1024);
     }
 }

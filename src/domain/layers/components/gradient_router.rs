@@ -502,7 +502,6 @@ pub struct GradientPartition {
     pub pre_attn_norm: usize,
     pub context: usize,
     pub adaptive_residuals: usize,
-    pub eprop_adaptor: usize,
 }
 
 impl GradientPartition {
@@ -515,7 +514,6 @@ impl GradientPartition {
             + self.pre_attn_norm
             + self.context
             + self.adaptive_residuals
-            + self.eprop_adaptor
     }
 
     /// Validates that the partition matches the expected gradient count.

@@ -9,10 +9,10 @@ pub mod types;
 // Keep the root `richards` namespace tight: re-export only the primary public types.
 pub use self::{
     act::{RichardsActivation, RichardsAttention},
+    adaptive::AdaptiveScalar,
     curve::{RichardsCurve, WeightsIter},
     gate::RichardsGate,
     glu::RichardsGlu,
     norm::RichardsNorm,
-    adaptive::AdaptiveScalar,
     types::Variant,
 };

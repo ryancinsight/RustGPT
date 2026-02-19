@@ -99,11 +99,7 @@ pub struct PatchMerge {
 
 impl PatchMerge {
     /// Create a new patch merging layer
-    pub fn new(
-        merge_factor: usize,
-        in_features: usize,
-        out_features: usize,
-    ) -> Result<Self> {
+    pub fn new(merge_factor: usize, in_features: usize, out_features: usize) -> Result<Self> {
         if merge_factor == 0 {
             return Err(crate::common::errors::ModelError::InvalidInput {
                 message: "merge_factor must be > 0".to_string(),
@@ -120,10 +116,8 @@ impl PatchMerge {
             });
         }
 
-        let (weight, bias) = PatchEmbed::init_weights(
-            in_features * merge_factor * merge_factor,
-            out_features,
-        );
+        let (weight, bias) =
+            PatchEmbed::init_weights(in_features * merge_factor * merge_factor, out_features);
 
         Ok(Self {
             weight,
@@ -135,7 +129,12 @@ impl PatchMerge {
     }
 
     /// Forward pass: merge adjacent patches
-    pub fn forward(&self, patches: &Array2<f32>, grid_h: usize, grid_w: usize) -> Result<Array2<f32>> {
+    pub fn forward(
+        &self,
+        patches: &Array2<f32>,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Array2<f32>> {
         let num_patches = patches.nrows();
         let expected_patches = grid_h * grid_w;
 
@@ -185,7 +184,10 @@ impl PatchMerge {
 
         // Convert to array and apply linear projection
         let merged_array = Array2::from_shape_vec(
-            (new_num_patches, self.in_features * self.merge_factor * self.merge_factor),
+            (
+                new_num_patches,
+                self.in_features * self.merge_factor * self.merge_factor,
+            ),
             merged.into_iter().flatten().collect(),
         )
         .map_err(|e| crate::common::errors::ModelError::InvalidInput {

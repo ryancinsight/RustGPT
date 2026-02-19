@@ -94,12 +94,12 @@ pub struct MambaScanBackwardOutput {
 
 /// Input bundle for Mamba-2 fused selective scan
 pub struct Mamba2ScanInput<'a> {
-    pub u: ArrayView2<'a, f32>, // (T, D)
-    pub a: ArrayView2<'a, f32>, // (T, H)
-    pub b: ArrayView2<'a, f32>, // (T, H*N)
-    pub c: ArrayView2<'a, f32>, // (T, H*N)
+    pub u: ArrayView2<'a, f32>,      // (T, D)
+    pub a: ArrayView2<'a, f32>,      // (T, H)
+    pub b: ArrayView2<'a, f32>,      // (T, H*N)
+    pub c: ArrayView2<'a, f32>,      // (T, H*N)
     pub d_skip: ArrayView1<'a, f32>, // (D)
-    pub head_dim: usize, // D / H
+    pub head_dim: usize,             // D / H
 }
 
 pub struct Mamba2ScanBackwardInput<'a> {
@@ -107,7 +107,7 @@ pub struct Mamba2ScanBackwardInput<'a> {
     pub a: ArrayView2<'a, f32>,
     pub b: ArrayView2<'a, f32>,
     pub c: ArrayView2<'a, f32>,
-    pub state: ArrayView2<'a, f32>, // (T, D*N)
+    pub state: ArrayView2<'a, f32>,      // (T, D*N)
     pub state_prev: ArrayView2<'a, f32>, // (T, D*N)
     pub d_z: ArrayView2<'a, f32>,
     pub d_skip: ArrayView1<'a, f32>,
@@ -116,9 +116,9 @@ pub struct Mamba2ScanBackwardInput<'a> {
 
 pub struct Mamba2ScanBackwardOutput {
     pub d_u: Array2<f32>,
-    pub d_a: Array2<f32>, // (T, H)
-    pub d_b: Array2<f32>, // (T, H*N)
-    pub d_c: Array2<f32>, // (T, H*N)
+    pub d_a: Array2<f32>,      // (T, H)
+    pub d_b: Array2<f32>,      // (T, H*N)
+    pub d_c: Array2<f32>,      // (T, H*N)
     pub d_d_skip: Array2<f32>, // (D)
 }
 
@@ -213,32 +213,32 @@ impl SelectiveScanner {
 
         // We use UnsafeCell/raw pointers or split_mut to write to output arrays in parallel.
         // ndarray's axis_chunks_iter_mut is perfect for this.
-        
+
         // Zip the mutable outputs along Axis 1 (D dimension)
         // state is [T, D*N], so we need to chunk it carefully.
         // It's easier to iterate indices in parallel and write via raw pointers or
         // unsafe slices, OR use ndarray::Zip if we can structure it right.
-        
+
         // Since state interleaves D and N (D*N flattened could be D blocks of N or N blocks of D?),
         // Mamba uses [T, D*N] where index = j*N + k.
         // This means for a fixed T, the layout is [Channel0_State0..N, Channel1_State0..N, ...]
         // So chunking D means chunking the columns of `state` by N * chunk_size.
-        
+
         let _state_cols_per_chunk = chunk_size * n_dim;
-        
+
         // We can collect mutable chunks into a Vec to pass to par_iter
         // But ndarray doesn't support easy "split at arbitrary indices" for multiple arrays.
         // We'll use parallel iterator over chunk indices and unsafe access for writing.
         // This is the standard "Elite" way to avoid bound checks and borrowing hell for disjoint writes.
-        
+
         let state_ptr = state.as_mut_ptr(); // Row-major: T rows, D*N cols.
-        let z_ptr = z.as_mut_ptr();         // Row-major: T rows, D cols.
-        
+        let z_ptr = z.as_mut_ptr(); // Row-major: T rows, D cols.
+
         // Safety: We ensure disjoint access by chunking D.
         // Thread i accesses j in [start..end].
         // state indices: row t, col j*N + k. (t * (D*N) + j*N + k)
         // z indices: row t, col j. (t * D + j)
-        
+
         // Sync wrapper for pointers
         let state_wrap = PtrWrapper(state_ptr);
         let z_wrap = PtrWrapper(z_ptr);
@@ -250,25 +250,25 @@ impl SelectiveScanner {
             .for_each(|chunk_indices| {
                 let state_base = state_wrap.get();
                 let z_base = z_wrap.get();
-                
+
                 // Process this chunk of D channels
                 for j in chunk_indices {
                     // Pre-fetch constants for channel j
                     let d_val = input.d_skip[j];
-                    
+
                     // State for this channel (N values)
                     // We keep current state in registers/stack array to avoid reading/writing main memory every micro-step
                     // if N is small (16).
                     let mut s_local = vec![0.0f32; n_dim];
-                    
+
                     for t in 0..t_len {
                         // Load inputs
                         let dt_val = input.dt[[t, j]];
                         let u_val = input.u[[t, j]];
-                        
+
                         // Z accumulator
                         let mut z_acc = d_val * u_val;
-                        
+
                         // Inner loop over N states
                         for k in 0..n_dim {
                             // Discretization
@@ -276,29 +276,29 @@ impl SelectiveScanner {
                             // exp(-dt * A)
                             // Using Padé approximation for stability and consistency with training gradients
                             let a_dt = pade::exp(-dt_val * a_scale_val).clamp(0.0, 1.0);
-                            
+
                             // B discretization: (1 - exp(-dt*A)) / A * B * u
                             // Avoid div by zero (handled by max(1e-6))
                             let b_scaling = (1.0 - a_dt) / a_scale_val;
                             let b_val = input.b[[t, k]];
                             let b_discrete = b_scaling * b_val * u_val;
-                            
+
                             // State update: s = A_bar * s_prev + B_bar * u
                             let s_new = a_dt * s_local[k] + b_discrete;
                             s_local[k] = s_new;
-                            
+
                             // Write state to global memory
                             // Index: t * (d_dim * n_dim) + j * n_dim + k
                             let state_idx = t * (d_dim * n_dim) + j * n_dim + k;
                             unsafe {
                                 *state_base.add(state_idx) = s_new;
                             }
-                            
+
                             // Output accumulation: z += C * s
                             let c_val = input.c[[t, k]];
                             z_acc += c_val * s_new;
                         }
-                        
+
                         // Write Z
                         // Index: t * d_dim + j
                         let z_idx = t * d_dim + j;
@@ -347,81 +347,81 @@ impl SelectiveScanner {
         // Raw pointers for parallel access
         let d_u_ptr = PtrWrapper(d_u.as_mut_ptr());
         let d_dt_ptr = PtrWrapper(d_dt.as_mut_ptr());
-        
+
         // For d_b, d_c, d_a_scale, d_d_skip, we need thread-local accumulation if we parallelize over D
         // because B and C are shared across D (broadcasted).
         // Wait, in Mamba 1, B and C are (T, N). They are broadcasted to D.
         // So d_B and d_C are sums over D.
         // This requires reduction.
-        
+
         // Strategy:
         // Parallelize over chunks of D. Each chunk computes partial d_B, d_C, d_A_scale, d_D_skip.
         // Then reduce (sum) them.
 
         let chunk_size = self.config.chunk_size;
-        
+
         let partial_grads: Vec<_> = (0..d_dim)
             .into_par_iter()
             .chunks(chunk_size)
             .map(|chunk_indices| {
                 let d_u_base = d_u_ptr.get();
                 let d_dt_base = d_dt_ptr.get();
-                
+
                 let mut local_d_a_scale = Array2::<f32>::zeros((d_dim, n_dim)); // Sparse! Only chunk rows used.
                 // Actually, d_a_scale is (D, N), so each thread owns its rows. No reduction needed for A!
                 // We can write directly to global d_a_scale if we use PtrWrapper.
-                
+
                 let mut local_d_d_skip = Array2::<f32>::zeros((d_dim, 1)); // Also distinct per D.
-                
+
                 // We'll compute d_B and d_C locally and return them for reduction.
                 // For d_A and d_D_skip, we can return them or write to global if we pass pointers.
                 // Let's write d_A and d_D_skip to local buffers to be safe/clean and return them.
                 // Actually, returning large sparse arrays is inefficient.
                 // Better: Write d_A and d_D_skip to global (disjoint). Return d_B and d_C (sum).
-                
+
                 // Let's refine:
                 // d_b: (T, N) -> Shared. Needs reduction.
                 // d_c: (T, N) -> Shared. Needs reduction.
                 // d_a_scale: (D, N) -> Distinct rows per D. Write directly.
                 // d_d_skip: (D) -> Distinct per D. Write directly.
-                
+
                 // Re-create PtrWrappers for distinct outputs inside the closure? No, pass them in.
                 // But we need to define them first.
-                
+
                 let mut d_b_acc = Array2::<f32>::zeros((t_len, n_dim));
                 let mut d_c_acc = Array2::<f32>::zeros((t_len, n_dim));
-                
+
                 // Temporary buffers for recurrence gradients
                 let mut d_s_next = vec![0.0f32; n_dim];
-                
+
                 for j in chunk_indices {
                     let d_val = input.d_skip[j];
-                    
+
                     // Reset d_s_next for the reverse pass (t = T-1 down to 0)
                     d_s_next.fill(0.0);
-                    
+
                     for t in (0..t_len).rev() {
                         let dt_val = input.dt[[t, j]];
                         let u_val = input.u[[t, j]];
                         let dz_val = input.d_z[[t, j]];
-                        
+
                         // Re-compute variables needed for gradients
                         // We need s[t], s[t-1]
-                        
+
                         // 1. Gradient of Output/Gate
                         // y = z (if no gate in scan). The caller handles gate gradient, passing d_z.
                         // z = D * u + sum(C * s)
-                        
+
                         // d_u += D * d_z
                         let mut du_acc = d_val * dz_val;
-                        
+
                         // d_D_skip += u * d_z (accumulate over T? No, D_skip is (D), so sum over T)
                         // Wait, d_d_skip is (D). We accumulate over T for this J.
                         local_d_d_skip[[j, 0]] += u_val * dz_val;
-                        
+
                         // d_dt accumulator for this step
                         let mut d_dt_acc = 0.0f32;
-                        
+
                         for k in 0..n_dim {
                             // Fetch values
                             let s_curr = input.state[[t, j * n_dim + k]]; // s[t]
@@ -429,64 +429,65 @@ impl SelectiveScanner {
                             let b_val = input.b[[t, k]];
                             let c_val = input.c[[t, k]];
                             let a_scale_val = input.a_scale[[j, k]].max(1e-6);
-                            
+
                             // Recompute A_dt and B_discrete
                             let a_dt = pade::exp(-dt_val * a_scale_val).clamp(0.0, 1.0);
                             let b_scaling = (1.0 - a_dt) / a_scale_val;
                             // let b_discrete = b_scaling * b_val * u_val; // Unused
-                            
+
                             // d_z flows into d_c and d_s
                             // z = ... + C * s
                             // d_C += s * d_z
                             d_c_acc[[t, k]] += s_curr * dz_val;
-                            
+
                             // d_s = C * d_z + d_s_next (from future)
                             let ds = c_val * dz_val + d_s_next[k];
-                            
+
                             // s = A_dt * s_prev + B_discrete
                             // d_s_prev = A_dt * ds
                             d_s_next[k] = a_dt * ds; // Propagate to t-1
-                            
+
                             // d_A_dt = s_prev * ds
                             let da_dt = s_prev * ds;
-                            
+
                             // d_B_discrete = ds
                             let db_discrete = ds;
-                            
+
                             // d_B_scaling = b_val * u_val * db_discrete
                             let db_scaling = b_val * u_val * db_discrete;
-                            
+
                             // d_b += b_scaling * u_val * db_discrete
                             d_b_acc[[t, k]] += b_scaling * u_val * db_discrete;
-                            
+
                             // d_u += b_scaling * b_val * db_discrete
                             du_acc += b_scaling * b_val * db_discrete;
-                            
+
                             // Gradients wrt dt and a_scale
                             // A_dt = exp(-dt * A_scale)
                             // d_A_dt / d_exp = 1
                             // d_exp / d_arg = A_dt
                             // arg = -dt * A_scale
-                            
+
                             // B_scaling = (1 - A_dt) / A_scale
                             // d_B_scaling / d_A_dt = -1 / A_scale
                             // d_B_scaling / d_A_scale = -(1-A_dt)/A_scale^2
-                            
+
                             let da_dt_total = da_dt + db_scaling * (-1.0 / a_scale_val);
-                            let da_scale_from_b = db_scaling * (-(1.0 - a_dt) / (a_scale_val * a_scale_val));
-                            
+                            let da_scale_from_b =
+                                db_scaling * (-(1.0 - a_dt) / (a_scale_val * a_scale_val));
+
                             let d_arg = da_dt_total * a_dt; // Chain rule through exp
-                            
+
                             // d_arg / d_dt = -A_scale
                             d_dt_acc += d_arg * (-a_scale_val);
-                            
+
                             // d_arg / d_A_scale = -dt
                             let da_scale_from_arg = d_arg * (-dt_val);
-                            
+
                             // Total d_A_scale
                             local_d_a_scale[[j, k]] += da_scale_from_b + da_scale_from_arg;
                         }
-                        
+
                         // Write d_u and d_dt
                         unsafe {
                             *d_u_base.add(t * d_dim + j) = du_acc;
@@ -494,7 +495,7 @@ impl SelectiveScanner {
                         }
                     }
                 }
-                
+
                 (d_b_acc, d_c_acc, local_d_a_scale, local_d_d_skip)
             })
             .collect();
@@ -556,17 +557,17 @@ impl SelectiveScanner {
         (0..num_heads).into_par_iter().for_each(|h| {
             let state_base = state_ptr.get();
             let z_base = z_ptr.get();
-            
+
             // For each head, we process channels [h*head_dim .. (h+1)*head_dim]
             let j_start = h * head_dim;
-            
+
             // Pre-allocate local state for channels in this head
             let mut s_prev = vec![0.0f32; head_dim * n_dim];
-            
+
             for t in 0..t_len {
                 let a_val = input.a[[t, h]]; // Scalar A for this head at time t
                 let b_base_idx = h * n_dim;
-                
+
                 for j_local in 0..head_dim {
                     let j = j_start + j_local;
                     if j >= d_dim {
@@ -574,30 +575,30 @@ impl SelectiveScanner {
                     }
                     let u_val = input.u[[t, j]];
                     let d_skip_val = input.d_skip[j];
-                    
+
                     let mut z_val = d_skip_val * u_val;
-                    
+
                     for k in 0..n_dim {
-                         let s_idx = j_local * n_dim + k;
-                         let prev = s_prev[s_idx];
-                         
-                         let b_val = input.b[[t, b_base_idx + k]];
-                         let c_val = input.c[[t, b_base_idx + k]];
-                         
-                         // Recurrence: s = a * s_prev + b * u
-                         let s_new = a_val * prev + b_val * u_val;
-                         
-                         s_prev[s_idx] = s_new;
-                         
-                         // Write to global state
-                         unsafe {
-                             *state_base.add(t * d_dim * n_dim + j * n_dim + k) = s_new;
-                         }
-                         
-                         // Accumulate z
-                         z_val += c_val * s_new;
+                        let s_idx = j_local * n_dim + k;
+                        let prev = s_prev[s_idx];
+
+                        let b_val = input.b[[t, b_base_idx + k]];
+                        let c_val = input.c[[t, b_base_idx + k]];
+
+                        // Recurrence: s = a * s_prev + b * u
+                        let s_new = a_val * prev + b_val * u_val;
+
+                        s_prev[s_idx] = s_new;
+
+                        // Write to global state
+                        unsafe {
+                            *state_base.add(t * d_dim * n_dim + j * n_dim + k) = s_new;
+                        }
+
+                        // Accumulate z
+                        z_val += c_val * s_new;
                     }
-                    
+
                     // Write z
                     unsafe {
                         *z_base.add(t * d_dim + j) = z_val;
@@ -614,104 +615,116 @@ impl SelectiveScanner {
         &self,
         input: Mamba2ScanBackwardInput,
     ) -> Mamba2ScanBackwardOutput {
-         let t_len = input.u.nrows();
-         let d_dim = input.u.ncols();
-         let num_heads = input.a.ncols();
-         let head_dim = input.head_dim;
-         let n_dim = input.b.ncols() / num_heads;
-         
-         let mut d_u = Array2::<f32>::zeros((t_len, d_dim));
-         let mut d_a = Array2::<f32>::zeros((t_len, num_heads));
-         let mut d_b = Array2::<f32>::zeros((t_len, num_heads * n_dim));
-         let mut d_c = Array2::<f32>::zeros((t_len, num_heads * n_dim));
-         let mut d_d_skip = Array2::<f32>::zeros((d_dim, 1));
-         
-         if t_len == 0 {
-             return Mamba2ScanBackwardOutput { d_u, d_a, d_b, d_c, d_d_skip };
-         }
-         
-         let d_u_ptr = PtrWrapper(d_u.as_mut_ptr());
-         let d_a_ptr = PtrWrapper(d_a.as_mut_ptr());
-         let d_b_ptr = PtrWrapper(d_b.as_mut_ptr());
-         let d_c_ptr = PtrWrapper(d_c.as_mut_ptr());
-         let d_d_skip_ptr = PtrWrapper(d_d_skip.as_mut_ptr());
-         
-         // Parallelize over Heads
-         (0..num_heads).into_par_iter().for_each(|h| {
-             let d_u_base = d_u_ptr.get();
-             let d_a_base = d_a_ptr.get();
-             let d_b_base = d_b_ptr.get();
-             let d_c_base = d_c_ptr.get();
-             let d_d_skip_base = d_d_skip_ptr.get();
-             
-             let j_start = h * head_dim;
-             let b_base_idx = h * n_dim;
-             
-             let mut d_s_next = vec![0.0f32; head_dim * n_dim];
-             
-             for t in (0..t_len).rev() {
-                 let a_val = input.a[[t, h]];
-                 
-                 let mut da_acc = 0.0f32;
-                 let mut db_acc = vec![0.0f32; n_dim];
-                 let mut dc_acc = vec![0.0f32; n_dim];
-                 
-                 for j_local in 0..head_dim {
+        let t_len = input.u.nrows();
+        let d_dim = input.u.ncols();
+        let num_heads = input.a.ncols();
+        let head_dim = input.head_dim;
+        let n_dim = input.b.ncols() / num_heads;
+
+        let mut d_u = Array2::<f32>::zeros((t_len, d_dim));
+        let mut d_a = Array2::<f32>::zeros((t_len, num_heads));
+        let mut d_b = Array2::<f32>::zeros((t_len, num_heads * n_dim));
+        let mut d_c = Array2::<f32>::zeros((t_len, num_heads * n_dim));
+        let mut d_d_skip = Array2::<f32>::zeros((d_dim, 1));
+
+        if t_len == 0 {
+            return Mamba2ScanBackwardOutput {
+                d_u,
+                d_a,
+                d_b,
+                d_c,
+                d_d_skip,
+            };
+        }
+
+        let d_u_ptr = PtrWrapper(d_u.as_mut_ptr());
+        let d_a_ptr = PtrWrapper(d_a.as_mut_ptr());
+        let d_b_ptr = PtrWrapper(d_b.as_mut_ptr());
+        let d_c_ptr = PtrWrapper(d_c.as_mut_ptr());
+        let d_d_skip_ptr = PtrWrapper(d_d_skip.as_mut_ptr());
+
+        // Parallelize over Heads
+        (0..num_heads).into_par_iter().for_each(|h| {
+            let d_u_base = d_u_ptr.get();
+            let d_a_base = d_a_ptr.get();
+            let d_b_base = d_b_ptr.get();
+            let d_c_base = d_c_ptr.get();
+            let d_d_skip_base = d_d_skip_ptr.get();
+
+            let j_start = h * head_dim;
+            let b_base_idx = h * n_dim;
+
+            let mut d_s_next = vec![0.0f32; head_dim * n_dim];
+
+            for t in (0..t_len).rev() {
+                let a_val = input.a[[t, h]];
+
+                let mut da_acc = 0.0f32;
+                let mut db_acc = vec![0.0f32; n_dim];
+                let mut dc_acc = vec![0.0f32; n_dim];
+
+                for j_local in 0..head_dim {
                     let j = j_start + j_local;
                     if j >= d_dim {
                         break;
                     }
                     let u_val = input.u[[t, j]];
-                     let dz_val = input.d_z[[t, j]];
-                     let d_skip_val = input.d_skip[j];
-                     
-                     let mut du_val = dz_val * d_skip_val;
-                     
-                     unsafe {
-                         *d_d_skip_base.add(j) += dz_val * u_val;
-                     }
-                     
-                     for k in 0..n_dim {
-                         let s_idx = j_local * n_dim + k;
-                         
-                         let s_curr = input.state[[t, j * n_dim + k]];
-                         let s_prev = if t > 0 {
-                             input.state_prev[[t, j * n_dim + k]]
-                         } else {
-                             0.0
-                         };
-                         
-                         let b_idx = b_base_idx + k;
-                         let b_val = input.b[[t, b_idx]];
-                         let c_val = input.c[[t, b_idx]];
-                         
-                         let ds = c_val * dz_val + d_s_next[s_idx];
-                         
-                         dc_acc[k] += dz_val * s_curr;
-                         
-                         d_s_next[s_idx] = a_val * ds;
-                         da_acc += s_prev * ds;
-                         
-                         db_acc[k] += u_val * ds;
-                         du_val += b_val * ds;
-                     }
-                     
-                     unsafe {
-                         *d_u_base.add(t * d_dim + j) = du_val;
-                     }
-                 }
-                 
-                 unsafe {
-                     *d_a_base.add(t * num_heads + h) = da_acc;
-                     for k in 0..n_dim {
-                         *d_b_base.add(t * (num_heads * n_dim) + b_base_idx + k) = db_acc[k];
-                         *d_c_base.add(t * (num_heads * n_dim) + b_base_idx + k) = dc_acc[k];
-                     }
-                 }
-             }
-         });
-         
-         Mamba2ScanBackwardOutput { d_u, d_a, d_b, d_c, d_d_skip }
+                    let dz_val = input.d_z[[t, j]];
+                    let d_skip_val = input.d_skip[j];
+
+                    let mut du_val = dz_val * d_skip_val;
+
+                    unsafe {
+                        *d_d_skip_base.add(j) += dz_val * u_val;
+                    }
+
+                    for k in 0..n_dim {
+                        let s_idx = j_local * n_dim + k;
+
+                        let s_curr = input.state[[t, j * n_dim + k]];
+                        let s_prev = if t > 0 {
+                            input.state_prev[[t, j * n_dim + k]]
+                        } else {
+                            0.0
+                        };
+
+                        let b_idx = b_base_idx + k;
+                        let b_val = input.b[[t, b_idx]];
+                        let c_val = input.c[[t, b_idx]];
+
+                        let ds = c_val * dz_val + d_s_next[s_idx];
+
+                        dc_acc[k] += dz_val * s_curr;
+
+                        d_s_next[s_idx] = a_val * ds;
+                        da_acc += s_prev * ds;
+
+                        db_acc[k] += u_val * ds;
+                        du_val += b_val * ds;
+                    }
+
+                    unsafe {
+                        *d_u_base.add(t * d_dim + j) = du_val;
+                    }
+                }
+
+                unsafe {
+                    *d_a_base.add(t * num_heads + h) = da_acc;
+                    for k in 0..n_dim {
+                        *d_b_base.add(t * (num_heads * n_dim) + b_base_idx + k) = db_acc[k];
+                        *d_c_base.add(t * (num_heads * n_dim) + b_base_idx + k) = dc_acc[k];
+                    }
+                }
+            }
+        });
+
+        Mamba2ScanBackwardOutput {
+            d_u,
+            d_a,
+            d_b,
+            d_c,
+            d_d_skip,
+        }
     }
 
     pub fn stable_scan(
@@ -728,17 +741,17 @@ impl SelectiveScanner {
         }
 
         let max_abs = 1.0 / threshold;
-        
+
         let mut result = self.scan(a, b, u);
-        
+
         // Parallel validation/clamping
         result.par_map_inplace(|val| {
-             if !val.is_finite() {
-                 // We can't return error easily from par_map_inplace, so we clamp to max_abs or 0
-                 // Realistically, we should check before/after. 
-                 // For now, assume strict mode would panic or we handle it.
-                 *val = 0.0; 
-             } else if val.abs() > max_abs {
+            if !val.is_finite() {
+                // We can't return error easily from par_map_inplace, so we clamp to max_abs or 0
+                // Realistically, we should check before/after.
+                // For now, assume strict mode would panic or we handle it.
+                *val = 0.0;
+            } else if val.abs() > max_abs {
                 *val = val.signum() * max_abs;
             }
         });

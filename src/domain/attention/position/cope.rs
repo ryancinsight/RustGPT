@@ -2,9 +2,9 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
-use super::traits::PositionEmbedding;
 use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
+use super::traits::PositionEmbedding;
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gradients container for CoPE
 #[derive(Clone, Debug)]
@@ -158,8 +158,7 @@ impl CoPE {
     /// Apply gradients from a slice of arrays
     pub fn apply_gradients_from_slice(&mut self, grads: &[Array2<f32>], lr: f32) {
         if !grads.is_empty() {
-            self.optimizer
-                .step(&mut self.pos_embeddings, &grads[0], lr);
+            self.optimizer.step(&mut self.pos_embeddings, &grads[0], lr);
         }
     }
 }

@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::mamba::{AMatrixType, Mamba};
 use crate::domain::{
+    compute_backend::{ComputeBackend, resolve_compute_backend_strict_auto_gpu},
     mixtures::{HeadSelectionStrategy, MoHGating, moh_gating::MoHStreamingWorkspace},
     network::Layer,
 };
@@ -40,6 +41,21 @@ pub struct MoHMamba2 {
 
     #[serde(skip, default)]
     pub streaming_workspace: Option<Box<MoHMamba2StreamingWorkspace>>,
+
+    #[serde(default)]
+    compute_backend: ComputeBackend,
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[serde(skip_serializing, skip_deserializing, default)]
+    head_gpu_backends: Option<
+        Vec<
+            std::sync::Arc<
+                std::sync::Mutex<
+                    crate::domain::layers::components::gpu_backend_variants::SsmGpuBackend,
+                >,
+            >,
+        >,
+    >,
 
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>,
@@ -84,6 +100,44 @@ impl Mamba2 {
 
     pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         self.inner.forward_step_into(input, output);
+    }
+
+    /// GPU-accelerated forward pass for Mamba2 (Phase 5.6.4)
+    ///
+    /// Delegates to inner Mamba GPU implementation.
+    /// Target: 20x speedup on multi-head selective scan.
+    pub fn forward_gpu(
+        &mut self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        self.inner.forward_gpu(input)
+    }
+
+    /// Set runtime compute backend.
+    #[inline]
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        self.inner.set_compute_backend(compute_backend);
+    }
+
+    /// Set runtime compute backend with strict validation.
+    #[inline]
+    pub fn set_compute_backend_checked(
+        &mut self,
+        compute_backend: ComputeBackend,
+    ) -> crate::common::errors::Result<()> {
+        self.inner.set_compute_backend_checked(compute_backend)
+    }
+
+    /// Resolve and apply strict auto-GPU backend preference.
+    #[inline]
+    pub fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        self.inner.enable_gpu_auto_detect()
+    }
+
+    /// Get runtime compute backend.
+    #[inline]
+    pub fn compute_backend(&self) -> ComputeBackend {
+        self.inner.compute_backend()
     }
 
     #[inline]
@@ -142,6 +196,9 @@ impl MoHMamba2 {
             moh,
             heads,
             streaming_workspace: None,
+            compute_backend: ComputeBackend::Cpu,
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            head_gpu_backends: None,
             cached_input: None,
             cached_eff: None,
             cached_head_out: None,
@@ -159,6 +216,124 @@ impl MoHMamba2 {
         self.last_avg_active_heads = None;
         self.last_head_activity_vec = None;
         self.last_token_head_activity_vec = None;
+    }
+
+    /// Set runtime compute backend.
+    #[inline]
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        self.set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set MoHMamba2 backend '{}': {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
+    }
+
+    /// Set runtime compute backend with strict validation.
+    #[inline]
+    pub fn set_compute_backend_checked(
+        &mut self,
+        compute_backend: ComputeBackend,
+    ) -> crate::common::errors::Result<()> {
+        if compute_backend.is_gpu() {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                // Eagerly validate backend availability in strict mode.
+                let _ = crate::domain::compute::GpuDevice::new(compute_backend)?;
+            }
+
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "MoHMamba2 requested GPU backend '{}' but this binary was built without GPU features.",
+                        compute_backend.as_str()
+                    ),
+                });
+            }
+        }
+
+        self.compute_backend = compute_backend;
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            self.head_gpu_backends = None;
+        }
+        Ok(())
+    }
+
+    /// Resolve and apply strict auto-GPU backend preference.
+    #[inline]
+    pub fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let backend = resolve_compute_backend_strict_auto_gpu()?;
+        self.set_compute_backend_checked(backend)
+    }
+
+    /// Get runtime compute backend.
+    #[inline]
+    pub fn compute_backend(&self) -> ComputeBackend {
+        self.compute_backend
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn desired_state_dim_mamba2(head_dim: usize) -> usize {
+        head_dim.clamp(16, 32)
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn ensure_head_gpu_backends(
+        &mut self,
+        seq_len: usize,
+    ) -> crate::common::errors::Result<
+        Vec<
+            std::sync::Arc<
+                std::sync::Mutex<
+                    crate::domain::layers::components::gpu_backend_variants::SsmGpuBackend,
+                >,
+            >,
+        >,
+    > {
+        use crate::domain::layers::components::{
+            gpu_backend_variants::SsmGpuBackend, unified_gpu_kernels::SsmParams,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let state_dim = Self::desired_state_dim_mamba2(self.head_dim);
+        let params = SsmParams::new(state_dim, self.head_dim, seq_len, 1);
+
+        let needs_rebuild = self
+            .head_gpu_backends
+            .as_ref()
+            .is_none_or(|backends| backends.len() != self.num_heads);
+        if needs_rebuild {
+            let mut backends = Vec::with_capacity(self.num_heads);
+            for _ in 0..self.num_heads {
+                let backend = SsmGpuBackend::mamba_with_backend(
+                    state_dim,
+                    self.head_dim,
+                    seq_len,
+                    1,
+                    self.compute_backend,
+                )?;
+                backends.push(Arc::new(Mutex::new(backend)));
+            }
+            self.head_gpu_backends = Some(backends);
+        } else if let Some(backends) = self.head_gpu_backends.as_ref() {
+            for backend in backends {
+                let mut locked =
+                    backend
+                        .lock()
+                        .map_err(|_| crate::common::errors::ModelError::Backend {
+                            message: "Failed to acquire MoHMamba2 cached head GPU backend lock"
+                                .to_string(),
+                        })?;
+                locked.set_params(params.clone());
+            }
+        }
+
+        Ok(self.head_gpu_backends.as_ref().cloned().unwrap_or_default())
     }
 
     pub fn take_tau_metrics(&mut self) -> Option<(f32, f32)> {
@@ -186,27 +361,27 @@ impl MoHMamba2 {
     pub fn forward_step_into(&mut self, input: &ArrayView1<f32>, output: &mut Array1<f32>) {
         self.ensure_streaming_workspace();
         let ws = self.streaming_workspace.as_mut().unwrap();
-        
+
         if ws.head_out_buffer.len() != self.head_dim {
             ws.head_out_buffer = Array1::zeros(self.head_dim);
         }
 
         let gate_input = self.moh.gate_input_view(input);
         self.moh.forward_weights_into(&gate_input, &mut ws.moh);
-        
+
         output.fill(0.0);
-        
+
         for (h, head) in self.heads.iter_mut().enumerate() {
             let weight = ws.moh.m[h];
             if weight > 0.0 {
                 let s = h * self.head_dim;
                 let e = s + self.head_dim;
-                
+
                 let input_view = input.slice(s![s..e]);
-                
+
                 // Run head into temp buffer
                 head.forward_step_into(&input_view, &mut ws.head_out_buffer);
-                
+
                 let mut out_slice = output.slice_mut(s![s..e]);
                 Zip::from(&mut out_slice)
                     .and(&ws.head_out_buffer)
@@ -227,8 +402,188 @@ impl MoHMamba2 {
         output
     }
 
+    /// GPU-accelerated forward pass for MoHMamba2.
+    ///
+    /// Uses per-head SSM GPU backends with strict no-fallback behavior.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn forward_gpu(
+        &mut self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "MoHMamba2::forward_gpu called without a GPU backend selected. \
+                          Call set_compute_backend_checked(...) with a GPU backend first."
+                    .to_string(),
+            });
+        }
+
+        let mut output = Array2::zeros(input.raw_dim());
+        self.forward_into(input, &mut output)?;
+        Ok(output)
+    }
+
+    /// GPU forward on non-GPU builds (strict no-fallback error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn forward_gpu(
+        &mut self,
+        _input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "MoHMamba2 GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
     pub fn set_verification_overrides(&mut self, overrides: Option<Vec<f64>>) {
         self.moh.set_verification_overrides(overrides);
+    }
+
+    /// Forward pass with in-place output (Zero Allocation Pattern).
+    ///
+    /// Computes MoH routing and per-head selective scan for Mamba2, writing results directly to output buffer.
+    /// Eliminates intermediate allocations during head computation and aggregation.
+    ///
+    /// # Arguments
+    /// * `input` - Input tensor (seq_len, embed_dim)
+    /// * `output` - Pre-allocated output buffer (seq_len, embed_dim)
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, error if output buffer has incorrect dimensions
+    pub fn forward_into(
+        &mut self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        let (t, d) = input.dim();
+        let use_gpu = self.compute_backend.is_gpu();
+
+        // Validate output buffer dimensions
+        if output.dim() != (t, d) {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: format!(
+                    "Output dimension mismatch: expected ({}, {}), got {:?}",
+                    t,
+                    d,
+                    output.dim()
+                ),
+            });
+        }
+
+        if t == 0 || d == 0 || self.num_heads == 0 || self.head_dim == 0 {
+            self.clear_caches();
+            self.cached_input = Some(input.clone());
+            output.fill(0.0);
+            return Ok(());
+        }
+
+        self.cached_input = Some(input.clone());
+
+        let input_view = input.view();
+        let gate_input = self.moh.gate_input_view2(&input_view);
+        let eff = self.moh.forward_weights_view(&gate_input, None, None);
+        self.cached_eff = Some(eff.clone());
+
+        output.fill(0.0);
+
+        let head_outs: Vec<Array2<f32>> = if use_gpu {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                let backend_name = self.compute_backend.as_str().to_string();
+                let backends = self.ensure_head_gpu_backends(t)?;
+                let mut outs = Vec::with_capacity(self.num_heads);
+
+                for (h, backend) in backends.into_iter().enumerate() {
+                    let c0 = h * self.head_dim;
+                    let c1 = c0 + self.head_dim;
+                    let x_view = input.slice(s![.., c0..c1]);
+                    let x_owned = x_view.to_owned();
+
+                    let mut locked =
+                        backend
+                            .lock()
+                            .map_err(|_| crate::common::errors::ModelError::Backend {
+                                message: "Failed to acquire MoHMamba2 cached head GPU backend lock"
+                                    .to_string(),
+                            })?;
+                    let y_h = locked.forward(&x_owned).map_err(|err| {
+                        crate::common::errors::ModelError::Backend {
+                            message: format!(
+                                "MoHMamba2 head {} GPU forward failed on backend '{}': {}",
+                                h, backend_name, err
+                            ),
+                        }
+                    })?;
+                    outs.push(y_h);
+                }
+
+                outs
+            }
+
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: "MoHMamba2 GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+                });
+            }
+        } else {
+            self.heads
+                .par_iter_mut()
+                .enumerate()
+                .map(|(h, head)| {
+                    let c0 = h * self.head_dim;
+                    let c1 = c0 + self.head_dim;
+                    let x_view = input.slice(s![.., c0..c1]);
+                    head.forward_view(&x_view)
+                })
+                .collect()
+        };
+
+        for (h, y_h) in head_outs.iter().enumerate().take(self.num_heads) {
+            let c0 = h * self.head_dim;
+            let c1 = c0 + self.head_dim;
+            let eff_col = eff.column(h);
+            let eff_col = eff_col.insert_axis(Axis(1));
+            let eff_col = eff_col
+                .broadcast((t, self.head_dim))
+                .expect("broadcast must succeed for (t, head_dim)");
+            let mut out_block = output.slice_mut(s![.., c0..c1]);
+            Zip::from(&mut out_block)
+                .and(y_h)
+                .and(eff_col)
+                .for_each(|o, &y, &w| {
+                    *o = y * w;
+                });
+        }
+
+        self.cached_head_out = Some(head_outs);
+
+        let avg = self
+            .moh
+            .head_selection_config
+            .gating
+            .get_avg_active_components();
+        self.last_avg_active_heads = Some(avg);
+
+        let mut hv = Vec::with_capacity(self.num_heads);
+        for h in 0..self.num_heads {
+            let mean = eff.column(h).iter().map(|&x| x.max(0.0)).sum::<f32>() / (t.max(1) as f32);
+            hv.push(mean);
+        }
+        self.last_head_activity_vec = Some(hv);
+        let mut tv = Vec::with_capacity(t);
+        for i in 0..t {
+            let mut sum = 0.0f32;
+            for h in 0..self.num_heads {
+                let w = eff[[i, h]];
+                sum += w.max(0.0);
+            }
+            let denom = self.num_heads.max(1) as f32;
+            let v = if denom > 0.0 { sum / denom } else { 0.0 };
+            tv.push(v.clamp(0.0, 1.0));
+        }
+        self.last_token_head_activity_vec = Some(tv);
+
+        Ok(())
     }
 }
 
@@ -238,6 +593,11 @@ impl Layer for Mamba2 {
     }
 
     fn forward(&mut self, input: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
+        if self.inner.compute_backend().is_gpu() {
+            return self
+                .forward_gpu(input)
+                .unwrap_or_else(|err| panic!("Mamba2 GPU forward failed: {err}"));
+        }
         self.inner.forward_mamba2(input)
     }
 
@@ -284,80 +644,10 @@ impl Layer for MoHMamba2 {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        let t = input.nrows();
-        let d = input.ncols();
-        if t == 0 || d == 0 || self.num_heads == 0 || self.head_dim == 0 {
-            self.clear_caches();
-            self.cached_input = Some(input.clone());
-            return Array2::<f32>::zeros((t, d));
-        }
-
-        self.cached_input = Some(input.clone());
-
-        let input_view = input.view();
-        let gate_input = self.moh.gate_input_view2(&input_view);
-        let eff = self.moh.forward_weights_view(&gate_input, None, None);
-        self.cached_eff = Some(eff.clone());
-
-        let mut out = Array2::<f32>::zeros((t, d));
-        let head_outs: Vec<Array2<f32>> = self
-            .heads
-            .par_iter_mut()
-            .enumerate()
-            .map(|(h, head)| {
-                let c0 = h * self.head_dim;
-                let c1 = c0 + self.head_dim;
-                let x_view = input.slice(s![.., c0..c1]);
-                head.forward_view(&x_view)
-            })
-            .collect();
-
-        for (h, y_h) in head_outs.iter().enumerate().take(self.num_heads) {
-            let c0 = h * self.head_dim;
-            let c1 = c0 + self.head_dim;
-            let eff_col = eff.column(h);
-            let eff_col = eff_col.insert_axis(Axis(1));
-            let eff_col = eff_col
-                .broadcast((t, self.head_dim))
-                .expect("broadcast must succeed for (t, head_dim)");
-            let mut out_block = out.slice_mut(s![.., c0..c1]);
-            Zip::from(&mut out_block)
-                .and(y_h)
-                .and(eff_col)
-                .for_each(|o, &y, &w| {
-                    *o = y * w;
-                });
-        }
-
-        self.cached_head_out = Some(head_outs);
-
-        let avg = self
-            .moh
-            .head_selection_config
-            .gating
-            .get_avg_active_components();
-        self.last_avg_active_heads = Some(avg);
-
-        let mut hv = Vec::with_capacity(self.num_heads);
-        for h in 0..self.num_heads {
-            let mean = eff.column(h).iter().map(|&x| x.max(0.0)).sum::<f32>() / (t.max(1) as f32);
-            hv.push(mean);
-        }
-        self.last_head_activity_vec = Some(hv);
-        let mut tv = Vec::with_capacity(t);
-        for i in 0..t {
-            let mut sum = 0.0f32;
-            for h in 0..self.num_heads {
-                let w = eff[[i, h]];
-                sum += w.max(0.0);
-            }
-            let denom = self.num_heads.max(1) as f32;
-            let v = if denom > 0.0 { sum / denom } else { 0.0 };
-            tv.push(v.clamp(0.0, 1.0));
-        }
-        self.last_token_head_activity_vec = Some(tv);
-
-        out
+        let mut output = Array2::zeros(input.raw_dim());
+        self.forward_into(input, &mut output)
+            .unwrap_or_else(|err| panic!("MoHMamba2 forward failed: {err}"));
+        output
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
@@ -631,5 +921,98 @@ mod tests {
         layer.forward(&x);
         let dx = layer.backward(&grads, 0.01);
         assert_eq!(dx.dim(), (5, 12));
+    }
+
+    #[test]
+    fn test_mamba2_forward_into_dimension_validation() {
+        let mut mamba = Mamba2::new(16);
+        let input = Array2::<f32>::from_elem((8, 16), 0.1);
+
+        // Wrong dimensions should fail
+        let mut output_wrong = Array2::zeros((7, 16));
+        let result = mamba.inner.forward_into(&input, &mut output_wrong);
+        assert!(result.is_err());
+
+        // Correct dimensions should succeed
+        let mut output_correct = Array2::zeros((8, 16));
+        let result = mamba.inner.forward_into(&input, &mut output_correct);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mamba2_forward_into_basic() {
+        let mut mamba = Mamba2::new(16);
+        let input = Array2::<f32>::from_elem((8, 16), 0.1);
+
+        // Should successfully compute and write to output
+        let mut output = Array2::zeros((8, 16));
+        let result = mamba.inner.forward_into(&input, &mut output);
+
+        assert!(result.is_ok());
+        assert_eq!(output.dim(), (8, 16));
+        assert!(output.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_moh_mamba2_forward_into_basic() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba2::new(12, 3, &cfg);
+        let input = Array2::<f32>::from_elem((6, 12), 0.1);
+
+        // Should successfully compute and write to output
+        let mut output = Array2::zeros((6, 12));
+        let result = moh.forward_into(&input, &mut output);
+
+        assert!(result.is_ok());
+        assert_eq!(output.dim(), (6, 12));
+        assert!(output.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_moh_mamba2_forward_into_dimension_validation() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba2::new(12, 3, &cfg);
+        let input = Array2::<f32>::from_elem((6, 12), 0.1);
+
+        // Wrong dimensions should fail
+        let mut output_wrong = Array2::zeros((5, 12));
+        let result = moh.forward_into(&input, &mut output_wrong);
+        assert!(result.is_err());
+
+        // Correct dimensions should succeed
+        let mut output_correct = Array2::zeros((6, 12));
+        let result = moh.forward_into(&input, &mut output_correct);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_moh_mamba2_set_compute_backend_checked_cpu() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba2::new(12, 3, &cfg);
+        let result = moh.set_compute_backend_checked(ComputeBackend::Cpu);
+        assert!(result.is_ok());
+        assert_eq!(moh.compute_backend(), ComputeBackend::Cpu);
+    }
+
+    #[test]
+    fn test_moh_mamba2_set_compute_backend_checked_gpu_is_strict_validation() {
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba2::new(12, 3, &cfg);
+        let result = moh.set_compute_backend_checked(ComputeBackend::Vulkan);
+
+        match result {
+            Ok(()) => assert!(moh.compute_backend().is_gpu()),
+            Err(err) => {
+                let msg = format!("{}", err).to_lowercase();
+                assert!(
+                    msg.contains("without gpu features")
+                        || msg.contains("unavailable")
+                        || msg.contains("gpu")
+                        || msg.contains("backend"),
+                    "expected strict GPU validation error, got: {}",
+                    err
+                );
+            }
+        }
     }
 }

@@ -1,5 +1,5 @@
-pub mod cope;
 pub mod config;
+pub mod cope;
 pub mod factorized_cope;
 pub mod gated_cope;
 pub mod gradient_ops;

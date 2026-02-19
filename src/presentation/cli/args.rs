@@ -2,11 +2,10 @@ use std::num::NonZeroUsize;
 
 use clap::{ArgAction, Parser, ValueEnum};
 
-use crate::{
-    domain::{
-        layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
-        models::config::{DiffusionTimestepStrategy, TemporalMixingType},
-    },
+use crate::domain::{
+    compute_backend::ComputeBackendPreference,
+    layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
+    models::config::{DiffusionTimestepStrategy, TemporalMixingType},
 };
 
 /// CLI argument parsing for the LLM training and inference tool
@@ -34,20 +33,8 @@ pub struct Args {
     #[arg(long)]
     pub continue_from: Option<String>,
 
-    /// Use E-prop (Eligibility Propagation) training instead of standard backpropagation
-    /// E-prop is a biologically plausible online learning algorithm for spiking neural networks
-    /// with O(N) complexity vs O(N²) for standard e-prop
-    #[arg(long)]
-    pub eprop: bool,
-
     #[arg(long)]
     pub diffusion: bool,
-
-    #[arg(long)]
-    pub trm: bool,
-
-    #[arg(long, value_enum)]
-    pub spiking: Option<SpikingNeuronCli>,
 
     #[arg(long, default_value_t = 0.5)]
     pub diffusion_ce_weight: f32,
@@ -146,24 +133,6 @@ pub struct Args {
     #[arg(long, default_value = "models")]
     pub checkpoint_dir: String,
 
-    #[arg(long)]
-    pub trm_recursions: Option<usize>,
-
-    #[arg(long)]
-    pub trm_supervision_steps: Option<usize>,
-
-    #[arg(long)]
-    pub trm_inference_steps: Option<usize>,
-
-    #[arg(long)]
-    pub trm_latent_moh: Option<bool>,
-
-    #[arg(long, default_value_t = 0.6)]
-    pub trm_latent_moh_top_p_min: f32,
-
-    #[arg(long, default_value_t = 0.95)]
-    pub trm_latent_moh_top_p_max: f32,
-
     /// Number of epochs to run during pre-training (default 100)
     #[arg(long, default_value_t = 100)]
     pub pretrain_epochs: usize,
@@ -171,6 +140,42 @@ pub struct Args {
     /// Number of epochs to run during instruction tuning (default 100)
     #[arg(long, default_value_t = 100)]
     pub instruction_epochs: usize,
+
+    /// Automatically tune batch size and gradient accumulation from dataset size and available RAM.
+    ///
+    /// Explicit `--*-batch-size` / `--*-gradient-accumulation-steps` values always take priority.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub auto_tune_batching: bool,
+
+    /// Optional memory budget (GiB) for auto-tuned training batch sizing.
+    ///
+    /// When set, auto-tuning will not assume more than this memory budget.
+    #[arg(long)]
+    pub memory_budget_gb: Option<f32>,
+
+    /// Batch size for pre-training (standard transformer path)
+    #[arg(long)]
+    pub pretrain_batch_size: Option<usize>,
+
+    /// Number of micro-batches to accumulate before each optimizer update during pre-training
+    #[arg(long)]
+    pub pretrain_gradient_accumulation_steps: Option<usize>,
+
+    /// Batch size for instruction tuning (standard transformer path)
+    #[arg(long)]
+    pub instruction_batch_size: Option<usize>,
+
+    /// Number of micro-batches to accumulate before each optimizer update during instruction tuning
+    #[arg(long)]
+    pub instruction_gradient_accumulation_steps: Option<usize>,
+
+    /// Batch size for diffusion CE training (both pretrain and instruction stages)
+    #[arg(long)]
+    pub diffusion_batch_size: Option<usize>,
+
+    /// Number of micro-batches to accumulate before each optimizer update during diffusion training
+    #[arg(long)]
+    pub diffusion_gradient_accumulation_steps: Option<usize>,
 
     /// Enable Mixture-of-Experts (MoE) for feedforward layers
     /// When enabled, replaces standard feedforward layers with sparse MoE layers
@@ -253,6 +258,13 @@ pub struct Args {
     /// Temporal mixing mechanism (attention vs SSM-style RG-LRU)
     #[arg(long, value_enum, default_value_t = TemporalMixingCli::Attention)]
     pub temporal_mixing: TemporalMixingCli,
+
+    /// Compute backend selection.
+    ///
+    /// `auto-gpu` prefers GPU and falls back to CPU only when no GPU is detected.
+    /// If a GPU is detected but not compiled in, startup fails so the GPU issue is visible.
+    #[arg(long, value_enum, default_value_t = ComputeBackendCli::AutoGpu)]
+    pub compute_backend: ComputeBackendCli,
 
     /// Auxiliary residual decorrelation weight (VICReg/Barlow-Twins style redundancy reduction).
     ///
@@ -342,6 +354,34 @@ pub enum TemporalMixingCli {
     Mamba2,
 }
 
+/// CLI representation of compute backend preferences.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum ComputeBackendCli {
+    /// Prefer automatic GPU detection; resolves to CPU only when no GPU backend is available.
+    #[value(alias = "auto", alias = "autogpu")]
+    AutoGpu,
+    /// Force CPU execution.
+    Cpu,
+    /// Require CUDA backend.
+    Cuda,
+    /// Require Metal backend.
+    Metal,
+    /// Require Vulkan backend.
+    Vulkan,
+}
+
+impl From<ComputeBackendCli> for ComputeBackendPreference {
+    fn from(arg: ComputeBackendCli) -> Self {
+        match arg {
+            ComputeBackendCli::AutoGpu => ComputeBackendPreference::AutoGpu,
+            ComputeBackendCli::Cpu => ComputeBackendPreference::Cpu,
+            ComputeBackendCli::Cuda => ComputeBackendPreference::Cuda,
+            ComputeBackendCli::Metal => ComputeBackendPreference::Metal,
+            ComputeBackendCli::Vulkan => ComputeBackendPreference::Vulkan,
+        }
+    }
+}
+
 impl From<TemporalMixingCli> for TemporalMixingType {
     fn from(arg: TemporalMixingCli) -> Self {
         match arg {
@@ -425,30 +465,6 @@ impl From<DiffusionTimestepCli> for DiffusionTimestepStrategy {
             DiffusionTimestepCli::Uniform => DiffusionTimestepStrategy::Uniform,
             DiffusionTimestepCli::MinSnr => DiffusionTimestepStrategy::MinSnr,
             DiffusionTimestepCli::EdmLogNormal => DiffusionTimestepStrategy::EdmLogNormal,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-pub enum SpikingNeuronCli {
-    Lif,
-    Alif,
-}
-
-impl From<SpikingNeuronCli> for crate::domain::eprop::NeuronModel {
-    fn from(value: SpikingNeuronCli) -> Self {
-        match value {
-            SpikingNeuronCli::Lif => crate::domain::eprop::NeuronModel::LIF,
-            SpikingNeuronCli::Alif => crate::domain::eprop::NeuronModel::ALIF,
-        }
-    }
-}
-
-impl From<SpikingNeuronCli> for crate::domain::eprop::config::NeuronConfig {
-    fn from(value: SpikingNeuronCli) -> Self {
-        match value {
-            SpikingNeuronCli::Lif => crate::domain::eprop::config::NeuronConfig::lif(),
-            SpikingNeuronCli::Alif => crate::domain::eprop::config::NeuronConfig::alif(),
         }
     }
 }

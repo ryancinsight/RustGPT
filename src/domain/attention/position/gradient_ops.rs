@@ -118,6 +118,7 @@ mod tests {
     struct TestGradients {
         field_a: Option<Array2<f32>>,
         field_b: Option<Array2<f32>>,
+        #[allow(dead_code)]
         scalar: f32,
     }
 
@@ -128,9 +129,9 @@ mod tests {
     fn test_accumulate_optional_arrays_both_some() {
         let mut a = Some(Array2::from_elem((2, 3), 1.0f32));
         let b = Some(Array2::from_elem((2, 3), 2.0f32));
-        
+
         accumulate_optional_arrays(&mut a, &b);
-        
+
         assert!(a.as_ref().unwrap().iter().all(|&x| (x - 3.0).abs() < 1e-6));
     }
 
@@ -138,9 +139,9 @@ mod tests {
     fn test_accumulate_optional_arrays_none_to_some() {
         let mut a: Option<Array2<f32>> = None;
         let b = Some(Array2::from_elem((2, 3), 2.0f32));
-        
+
         accumulate_optional_arrays(&mut a, &b);
-        
+
         assert!(a.is_some());
         assert!(a.as_ref().unwrap().iter().all(|&x| (x - 2.0).abs() < 1e-6));
     }
@@ -149,9 +150,9 @@ mod tests {
     fn test_accumulate_optional_arrays_some_to_none() {
         let mut a = Some(Array2::from_elem((2, 3), 1.0f32));
         let b: Option<Array2<f32>> = None;
-        
+
         accumulate_optional_arrays(&mut a, &b);
-        
+
         assert!(a.as_ref().unwrap().iter().all(|&x| (x - 1.0).abs() < 1e-6));
     }
 
@@ -167,11 +168,23 @@ mod tests {
             field_b: Some(Array2::from_elem((3, 3), 3.0)),
             scalar: 0.0,
         };
-        
+
         g1.accumulate(&g2);
-        
-        assert!(g1.field_a.as_ref().unwrap().iter().all(|&x| (x - 3.0).abs() < 1e-6));
-        assert!(g1.field_b.as_ref().unwrap().iter().all(|&x| (x - 3.0).abs() < 1e-6));
+
+        assert!(
+            g1.field_a
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&x| (x - 3.0).abs() < 1e-6)
+        );
+        assert!(
+            g1.field_b
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&x| (x - 3.0).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -181,9 +194,9 @@ mod tests {
             field_b: Some(Array2::from_elem((1, 2), 2.0)),
             scalar: 0.0,
         };
-        
+
         let v = g.to_vec();
-        
+
         // field_a: 4 elements of 1.0, field_b: 2 elements of 2.0
         assert_eq!(v.len(), 6);
         assert!(v[..4].iter().all(|&x| (x - 1.0).abs() < 1e-6));
@@ -194,9 +207,9 @@ mod tests {
     fn test_append_optional_array_to_vec() {
         let mut v = vec![0.0, 0.0];
         let arr = Some(Array2::from_elem((2, 2), 1.0f32));
-        
+
         append_optional_array_to_vec(&mut v, &arr);
-        
+
         assert_eq!(v.len(), 6);
         assert!(v[..2].iter().all(|&x| x == 0.0));
         assert!(v[2..].iter().all(|&x| (x - 1.0).abs() < 1e-6));
@@ -206,9 +219,9 @@ mod tests {
     fn test_append_optional_array_none() {
         let mut v = vec![1.0, 2.0];
         let arr: Option<Array2<f32>> = None;
-        
+
         append_optional_array_to_vec(&mut v, &arr);
-        
+
         assert_eq!(v, vec![1.0, 2.0]);
     }
 }

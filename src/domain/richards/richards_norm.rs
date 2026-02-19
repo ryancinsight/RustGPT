@@ -225,6 +225,47 @@ impl RichardsNorm {
         out
     }
 
+    /// Forward normalization into a pre-allocated output matrix.
+    ///
+    /// This mirrors `normalize` behavior (including cache updates for backward) while
+    /// avoiding allocation of the normalized output tensor.
+    pub fn normalize_into(&mut self, input: &Array2<f32>, output: &mut Array2<f32>) {
+        assert_eq!(
+            input.dim(),
+            output.dim(),
+            "normalize_into expects output with same shape as input"
+        );
+
+        self.cached_input = Some(input.clone());
+
+        ndarray::Zip::from(output.outer_iter_mut())
+            .and(input.outer_iter())
+            .par_for_each(|mut out_row, in_row| {
+                let in_row_2d = in_row.insert_axis(ndarray::Axis(0));
+                let (adjusted_temp, adjusted_m, adjusted_beta) =
+                    self.compute_dynamic_adjustments(&in_row_2d);
+
+                let in_slice = in_row.as_slice().unwrap();
+                let out_slice = out_row.as_slice_mut().unwrap();
+                self.richards.forward_into_f32_with_overrides(
+                    in_slice,
+                    out_slice,
+                    adjusted_temp,
+                    adjusted_m,
+                    adjusted_beta,
+                );
+            });
+
+        let (adj_temp, _, _) = self.compute_dynamic_adjustments(input);
+        if let Some(t) = adj_temp {
+            let mut curve = self.richards.clone();
+            curve.learned_temperature = Some(t);
+            self.cached_adjusted_richards = Some(curve);
+        } else {
+            self.cached_adjusted_richards = Some(self.richards.clone());
+        }
+    }
+
     /// Normalize into a pre-allocated slice (no allocations)
     pub fn normalize_into_f32(&self, input: &[f32], output: &mut [f32]) {
         use ndarray::ArrayView1;

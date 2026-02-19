@@ -14,16 +14,134 @@ use crate::{
         rng::get_rng,
     },
     domain::{
+        layers::components::{
+            common::FeedForwardVariant,
+            temporal_processing::{SharedTemporalProcessing, TemporalMoeMetrics},
+        },
         layers::transformer::speculative::{SpeculativeMode, SpeculativeSamplingConfig},
         metrics::text::corpus_bleu_1_2,
+        mixtures::moe::MixtureOfExperts,
         models::config::DiffusionTimestepStrategy,
         network::{Layer, LayerEnum},
         richards::AdaptiveScalar,
     },
 };
 
-impl LayerEnum {
-    // Removed downcast helpers for SelfAttention/TRM to simplify to PolyAttention-only
+impl LayerEnum {}
+
+// GPU dispatch helpers - try GPU forward, fallback to CPU if GPU unavailable or disabled
+// Note: Transformer/Diffusion blocks delegate to their internal components (temporal_mixing, feedforward)
+// which handle GPU dispatch internally. We just use CPU forward here.
+
+#[inline]
+fn try_forward_gpu_richards(
+    layer: &mut crate::domain::richards::RichardsGlu,
+    input: &Array2<f32>,
+) -> Array2<f32> {
+    // Strict GPU enforcement - NO FALLBACK WHEN GPU FEATURES ENABLED
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
+    {
+        use crate::domain::compute::GpuComponent;
+        tracing::debug!(
+            is_gpu_ready = layer.is_gpu_ready(),
+            gpu_backend = layer.gpu_backend_name(),
+            input_shape = ?input.dim(),
+            "RichardsGlu attempting GPU forward"
+        );
+        match layer.forward_gpu(input) {
+            Ok(output) => {
+                tracing::debug!(output_shape = ?output.dim(), "RichardsGlu GPU forward succeeded");
+                return output;
+            }
+            Err(e) => {
+                // GPU was requested but failed - don't silently fallback
+                tracing::error!(
+                    error = ?e,
+                    "GPU forward_gpu failed for RichardsGlu (strict no-fallback mode enabled)"
+                );
+                panic!(
+                    "RichardsGlu GPU forward failed (GPU enabled, no fallback): {:?}",
+                    e
+                );
+            }
+        }
+    }
+    // GPU not available at compile time - use CPU
+    #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda")))]
+    {
+        tracing::debug!("RichardsGlu using CPU forward (GPU not compiled)");
+        layer.forward(input)
+    }
+}
+
+#[inline]
+fn try_forward_gpu_poly_attention(
+    layer: &mut Box<crate::domain::attention::poly_attention::PolyAttention>,
+    input: &Array2<f32>,
+) -> Array2<f32> {
+    // Strict GPU enforcement - NO FALLBACK WHEN GPU FEATURES ENABLED
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
+    {
+        use crate::domain::compute::GpuComponent;
+        tracing::debug!(
+            is_gpu_ready = layer.is_gpu_ready(),
+            gpu_backend = layer.gpu_backend_name(),
+            input_shape = ?input.dim(),
+            "PolyAttention attempting GPU forward"
+        );
+        match layer.forward_gpu(input) {
+            Ok(output) => {
+                tracing::debug!(output_shape = ?output.dim(), "PolyAttention GPU forward succeeded");
+                return output;
+            }
+            Err(e) => {
+                // GPU was requested but failed - don't silently fallback
+                tracing::error!(
+                    error = ?e,
+                    "GPU forward_gpu failed for PolyAttention (strict no-fallback mode enabled)"
+                );
+                panic!(
+                    "PolyAttention GPU forward failed (GPU enabled, no fallback): {:?}",
+                    e
+                );
+            }
+        }
+    }
+    // GPU not available at compile time - use CPU
+    #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda")))]
+    {
+        tracing::debug!("PolyAttention using CPU forward (GPU not compiled)");
+        layer.forward(input)
+    }
+}
+
+#[derive(Default)]
+struct MoeMetricsTotals {
+    avg_experts_sum: f32,
+    significant_experts_sum: f32,
+    routing_entropy_sum: f32,
+    experts_load_cv_sum: f32,
+    experts_load_cv_count: usize,
+    experts_layers_count: usize,
+    total_experts_sum: usize,
+}
+
+impl MoeMetricsTotals {
+    #[inline]
+    fn accumulate(&mut self, moe: &MixtureOfExperts) {
+        let layer_avg_active_experts = moe.config.get_avg_active_experts();
+        let layer_significant_experts = moe.config.get_avg_significant_experts();
+        let layer_routing_entropy = moe.config.get_routing_entropy();
+        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
+
+        self.avg_experts_sum += layer_avg_active_experts;
+        self.significant_experts_sum += layer_significant_experts;
+        self.routing_entropy_sum += layer_routing_entropy;
+        self.experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
+        self.experts_load_cv_count += 1;
+        self.experts_layers_count += 1;
+        self.total_experts_sum += moe.config.num_experts;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +171,8 @@ impl ToolRegistry {
     }
 
     fn register(&mut self, name: &str, handler: fn(&str) -> Result<String>) {
-        self.tools.insert(name.to_string(), ToolDefinition { handler });
+        self.tools
+            .insert(name.to_string(), ToolDefinition { handler });
     }
 
     fn call(&self, name: &str, args: &str) -> Result<String> {
@@ -806,7 +925,8 @@ impl LLM {
         // Get full model probabilities for verification
         // Run through all layers (full model)
         let full_logits = self.get_sequence_logit_row(current_tokens);
-        let target_probs = crate::domain::soft::Softmax::new().forward_immutable_row(&full_logits.view());
+        let target_probs =
+            crate::domain::soft::Softmax::new().forward_immutable_row(&full_logits.view());
 
         // Speculative decoding acceptance with rejection sampling
         // Accept token i with probability min(1, p_target(i) / p_draft(i))
@@ -886,40 +1006,14 @@ impl LLM {
         // Forward through all layers except output projection
         let network_len = self.network.len();
         for i in 1..network_len {
-            match &mut self.network[i] {
-                LayerEnum::OutputProjection(_) => break,
-                LayerEnum::TransformerBlock(block) => {
-                    block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                    hidden = block.forward(&hidden);
-                    if let Some(existing) = similarity_ctx.as_mut() {
-                        existing.assign(block.activation_similarity_matrix());
-                    } else {
-                        similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                    }
-                }
-                LayerEnum::DiffusionBlock(block) => {
-                    block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                    hidden = block.forward(&hidden);
-                    if let Some(existing) = similarity_ctx.as_mut() {
-                        existing.assign(block.activation_similarity_matrix());
-                    } else {
-                        similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                    }
-                }
-                LayerEnum::LRM(block) => {
-                    block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                    hidden = block.forward(&hidden);
-                    if let Some(existing) = similarity_ctx.as_mut() {
-                        existing.assign(block.activation_similarity_matrix());
-                    } else {
-                        similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                    }
-                }
-                layer => {
-                    similarity_ctx = None;
-                    hidden = layer.forward(&hidden);
-                }
+            if matches!(self.network[i], LayerEnum::OutputProjection(_)) {
+                break;
             }
+            hidden = Self::forward_with_similarity_context(
+                &mut self.network[i],
+                &hidden,
+                &mut similarity_ctx,
+            );
         }
 
         // Apply output projection if it exists
@@ -994,6 +1088,150 @@ impl LLM {
 }
 
 impl LLM {
+    /// Enable GPU execution for all layers with automatic backend detection.
+    ///
+    /// This method attempts to initialize GPU for all layers that support it.
+    /// Uses strict no-fallback policy: if GPU is detected but unavailable, returns an error.
+    ///
+    /// # Returns
+    /// - `Ok(backend)` on success with the detected backend
+    /// - `Err` if GPU detection fails or GPU is unavailable
+    ///
+    /// # Example
+
+    /// Get the compute backend currently in use (from first GPU-capable layer).
+    pub fn compute_backend(&self) -> crate::domain::compute_backend::ComputeBackend {
+        for layer in &self.network {
+            match layer {
+                LayerEnum::TransformerBlock(block) => {
+                    return block.compute_backend();
+                }
+                LayerEnum::DiffusionBlock(block) => {
+                    return block.compute_backend();
+                }
+                _ => continue,
+            }
+        }
+        crate::domain::compute_backend::ComputeBackend::Cpu
+    }
+
+    #[inline]
+    fn block_temporal_mixing_mut(layer: &mut LayerEnum) -> Option<&mut SharedTemporalProcessing> {
+        match layer {
+            LayerEnum::TransformerBlock(block) => Some(block.temporal_mixing_mut()),
+            LayerEnum::DiffusionBlock(block) => Some(block.temporal_mixing_mut()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn block_feedforward(layer: &LayerEnum) -> Option<&FeedForwardVariant> {
+        match layer {
+            LayerEnum::TransformerBlock(block) => Some(block.feedforward()),
+            LayerEnum::DiffusionBlock(block) => Some(block.feedforward()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn set_block_training_mode(layer: &mut LayerEnum, is_training: bool) {
+        match layer {
+            LayerEnum::TransformerBlock(block) => block.set_training_mode(is_training),
+            LayerEnum::DiffusionBlock(block) => block.set_training_mode(is_training),
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn accumulate_layer_moe_metrics(layer: &LayerEnum, totals: &mut MoeMetricsTotals) {
+        if let Some(feedforward) = Self::block_feedforward(layer) {
+            if let Some(moe) = feedforward.as_moe() {
+                totals.accumulate(moe);
+            }
+            return;
+        }
+        if let LayerEnum::MixtureOfExperts(moe) = layer {
+            totals.accumulate(moe);
+        }
+    }
+
+    #[inline]
+    fn update_similarity_context(
+        similarity_ctx: &mut Option<Array2<f32>>,
+        next_ctx: Option<&Array2<f32>>,
+    ) {
+        if let Some(ctx) = next_ctx {
+            if let Some(existing) = similarity_ctx.as_mut() {
+                if existing.raw_dim() == ctx.raw_dim() {
+                    existing.assign(ctx);
+                } else {
+                    *similarity_ctx = Some(ctx.clone());
+                }
+            } else {
+                *similarity_ctx = Some(ctx.clone());
+            }
+        }
+    }
+
+    #[inline]
+    fn forward_with_similarity_context(
+        layer: &mut LayerEnum,
+        input: &Array2<f32>,
+        similarity_ctx: &mut Option<Array2<f32>>,
+    ) -> Array2<f32> {
+        match layer {
+            LayerEnum::TransformerBlock(block) => {
+                block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                // Block delegates to internal components (temporal_mixing, feedforward)
+                // which handle GPU dispatch automatically through GpuComponent trait
+                let out = block.forward(input);
+                Self::update_similarity_context(
+                    similarity_ctx,
+                    block.activation_similarity_matrix(),
+                );
+                out
+            }
+            LayerEnum::DiffusionBlock(block) => {
+                block.set_incoming_similarity_context(similarity_ctx.as_ref());
+                // Block delegates to internal components which handle GPU dispatch automatically
+                let out = block.forward(input);
+                Self::update_similarity_context(
+                    similarity_ctx,
+                    block.activation_similarity_matrix(),
+                );
+                out
+            }
+            LayerEnum::RichardsGlu(layer) => {
+                *similarity_ctx = None;
+                // GPU-aware dispatch: try GPU forward with fallback to CPU
+                try_forward_gpu_richards(layer, input)
+            }
+            LayerEnum::PolyAttention(layer) => {
+                *similarity_ctx = None;
+                // GPU-aware dispatch: try GPU forward with fallback to CPU
+                try_forward_gpu_poly_attention(layer, input)
+            }
+            _ => {
+                *similarity_ctx = None;
+                layer.forward(input)
+            }
+        }
+    }
+
+    #[inline]
+    fn forward_diffusion_with_similarity_context(
+        block: &mut crate::domain::layers::diffusion::DiffusionBlock,
+        input: &Array2<f32>,
+        t_idx: usize,
+        similarity_ctx: &mut Option<Array2<f32>>,
+    ) -> Array2<f32> {
+        block.set_timestep(t_idx);
+        block.set_incoming_similarity_context(similarity_ctx.as_ref());
+        let out = block.forward_with_timestep(input, t_idx);
+        Self::update_similarity_context(similarity_ctx, block.activation_similarity_matrix());
+        out
+    }
+
     fn forward_diffusion_stack(
         &mut self,
         block_indices: &[usize],
@@ -1004,14 +1242,31 @@ impl LLM {
         let mut similarity_ctx: Option<Array2<f32>> = None;
         for &idx in block_indices {
             if let LayerEnum::DiffusionBlock(block) = &mut self.network[idx] {
+                hidden = Self::forward_diffusion_with_similarity_context(
+                    block,
+                    &hidden,
+                    t_idx,
+                    &mut similarity_ctx,
+                );
+            }
+        }
+        hidden
+    }
+
+    #[inline]
+    fn forward_diffusion_stack_plain(
+        &mut self,
+        block_indices: &[usize],
+        input: &Array2<f32>,
+        t_idx: usize,
+        causal_attention: bool,
+    ) -> Array2<f32> {
+        let mut hidden = input.clone();
+        for &idx in block_indices {
+            if let LayerEnum::DiffusionBlock(block) = &mut self.network[idx] {
+                block.set_causal_attention(causal_attention);
                 block.set_timestep(t_idx);
-                block.set_incoming_similarity_context(similarity_ctx.as_ref());
                 hidden = block.forward_with_timestep(&hidden, t_idx);
-                if let Some(existing) = similarity_ctx.as_mut() {
-                    existing.assign(block.activation_similarity_matrix());
-                } else {
-                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                }
             }
         }
         hidden
@@ -1091,48 +1346,10 @@ impl LLM {
         network_params + self.decoder.parameters()
     }
 
-    /// Set TRM layers to inference mode for faster prediction
-    pub fn set_trm_inference_mode(&mut self) {
+    /// Set trainable block layers to training mode.
+    pub fn set_training_mode(&mut self) {
         for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer {
-                lrm.set_training_mode(false);
-            }
-        }
-    }
-
-    /// Set TRM layers to training mode for full supervision steps
-    pub fn set_trm_training_mode(&mut self) {
-        for layer in &mut self.network {
-            match layer {
-                LayerEnum::LRM(lrm) => {
-                    lrm.set_training_mode(true);
-                }
-                LayerEnum::TransformerBlock(block) => {
-                    block.set_training_mode(true);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    pub fn set_trm_recursions(&mut self, n: usize) {
-        for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer {
-                lrm.set_recursions(n);
-            }
-        }
-    }
-
-    pub fn set_trm_steps(&mut self, supervision: Option<usize>, inference: Option<usize>) {
-        for layer in &mut self.network {
-            if let LayerEnum::LRM(lrm) = layer {
-                if let Some(s) = supervision {
-                    lrm.set_supervision_steps(s);
-                }
-                if let Some(i) = inference {
-                    lrm.set_inference_steps(i);
-                }
-            }
+            Self::set_block_training_mode(layer, true);
         }
     }
 
@@ -1164,7 +1381,6 @@ impl LLM {
             let candidate = match layer {
                 LayerEnum::TransformerBlock(block) => Some(block.max_seq_len()),
                 LayerEnum::DiffusionBlock(block) => Some(block.max_seq_len()),
-                LayerEnum::LRM(lrm) => lrm.max_seq_len(),
                 _ => None,
             };
             if let Some(len) = candidate {
@@ -1236,42 +1452,7 @@ impl LLM {
             let mut similarity_ctx: Option<Array2<f32>> = None;
 
             for layer in self.network.iter_mut() {
-                input = match layer {
-                    LayerEnum::TransformerBlock(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(&input);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    LayerEnum::DiffusionBlock(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(&input);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    LayerEnum::LRM(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(&input);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    _ => {
-                        similarity_ctx = None;
-                        layer.forward(&input)
-                    }
-                };
+                input = Self::forward_with_similarity_context(layer, &input, &mut similarity_ctx);
             }
 
             let logits = input;
@@ -1310,27 +1491,26 @@ impl LLM {
                 if next_token == end_id {
                     let end_pos = output_tokens.len().saturating_sub(1);
                     if end_pos > 0 {
-                        if let Some(start_pos) =
-                            output_tokens[..end_pos].iter().rposition(|&id| id == start_id)
+                        if let Some(start_pos) = output_tokens[..end_pos]
+                            .iter()
+                            .rposition(|&id| id == start_id)
                         {
                             if start_pos < end_pos {
                                 let call_tokens = &output_tokens[start_pos + 1..end_pos];
                                 let tool_result = match parse_tool_call(&self.vocab, call_tokens) {
-                                    Ok(call) => match self.tool_registry.call(&call.name, &call.args)
-                                    {
-                                        Ok(res) => res,
-                                        Err(err) => format!("ToolError: {}", err),
-                                    },
+                                    Ok(call) => {
+                                        match self.tool_registry.call(&call.name, &call.args) {
+                                            Ok(res) => res,
+                                            Err(err) => format!("ToolError: {}", err),
+                                        }
+                                    }
                                     Err(err) => format!("ToolError: {}", err),
                                 };
                                 let tool_output = if let (Some(rs), Some(re)) =
                                     (tool_result_start, tool_result_end)
                                 {
                                     let _ = (rs, re);
-                                    format!(
-                                        "<tool_result> {} </tool_result>",
-                                        tool_result
-                                    )
+                                    format!("<tool_result> {} </tool_result>", tool_result)
                                 } else {
                                     tool_result
                                 };
@@ -1382,13 +1562,91 @@ impl LLM {
         batch_size: usize,
         warmup_epochs: usize,
     ) -> Result<()> {
-        // Set TRM layers to training mode (full supervision steps)
-        self.set_trm_training_mode();
+        self.train_with_warmup_with_accumulation(
+            data,
+            epochs,
+            target_lr,
+            batch_size,
+            warmup_epochs,
+            1,
+        )
+    }
+
+    /// Train with learning rate warmup and configurable gradient accumulation.
+    ///
+    /// `batch_size` is treated as micro-batch size. Optimizer updates happen every
+    /// `gradient_accumulation_steps` micro-batches.
+    pub fn train_with_warmup_with_accumulation(
+        &mut self,
+        data: Vec<&str>,
+        epochs: usize,
+        target_lr: f32,
+        batch_size: usize,
+        warmup_epochs: usize,
+        gradient_accumulation_steps: usize,
+    ) -> Result<()> {
+        self.set_training_mode();
+        let micro_batch_size = batch_size.max(1);
+        let grad_accum_steps = gradient_accumulation_steps.max(1);
+        let update_batch_size = micro_batch_size.saturating_mul(grad_accum_steps).max(1);
 
         // Store previous richards_glu richards weights for delta tracking
         let mut prev_richards_glu_weights: Vec<Vec<f64>> = Vec::new();
 
         let mut scratch = std::mem::take(&mut self.training_scratch);
+
+        // Initialize GPU for all layers if GPU features are enabled
+        #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
+        {
+            use crate::domain::compute::GpuComponent;
+            tracing::info!(
+                "Attempting GPU auto-detection for {} layers",
+                self.network.len()
+            );
+            for layer in &mut self.network {
+                // Attempt GPU initialization for layers that support it
+                match layer {
+                    LayerEnum::RichardsGlu(layer) => match layer.enable_gpu_auto_detect() {
+                        Ok(()) => {
+                            tracing::info!(
+                                backend = layer.gpu_backend_name(),
+                                "RichardsGlu GPU initialization successful"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                "RichardsGlu GPU initialization failed (will use CPU)"
+                            );
+                        }
+                    },
+                    LayerEnum::PolyAttention(layer) => match layer.enable_gpu_auto_detect() {
+                        Ok(()) => {
+                            tracing::info!(
+                                backend = layer.gpu_backend_name(),
+                                "PolyAttention GPU initialization successful"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                "PolyAttention GPU initialization failed (will use CPU)"
+                            );
+                        }
+                    },
+                    _ => {
+                        // Other layers delegate to internal components
+                    }
+                }
+            }
+            tracing::info!("GPU initialization phase complete");
+        }
+
+        #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda")))]
+        {
+            tracing::info!("GPU features not compiled - using CPU only");
+        }
+
         let res: Result<()> = (|| {
             for epoch in 0..epochs {
                 let t_epoch_start = std::time::Instant::now();
@@ -1426,8 +1684,8 @@ impl LLM {
                 for layer in &mut self.network {
                     layer.set_training_progress(training_progress);
                 }
-                // Process data in batches
-                for batch_strs in data.chunks(batch_size.max(1)) {
+                // Process data in optimizer-update batches (micro-batch * accumulation steps).
+                for batch_strs in data.chunks(update_batch_size) {
                     let batch_tokenized: Vec<Vec<usize>> = batch_strs
                         .par_iter()
                         .map(|input| self.tokenize(input))
@@ -1513,246 +1771,45 @@ impl LLM {
                 let mut avg_heads_per_token_sum = 0.0f32;
                 let mut heads_layers_count = 0usize;
                 let mut total_heads_sum = 0usize;
-                let mut avg_experts_sum = 0.0f32;
-                let mut significant_experts_sum = 0.0f32;
-                let mut routing_entropy_sum = 0.0f32;
-                let mut experts_load_cv_sum = 0.0f32;
-                let mut experts_load_cv_count = 0usize;
-                let mut experts_layers_count = 0usize;
-                let mut total_experts_sum = 0usize;
+                let mut moe_totals = MoeMetricsTotals::default();
+                let mut accumulate_temporal_metrics = |metrics: TemporalMoeMetrics| {
+                    if let Some((min_tau, max_tau)) = metrics.tau_metrics {
+                        tau_available = true;
+                        if min_tau < tau_min_epoch {
+                            tau_min_epoch = min_tau;
+                        }
+                        if max_tau > tau_max_epoch {
+                            tau_max_epoch = max_tau;
+                        }
+                    }
+                    if let Some(rms_g) = metrics.pred_norm {
+                        pred_norm_sum += rms_g;
+                        pred_norm_count += 1;
+                    }
+                    if !metrics.per_head_metrics.is_empty() {
+                        let layer_avg_active_heads = metrics
+                            .per_head_metrics
+                            .iter()
+                            .map(|(avg, _tokens)| avg)
+                            .sum::<f32>();
+                        avg_heads_per_token_sum += layer_avg_active_heads;
+                        heads_layers_count += 1;
+                        total_heads_sum += metrics.per_head_metrics.len();
+                    }
+                };
 
                 for layer in &mut self.network {
                     if let LayerEnum::PolyAttention(pa) = layer {
-                        if let Some((min_tau, max_tau)) = pa.take_tau_metrics() {
-                            tau_available = true;
-                            if min_tau < tau_min_epoch {
-                                tau_min_epoch = min_tau;
-                            }
-                            if max_tau > tau_max_epoch {
-                                tau_max_epoch = max_tau;
-                            }
-                        }
-                        if let Some(rms_g) = pa.take_pred_norm() {
-                            pred_norm_sum += rms_g;
-                            pred_norm_count += 1;
-                        }
-                        let per_head = pa.get_head_metrics_and_reset();
-                        if !per_head.is_empty() {
-                            let layer_avg_active_heads =
-                                per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                            avg_heads_per_token_sum += layer_avg_active_heads;
-                            heads_layers_count += 1;
-                            total_heads_sum += per_head.len();
-                        }
+                        accumulate_temporal_metrics(TemporalMoeMetrics {
+                            tau_metrics: pa.take_tau_metrics(),
+                            pred_norm: pa.take_pred_norm(),
+                            per_head_metrics: pa.get_head_metrics_and_reset(),
+                        });
                     }
-                    if let LayerEnum::TransformerBlock(block) = layer {
-                        // Pull through MoH instrumentation from the temporal-mixing layer.
-                        match &mut block.temporal_mixing_mut().temporal_mixing {
-                            crate::domain::layers::components::common::TemporalMixingLayer::Attention(
-                                attn,
-                            ) => {
-                                if let Some((min_tau, max_tau)) = attn.take_tau_metrics() {
-                                    tau_available = true;
-                                    if min_tau < tau_min_epoch {
-                                        tau_min_epoch = min_tau;
-                                    }
-                                    if max_tau > tau_max_epoch {
-                                        tau_max_epoch = max_tau;
-                                    }
-                                }
-                                if let Some(rms_g) = attn.take_pred_norm() {
-                                    pred_norm_sum += rms_g;
-                                    pred_norm_count += 1;
-                                }
-                                let per_head = attn.get_head_metrics_and_reset();
-                                if !per_head.is_empty() {
-                                    let layer_avg_active_heads =
-                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                    avg_heads_per_token_sum += layer_avg_active_heads;
-                                    heads_layers_count += 1;
-                                    total_heads_sum += per_head.len();
-                                }
-                            }
-                            crate::domain::layers::components::common::TemporalMixingLayer::RgLruMoH(
-                                rglru,
-                            ) => {
-                                if let Some((min_tau, max_tau)) = rglru.take_tau_metrics() {
-                                    tau_available = true;
-                                    if min_tau < tau_min_epoch {
-                                        tau_min_epoch = min_tau;
-                                    }
-                                    if max_tau > tau_max_epoch {
-                                        tau_max_epoch = max_tau;
-                                    }
-                                }
-                                if let Some(rms_g) = rglru.take_pred_norm() {
-                                    pred_norm_sum += rms_g;
-                                    pred_norm_count += 1;
-                                }
-                                let per_head = rglru.get_head_metrics_and_reset();
-                                if !per_head.is_empty() {
-                                    let layer_avg_active_heads =
-                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                    avg_heads_per_token_sum += layer_avg_active_heads;
-                                    heads_layers_count += 1;
-                                    total_heads_sum += per_head.len();
-                                }
-                            }
-                            crate::domain::layers::components::common::TemporalMixingLayer::MambaMoH(m) => {
-                                if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
-                                    tau_available = true;
-                                    if min_tau < tau_min_epoch {
-                                        tau_min_epoch = min_tau;
-                                    }
-                                    if max_tau > tau_max_epoch {
-                                        tau_max_epoch = max_tau;
-                                    }
-                                }
-                                if let Some(rms_g) = m.take_pred_norm() {
-                                    pred_norm_sum += rms_g;
-                                    pred_norm_count += 1;
-                                }
-                                let per_head = m.get_head_metrics_and_reset();
-                                if !per_head.is_empty() {
-                                    let layer_avg_active_heads =
-                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                    avg_heads_per_token_sum += layer_avg_active_heads;
-                                    heads_layers_count += 1;
-                                    total_heads_sum += per_head.len();
-                                }
-                            }
-                            crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(
-                                m,
-                            ) => {
-                                if let Some((min_tau, max_tau)) = m.take_tau_metrics() {
-                                    tau_available = true;
-                                    if min_tau < tau_min_epoch {
-                                        tau_min_epoch = min_tau;
-                                    }
-                                    if max_tau > tau_max_epoch {
-                                        tau_max_epoch = max_tau;
-                                    }
-                                }
-                                if let Some(rms_g) = m.take_pred_norm() {
-                                    pred_norm_sum += rms_g;
-                                    pred_norm_count += 1;
-                                }
-                                let per_head = m.get_head_metrics_and_reset();
-                                if !per_head.is_empty() {
-                                    let layer_avg_active_heads =
-                                        per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                                    avg_heads_per_token_sum += layer_avg_active_heads;
-                                    heads_layers_count += 1;
-                                    total_heads_sum += per_head.len();
-                                }
-                            }
-                            _ => {}
-                        }
-
-                        // Pull through MoE metrics when MoE is used inside the block.
-                        if let Some(moe) = block.feedforward().as_moe() {
-                        let layer_avg_active_experts = moe.config.get_avg_active_experts();
-                        let layer_significant_experts = moe.config.get_avg_significant_experts();
-                        let layer_routing_entropy = moe.config.get_routing_entropy();
-                        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
-                        avg_experts_sum += layer_avg_active_experts;
-                        significant_experts_sum += layer_significant_experts;
-                        routing_entropy_sum += layer_routing_entropy;
-                        experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
-                        experts_load_cv_count += 1;
-                        experts_layers_count += 1;
-                        total_experts_sum += moe.config.num_experts;
+                    if let Some(temporal) = Self::block_temporal_mixing_mut(layer) {
+                        accumulate_temporal_metrics(temporal.take_moh_metrics());
                     }
-                    }
-                    if let LayerEnum::DiffusionBlock(block) = layer {
-                        // Pull through MoE metrics when MoE is used inside the diffusion block.
-                        if let Some(moe) = block.feedforward.as_moe() {
-                        let layer_avg_active_experts = moe.config.get_avg_active_experts();
-                        let layer_significant_experts = moe.config.get_avg_significant_experts();
-                        let layer_routing_entropy = moe.config.get_routing_entropy();
-                        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
-                        avg_experts_sum += layer_avg_active_experts;
-                        significant_experts_sum += layer_significant_experts;
-                        routing_entropy_sum += layer_routing_entropy;
-                        experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
-                        experts_load_cv_count += 1;
-                        experts_layers_count += 1;
-                        total_experts_sum += moe.config.num_experts;
-                    }
-                    }
-                    if let LayerEnum::LRM(lrm) = layer {
-                        if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
-                            tau_available = true;
-                            if min_tau < tau_min_epoch {
-                                tau_min_epoch = min_tau;
-                            }
-                            if max_tau > tau_max_epoch {
-                                tau_max_epoch = max_tau;
-                            }
-                        }
-                        if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
-                            pred_norm_sum += rms_g;
-                            pred_norm_count += 1;
-                        }
-                        let per_head = lrm.attention_mut().get_head_metrics_and_reset();
-                        if !per_head.is_empty() {
-                            let layer_avg_active_heads =
-                                per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                            avg_heads_per_token_sum += layer_avg_active_heads;
-                            heads_layers_count += 1;
-                            total_heads_sum += per_head.len();
-                        }
-
-                        // Pull through MoE metrics when MoE is used inside the recursive core
-                        // block. LRM wraps either a TransformerBlock or
-                        // DiffusionBlock.
-                        let guard = lrm.block.read().unwrap();
-                        match &*guard {
-                        crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
-                            if let Some(moe) = b.feedforward().as_moe() {
-                                let layer_avg_active_experts = moe.config.get_avg_active_experts();
-                                let layer_significant_experts = moe.config.get_avg_significant_experts();
-                                let layer_routing_entropy = moe.config.get_routing_entropy();
-                                let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
-                                avg_experts_sum += layer_avg_active_experts;
-                                significant_experts_sum += layer_significant_experts;
-                                routing_entropy_sum += layer_routing_entropy;
-                                experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
-                                experts_load_cv_count += 1;
-                                experts_layers_count += 1;
-                                total_experts_sum += moe.config.num_experts;
-                            }
-                        }
-                        crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                            if let Some(moe) = b.feedforward.as_moe() {
-                                let layer_avg_active_experts = moe.config.get_avg_active_experts();
-                                let layer_significant_experts = moe.config.get_avg_significant_experts();
-                                let layer_routing_entropy = moe.config.get_routing_entropy();
-                                let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
-                                avg_experts_sum += layer_avg_active_experts;
-                                significant_experts_sum += layer_significant_experts;
-                                routing_entropy_sum += layer_routing_entropy;
-                                experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
-                                experts_load_cv_count += 1;
-                                experts_layers_count += 1;
-                                total_experts_sum += moe.config.num_experts;
-                            }
-                        }
-                    }
-                    }
-                    if let LayerEnum::MixtureOfExperts(moe) = layer {
-                        let layer_avg_active_experts = moe.config.get_avg_active_experts();
-                        let layer_significant_experts = moe.config.get_avg_significant_experts();
-                        let layer_routing_entropy = moe.config.get_routing_entropy();
-                        let (_v, _sd, cv) = moe.config.gating.metrics.get_load_distribution_stats();
-                        avg_experts_sum += layer_avg_active_experts;
-                        significant_experts_sum += layer_significant_experts;
-                        routing_entropy_sum += layer_routing_entropy;
-                        experts_load_cv_sum += if cv.is_finite() { cv } else { 0.0 };
-                        experts_load_cv_count += 1;
-                        experts_layers_count += 1;
-                        total_experts_sum += moe.config.num_experts;
-                    }
+                    Self::accumulate_layer_moe_metrics(layer, &mut moe_totals);
                 }
 
                 let tau_min_log = if tau_available {
@@ -1790,23 +1847,23 @@ impl LLM {
                 } else {
                     None
                 };
-                let avg_active_experts = if experts_layers_count > 0 {
-                    avg_experts_sum / experts_layers_count as f32
+                let avg_active_experts = if moe_totals.experts_layers_count > 0 {
+                    moe_totals.avg_experts_sum / moe_totals.experts_layers_count as f32
                 } else {
                     0.0
                 };
-                let avg_significant_experts = if experts_layers_count > 0 {
-                    significant_experts_sum / experts_layers_count as f32
+                let avg_significant_experts = if moe_totals.experts_layers_count > 0 {
+                    moe_totals.significant_experts_sum / moe_totals.experts_layers_count as f32
                 } else {
                     0.0
                 };
-                let avg_routing_entropy = if experts_layers_count > 0 {
-                    routing_entropy_sum / experts_layers_count as f32
+                let avg_routing_entropy = if moe_totals.experts_layers_count > 0 {
+                    moe_totals.routing_entropy_sum / moe_totals.experts_layers_count as f32
                 } else {
                     0.0
                 };
-                let experts_load_cv = if experts_load_cv_count > 0 {
-                    experts_load_cv_sum / experts_load_cv_count as f32
+                let experts_load_cv = if moe_totals.experts_load_cv_count > 0 {
+                    moe_totals.experts_load_cv_sum / moe_totals.experts_load_cv_count as f32
                 } else {
                     0.0
                 };
@@ -1819,8 +1876,9 @@ impl LLM {
                 } else {
                     0
                 };
-                let total_experts = if experts_layers_count > 0 {
-                    ((total_experts_sum as f32) / (experts_layers_count as f32))
+                let total_experts = if moe_totals.experts_layers_count > 0 {
+                    ((moe_totals.total_experts_sum as f32)
+                        / (moe_totals.experts_layers_count as f32))
                         .round()
                         .max(0.0) as usize
                 } else {
@@ -2037,20 +2095,9 @@ impl LLM {
                     },
                 };
                 for layer in &mut self.network {
-                    if let LayerEnum::TransformerBlock(tb) = layer
-                        && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(
-                            attn,
-                        ) = &mut tb.temporal_mixing_mut().temporal_mixing
-                    {
-                        attn.adapt_degree(&metrics);
+                    if let Some(temporal) = Self::block_temporal_mixing_mut(layer) {
+                        temporal.adapt_attention_degree(&metrics);
                     }
-                if let LayerEnum::DiffusionBlock(db) = layer
-                    && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(
-                        attn,
-                        ) = &mut db.temporal_mixing.temporal_mixing
-                {
-                    attn.adapt_degree(&metrics);
-                }
                     if let LayerEnum::PolyAttention(pa) = layer {
                         pa.adapt_degree(&metrics);
                     }
@@ -2082,599 +2129,7 @@ impl LLM {
         res
     }
 
-    #[instrument(skip(self, data))]
-    pub fn train_with_warmup_eprop(
-        &mut self,
-        data: Vec<&str>,
-        epochs: usize,
-        target_lr: f32,
-        batch_size: usize,
-        warmup_epochs: usize,
-    ) -> Result<()> {
-        self.set_trm_training_mode();
-
-        for epoch in 0..epochs {
-            let t_epoch_start = std::time::Instant::now();
-            let mut total_loss = 0.0f32;
-            let mut total_base_loss = 0.0f32;
-            let mut total_grad_norm = 0.0f32;
-            let mut batch_count = 0usize;
-            let mut per_layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
-
-            let effective_lr = if epoch < warmup_epochs {
-                target_lr * ((epoch + 1) as f32 / warmup_epochs.max(1) as f32)
-            } else {
-                let t = (epoch - warmup_epochs) as f32;
-                let t_max = (epochs.saturating_sub(warmup_epochs)).max(1) as f32;
-                let lr_min = target_lr * 0.10;
-                let lr_max = target_lr;
-                lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * t / t_max).cos())
-            };
-
-            for batch_strs in data.chunks(batch_size.max(1)) {
-                let batch_tokenized: Vec<Vec<usize>> = batch_strs
-                    .par_iter()
-                    .map(|input| self.tokenize(input))
-                    .collect();
-
-                let (batch_loss, batch_base_loss, grad_norm, layer_param_grad_norm_sq) =
-                    self.train_batch_eprop_profiled(&batch_tokenized, effective_lr)?;
-                total_loss += batch_loss;
-                total_base_loss += batch_base_loss;
-                total_grad_norm += grad_norm;
-                batch_count += 1;
-                for (i, s) in layer_param_grad_norm_sq.into_iter().enumerate() {
-                    if i < per_layer_param_grad_norm_sq.len() {
-                        per_layer_param_grad_norm_sq[i] += s;
-                    }
-                }
-            }
-
-            let avg_loss = total_loss / (batch_count.max(1) as f32);
-            let avg_base_loss = total_base_loss / (batch_count.max(1) as f32);
-            let avg_grad_norm = total_grad_norm / (batch_count.max(1) as f32);
-            let per_layer_rms: Vec<f32> = per_layer_param_grad_norm_sq
-                .iter()
-                .map(|&s| (s / (batch_count.max(1) as f32)).sqrt())
-                .collect();
-
-            let epoch_ms = t_epoch_start.elapsed().as_millis();
-            info!(
-                epoch = epoch,
-                loss = avg_loss,
-                base_loss = avg_base_loss,
-                grad_norm = avg_grad_norm,
-                learning_rate = effective_lr,
-                per_layer_rms = ?per_layer_rms,
-                epoch_ms = epoch_ms,
-                "E-prop-style training epoch completed"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Train TRM layers using autoencoding (pretraining phase)
-    /// During autoencoding, the model learns to reconstruct its input through recursive processing
-    /// This is the first phase of TRM training before chat-tuning
-    #[instrument(skip(self, data))]
-    pub fn train_trm_autoencoding(
-        &mut self,
-        data: Vec<&str>,
-        epochs: usize,
-        lr: f32,
-        batch_size: usize,
-    ) -> Result<()> {
-        // Set TRM layers to training mode (full supervision steps)
-        self.set_trm_training_mode();
-
-        info!(
-            "Starting TRM autoencoding pretraining: {} epochs, {} sequences",
-            epochs,
-            data.len()
-        );
-
-        let mut scratch = std::mem::take(&mut self.training_scratch);
-        let res: Result<()> = (|| {
-            for epoch in 0..epochs {
-                let mut total_loss = 0.0;
-                let mut total_base_loss = 0.0;
-                let mut total_grad_norm = 0.0;
-                let mut batch_count = 0;
-                // Process data in batches
-                for batch_strs in data.chunks(batch_size.max(1)) {
-                    let batch_tokenized: Vec<Vec<usize>> = batch_strs
-                        .par_iter()
-                        .map(|input| self.tokenize(input))
-                        .collect();
-
-                    let (batch_loss, batch_base_loss, grad_norm) =
-                        self.train_batch_trm_autoencoding(&batch_tokenized, lr, &mut scratch)?;
-                    total_loss += batch_loss;
-                    total_base_loss += batch_base_loss;
-                    total_grad_norm += grad_norm;
-                    batch_count += 1;
-                }
-
-                let avg_loss = total_loss / data.len() as f32;
-                let avg_base_loss = total_base_loss / data.len() as f32;
-                let avg_grad_norm = total_grad_norm / batch_count as f32;
-
-                // NFR-5.2: Training divergence detection
-                if avg_loss.is_nan() || avg_loss.is_infinite() {
-                    return Err(ModelError::Training {
-                        message: format!(
-                            "TRM autoencoding diverged at epoch {}: loss is {} (NaN or Inf detected)",
-                            epoch, avg_loss
-                        ),
-                    });
-                }
-
-                let mut tau_min_epoch = f32::INFINITY;
-                let mut tau_max_epoch = f32::NEG_INFINITY;
-                let mut tau_available = false;
-                let mut pred_norm_sum = 0.0f32;
-                let mut pred_norm_count = 0usize;
-                let mut avg_heads_per_token_sum = 0.0f32;
-                let mut heads_layers_count = 0usize;
-                for layer in &mut self.network {
-                    if let LayerEnum::LRM(lrm) = layer {
-                        if let Some((min_tau, max_tau)) = lrm.attention_mut().take_tau_metrics() {
-                            tau_available = true;
-                            if min_tau < tau_min_epoch {
-                                tau_min_epoch = min_tau;
-                            }
-                            if max_tau > tau_max_epoch {
-                                tau_max_epoch = max_tau;
-                            }
-                        }
-                        if let Some(rms_g) = lrm.attention_mut().take_pred_norm() {
-                            pred_norm_sum += rms_g;
-                            pred_norm_count += 1;
-                        }
-                        let per_head = lrm.attention_mut().get_head_metrics_and_reset();
-                        if !per_head.is_empty() {
-                            let layer_avg_active_heads =
-                                per_head.iter().map(|(avg, _tokens)| avg).sum::<f32>();
-                            avg_heads_per_token_sum += layer_avg_active_heads;
-                            heads_layers_count += 1;
-                        }
-                    }
-                }
-                let tau_min_log = if tau_available {
-                    tau_min_epoch
-                } else {
-                    f32::NAN
-                };
-                let tau_max_log = if tau_available {
-                    tau_max_epoch
-                } else {
-                    f32::NAN
-                };
-                let tau_range_log = if tau_available {
-                    tau_max_epoch - tau_min_epoch
-                } else {
-                    f32::NAN
-                };
-                let pred_norm_rms = if pred_norm_count > 0 {
-                    pred_norm_sum / pred_norm_count as f32
-                } else {
-                    f32::NAN
-                };
-                let avg_active_heads = if heads_layers_count > 0 {
-                    avg_heads_per_token_sum / heads_layers_count as f32
-                } else {
-                    f32::NAN
-                };
-
-                let mut lb_loss = f32::NAN;
-                let mut cx_loss = f32::NAN;
-                let mut sp_loss = f32::NAN;
-                let mut rec_avg_heads = f32::NAN;
-                let mut rec_tau_min = f32::NAN;
-                let mut rec_tau_max = f32::NAN;
-                for layer in &self.network {
-                    if let LayerEnum::LRM(lrm) = layer {
-                        lb_loss = lrm
-                            .attention()
-                            .moh
-                            .head_selection_config
-                            .compute_load_balance_loss();
-                        cx_loss = lrm
-                            .attention()
-                            .moh
-                            .head_selection_config
-                            .compute_complexity_loss(lrm.attention().moh_num_active() as f32);
-                        sp_loss = lrm
-                            .attention()
-                            .moh
-                            .head_selection_config
-                            .compute_sparsity_loss();
-                        if !lrm.recursion_metrics.is_empty() {
-                            let mut hsum = 0.0f32;
-                            let mut c = 0usize;
-                            let mut tmin = f32::INFINITY;
-                            let mut tmax = f32::NEG_INFINITY;
-                            for (h, mn, mx) in lrm.recursion_metrics.iter().cloned() {
-                                hsum += h;
-                                c += 1;
-                                if mn < tmin {
-                                    tmin = mn;
-                                }
-                                if mx > tmax {
-                                    tmax = mx;
-                                }
-                            }
-                            rec_avg_heads = if c > 0 { hsum / c as f32 } else { f32::NAN };
-                            rec_tau_min = if c > 0 { tmin } else { f32::NAN };
-                            rec_tau_max = if c > 0 { tmax } else { f32::NAN };
-                        }
-                        break;
-                    }
-                }
-
-                info!(
-                    epoch = epoch,
-                    loss = avg_loss,
-                    base_loss = avg_base_loss,
-                    grad_norm = avg_grad_norm,
-                    tau_min = tau_min_log,
-                    tau_max = tau_max_log,
-                    tau_range = tau_range_log,
-                    pred_norm_rms = pred_norm_rms,
-                    avg_active_heads = avg_active_heads,
-                    rec_avg_heads = rec_avg_heads,
-                    rec_tau_min = rec_tau_min,
-                    rec_tau_max = rec_tau_max,
-                    moh_lb = lb_loss,
-                    moh_cx = cx_loss,
-                    moh_sp = sp_loss,
-                    "LRM autoencoding epoch completed"
-                );
-
-                for layer in &mut self.network {
-                    if let LayerEnum::LRM(lrm) = layer {
-                        let heads = lrm.attention().num_heads() as f32;
-                        let h_ratio = if avg_active_heads.is_finite() && heads > 0.0 {
-                            (avg_active_heads / heads).clamp(0.1, 1.0)
-                        } else {
-                            0.5
-                        };
-                        lrm.set_latent_update_alpha(0.03 + 0.05 * (1.0 - h_ratio));
-                        let ent = lrm
-                            .attention()
-                            .moh
-                            .head_selection_config
-                            .gating
-                            .get_gating_entropy();
-                        let g = &mut lrm.attention_mut().moh.head_selection_config.gating;
-                        if ent < 0.2 {
-                            g.load_balance_weight = (g.load_balance_weight + 0.01).min(0.2);
-                        }
-                        if avg_active_heads.is_finite() {
-                            if avg_active_heads > heads * 0.5 {
-                                g.sparsity_weight = (g.sparsity_weight + 0.01).min(0.2);
-                            } else {
-                                g.sparsity_weight = (g.sparsity_weight * 0.95).max(0.0);
-                            }
-                        }
-                        g.complexity_loss_weight = (g.complexity_loss_weight * 0.9) + 0.01;
-                    }
-                }
-            }
-
-            Ok(())
-        })();
-        self.training_scratch = scratch;
-        res
-    }
-
-    /// Complete TRM training pipeline: autoencoding pretraining + chat-tuning
-    /// Phase 1: Autoencoding - TRM learns to reconstruct input through recursion
-    /// Phase 2: Chat-tuning - Standard next-token prediction on conversational data
-    #[instrument(skip(self, pretraining_data, chat_data))]
-    pub fn train_trm_complete(
-        &mut self,
-        pretraining_data: Vec<&str>,
-        chat_data: Vec<&str>,
-        autoencoding_epochs: usize,
-        chat_epochs: usize,
-        lr: f32,
-        batch_size: usize,
-    ) -> Result<()> {
-        info!(
-            "Starting TRM complete training: {} autoencoding epochs + {} chat-tuning epochs",
-            autoencoding_epochs, chat_epochs
-        );
-
-        // Phase 1: Autoencoding pretraining
-        if autoencoding_epochs > 0 {
-            info!("Phase 1: TRM Autoencoding Pretraining");
-            self.train_trm_autoencoding(pretraining_data, autoencoding_epochs, lr, batch_size)?;
-        }
-
-        // Phase 2: Chat-tuning (standard next-token prediction)
-        if chat_epochs > 0 {
-            info!("Phase 2: Chat-Tuning (next-token prediction)");
-            self.train_with_warmup(chat_data, chat_epochs, lr, batch_size, 15)?;
-        }
-
-        info!("TRM training completed successfully");
-        Ok(())
-    }
-
-    /// Train on a single batch using TRM autoencoding
-    /// For autoencoding, the TRM layer learns to reconstruct its embedded input
-    fn train_batch_trm_autoencoding(
-        &mut self,
-        batch: &[Vec<usize>],
-        lr: f32,
-        scratch: &mut TrainingScratch,
-    ) -> Result<(f32, f32, f32)> {
-        let mut batch_loss = 0.0;
-        let mut batch_base_loss = 0.0;
-
-        // Reset scratch buffers for the new batch, reusing allocations.
-        scratch.reset(self.network.len());
-
-        let mut embeddings_idx: Option<usize> = None;
-        let mut trm_idx: Option<usize> = None;
-        let mut norm_idx: Option<usize> = None;
-        let mut out_proj_idx: Option<usize> = None;
-        for (i, layer) in self.network.iter().enumerate() {
-            match layer {
-                LayerEnum::TokenEmbeddings(_) => {
-                    if embeddings_idx.is_none() {
-                        embeddings_idx = Some(i)
-                    }
-                }
-                LayerEnum::LRM(_) => {
-                    if trm_idx.is_none() {
-                        trm_idx = Some(i)
-                    }
-                }
-                LayerEnum::DynamicTanhNorm(_) => norm_idx = Some(i),
-                LayerEnum::OutputProjection(_) => out_proj_idx = Some(i),
-                _ => {}
-            }
-        }
-
-        for sequence in batch {
-            if sequence.len() < 2 {
-                continue;
-            }
-            let input_ids = &sequence[..sequence.len() - 1];
-            let target_ids = &sequence[1..];
-            let mut ids_arr = Array2::<f32>::zeros((1, input_ids.len()));
-            for (i, &token_id) in input_ids.iter().enumerate() {
-                ids_arr[[0, i]] = token_id as f32;
-            }
-
-            let emb_idx = embeddings_idx.unwrap();
-            let mut hidden = match &mut self.network[emb_idx] {
-                LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_arr),
-                _ => ids_arr.clone(),
-            };
-
-            let t_idx = trm_idx.unwrap();
-            let trm_input_saved = hidden.clone();
-            hidden = match &mut self.network[t_idx] {
-                LayerEnum::LRM(l) => l.forward(&hidden),
-                _ => hidden,
-            };
-
-            if let Some(nidx) = norm_idx {
-                hidden = match &mut self.network[nidx] {
-                    LayerEnum::DynamicTanhNorm(n) => n.forward(&hidden),
-                    _ => hidden,
-                };
-            }
-
-            let logits = if let Some(opidx) = out_proj_idx {
-                match &mut self.network[opidx] {
-                    LayerEnum::OutputProjection(op) => op.forward(&hidden),
-                    _ => hidden.clone(),
-                }
-            } else {
-                hidden.clone()
-            };
-
-            let probs = crate::domain::soft::Softmax::new().forward_immutable(&logits.view());
-            let sce_cfg = crate::domain::loss::SymmetricCEConfig::default();
-            let sce = crate::domain::loss::symmetric_cross_entropy(
-                &probs,
-                target_ids,
-                sce_cfg.alpha,
-                sce_cfg.beta,
-                sce_cfg.epsilon,
-            );
-            let loss_norm = sce / (target_ids.len().max(1) as f32);
-            batch_loss += loss_norm;
-            batch_base_loss += loss_norm;
-
-            // Auxiliary: residual decorrelation (redundancy reduction) on the pre-logit hidden
-            // state.
-            let mut decor_grad_opt: Option<Array2<f32>> = None;
-            let base_w = self.training_hparams.residual_decorrelation_weight;
-            if base_w > 0.0 {
-                let difficulty = if self.training_hparams.residual_decorrelation_adaptive {
-                    (loss_norm / (loss_norm + 1.0)).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let w = base_w * (1.0 + difficulty);
-                let decor_loss = crate::domain::loss::residual_decorrelation_loss(&hidden.view());
-                batch_loss += w * decor_loss;
-                let decor_grad = crate::domain::loss::residual_decorrelation_gradients(&hidden.view());
-                decor_grad_opt = Some(decor_grad.mapv(|x| x * w));
-            }
-
-            // Auxiliary: hard-negative residual repulsion (pooled hidden vs memory bank).
-            let mut hardneg_grad_opt: Option<Array2<f32>> = None;
-            let base_hn_w = self.training_hparams.residual_hardneg_weight;
-            if base_hn_w > 0.0 {
-                let difficulty = if self.training_hparams.residual_hardneg_adaptive {
-                    (loss_norm / (loss_norm + 1.0)).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let w = base_hn_w * (1.0 + difficulty);
-
-                // Mean-pool across tokens.
-                let rows = hidden.nrows().max(1);
-                let cols = hidden.ncols();
-                let mut anchor = vec![0.0f32; cols];
-                for i in 0..rows {
-                    for j in 0..cols {
-                        let v = hidden[[i, j]];
-                        anchor[j] += if v.is_finite() { v } else { 0.0 };
-                    }
-                }
-                let inv = 1.0f32 / (rows as f32);
-                for a in &mut anchor {
-                    *a *= inv;
-                }
-
-                let (hn_loss, grad_anchor) = crate::domain::loss::hard_negative_repulsion_loss_and_grad(
-                    &anchor,
-                    self.residual_neg_bank.as_slice(),
-                    self.training_hparams.residual_hardneg_k,
-                    self.training_hparams.residual_hardneg_margin,
-                    self.training_hparams.residual_hardneg_temperature,
-                );
-                batch_loss += w * hn_loss;
-
-                // Distribute pooled gradient equally back to each token row.
-                let mut g = Array2::<f32>::zeros(hidden.raw_dim());
-                for i in 0..rows {
-                    for j in 0..cols {
-                        g[[i, j]] = (grad_anchor[j] * w) * inv;
-                    }
-                }
-                hardneg_grad_opt = Some(g);
-
-                // Update memory bank with current anchor (detached).
-                self.residual_neg_bank
-                    .push(anchor, self.training_hparams.residual_hardneg_bank_size);
-            }
-
-            let target_avg = match &self.network[t_idx] {
-                LayerEnum::LRM(l) => l.attention().moh_num_active() as f32,
-                _ => 0.0,
-            };
-            let moh_penalty = match &self.network[t_idx] {
-                LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg),
-                _ => 0.0,
-            };
-
-            let moe_penalty = match &self.network[t_idx] {
-                LayerEnum::LRM(lrm) => {
-                    let guard = lrm.block.read().unwrap();
-                    match &*guard {
-                        crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
-                            if let Some(moe) = b.feedforward().as_moe() {
-                                moe.last_aux_loss()
-                            } else {
-                                0.0
-                            }
-                        }
-                        crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                            if let Some(moe) = b.feedforward.as_moe() {
-                                moe.last_aux_loss()
-                            } else {
-                                0.0
-                            }
-                        }
-                    }
-                }
-                _ => 0.0,
-            };
-
-            if moh_penalty > 10.0 {
-                info!("High MoH penalty in batch: {}", moh_penalty);
-            }
-
-            if moe_penalty > 10.0 {
-                info!("High MoE penalty in batch: {}", moe_penalty);
-            }
-
-            batch_loss += moh_penalty;
-            batch_loss += moe_penalty;
-
-            let grads_logits = crate::domain::loss::symmetric_cross_entropy_gradients(
-                &probs,
-                target_ids,
-                sce_cfg.alpha,
-                sce_cfg.beta,
-                sce_cfg.epsilon,
-            );
-
-            let (mut grad_hidden, op_param_grads) = if let Some(opidx) = out_proj_idx {
-                match &mut self.network[opidx] {
-                    LayerEnum::OutputProjection(op) => op.compute_gradients(&hidden, &grads_logits),
-                    _ => (grads_logits.clone(), Vec::new()),
-                }
-            } else {
-                (grads_logits.clone(), Vec::new())
-            };
-
-            if let Some(decor_grad) = decor_grad_opt {
-                grad_hidden = grad_hidden + decor_grad;
-            }
-
-            if let Some(hn_grad) = hardneg_grad_opt {
-                grad_hidden = grad_hidden + hn_grad;
-            }
-            if let Some(opidx) = out_proj_idx {
-                Self::accumulate_layer_gradients(
-                    &mut scratch.accumulated_param_grads[opidx],
-                    op_param_grads,
-                    "OutputProjection",
-                );
-            }
-
-            if let Some(nidx) = norm_idx {
-                grad_hidden = match &mut self.network[nidx] {
-                    LayerEnum::DynamicTanhNorm(n) => n.backward(&grad_hidden, lr),
-                    _ => grad_hidden,
-                };
-            }
-
-            let (trm_in_grad, trm_param_grads) = match &self.network[t_idx] {
-                LayerEnum::LRM(layer) => layer.compute_gradients(&trm_input_saved, &grad_hidden),
-                _ => (grad_hidden.clone(), Vec::new()),
-            };
-            let _ = trm_in_grad;
-            Self::accumulate_layer_gradients(
-                &mut scratch.accumulated_param_grads[t_idx],
-                trm_param_grads,
-                "LRM",
-            );
-            scratch.layer_grad_norms[t_idx] +=
-                grad_hidden.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        }
-
-        let batch_scale = 1.0 / batch.len().max(1) as f32;
-        for (layer_idx, param_grads) in scratch.accumulated_param_grads.iter_mut().enumerate() {
-            if param_grads.is_empty() {
-                continue;
-            }
-            for grad in param_grads.iter_mut() {
-                grad.mapv_inplace(|x| x * batch_scale);
-            }
-            let grads_slice = param_grads.as_slice();
-            self.network[layer_idx].apply_gradients(grads_slice, lr)?;
-        }
-
-        let total_grad_norm = scratch
-            .layer_grad_norms
-            .iter()
-            .map(|&x| x * x)
-            .sum::<f32>()
-            .sqrt();
-        Ok((batch_loss, batch_base_loss, total_grad_norm))
-    }
-
+    #[cfg(test)]
     fn accumulate_layer_gradients(
         accumulator: &mut Vec<Array2<f32>>,
         new_grads: Vec<Array2<f32>>,
@@ -2692,7 +2147,7 @@ impl LLM {
                 layer = layer_name,
                 existing = accumulator.len(),
                 incoming = new_grads.len(),
-                "TRM autoencoding gradient accumulation length mismatch; replacing accumulator"
+                "Gradient accumulation length mismatch; replacing accumulator"
             );
             *accumulator = new_grads;
             return;
@@ -2700,648 +2155,6 @@ impl LLM {
         for (acc, grad) in accumulator.iter_mut().zip(new_grads.into_iter()) {
             *acc += &grad;
         }
-    }
-
-    fn train_batch_eprop_profiled(
-        &mut self,
-        batch: &[Vec<usize>],
-        lr: f32,
-    ) -> Result<(f32, f32, f32, Vec<f32>)> {
-        // E-Prop is enabled when TransformerBlock layers are present with eligibility traces
-        // initialized
-        let _eprop_enabled = self
-            .network
-            .iter()
-            .any(|layer| matches!(layer, LayerEnum::TransformerBlock(_)));
-
-        // Re-use the profiled training logic which is now capable of handling E-Prop gradients
-        // via the updated TransformerBlock::backward / compute_gradients implementation.
-        // We duplicate the logic here to allow for future E-Prop specific divergence
-        // (e.g. different learning rules, eligibility trace logging, etc.) without coupling.
-
-        let check_finite = std::env::var_os("RUSTGPT_CHECK_FINITE").is_some();
-        let mut batch_loss = 0.0;
-        let mut batch_base_loss = 0.0;
-        let mut accumulated_param_grads: Vec<Vec<Array2<f32>>> = Vec::new();
-        let mut layer_grad_norms: Vec<f32> = Vec::new(); // Track per-layer gradient norms
-
-        // Initialize accumulated gradients for each layer
-        for _ in &self.network {
-            accumulated_param_grads.push(Vec::new());
-            layer_grad_norms.push(0.0);
-        }
-
-        // OutputProjection index (used to attach residual decorrelation to the pre-logit hidden
-        // state).
-        let mut out_proj_idx: Option<usize> = None;
-        for (i, layer) in self.network.iter().enumerate() {
-            if matches!(layer, LayerEnum::OutputProjection(_)) {
-                out_proj_idx = Some(i);
-            }
-        }
-
-        let mut layer_inputs: Vec<Array2<f32>> = Vec::with_capacity(self.network.len());
-
-        // Process each sequence in the batch
-        for training_row in batch {
-            if training_row.len() < 2 {
-                continue;
-            }
-
-            // 1. Slice input and targets
-            let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
-            let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab.
-
-            // Forward pass with signal propagation variance tracking
-            let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-            for (i, &token_id) in input_ids.iter().enumerate() {
-                input[[0, i]] = token_id as f32;
-            }
-
-            // Track forward pass variance for signal propagation analysis
-            let mut layer_variances: Vec<f32> = Vec::new();
-            layer_inputs.clear();
-
-            let mut similarity_ctx: Option<Array2<f32>> = None;
-
-            for layer in &mut self.network {
-                layer_inputs.push(input);
-                let input_ref = layer_inputs.last().unwrap();
-                input = match layer {
-                    LayerEnum::TransformerBlock(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(input_ref);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    LayerEnum::DiffusionBlock(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(input_ref);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    LayerEnum::LRM(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(input_ref);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    _ => {
-                        similarity_ctx = None;
-                        layer.forward(input_ref)
-                    }
-                };
-
-                // Compute variance of layer output in single pass
-                let (sum, sum_sq) = input
-                    .iter()
-                    .fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
-                let n = input.len() as f32;
-                let mean = sum / n;
-                let variance = (sum_sq / n) - mean * mean;
-                layer_variances.push(variance);
-            }
-
-            let logits = input;
-            let probs = crate::domain::soft::Softmax::new().forward_immutable(&logits.view());
-
-            // Symmetric cross-entropy loss and gradients
-            let sce_cfg = crate::domain::loss::SymmetricCEConfig::default();
-            let sce = crate::domain::loss::symmetric_cross_entropy(
-                &probs,
-                target_ids,
-                sce_cfg.alpha,
-                sce_cfg.beta,
-                sce_cfg.epsilon,
-            );
-            let sce_norm = sce / (target_ids.len().max(1) as f32);
-            batch_loss += sce_norm;
-            batch_base_loss += sce_norm;
-
-            // Auxiliary residual decorrelation (redundancy reduction)
-            let decor_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx {
-                let base_w = self.training_hparams.residual_decorrelation_weight;
-                if base_w > 0.0 {
-                    let difficulty = if self.training_hparams.residual_decorrelation_adaptive {
-                        (sce_norm / (sce_norm + 1.0)).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let w = base_w * (1.0 + difficulty);
-                    let hidden_prelogit = &layer_inputs[op_idx];
-                    let dl = crate::domain::loss::residual_decorrelation_loss(&hidden_prelogit.view());
-                    batch_loss += w * dl;
-                    let dg = crate::domain::loss::residual_decorrelation_gradients(&hidden_prelogit.view());
-                    Some((op_idx, dg.mapv(|x| x * w)))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Auxiliary hard-negative repulsion
-            let hardneg_grad_opt: Option<(usize, Array2<f32>)> = if let Some(op_idx) = out_proj_idx
-            {
-                let base_w = self.training_hparams.residual_hardneg_weight;
-                if base_w > 0.0 {
-                    let difficulty = if self.training_hparams.residual_hardneg_adaptive {
-                        (sce_norm / (sce_norm + 1.0)).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let w = base_w * (1.0 + difficulty);
-                    let hidden_prelogit = &layer_inputs[op_idx];
-                    let rows = hidden_prelogit.nrows();
-                    let cols = hidden_prelogit.ncols();
-
-                    let mut anchor_all = vec![0.0f32; cols];
-                    let mut anchor_even = vec![0.0f32; cols];
-                    let mut anchor_odd = vec![0.0f32; cols];
-                    let mut count_even = 0usize;
-                    let mut count_odd = 0usize;
-
-                    for i in 0..rows {
-                        let is_even = i % 2 == 0;
-                        if is_even {
-                            count_even += 1;
-                        } else {
-                            count_odd += 1;
-                        }
-                        for j in 0..cols {
-                            let v = hidden_prelogit[[i, j]];
-                            let v = if v.is_finite() { v } else { 0.0 };
-                            anchor_all[j] += v;
-                            if is_even {
-                                anchor_even[j] += v;
-                            } else {
-                                anchor_odd[j] += v;
-                            }
-                        }
-                    }
-
-                    let inv_all = 1.0f32 / (rows.max(1) as f32);
-                    for a in &mut anchor_all {
-                        *a *= inv_all;
-                    }
-                    let inv_even = if count_even > 0 {
-                        1.0f32 / (count_even as f32)
-                    } else {
-                        0.0
-                    };
-                    for a in &mut anchor_even {
-                        *a *= inv_even;
-                    }
-                    let inv_odd = if count_odd > 0 {
-                        1.0f32 / (count_odd as f32)
-                    } else {
-                        0.0
-                    };
-                    for a in &mut anchor_odd {
-                        *a *= inv_odd;
-                    }
-
-                    let (hn_loss, grad_anchor) = crate::domain::loss::hard_negative_repulsion_loss_and_grad(
-                        &anchor_all,
-                        self.residual_neg_bank.as_slice(),
-                        self.training_hparams.residual_hardneg_k,
-                        self.training_hparams.residual_hardneg_margin,
-                        self.training_hparams.residual_hardneg_temperature,
-                    );
-                    let (nce_loss, grad_even, grad_odd) = if count_even > 0 && count_odd > 0 {
-                        crate::domain::loss::info_nce_loss_and_grads(
-                            &anchor_even,
-                            &anchor_odd,
-                            self.residual_neg_bank.as_slice(),
-                            self.training_hparams.residual_hardneg_k,
-                            self.training_hparams.residual_hardneg_temperature,
-                        )
-                    } else {
-                        (0.0, vec![0.0f32; cols], vec![0.0f32; cols])
-                    };
-                    batch_loss += w * (hn_loss + nce_loss);
-
-                    let mut g = Array2::<f32>::zeros(hidden_prelogit.raw_dim());
-                    for i in 0..rows {
-                        let is_even = i % 2 == 0;
-                        for j in 0..cols {
-                            let mut v = grad_anchor[j] * inv_all;
-                            if count_even > 0 && count_odd > 0 {
-                                if is_even {
-                                    v += grad_even[j] * inv_even;
-                                } else {
-                                    v += grad_odd[j] * inv_odd;
-                                }
-                            }
-                            g[[i, j]] = v * w;
-                        }
-                    }
-
-                    // Update memory bank.
-                    self.residual_neg_bank
-                        .push(anchor_all, self.training_hparams.residual_hardneg_bank_size);
-
-                    Some((op_idx, g))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Compute gradients w.r.t. logits
-            let mut grads_output = crate::domain::loss::symmetric_cross_entropy_gradients(
-                &probs,
-                target_ids,
-                sce_cfg.alpha,
-                sce_cfg.beta,
-                sce_cfg.epsilon,
-            );
-
-            // Handle LRM supervision if present
-            let mut lrm_index: Option<usize> = None;
-            for (i, layer) in self.network.iter().enumerate() {
-                if let LayerEnum::LRM(_) = layer {
-                    lrm_index = Some(i);
-                    break;
-                }
-            }
-            if let Some(t_idx) = lrm_index {
-                let aux_steps: &[Array2<f32>] = match &self.network[t_idx] {
-                    LayerEnum::LRM(lrm) => lrm.get_supervision_outputs(),
-                    _ => &[],
-                };
-                let mut aux_loss_sum = 0.0f32;
-                if !aux_steps.is_empty() {
-                    let mut rn_idx: Option<usize> = None;
-                    let mut op_idx: Option<usize> = None;
-                    for i in (t_idx + 1)..self.network.len() {
-                        if matches!(self.network[i], LayerEnum::DynamicTanhNorm(_)) {
-                            rn_idx = Some(i);
-                            break;
-                        }
-                    }
-                    if let Some(rn_i) = rn_idx {
-                        for i in (rn_i + 1)..self.network.len() {
-                            if matches!(self.network[i], LayerEnum::OutputProjection(_)) {
-                                op_idx = Some(i);
-                                break;
-                            }
-                        }
-                    }
-                    let (rn_idx, op_idx) = match (rn_idx, op_idx) {
-                        (Some(rn), Some(op)) => (rn, op),
-                        _ => {
-                            batch_loss += aux_loss_sum;
-                            continue;
-                        }
-                    };
-                    let mut rn_clone = match &self.network[rn_idx] {
-                        LayerEnum::DynamicTanhNorm(n) => n.clone(),
-                        _ => {
-                            batch_loss += aux_loss_sum;
-                            continue;
-                        }
-                    };
-                    let mut op_clone = match &self.network[op_idx] {
-                        LayerEnum::OutputProjection(op) => op.clone(),
-                        _ => {
-                            batch_loss += aux_loss_sum;
-                            continue;
-                        }
-                    };
-                    let steps_total = aux_steps.len();
-                    let aux_base: f32 = 1.0;
-                    let decay_rate: f32 = 0.6;
-                    for (si, y_t) in aux_steps.iter().enumerate() {
-                        let norm_y = rn_clone.forward(y_t);
-                        let logits_t = op_clone.forward(&norm_y);
-                        let probs_t =
-                            crate::domain::soft::Softmax::new().forward_immutable(&logits_t.view());
-                        let sce_t = crate::domain::loss::symmetric_cross_entropy(
-                            &probs_t,
-                            target_ids,
-                            sce_cfg.alpha,
-                            sce_cfg.beta,
-                            sce_cfg.epsilon,
-                        );
-                        let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
-                        let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
-                        let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
-                        if step_weight < 1e-5 {
-                            continue;
-                        }
-                        aux_loss_sum += sce_t_norm * step_weight;
-                        let mut grad_logits_t = crate::domain::loss::symmetric_cross_entropy_gradients(
-                            &probs_t,
-                            target_ids,
-                            sce_cfg.alpha,
-                            sce_cfg.beta,
-                            sce_cfg.epsilon,
-                        );
-                        grad_logits_t.mapv_inplace(|v| v * step_weight);
-                        let (grad_norm_in, _) =
-                            op_clone.compute_gradients(&norm_y, &grad_logits_t);
-                        let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
-
-                        let lrm_param_grads_step = match &self.network[t_idx] {
-                            LayerEnum::LRM(layer) => {
-                                let (_in_grad_unused, param_grads) =
-                                    layer.compute_gradients_at_step(si, &grad_y_in);
-                                param_grads
-                            }
-                            _ => Vec::new(),
-                        };
-                        if !lrm_param_grads_step.is_empty() {
-                            if accumulated_param_grads[t_idx].is_empty() {
-                                accumulated_param_grads[t_idx] = lrm_param_grads_step;
-                            } else {
-                                for (acc_grad, new_grad) in accumulated_param_grads[t_idx]
-                                    .iter_mut()
-                                    .zip(lrm_param_grads_step)
-                                {
-                                    *acc_grad += &new_grad;
-                                }
-                            }
-                        }
-                    }
-                }
-                batch_loss += aux_loss_sum;
-            }
-
-            // Backward pass: compute parameter gradients for each layer
-            // TransformerBlock::compute_gradients() will return E-Prop gradients if enabled.
-            for (rev_idx, layer) in self.network.iter().rev().enumerate() {
-                let layer_idx = self.network.len() - 1 - rev_idx;
-                let (input_grads, param_grads) =
-                    layer.compute_gradients(&layer_inputs[layer_idx], &grads_output);
-
-                if check_finite {
-                    if let Some((bad_i, bad_v)) =
-                        input_grads.iter().enumerate().find(|(_, v)| !v.is_finite())
-                    {
-                        return Err(crate::common::errors::ModelError::Training {
-                            message: format!(
-                                "Non-finite input_grads at layer {} index {}: {}",
-                                layer_idx, bad_i, bad_v
-                            ),
-                        });
-                    }
-                    for (g_idx, g) in param_grads.iter().enumerate() {
-                        if let Some((bad_i, bad_v)) =
-                            g.iter().enumerate().find(|(_, v)| !v.is_finite())
-                        {
-                            return Err(crate::common::errors::ModelError::Training {
-                                message: format!(
-                                    "Non-finite param_grads[{}] at layer {} index {}: {}",
-                                    g_idx, layer_idx, bad_i, bad_v
-                                ),
-                            });
-                        }
-                    }
-                }
-
-                let layer_grad_norm: f32 = input_grads.iter().map(|&x| x * x).sum::<f32>().sqrt();
-                layer_grad_norms[layer_idx] += layer_grad_norm;
-                grads_output = input_grads;
-
-                if let Some((op_idx, ref decor_grad)) = decor_grad_opt
-                    && layer_idx == op_idx
-                {
-                    grads_output = &grads_output + decor_grad;
-                }
-
-                if let Some((op_idx, ref hn_grad)) = hardneg_grad_opt
-                    && layer_idx == op_idx
-                {
-                    grads_output = &grads_output + hn_grad;
-                }
-
-                if accumulated_param_grads[layer_idx].is_empty() {
-                    accumulated_param_grads[layer_idx] = param_grads;
-                } else {
-                    for (acc_grad, new_grad) in accumulated_param_grads[layer_idx]
-                        .iter_mut()
-                        .zip(param_grads)
-                    {
-                        *acc_grad += &new_grad;
-                    }
-                }
-            }
-        }
-
-        // Average layer-wise gradient norms
-        for norm in &mut layer_grad_norms {
-            *norm /= batch.len() as f32;
-        }
-
-        let max_layer_grad = layer_grad_norms.iter().fold(0.0f32, |a, &b| a.max(b));
-        if max_layer_grad > 10.0 {
-            tracing::warn!(
-                "Layer-wise gradient norms: {:?}",
-                layer_grad_norms
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &norm)| format!(
-                        "L{}({}): {:.2}",
-                        i,
-                        self.network[i].layer_type(),
-                        norm
-                    ))
-                    .collect::<Vec<_>>()
-            );
-        }
-
-        // Prepare averaged gradients and detect anomalies
-        let mut averaged_grads_per_layer: Vec<Vec<Array2<f32>>> = Vec::new();
-        let mut total_grad_norm_sq = 0.0f32;
-        let mut layer_param_grad_norm_sq: Vec<f32> = vec![0.0; self.network.len()];
-
-        for (layer_idx, param_grads) in accumulated_param_grads.into_iter().enumerate() {
-            if !param_grads.is_empty() {
-                let averaged_grads: Vec<Array2<f32>> = param_grads
-                    .into_iter()
-                    .map(|grad| grad / batch.len() as f32)
-                    .collect();
-
-                let max_reasonable_grad_per_param = 5.0;
-                let max_total_grad_norm =
-                    (averaged_grads.iter().map(|g| g.len()).sum::<usize>() as f32).sqrt()
-                        * max_reasonable_grad_per_param;
-                let mut total_layer_grad_norm_sq = 0.0;
-                for grad in &averaged_grads {
-                    total_layer_grad_norm_sq += grad.iter().map(|&x| x * x).sum::<f32>();
-                }
-                let total_layer_grad_norm = total_layer_grad_norm_sq.sqrt();
-                let scale = if total_layer_grad_norm > max_total_grad_norm {
-                    max_total_grad_norm / total_layer_grad_norm
-                } else {
-                    1.0
-                };
-
-                let mut clipped_grads: Vec<Array2<f32>> = if scale < 1.0 {
-                    averaged_grads
-                        .into_iter()
-                        .map(|grad| grad.mapv(|x| x * scale))
-                        .collect()
-                } else {
-                    averaged_grads
-                };
-
-                const MAX_GRAD_ABS: f32 = 5000.0;
-                let mut max_abs: f32 = 0.0;
-                for g in &clipped_grads {
-                    for &v in g.iter() {
-                        if v.abs() > max_abs {
-                            max_abs = v.abs();
-                        }
-                    }
-                }
-                if max_abs > MAX_GRAD_ABS {
-                    let s = MAX_GRAD_ABS / max_abs;
-                    for g in &mut clipped_grads {
-                        g.mapv_inplace(|v| v * s);
-                    }
-                }
-
-                if check_finite {
-                    for (g_idx, g) in clipped_grads.iter().enumerate() {
-                        if let Some((bad_i, bad_v)) =
-                            g.iter().enumerate().find(|(_, v)| !v.is_finite())
-                        {
-                            return Err(crate::common::errors::ModelError::Training {
-                                message: format!(
-                                    "Non-finite clipped_grads[{}] at layer {} index {}: {}",
-                                    g_idx, layer_idx, bad_i, bad_v
-                                ),
-                            });
-                        }
-                    }
-                } else {
-                    for grad in &mut clipped_grads {
-                        grad.iter_mut().for_each(|v| {
-                            if !v.is_finite() {
-                                *v = 0.0
-                            }
-                        });
-                    }
-                }
-
-                if let Err(e) = Self::detect_gradient_anomalies(&clipped_grads) {
-                    tracing::error!("Gradient anomaly detected in layer {}", layer_idx);
-                    return Err(e);
-                }
-
-                let mut s_layer = 0.0f32;
-                for grad in &clipped_grads {
-                    let s = grad.iter().map(|&x| x * x).sum::<f32>();
-                    total_grad_norm_sq += s;
-                    s_layer += s;
-                }
-                layer_param_grad_norm_sq[layer_idx] += s_layer;
-                averaged_grads_per_layer.push(clipped_grads);
-            } else {
-                averaged_grads_per_layer.push(Vec::new());
-            }
-        }
-
-        let grad_norm = total_grad_norm_sq.sqrt();
-        let per_layer_grad_norms: Vec<f32> = self
-            .network
-            .iter()
-            .zip(&averaged_grads_per_layer)
-            .map(|(_layer, grads)| {
-                if grads.is_empty() {
-                    0.0
-                } else {
-                    let mut s = 0.0f32;
-                    for g in grads {
-                        s += g.iter().map(|&x| x * x).sum::<f32>();
-                    }
-                    s.sqrt()
-                }
-            })
-            .collect();
-
-        let mut nonzero: Vec<f32> = per_layer_grad_norms
-            .iter()
-            .cloned()
-            .filter(|&v| v > 0.0)
-            .collect();
-        let median_grad_norm = if nonzero.is_empty() {
-            grad_norm.max(1e-6)
-        } else {
-            nonzero.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let mid = nonzero.len() / 2;
-            if nonzero.len() % 2 == 0 {
-                (nonzero[mid - 1] + nonzero[mid]) * 0.5
-            } else {
-                nonzero[mid]
-            }
-        };
-
-        const EMA_BETA: f32 = 0.9;
-        let _median_smoothed = if let Some(prev) = self.median_grad_ema {
-            let sm = EMA_BETA * prev + (1.0 - EMA_BETA) * median_grad_norm;
-            self.median_grad_ema = Some(sm);
-            sm
-        } else {
-            self.median_grad_ema = Some(median_grad_norm);
-            median_grad_norm
-        };
-
-        // Compute adaptive learning rates
-        let adaptive_lrs: Vec<f32> = self
-            .network
-            .iter()
-            .zip(&averaged_grads_per_layer)
-            .enumerate()
-            .map(|(layer_idx, (layer, grads))| {
-                if grads.is_empty() {
-                    lr
-                } else {
-                    Self::compute_layer_adaptive_lr_static(
-                        layer,
-                        grads,
-                        lr,
-                        layer_idx,
-                        median_grad_norm,
-                    )
-                }
-            })
-            .collect();
-
-        // Apply gradients (this will now route E-Prop gradients via ParamPartitions in
-        // apply_gradients)
-        for ((layer, grads), adaptive_lr) in self
-            .network
-            .iter_mut()
-            .zip(averaged_grads_per_layer)
-            .zip(adaptive_lrs)
-        {
-            if !grads.is_empty() {
-                layer.apply_gradients(&grads, adaptive_lr)?;
-            }
-        }
-
-        Ok((
-            batch_loss,
-            batch_base_loss,
-            grad_norm,
-            layer_param_grad_norm_sq,
-        ))
     }
 
     /// Train on a single batch of sequences
@@ -3384,10 +2197,6 @@ impl LLM {
                 input[[0, i]] = token_id as f32;
             }
 
-            // Track forward pass variance for signal propagation analysis
-            // Reference: "Deep Information Propagation" (Schoenholz et al., 2017)
-            // Ideal: Var(x_l) ≈ Var(x_0) for all layers (isometry condition)
-            let mut layer_variances: Vec<f32> = Vec::new();
             scratch.layer_inputs.clear();
 
             let mut similarity_ctx: Option<Array2<f32>> = None;
@@ -3395,51 +2204,8 @@ impl LLM {
             for layer in &mut self.network {
                 scratch.layer_inputs.push(input);
                 let input_ref = scratch.layer_inputs.last().unwrap();
-                input = match layer {
-                    LayerEnum::TransformerBlock(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(input_ref);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    LayerEnum::DiffusionBlock(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(input_ref);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    LayerEnum::LRM(block) => {
-                        block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        let out = block.forward(input_ref);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(block.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                        }
-                        out
-                    }
-                    _ => {
-                        similarity_ctx = None;
-                        layer.forward(input_ref)
-                    }
-                };
-
-                // Compute variance of layer output in single pass
-                let (sum, sum_sq) = input
-                    .iter()
-                    .fold((0.0, 0.0), |(s, sq), &x| (s + x, sq + x * x));
-                let n = input.len() as f32;
-                let mean = sum / n;
-                let variance = (sum_sq / n) - mean * mean;
-                layer_variances.push(variance);
+                input =
+                    Self::forward_with_similarity_context(layer, input_ref, &mut similarity_ctx);
             }
 
             let logits = input;
@@ -3470,9 +2236,12 @@ impl LLM {
                     };
                     let w = base_w * (1.0 + difficulty);
                     let hidden_prelogit = &scratch.layer_inputs[op_idx];
-                    let dl = crate::domain::loss::residual_decorrelation_loss(&hidden_prelogit.view());
+                    let dl =
+                        crate::domain::loss::residual_decorrelation_loss(&hidden_prelogit.view());
                     batch_loss += w * dl;
-                    let dg = crate::domain::loss::residual_decorrelation_gradients(&hidden_prelogit.view());
+                    let dg = crate::domain::loss::residual_decorrelation_gradients(
+                        &hidden_prelogit.view(),
+                    );
                     Some((op_idx, dg.mapv(|x| x * w)))
                 } else {
                     None
@@ -3509,13 +2278,14 @@ impl LLM {
                         *a *= inv;
                     }
 
-                    let (hn_loss, grad_anchor) = crate::domain::loss::hard_negative_repulsion_loss_and_grad(
-                        &anchor,
-                        self.residual_neg_bank.as_slice(),
-                        self.training_hparams.residual_hardneg_k,
-                        self.training_hparams.residual_hardneg_margin,
-                        self.training_hparams.residual_hardneg_temperature,
-                    );
+                    let (hn_loss, grad_anchor) =
+                        crate::domain::loss::hard_negative_repulsion_loss_and_grad(
+                            &anchor,
+                            self.residual_neg_bank.as_slice(),
+                            self.training_hparams.residual_hardneg_k,
+                            self.training_hparams.residual_hardneg_margin,
+                            self.training_hparams.residual_hardneg_temperature,
+                        );
                     batch_loss += w * hn_loss;
 
                     // Spread pooled grad across tokens.
@@ -3546,174 +2316,6 @@ impl LLM {
                 sce_cfg.beta,
                 sce_cfg.epsilon,
             );
-
-            let mut lrm_index: Option<usize> = None;
-            for (i, layer) in self.network.iter().enumerate() {
-                if let LayerEnum::LRM(_) = layer {
-                    lrm_index = Some(i);
-                    break;
-                }
-            }
-            if let Some(t_idx) = lrm_index {
-                let aux_steps: &[Array2<f32>] = match &self.network[t_idx] {
-                    LayerEnum::LRM(lrm) => lrm.get_supervision_outputs(),
-                    _ => &[],
-                };
-                let mut aux_loss_sum = 0.0f32;
-                if !aux_steps.is_empty() {
-                    // IMPORTANT: Do NOT call forward() on real layers here.
-                    // OutputProjection/DynamicTanhNorm rely on internal cached_input for gradients;
-                    // calling forward() for aux supervision would overwrite caches and corrupt the
-                    // main backward pass.
-
-                    // Find the normalization layer after the LRM and the output projection layer.
-                    let mut rn_idx: Option<usize> = None;
-                    let mut op_idx: Option<usize> = None;
-                    for i in (t_idx + 1)..self.network.len() {
-                        if matches!(self.network[i], LayerEnum::DynamicTanhNorm(_)) {
-                            rn_idx = Some(i);
-                            break;
-                        }
-                    }
-                    if let Some(rn_i) = rn_idx {
-                        for i in (rn_i + 1)..self.network.len() {
-                            if matches!(self.network[i], LayerEnum::OutputProjection(_)) {
-                                op_idx = Some(i);
-                                break;
-                            }
-                        }
-                    }
-
-                    let (rn_idx, op_idx) = match (rn_idx, op_idx) {
-                        (Some(rn), Some(op)) => (rn, op),
-                        _ => {
-                            tracing::warn!(
-                                "TRM supervision skipped: could not find Norm/OutputProjection after LRM"
-                            );
-                            // Still add the aux loss (0.0) and proceed with main backward.
-                            batch_loss += aux_loss_sum;
-                            continue;
-                        }
-                    };
-
-                    // Clone layers to keep aux supervision cache-isolated.
-                    let mut rn_clone = match &self.network[rn_idx] {
-                        LayerEnum::DynamicTanhNorm(n) => n.clone(),
-                        _ => {
-                            batch_loss += aux_loss_sum;
-                            continue;
-                        }
-                    };
-                    let mut op_clone = match &self.network[op_idx] {
-                        LayerEnum::OutputProjection(op) => op.clone(),
-                        _ => {
-                            batch_loss += aux_loss_sum;
-                            continue;
-                        }
-                    };
-
-                    let steps_total = aux_steps.len();
-                    let aux_base: f32 = 1.0;
-                    let decay_rate: f32 = 0.6; // decay towards earlier steps
-                    for (si, y_t) in aux_steps.iter().enumerate() {
-                        let norm_y = rn_clone.forward(y_t);
-                        let logits_t = op_clone.forward(&norm_y);
-                        let probs_t =
-                            crate::domain::soft::Softmax::new().forward_immutable(&logits_t.view());
-                        let sce_t = crate::domain::loss::symmetric_cross_entropy(
-                            &probs_t,
-                            target_ids,
-                            sce_cfg.alpha,
-                            sce_cfg.beta,
-                            sce_cfg.epsilon,
-                        );
-                        let sce_t_norm = sce_t / (target_ids.len().max(1) as f32);
-                        let pos_from_end = (steps_total.saturating_sub(1)).saturating_sub(si);
-                        let step_weight = aux_base * decay_rate.powf(pos_from_end as f32);
-
-                        if step_weight < 1e-5 {
-                            continue;
-                        }
-
-                        aux_loss_sum += sce_t_norm * step_weight;
-                        let mut grad_logits_t = crate::domain::loss::symmetric_cross_entropy_gradients(
-                            &probs_t,
-                            target_ids,
-                            sce_cfg.alpha,
-                            sce_cfg.beta,
-                            sce_cfg.epsilon,
-                        );
-                        grad_logits_t.mapv_inplace(|v| v * step_weight);
-                        let (grad_norm_in, _) =
-                            op_clone.compute_gradients(&norm_y, &grad_logits_t);
-                        let (grad_y_in, _) = rn_clone.compute_gradients(y_t, &grad_norm_in);
-
-                        let lrm_param_grads_step = match &self.network[t_idx] {
-                            LayerEnum::LRM(layer) => {
-                                let (_in_grad_unused, param_grads) =
-                                    layer.compute_gradients_at_step(si, &grad_y_in);
-                                param_grads
-                            }
-                            _ => Vec::new(),
-                        };
-                        if !lrm_param_grads_step.is_empty() {
-                            if scratch.accumulated_param_grads[t_idx].is_empty() {
-                                scratch.accumulated_param_grads[t_idx] = lrm_param_grads_step;
-                            } else {
-                                for (acc_grad, new_grad) in scratch.accumulated_param_grads[t_idx]
-                                    .iter_mut()
-                                    .zip(lrm_param_grads_step)
-                                {
-                                    *acc_grad += &new_grad;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if aux_loss_sum > 10.0 {
-                    tracing::info!("TRM Supervision Loss: {}", aux_loss_sum);
-                }
-
-                let target_avg = match &self.network[t_idx] {
-                    LayerEnum::LRM(l) => l.attention().moh_num_active() as f32,
-                    _ => 0.0,
-                };
-                let moh_penalty = match &self.network[t_idx] {
-                    LayerEnum::LRM(l) => l.attention().compute_moh_aux_weighted_total(target_avg),
-                    _ => 0.0,
-                };
-                let moe_penalty = match &self.network[t_idx] {
-                    LayerEnum::LRM(lrm) => {
-                        let guard = lrm.block.read().unwrap();
-                        match &*guard {
-                            crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Transformer(b) => {
-                                if let Some(moe) = b.feedforward().as_moe() {
-                                    moe.last_aux_loss()
-                                } else {
-                                    0.0
-                                }
-                            }
-                            crate::domain::layers::recurrence::lrm::RecursiveBlockVariant::Diffusion(b) => {
-                                if let Some(moe) = b.feedforward.as_moe() {
-                                    moe.last_aux_loss()
-                                } else {
-                                    0.0
-                                }
-                            }
-                        }
-                    }
-                    _ => 0.0,
-                };
-                if moh_penalty > 0.01 {
-                    tracing::info!("MoH Penalty (not in loss): {}", moh_penalty);
-                }
-                if moe_penalty > 0.01 {
-                    tracing::info!("MoE Penalty (not in loss): {}", moe_penalty);
-                }
-
-                batch_loss += aux_loss_sum;
-            }
 
             // Backward pass: compute parameter gradients for each layer
             // Note: AttentionMoE layers use backward() directly and are handled separately
@@ -4087,7 +2689,7 @@ impl LLM {
 
         // Combined scale with conservative clamping
         // Tighter bounds reduce jitter and large swings
-        // Expanded range to allow LARS to effectively throttle exploding gradients (e.g. in TRM)
+        // Expanded range to allow LARS to effectively throttle exploding gradients.
         const MIN_SCALE: f32 = 0.01;
         const MAX_SCALE: f32 = 5.0;
         let scale = (trust_ratio * balance_scale).clamp(MIN_SCALE, MAX_SCALE);
@@ -4227,6 +2829,36 @@ impl LLM {
         checkpoint_dir: Option<String>,
         checkpoint_stage: Option<String>,
     ) -> Result<()> {
+        self.train_diffusion_ce_with_accumulation(
+            data,
+            epochs,
+            lr,
+            batch_size,
+            1,
+            ce_weight,
+            validation_ratio,
+            min_snr_gamma,
+            checkpoint_every,
+            checkpoint_dir,
+            checkpoint_stage,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_diffusion_ce_with_accumulation(
+        &mut self,
+        data: Vec<&str>,
+        epochs: usize,
+        lr: f32,
+        batch_size: usize,
+        gradient_accumulation_steps: usize,
+        ce_weight: AdaptiveScalar,
+        validation_ratio: f32,
+        min_snr_gamma: AdaptiveScalar,
+        checkpoint_every: Option<usize>,
+        checkpoint_dir: Option<String>,
+        checkpoint_stage: Option<String>,
+    ) -> Result<()> {
         let mut diffusion_blocks_idx: Vec<usize> = Vec::new();
         let mut embeddings_idx: Option<usize> = None;
         let mut norm_idx: Option<usize> = None;
@@ -4334,7 +2966,9 @@ impl LLM {
         let plateau_patience = 5usize;
         let plateau_reduce = 0.5f32;
         let min_lr_scale = 0.1f32;
-        let effective_batch_size = batch_size.max(1);
+        let micro_batch_size = batch_size.max(1);
+        let grad_accum_steps = gradient_accumulation_steps.max(1);
+        let effective_update_batch_size = micro_batch_size.saturating_mul(grad_accum_steps).max(1);
 
         // Warmup epochs default to 15% of total for stability
         let warmup_epochs = ((epochs as f32) * 0.15).ceil() as usize;
@@ -4343,6 +2977,28 @@ impl LLM {
         let val_start = (data.len() as f32 * (1.0 - validation_ratio)).floor() as usize;
         let train_data = &data[..val_start];
         let val_data = &data[val_start..];
+
+        // Initialize GPU for all layers if GPU features are enabled
+        #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
+        {
+            use crate::domain::compute::GpuComponent;
+            for layer in &mut self.network {
+                // Attempt GPU initialization for layers that support it
+                // Ignore errors - some layers may not support GPU
+                match layer {
+                    LayerEnum::RichardsGlu(layer) => {
+                        let _ = layer.enable_gpu_auto_detect();
+                    }
+                    LayerEnum::PolyAttention(layer) => {
+                        let _ = layer.enable_gpu_auto_detect();
+                    }
+                    _ => {
+                        // Other layers delegate to internal components
+                    }
+                }
+            }
+            tracing::info!("GPU initialization for diffusion training complete");
+        }
 
         for epoch in 0..epochs {
             let t_epoch_start = std::time::Instant::now();
@@ -4394,19 +3050,20 @@ impl LLM {
                 let mut weights = Vec::with_capacity(active_steps_epoch);
                 // Base distribution (schedule/target-aware) + online adaptive reweighting (learned from
                 // data via per-timestep EMA difficulty).
-                let base_weights_full: Vec<f32> =
-                    if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                        match timestep_strategy {
-                            DiffusionTimestepStrategy::MinSnr => (0..num_timesteps)
-                                .map(|t| b0.min_snr_weight(t, current_gamma).max(1e-12))
-                                .collect(),
-                            DiffusionTimestepStrategy::EdmLogNormal => {
-                                // EDM log-normal sampling over σ, discretized over timesteps.
-                                let p_mean: f32 = -1.2;
-                                let p_std: f32 = 1.2;
-                                let norm_const: f32 =
-                                    1.0 / (p_std * (2.0 * std::f32::consts::PI).sqrt());
-                                (0..num_timesteps)
+                let base_weights_full: Vec<f32> = if let LayerEnum::DiffusionBlock(b0) =
+                    &self.network[first_block]
+                {
+                    match timestep_strategy {
+                        DiffusionTimestepStrategy::MinSnr => (0..num_timesteps)
+                            .map(|t| b0.min_snr_weight(t, current_gamma).max(1e-12))
+                            .collect(),
+                        DiffusionTimestepStrategy::EdmLogNormal => {
+                            // EDM log-normal sampling over σ, discretized over timesteps.
+                            let p_mean: f32 = -1.2;
+                            let p_std: f32 = 1.2;
+                            let norm_const: f32 =
+                                1.0 / (p_std * (2.0 * std::f32::consts::PI).sqrt());
+                            (0..num_timesteps)
                                     .map(|t| {
                                         if t == 0 {
                                             return 0.0;
@@ -4425,12 +3082,12 @@ impl LLM {
                                         (norm_const * (-0.5 * z * z).exp()).max(1e-12)
                                     })
                                     .collect()
-                            }
-                            DiffusionTimestepStrategy::Uniform => vec![1.0f32; num_timesteps],
                         }
-                    } else {
-                        vec![1.0f32; num_timesteps]
-                    };
+                        DiffusionTimestepStrategy::Uniform => vec![1.0f32; num_timesteps],
+                    }
+                } else {
+                    vec![1.0f32; num_timesteps]
+                };
 
                 for t in 0..active_steps_epoch {
                     let base = base_weights_full.get(t).copied().unwrap_or(1.0).max(1e-12);
@@ -4467,11 +3124,15 @@ impl LLM {
             let mut count = 0usize;
             let mut total_grad_norm_sq = 0.0f32;
 
-            for batch_strs in train_data.chunks(effective_batch_size) {
-                let batch_tokenized: Vec<Vec<usize>> = batch_strs
-                    .par_iter()
-                    .map(|input| self.tokenize(input))
-                    .collect();
+            for batch_strs in train_data.chunks(effective_update_batch_size) {
+                let mut batch_tokenized: Vec<Vec<usize>> = Vec::with_capacity(batch_strs.len());
+                for micro_batch in batch_strs.chunks(micro_batch_size) {
+                    let tokenized_micro: Vec<Vec<usize>> = micro_batch
+                        .par_iter()
+                        .map(|input| self.tokenize(input))
+                        .collect();
+                    batch_tokenized.extend(tokenized_micro);
+                }
 
                 let batch_response_spans: Vec<Option<(usize, usize)>> = batch_tokenized
                     .iter()
@@ -4542,7 +3203,7 @@ impl LLM {
                         let unique = training_row
                             .iter()
                             .copied()
-                            .collect::<std::collections::BTreeSet<usize>>()
+                            .collect::<std::collections::HashSet<usize>>()
                             .len() as f32;
                         (unique / training_row.len().max(1) as f32).clamp(0.0, 1.0)
                     };
@@ -4608,15 +3269,9 @@ impl LLM {
                         continue;
                     };
 
-                    // Predict via full diffusion stack (epsilon or v parameterization)
-                    let mut pred = x_t.clone();
-                    for &idx in &diffusion_blocks_idx {
-                        if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                            b.set_causal_attention(true);
-                            b.set_timestep(t);
-                            pred = b.forward_with_timestep(&pred, t);
-                        }
-                    }
+                    // Predict via full diffusion stack (epsilon or v parameterization).
+                    let pred =
+                        self.forward_diffusion_stack_plain(&diffusion_blocks_idx, &x_t, t, true);
 
                     // Recover x0_hat for continuous path according to parameterization
                     let x0_hat = if discrete_used {
@@ -4659,7 +3314,8 @@ impl LLM {
                     } else {
                         continue;
                     };
-                    let probs = crate::domain::soft::Softmax::new().forward_immutable(&logits.view());
+                    let probs =
+                        crate::domain::soft::Softmax::new().forward_immutable(&logits.view());
                     let target_len = target_ids.len();
                     let probs_slice = probs.slice(s![0..target_len, ..]);
                     let lambda_ce = if discrete_used {
@@ -4694,7 +3350,8 @@ impl LLM {
                         let w = base_w * (1.0 + difficulty);
                         let dl = crate::domain::loss::residual_decorrelation_loss(&hidden.view());
                         decor_term = w * dl;
-                        let dg = crate::domain::loss::residual_decorrelation_gradients(&hidden.view());
+                        let dg =
+                            crate::domain::loss::residual_decorrelation_gradients(&hidden.view());
                         decor_grad_opt = Some(dg.mapv(|x| x * w));
                     }
 
@@ -5024,23 +3681,10 @@ impl LLM {
             let mut tau_range: Option<(f32, f32)> = None;
             let mut pred_norm_rms: Option<f32> = None;
             for layer in &mut self.network {
-                if let LayerEnum::TransformerBlock(tb) = layer
-                    && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut tb.temporal_mixing_mut().temporal_mixing
-                {
-                    tau_range = attn.take_tau_metrics();
-                    pred_norm_rms = attn.take_pred_norm();
-                }
-                if let LayerEnum::DiffusionBlock(db) = layer
-                    && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut db.temporal_mixing.temporal_mixing
-                {
-                    tau_range = attn.take_tau_metrics();
-                    pred_norm_rms = attn.take_pred_norm();
-                }
-                if let LayerEnum::LRM(lrm) = layer {
-                    tau_range = lrm.attention_mut().take_tau_metrics();
-                    pred_norm_rms = lrm.attention_mut().take_pred_norm();
+                if let Some(temporal) = Self::block_temporal_mixing_mut(layer) {
+                    let metrics = temporal.take_moh_metrics();
+                    tau_range = metrics.tau_metrics;
+                    pred_norm_rms = metrics.pred_norm;
                 }
             }
             let metrics = crate::domain::attention::poly_attention::DegreeAdaptationMetrics {
@@ -5053,20 +3697,8 @@ impl LLM {
                 pred_norm_rms,
             };
             for layer in &mut self.network {
-                if let LayerEnum::TransformerBlock(tb) = layer
-                    && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut tb.temporal_mixing_mut().temporal_mixing
-                {
-                    attn.adapt_degree(&metrics);
-                }
-                if let LayerEnum::DiffusionBlock(db) = layer
-                    && let crate::domain::layers::components::common::TemporalMixingLayer::Attention(attn) =
-                        &mut db.temporal_mixing.temporal_mixing
-                {
-                    attn.adapt_degree(&metrics);
-                }
-                if let LayerEnum::LRM(lrm) = layer {
-                    lrm.attention_mut().adapt_degree(&metrics);
+                if let Some(temporal) = Self::block_temporal_mixing_mut(layer) {
+                    temporal.adapt_attention_degree(&metrics);
                 }
             }
             // Validation split (last 10% examples)
@@ -5075,7 +3707,7 @@ impl LLM {
             let mut val_mse_total = 0.0f32;
             let mut val_count = 0usize;
 
-            for batch_strs in val_data.chunks(effective_batch_size) {
+            for batch_strs in val_data.chunks(micro_batch_size) {
                 let batch_tokenized: Vec<Vec<usize>> = batch_strs
                     .par_iter()
                     .map(|input| self.tokenize(input))
@@ -5091,89 +3723,85 @@ impl LLM {
                     }
                     let response_span = batch_response_spans[i];
                     let input_ids = &training_row[..training_row.len() - 1];
-                let target_ids = &training_row[1..];
-                let mut ids_arr = Array2::<f32>::zeros((1, input_ids.len()));
-                for (i, &tid) in input_ids.iter().enumerate() {
-                    ids_arr[[0, i]] = tid as f32;
-                }
-                let emb_idx = embeddings_idx.unwrap();
-                let x0 = match &mut self.network[emb_idx] {
-                    LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_arr),
-                    _ => continue,
-                };
-                let first_block = diffusion_blocks_idx[0];
-                let is_discrete = if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                    b.is_discrete_masked()
-                } else {
-                    false
-                };
-                let mask_id_opt = if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                    b.mask_token_id()
-                } else {
-                    None
-                };
-                let mut noise = Array2::<f32>::zeros(x0.raw_dim());
-                if let Some(slice) = noise.as_slice_mut() {
-                    slice.par_iter_mut().for_each(|v| {
-                        *v = normal.sample(&mut get_rng()) as f32;
-                    });
-                } else {
-                    for v in noise.iter_mut() {
-                        *v = normal.sample(&mut rng) as f32;
+                    let target_ids = &training_row[1..];
+                    let mut ids_arr = Array2::<f32>::zeros((1, input_ids.len()));
+                    for (i, &tid) in input_ids.iter().enumerate() {
+                        ids_arr[[0, i]] = tid as f32;
                     }
-                }
-                let t = rng.random_range(0..num_timesteps.max(1));
-                let (x_t, sqrt_a, sqrt_one_minus_a, discrete_used) = {
-                    if is_discrete {
-                        let mask_token_id = mask_id_opt
-                            .or_else(|| self.vocab.encode("<mask>"))
-                            .unwrap_or(self.vocab.encode_or_unknown("<unk>").unwrap_or(0));
-                        let ids_masked =
-                            if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                                if let Some(ds) = &b.discrete_scheduler {
-                                    if let Some((span_start, span_end)) = response_span {
-                                        ds.mask_sequence_span_at_t(
-                                            &ids_arr,
-                                            mask_token_id,
-                                            t,
-                                            span_start,
-                                            span_end,
-                                        )
+                    let emb_idx = embeddings_idx.unwrap();
+                    let x0 = match &mut self.network[emb_idx] {
+                        LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_arr),
+                        _ => continue,
+                    };
+                    let first_block = diffusion_blocks_idx[0];
+                    let is_discrete =
+                        if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                            b.is_discrete_masked()
+                        } else {
+                            false
+                        };
+                    let mask_id_opt =
+                        if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                            b.mask_token_id()
+                        } else {
+                            None
+                        };
+                    let mut noise = Array2::<f32>::zeros(x0.raw_dim());
+                    if let Some(slice) = noise.as_slice_mut() {
+                        slice.par_iter_mut().for_each(|v| {
+                            *v = normal.sample(&mut get_rng()) as f32;
+                        });
+                    } else {
+                        for v in noise.iter_mut() {
+                            *v = normal.sample(&mut rng) as f32;
+                        }
+                    }
+                    let t = rng.random_range(0..num_timesteps.max(1));
+                    let (x_t, sqrt_a, sqrt_one_minus_a, discrete_used) = {
+                        if is_discrete {
+                            let mask_token_id = mask_id_opt
+                                .or_else(|| self.vocab.encode("<mask>"))
+                                .unwrap_or(self.vocab.encode_or_unknown("<unk>").unwrap_or(0));
+                            let ids_masked =
+                                if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                                    if let Some(ds) = &b.discrete_scheduler {
+                                        if let Some((span_start, span_end)) = response_span {
+                                            ds.mask_sequence_span_at_t(
+                                                &ids_arr,
+                                                mask_token_id,
+                                                t,
+                                                span_start,
+                                                span_end,
+                                            )
+                                        } else {
+                                            ds.mask_sequence_at_t(&ids_arr, mask_token_id, t)
+                                        }
                                     } else {
-                                        ds.mask_sequence_at_t(&ids_arr, mask_token_id, t)
+                                        ids_arr.clone()
                                     }
                                 } else {
                                     ids_arr.clone()
-                                }
-                            } else {
-                                ids_arr.clone()
+                                };
+                            let x_t_local = match &mut self.network[embeddings_idx.unwrap()] {
+                                LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_masked),
+                                _ => x0.clone(),
                             };
-                        let x_t_local = match &mut self.network[embeddings_idx.unwrap()] {
-                            LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_masked),
-                            _ => x0.clone(),
-                        };
-                        (x_t_local, 1.0, 0.0, true)
-                    } else if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
-                        let x_t_local = b.noise_scheduler.q_sample(&x0, t, &noise);
-                        let sa = b.noise_scheduler.sqrt_alpha_cumprod(t);
-                        let soa = b.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
-                        (x_t_local, sa, soa, false)
-                    } else {
-                        continue;
-                    }
-                };
-                let mut pred = x_t.clone();
-                for &idx in &diffusion_blocks_idx {
-                    if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                        b.set_causal_attention(true);
-                        b.set_timestep(t);
-                        pred = b.forward_with_timestep(&pred, t);
-                    }
-                }
-                let x0_hat = if discrete_used {
-                    pred.clone()
-                } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                    match b0.prediction_target() {
+                            (x_t_local, 1.0, 0.0, true)
+                        } else if let LayerEnum::DiffusionBlock(b) = &self.network[first_block] {
+                            let x_t_local = b.noise_scheduler.q_sample(&x0, t, &noise);
+                            let sa = b.noise_scheduler.sqrt_alpha_cumprod(t);
+                            let soa = b.noise_scheduler.sqrt_one_minus_alpha_cumprod(t);
+                            (x_t_local, sa, soa, false)
+                        } else {
+                            continue;
+                        }
+                    };
+                    let pred =
+                        self.forward_diffusion_stack_plain(&diffusion_blocks_idx, &x_t, t, true);
+                    let x0_hat = if discrete_used {
+                        pred.clone()
+                    } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
+                        match b0.prediction_target() {
                         crate::domain::layers::diffusion::DiffusionPredictionTarget::Epsilon => {
                             let sa = sqrt_a.max(1e-6);
                             let pred_scaled = &pred * sqrt_one_minus_a;
@@ -5185,62 +3813,63 @@ impl LLM {
                         crate::domain::layers::diffusion::DiffusionPredictionTarget::Sample => pred.clone(),
                         crate::domain::layers::diffusion::DiffusionPredictionTarget::EdmX0 => pred.clone(),
                     }
-                } else {
-                    pred.clone()
-                };
-                let mut hidden = x0_hat.clone();
-                if let Some(nidx) = norm_idx
-                    && let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx]
-                {
-                    hidden = norm.forward(&hidden);
-                }
-                let logits = if let Some(opidx) = out_proj_idx {
-                    if let LayerEnum::OutputProjection(op) = &mut self.network[opidx] {
-                        op.forward(&hidden)
+                    } else {
+                        pred.clone()
+                    };
+                    let mut hidden = x0_hat.clone();
+                    if let Some(nidx) = norm_idx
+                        && let LayerEnum::DynamicTanhNorm(norm) = &mut self.network[nidx]
+                    {
+                        hidden = norm.forward(&hidden);
+                    }
+                    let logits = if let Some(opidx) = out_proj_idx {
+                        if let LayerEnum::OutputProjection(op) = &mut self.network[opidx] {
+                            op.forward(&hidden)
+                        } else {
+                            continue;
+                        }
                     } else {
                         continue;
-                    }
-                } else {
-                    continue;
-                };
-                let probs = crate::domain::soft::Softmax::new().forward_immutable(&logits.view());
-                let target_len = target_ids.len();
-                let probs_slice = probs.slice(s![0..target_len, ..]);
-                let (denoise_target, w_mse) = if discrete_used {
-                    (None, 1.0f32)
-                } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
-                    let mut w = b0.min_snr_weight(t, current_gamma);
-                    if b0.prediction_target()
-                        == crate::domain::layers::diffusion::DiffusionPredictionTarget::EdmX0
-                    {
-                        w *= b0.edm_loss_weight(t);
-                    }
-                    (Some(b0.training_target(&x0, &noise, t)), w)
-                } else {
-                    (None, 1.0f32)
-                };
-                let ce = crate::domain::loss::symmetric_cross_entropy(
-                    &probs_slice.to_owned(),
-                    target_ids,
-                    current_ce_weight,
-                    current_ce_weight,
-                    1e-4,
-                );
-                let mse = if let Some(target) = denoise_target.as_ref() {
-                    crate::domain::loss::epsilon_mse(&pred, target) * w_mse
-                } else {
-                    0.0
-                };
-                let lambda_ce = if discrete_used {
-                    1.0f32
-                } else {
-                    lambda_ce_schedule(t)
-                };
-                val_loss_total += lambda_ce * ce + (1.0 - lambda_ce) * mse;
-                val_sce_total += ce;
-                val_mse_total += mse;
-                val_count += 1;
-            }
+                    };
+                    let probs =
+                        crate::domain::soft::Softmax::new().forward_immutable(&logits.view());
+                    let target_len = target_ids.len();
+                    let probs_slice = probs.slice(s![0..target_len, ..]);
+                    let (denoise_target, w_mse) = if discrete_used {
+                        (None, 1.0f32)
+                    } else if let LayerEnum::DiffusionBlock(b0) = &self.network[first_block] {
+                        let mut w = b0.min_snr_weight(t, current_gamma);
+                        if b0.prediction_target()
+                            == crate::domain::layers::diffusion::DiffusionPredictionTarget::EdmX0
+                        {
+                            w *= b0.edm_loss_weight(t);
+                        }
+                        (Some(b0.training_target(&x0, &noise, t)), w)
+                    } else {
+                        (None, 1.0f32)
+                    };
+                    let ce = crate::domain::loss::symmetric_cross_entropy(
+                        &probs_slice.to_owned(),
+                        target_ids,
+                        current_ce_weight,
+                        current_ce_weight,
+                        1e-4,
+                    );
+                    let mse = if let Some(target) = denoise_target.as_ref() {
+                        crate::domain::loss::epsilon_mse(&pred, target) * w_mse
+                    } else {
+                        0.0
+                    };
+                    let lambda_ce = if discrete_used {
+                        1.0f32
+                    } else {
+                        lambda_ce_schedule(t)
+                    };
+                    val_loss_total += lambda_ce * ce + (1.0 - lambda_ce) * mse;
+                    val_sce_total += ce;
+                    val_mse_total += mse;
+                    val_count += 1;
+                }
             }
             let val_loss = if val_count > 0 {
                 val_loss_total / val_count as f32
@@ -5303,7 +3932,9 @@ impl LLM {
                 for &idx in &diffusion_blocks_idx {
                     if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
                         b.config.ddim_steps_policy =
-                            crate::domain::layers::diffusion::DdimStepsPolicy::Fixed(learned_ddim_steps);
+                            crate::domain::layers::diffusion::DdimStepsPolicy::Fixed(
+                                learned_ddim_steps,
+                            );
                     }
                 }
                 info!(
@@ -5499,11 +4130,6 @@ impl LLM {
                     steps,
                     total_timesteps,
                 );
-                for &idx in &diffusion_blocks_idx {
-                    if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                        b.set_timestep(t_idx);
-                    }
-                }
                 let x_t = match &mut self.network[0] {
                     LayerEnum::TokenEmbeddings(layer) => layer.forward(&ids_arr),
                     _ => current_sample.clone(),
@@ -5512,13 +4138,12 @@ impl LLM {
                 let mut similarity_ctx: Option<Array2<f32>> = None;
                 for &idx in &diffusion_blocks_idx {
                     if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                        b.set_incoming_similarity_context(similarity_ctx.as_ref());
-                        hidden = b.forward_with_timestep(&hidden, t_idx);
-                        if let Some(existing) = similarity_ctx.as_mut() {
-                            existing.assign(b.activation_similarity_matrix());
-                        } else {
-                            similarity_ctx = Some(b.activation_similarity_matrix().clone());
-                        }
+                        hidden = Self::forward_diffusion_with_similarity_context(
+                            b,
+                            &hidden,
+                            t_idx,
+                            &mut similarity_ctx,
+                        );
                     }
                 }
                 for layer in &mut self.network {
@@ -5791,14 +4416,12 @@ impl LLM {
             let mut similarity_ctx: Option<Array2<f32>> = None;
             for &idx in &diffusion_blocks_idx {
                 if let LayerEnum::DiffusionBlock(b) = &mut self.network[idx] {
-                    b.set_timestep(0);
-                    b.set_incoming_similarity_context(similarity_ctx.as_ref());
-                    hidden = b.forward_with_timestep(&hidden, 0);
-                    if let Some(existing) = similarity_ctx.as_mut() {
-                        existing.assign(b.activation_similarity_matrix());
-                    } else {
-                        similarity_ctx = Some(b.activation_similarity_matrix().clone());
-                    }
+                    hidden = Self::forward_diffusion_with_similarity_context(
+                        b,
+                        &hidden,
+                        0,
+                        &mut similarity_ctx,
+                    );
                 }
             }
             if let Some(nidx) = norm_idx
@@ -5859,7 +4482,10 @@ impl LLM {
     }
 
     /// Enable continual learning with the given configuration
-    pub fn enable_continual_learning(&mut self, config: crate::application::training::ContinualLearningConfig) {
+    pub fn enable_continual_learning(
+        &mut self,
+        config: crate::application::training::ContinualLearningConfig,
+    ) {
         use crate::application::training::ContinualLearningManager;
         self.continual_learning = Some(ContinualLearningManager::new(config));
         tracing::info!("Continual learning enabled");
@@ -5880,7 +4506,7 @@ impl LLM {
         }
         // Tokenize first to avoid borrowing issues
         let token_ids = self.tokenize(&format!("{} {}", user_input, model_output));
-        
+
         // Now borrow continual_learning mutably
         if let Some(ref mut manager) = self.continual_learning {
             manager.record_interaction(user_input, model_output, token_ids, None)?;
@@ -5889,7 +4515,10 @@ impl LLM {
     }
 
     /// Record user feedback for the last interaction
-    pub fn record_feedback(&mut self, feedback: crate::application::training::UserFeedback) -> Result<()> {
+    pub fn record_feedback(
+        &mut self,
+        feedback: crate::application::training::UserFeedback,
+    ) -> Result<()> {
         if let Some(ref mut manager) = self.continual_learning {
             manager.record_feedback(feedback)?;
         }

@@ -1,0 +1,7 @@
+[alias]
+build-main = "build --profile release-fast --bin main"
+build-main-release = "build --release --bin main"
+check-main = "check --bin main"
+run-main = "run --profile release-fast --bin main"
+run-main-release = "run --release --bin main"
+run-infer = "run --profile release-fast --bin infer"

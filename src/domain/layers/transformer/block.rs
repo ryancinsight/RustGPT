@@ -1,8 +1,5 @@
 #![allow(dead_code)]
-use std::{
-    borrow::Cow,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -11,21 +8,19 @@ use crate::{
     common::errors::Result,
     domain::attention::poly_attention::PolyAttention,
     domain::{
-        layers::{
-            components::{
-                adaptive_residuals::AdaptiveResiduals,
-                attention_context::SharedAttentionContext,
-                common::{
-                    CommonLayerConfig, CommonLayers, FeedForwardVariant, TemporalMixingLayer,
-                    TitanMemoryWorkspace,
-                },
-                feedforward::SharedFeedforward,
-                gradient_router::GradientRouter,
-                temporal_processing::SharedTemporalProcessing,
+        compute_backend::{ComputeBackend, resolve_compute_backend_strict_auto_gpu},
+        layers::components::{
+            adaptive_residuals::AdaptiveResiduals,
+            attention_context::SharedAttentionContext,
+            block_core::build_shared_block_core,
+            common::{
+                CommonLayerConfig, FeedForwardVariant, TemporalMixingLayer, TitanMemoryWorkspace,
             },
-            transformer::components::eprop_adaptor::{
-                EPropAdaptor, EPropAdaptorConfig, EPropAdaptorStreamingWorkspace,
-            },
+            feedforward::SharedFeedforward,
+            gradient_router::GradientRouter,
+            temporal_processing::SharedTemporalProcessing,
+            unified_layer_workspace::UnifiedLayerWorkspace,
+            workspace_managed::WorkspaceManaged,
         },
         mixtures::{HeadSelectionStrategy, moe::ExpertRouterConfig},
         models::config::{
@@ -49,10 +44,6 @@ pub struct TransformerBlockStreamingWorkspace {
     pub ffn_out: Array1<f32>,
     pub residual: Array1<f32>,
     pub input_used: Array1<f32>,
-
-    // E-Prop buffers
-    pub eprop_out: Array1<f32>,
-    pub eprop_workspace: EPropAdaptorStreamingWorkspace,
 }
 
 /// Cached transformer block intermediates to improve readability
@@ -116,31 +107,26 @@ pub struct TransformerBlock {
     #[serde(skip_serializing, skip_deserializing)]
     adaptive_residuals: Option<AdaptiveResiduals>,
 
-    /// E-Prop trace-based adaptor (if enabled)
-    #[serde(skip_serializing, skip_deserializing)]
-    eprop_adaptor: Option<EPropAdaptor>,
-
     #[serde(skip_serializing, skip_deserializing)]
     titan_memory_workspace: TitanMemoryWorkspace,
 
     #[serde(skip_serializing, skip_deserializing)]
     streaming_workspace: Option<TransformerBlockStreamingWorkspace>,
 
-    /// Pre-allocated workspace for batch forward passes to reduce allocations.
-    /// Uses generational buffer pattern for efficient buffer reuse.
+    /// Unified workspace for batch forward passes (consolidates buffer management).
+    /// Replaces separate workspace pools with a single, coherent design.
     #[serde(skip_serializing, skip_deserializing)]
-    batch_workspace: Option<TransformerWorkspace>,
+    unified_workspace: UnifiedLayerWorkspace,
+
+    #[serde(skip_serializing, skip_deserializing, default)]
+    compute_backend: ComputeBackend,
 }
 
 impl Clone for TransformerBlock {
     fn clone(&self) -> Self {
         Self {
             pre_attention_norm: self.pre_attention_norm.clone(),
-            temporal_mixing: SharedTemporalProcessing::new(
-                self.temporal_mixing.temporal_mixing.clone(),
-                self.temporal_mixing.window_size,
-                self.temporal_mixing.use_adaptive_window,
-            ),
+            temporal_mixing: self.temporal_mixing.clone(),
             pre_ffn_norm: self.pre_ffn_norm.clone(),
             feedforward: self.feedforward.clone(),
             config: self.config.clone(),
@@ -150,10 +136,10 @@ impl Clone for TransformerBlock {
             context: self.context.clone(),
             opt_similarity_context_strength: self.opt_similarity_context_strength.clone(),
             adaptive_residuals: self.adaptive_residuals.clone(),
-            eprop_adaptor: self.eprop_adaptor.clone(),
             titan_memory_workspace: self.titan_memory_workspace.clone(),
             streaming_workspace: self.streaming_workspace.clone(),
-            batch_workspace: None, // Start fresh for cloned block
+            unified_workspace: UnifiedLayerWorkspace::new(), // Start fresh for cloned block
+            compute_backend: self.compute_backend,
         }
     }
 }
@@ -206,9 +192,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
 
                 #[serde(default = "default_similarity_context_strength")]
                 similarity_context_strength: Array2<f32>,
-
-                #[serde(default)]
-                eprop_adaptor: Option<EPropAdaptor>,
             },
             // V3: temporal mixing serialized as SharedTemporalProcessing wrapper.
             V3 {
@@ -220,9 +203,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
 
                 #[serde(default = "default_similarity_context_strength")]
                 similarity_context_strength: Array2<f32>,
-
-                #[serde(default)]
-                eprop_adaptor: Option<EPropAdaptor>,
             },
         }
 
@@ -233,7 +213,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             feedforward,
             config,
             similarity_context_strength_raw,
-            eprop_adaptor,
         ) = match TransformerBlockSerdeCompat::deserialize(deserializer)? {
             TransformerBlockSerdeCompat::V1 {
                 pre_attention_norm,
@@ -253,7 +232,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward.into_shared(),
                 config,
                 similarity_context_strength,
-                None,
             ),
             TransformerBlockSerdeCompat::V2 {
                 pre_attention_norm,
@@ -262,7 +240,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward,
                 config,
                 similarity_context_strength,
-                eprop_adaptor,
             } => (
                 pre_attention_norm,
                 SharedTemporalProcessing::new(
@@ -274,7 +251,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward.into_shared(),
                 config,
                 similarity_context_strength,
-                eprop_adaptor,
             ),
             TransformerBlockSerdeCompat::V3 {
                 pre_attention_norm,
@@ -283,7 +259,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward,
                 config,
                 similarity_context_strength,
-                eprop_adaptor,
             } => (
                 pre_attention_norm,
                 temporal_mixing,
@@ -291,7 +266,6 @@ impl<'de> Deserialize<'de> for TransformerBlock {
                 feedforward.into_shared(),
                 config,
                 similarity_context_strength,
-                eprop_adaptor,
             ),
         };
 
@@ -326,10 +300,10 @@ impl<'de> Deserialize<'de> for TransformerBlock {
             } else {
                 None
             },
-            eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
             streaming_workspace: None,
-            batch_workspace: None, // Allocated on first use with correct dimensions
+            unified_workspace: UnifiedLayerWorkspace::new(),
+            compute_backend: ComputeBackend::Cpu,
         })
     }
 }
@@ -342,7 +316,6 @@ struct ParamPartitions {
     pre_attn_norm: usize,
     context: usize,
     adaptive_residuals: usize,
-    eprop_adaptor: usize,
 }
 
 /// Configuration for a transformer block
@@ -399,110 +372,6 @@ pub struct TransformerBlockConfig {
 
     #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
-
-    /// E-Prop trace-based adaptor configuration
-    #[serde(default)]
-    pub eprop_adaptor: Option<EPropAdaptorConfig>,
-}
-
-/// Pre-allocated workspace for transformer block operations.
-/// Enables buffer reuse across forward/backward passes to reduce allocations.
-///
-/// # Design
-/// Uses a generational buffer pattern where buffers are resized only when
-/// dimensions change, avoiding repeated allocations during training.
-#[derive(Debug, Clone)]
-pub struct TransformerWorkspace {
-    /// Expected sequence length for capacity planning
-    seq_len: usize,
-    /// Expected embedding dimension for capacity planning
-    embed_dim: usize,
-    /// Reusable scratch buffer for normalization outputs
-    norm_scratch: Array2<f32>,
-    /// Reusable scratch buffer for temporal mixing outputs
-    mix_scratch: Array2<f32>,
-    /// Reusable scratch buffer for residual connections
-    residual_scratch: Array2<f32>,
-    /// Reusable scratch buffer for FFN output
-    ffn_scratch: Array2<f32>,
-}
-
-impl Default for TransformerWorkspace {
-    fn default() -> Self {
-        Self {
-            seq_len: 0,
-            embed_dim: 0,
-            norm_scratch: Array2::zeros((0, 0)),
-            mix_scratch: Array2::zeros((0, 0)),
-            residual_scratch: Array2::zeros((0, 0)),
-            ffn_scratch: Array2::zeros((0, 0)),
-        }
-    }
-}
-
-impl TransformerWorkspace {
-    /// Create a new workspace with pre-allocated buffers for given dimensions.
-    pub fn new(seq_len: usize, embed_dim: usize) -> Self {
-        Self {
-            seq_len,
-            embed_dim,
-            norm_scratch: Array2::zeros((seq_len, embed_dim)),
-            mix_scratch: Array2::zeros((seq_len, embed_dim)),
-            residual_scratch: Array2::zeros((seq_len, embed_dim)),
-            ffn_scratch: Array2::zeros((seq_len, embed_dim)),
-        }
-    }
-
-    /// Ensure workspace has capacity for given dimensions, reallocating only when necessary.
-    /// Uses zero-copy resize when possible (when dimensions match, just zeros existing buffer).
-    #[inline]
-    pub fn ensure_capacity(&mut self, seq_len: usize, embed_dim: usize) {
-        if self.seq_len != seq_len || self.embed_dim != embed_dim {
-            self.seq_len = seq_len;
-            self.embed_dim = embed_dim;
-            // Reallocate only when dimensions change
-            self.norm_scratch = Array2::zeros((seq_len, embed_dim));
-            self.mix_scratch = Array2::zeros((seq_len, embed_dim));
-            self.residual_scratch = Array2::zeros((seq_len, embed_dim));
-            self.ffn_scratch = Array2::zeros((seq_len, embed_dim));
-        } else {
-            // Zero existing buffers for reuse (no allocation)
-            self.norm_scratch.fill(0.0);
-            self.mix_scratch.fill(0.0);
-            self.residual_scratch.fill(0.0);
-            self.ffn_scratch.fill(0.0);
-        }
-    }
-
-    /// Get mutable reference to normalization scratch buffer.
-    /// # Panics
-    /// Panics if ensure_capacity has not been called with valid dimensions.
-    #[inline]
-    #[must_use]
-    pub fn norm_buffer(&mut self) -> &mut Array2<f32> {
-        &mut self.norm_scratch
-    }
-
-    /// Get mutable reference to temporal mixing scratch buffer.
-    #[inline]
-    #[must_use]
-    pub fn mix_buffer(&mut self) -> &mut Array2<f32> {
-        &mut self.mix_scratch
-    }
-
-    /// Get mutable reference to residual scratch buffer.
-    #[inline]
-    #[must_use]
-    pub fn residual_buffer(&mut self) -> &mut Array2<f32> {
-        &mut self.residual_scratch
-    }
-
-    /// Get mutable reference to FFN scratch buffer.
-    #[inline]
-    #[must_use]
-    pub fn ffn_buffer(&mut self) -> &mut Array2<f32> {
-        &mut self.ffn_scratch
-    }
 }
 
 impl From<&TransformerBlockConfig> for CommonLayerConfig {
@@ -538,7 +407,11 @@ impl TransformerBlock {
     pub fn new(config: TransformerBlockConfig) -> Self {
         let embed_dim = config.embed_dim;
         let common_config = CommonLayerConfig::from(&config);
-        let layers = CommonLayers::new(&common_config);
+        let core_layers = build_shared_block_core(
+            &common_config,
+            config.window_size,
+            config.use_adaptive_window,
+        );
 
         let use_advanced_adaptive_residuals = config.use_advanced_adaptive_residuals;
 
@@ -546,20 +419,11 @@ impl TransformerBlock {
         let context = SharedAttentionContext::new();
         let opt_similarity_context_strength = Adam::new((1, 1));
 
-        let eprop_adaptor = config
-            .eprop_adaptor
-            .as_ref()
-            .map(|conf| EPropAdaptor::new(conf.clone()));
-
         Self {
-            pre_attention_norm: layers.pre_attention_norm,
-            temporal_mixing: SharedTemporalProcessing::new(
-                layers.temporal_mixing,
-                config.window_size,
-                config.use_adaptive_window,
-            ),
-            pre_ffn_norm: layers.pre_ffn_norm,
-            feedforward: SharedFeedforward::new(layers.feedforward),
+            pre_attention_norm: core_layers.pre_attention_norm,
+            temporal_mixing: core_layers.temporal_mixing,
+            pre_ffn_norm: core_layers.pre_ffn_norm,
+            feedforward: core_layers.feedforward,
             config,
             cached_intermediates: RwLock::new(None),
             param_partitions: RwLock::new(None),
@@ -572,10 +436,10 @@ impl TransformerBlock {
             } else {
                 None
             },
-            eprop_adaptor,
             titan_memory_workspace: TitanMemoryWorkspace::default(),
             streaming_workspace: None,
-            batch_workspace: None, // Allocated on first use with correct dimensions
+            unified_workspace: UnifiedLayerWorkspace::new(),
+            compute_backend: ComputeBackend::Cpu,
         }
     }
 
@@ -583,7 +447,7 @@ impl TransformerBlock {
         self.config.max_pos.saturating_add(1)
     }
 
-    pub fn activation_similarity_matrix(&self) -> &Array2<f32> {
+    pub fn activation_similarity_matrix(&self) -> Option<&Array2<f32>> {
         self.context.get_outgoing_context()
     }
 
@@ -636,20 +500,55 @@ impl TransformerBlock {
     }
 
     pub fn set_incoming_similarity_context(&mut self, context: Option<&Array2<f32>>) {
-        if let Some(ctx) = context {
-            if ctx.nrows() != self.config.embed_dim || ctx.ncols() != self.config.embed_dim {
-                // Shape mismatch: ignore rather than panic.
-                self.context.clear_context();
-                return;
-            }
-        }
-        self.context.set_incoming_context(context);
+        self.context
+            .set_incoming_context_checked_reuse(context, self.config.embed_dim);
     }
 
     pub fn set_training_mode(&mut self, is_training: bool) {
         if let Some(moe) = self.feedforward.as_moe_mut() {
             moe.set_training_mode(is_training);
         }
+    }
+
+    /// Set runtime compute backend for this block and its shared components.
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        self.set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set TransformerBlock backend '{}': {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
+    }
+
+    /// Set runtime compute backend with strict validation.
+    ///
+    /// When a GPU backend is selected this eagerly validates shared component
+    /// GPU readiness, surfacing unsupported GPU variants immediately.
+    pub fn set_compute_backend_checked(&mut self, compute_backend: ComputeBackend) -> Result<()> {
+        self.compute_backend = compute_backend;
+        self.unified_workspace.set_compute_backend(compute_backend);
+        self.temporal_mixing
+            .set_compute_backend_checked(compute_backend)?;
+        self.feedforward
+            .set_compute_backend_checked(compute_backend)?;
+        Ok(())
+    }
+
+    /// Resolve and apply strict auto-GPU backend preference.
+    ///
+    /// Uses automatic GPU detection with strict no-fallback behavior when a GPU
+    /// is detected but not usable for the selected layer variants.
+    pub fn enable_gpu_auto_detect(&mut self) -> Result<()> {
+        let backend = resolve_compute_backend_strict_auto_gpu()?;
+        self.set_compute_backend_checked(backend)
+    }
+
+    /// Get runtime compute backend for this block.
+    #[inline]
+    pub fn compute_backend(&self) -> ComputeBackend {
+        self.compute_backend
     }
 
     #[inline]
@@ -671,6 +570,7 @@ impl TransformerBlock {
         norm2_overrides: Option<(Option<f64>, Option<f64>, Option<f64>)>,
         moh_overrides: Option<Vec<f64>>,
     ) {
+        // Streaming step mode uses CPU path; sub-components handle their own dispatch
         // Initialize workspace if needed
         if self.streaming_workspace.is_none() {
             let dim = self.config.embed_dim;
@@ -681,11 +581,6 @@ impl TransformerBlock {
                 ffn_out: Array1::zeros(dim),
                 residual: Array1::zeros(dim),
                 input_used: Array1::zeros(dim),
-                eprop_out: Array1::zeros(dim),
-                eprop_workspace: crate::domain::layers::transformer::components::eprop_adaptor::EPropAdaptorStreamingWorkspace {
-                    neuron_workspace: crate::domain::eprop::neuron::NeuronWorkspace::new(dim),
-                    eps_f_workspace: Array1::zeros(dim),
-                },
             });
         }
         let mut workspace = self.streaming_workspace.take().unwrap();
@@ -705,45 +600,20 @@ impl TransformerBlock {
         let norm1_out_view = workspace.norm1_out.view();
 
         // 2. Temporal Mixing
-        // Apply overrides if available
-        if let Some(overrides) = moh_overrides {
-            match &mut self.temporal_mixing.temporal_mixing {
-                TemporalMixingLayer::RgLruMoH(rglru) => {
-                    rglru.set_verification_overrides(Some(overrides))
-                }
-                TemporalMixingLayer::MambaMoH(mamba) => {
-                    mamba.set_verification_overrides(Some(overrides))
-                }
-                TemporalMixingLayer::Mamba2MoH(mamba) => {
-                    mamba.set_verification_overrides(Some(overrides))
-                }
-                _ => {}
-            }
-        }
+        // Apply/clear MoH verification overrides through shared temporal accessor.
+        self.temporal_mixing
+            .set_moh_verification_overrides(moh_overrides);
 
         self.temporal_mixing
             .forward_step_into(&norm1_out_view, &mut workspace.mix_out);
 
-        // Titan Memory Integration
-        if !matches!(
-            self.temporal_mixing.temporal_mixing,
-            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
-        ) {
-            let _mix_out_processed = workspace.mix_out.clone(); // Temporary clone for logic flow, optimized below
-            // Actually, we can do in-place update if Titan allows.
-            // Titan: apply_step_into(input, out, workspace)
-            // It adds to `out`.
-            // We want `mix_out = mix_out + titan(norm1_out)`?
-            // Original code:
-            // apply_into_out_with_workspace(&mut mix_out, &norm1_out, ...)
-            // Yes, it accumulates into mix_out.
-
-            self.config.titan_memory.apply_step_into(
-                &norm1_out_view,
-                &mut workspace.mix_out,
-                &mut self.titan_memory_workspace,
-            );
-        }
+        // Titan Memory Integration for SSM/recurrent temporal mixers.
+        self.temporal_mixing.fuse_titan_step_into(
+            &norm1_out_view,
+            &mut workspace.mix_out,
+            &self.config.titan_memory,
+            &mut self.titan_memory_workspace,
+        );
         let mix_out_view = workspace.mix_out.view();
 
         // Update activation similarity matrix
@@ -757,9 +627,9 @@ impl TransformerBlock {
             .update_outgoing_context(&input_used_2d, &mix_out_2d, self.config.embed_dim);
 
         // Head activity ratio logic...
-        let (head_activity_ratio, head_activity_vec) =
-            self.temporal_mixing.get_head_activity_metrics();
-        let head_activity_ratio = head_activity_ratio.unwrap_or(1.0);
+        let head_activity = self.temporal_mixing.head_activity_summary();
+        let head_activity_ratio = head_activity.ratio;
+        let head_activity_vec = head_activity.head_activity;
 
         // Adaptive Residuals
         let alpha = 1.0;
@@ -789,9 +659,8 @@ impl TransformerBlock {
         let norm2_out_view = workspace.norm2_out.view();
 
         // 4. Feedforward
-        let token_head_activity = self
-            .temporal_mixing
-            .get_token_head_activity_vec()
+        let token_head_activity = head_activity
+            .token_head_activity
             .and_then(|v| v.first().copied());
 
         self.feedforward.forward_step_into(
@@ -812,16 +681,6 @@ impl TransformerBlock {
         } else {
             output.assign(&residual_view);
             output.zip_mut_with(&workspace.ffn_out, |o, &f| *o += f);
-        }
-
-        // E-Prop Adaptor
-        if let Some(ref mut adaptor) = self.eprop_adaptor {
-            // TODO: Make EProp zero-alloc. For now, we adapt.
-            let out_2d = output.view().insert_axis(ndarray::Axis(0)).to_owned();
-            if let Ok(adaptation) = adaptor.forward(&out_2d) {
-                let adapt_1d = adaptation.index_axis(ndarray::Axis(0), 0);
-                *output += &adapt_1d;
-            }
         }
 
         self.streaming_workspace = Some(workspace);
@@ -885,22 +744,19 @@ impl TransformerBlock {
             entropy_ema_alpha: config.entropy_ema_alpha,
             use_advanced_adaptive_residuals: true, // Enable by default
             titan_memory: config.titan_memory.clone(),
-            eprop_adaptor: if config.eprop_enabled {
-                Some(EPropAdaptorConfig {
-                    dim: config.embedding_dim,
-                    neuron_config: config
-                        .eprop_neuron_config
-                        .clone()
-                        .unwrap_or_else(crate::domain::eprop::config::NeuronConfig::lif),
-                    adaptation_rate: 0.01,
-                    use_multi_scale: true,
-                })
-            } else {
-                None
-            },
         };
-
-        Self::new(block_config)
+        let mut block = Self::new(block_config);
+        let backend = config.resolve_compute_backend_or_panic();
+        block
+            .set_compute_backend_checked(backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set TransformerBlock backend '{}' from model config: {}",
+                    backend.as_str(),
+                    err
+                )
+            });
+        block
     }
 
     /// Get the cached intermediates
@@ -925,10 +781,6 @@ impl TransformerBlock {
             count += residuals.parameter_count();
         }
 
-        if let Some(ref adaptor) = self.eprop_adaptor {
-            count += adaptor.parameter_count();
-        }
-
         count
     }
 
@@ -944,10 +796,6 @@ impl TransformerBlock {
             sum_sq += residuals.weight_norm().powi(2);
         }
 
-        if let Some(ref adaptor) = self.eprop_adaptor {
-            sum_sq += adaptor.weight_norm().powi(2);
-        }
-
         sum_sq.sqrt()
     }
 }
@@ -960,7 +808,6 @@ impl ParamPartitions {
             + self.pre_attn_norm
             + self.context
             + self.adaptive_residuals
-            + self.eprop_adaptor
     }
 }
 
@@ -970,8 +817,19 @@ impl Layer for TransformerBlock {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        // GPU execution is handled by sub-components (temporal_mixing, feedforward)
+        // which have their own GPU forward paths. No need to block here.
         // Reset Titan Memory workspace for batch processing to ensure clean state
         self.titan_memory_workspace.reset();
+
+        let seq_len = input.nrows();
+        let input_width = input.ncols();
+        let embed_dim = self.config.embed_dim;
+
+        // For execution hot-paths we require exact-shape buffers so in-place kernels can write
+        // directly into workspace outputs.
+        let mut workspace = std::mem::take(&mut self.unified_workspace);
+        workspace.ensure_exact_execution_capacity(seq_len, input_width, embed_dim);
 
         let mut reuse_ffn_out_cache = None;
         if let Ok(mut guard) = self.cached_intermediates.write()
@@ -987,14 +845,33 @@ impl Layer for TransformerBlock {
         // This makes the similarity matrix an explicit signal used by the next layer.
         let input_original_arc = Arc::new(input.clone());
 
-        let input_used_arc: Arc<Array2<f32>> =
-            match self.context.apply_context(input_original_arc.as_ref()) {
-                Cow::Borrowed(_) => input_original_arc.clone(),
-                Cow::Owned(owned) => Arc::new(owned),
-            };
+        let input_used_arc: Arc<Array2<f32>> = if self.context.has_context() {
+            let input_used_buf = workspace
+                .residual1_mut()
+                .expect("residual1 workspace buffer must be allocated");
+            let applied = self
+                .context
+                .apply_context_into(input_original_arc.as_ref(), input_used_buf)
+                .unwrap_or_else(|err| {
+                    panic!("TransformerBlock context apply_context_into failed: {err}")
+                });
+            if applied {
+                Arc::new(input_used_buf.clone())
+            } else {
+                input_original_arc.clone()
+            }
+        } else {
+            input_original_arc.clone()
+        };
 
-        // Pre-attention normalization
-        let norm1_out = self.pre_attention_norm.forward(input_used_arc.as_ref());
+        // Pre-attention normalization into reusable workspace buffer.
+        {
+            let norm1_out_buf = workspace
+                .norm1_out_mut()
+                .expect("norm1_out workspace buffer must be allocated");
+            self.pre_attention_norm
+                .normalize_into(input_used_arc.as_ref(), norm1_out_buf);
+        }
 
         // Temporal mixing with residual connection
         let seq_len = input_used_arc.nrows();
@@ -1007,10 +884,7 @@ impl Layer for TransformerBlock {
             let min_w = self.config.min_window_size.max(1);
             let max_w = self.config.max_window_size.max(min_w);
             // Adaptive window is attention-specific; skip when not using attention.
-            if matches!(
-                self.temporal_mixing.temporal_mixing,
-                TemporalMixingLayer::Attention(_)
-            ) {
+            if self.temporal_mixing.is_attention() {
                 match self.config.window_adaptation_strategy {
                     WindowAdaptationStrategy::Fixed => {
                         dynamic_w = base_w.min(seq_len.max(1));
@@ -1040,18 +914,30 @@ impl Layer for TransformerBlock {
         // Push window-size to attention only (no-op for RG-LRU).
         self.temporal_mixing.set_window_size(Some(dynamic_w));
 
-        // Temporal mixing forward
-        let mut mix_out = self.temporal_mixing.forward(&norm1_out);
-        if !matches!(
-            self.temporal_mixing.temporal_mixing,
-            TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
-        ) {
-            self.config.titan_memory.apply_into_out_with_workspace(
-                &mut mix_out,
-                &norm1_out,
-                &mut self.titan_memory_workspace,
-            );
+        // Temporal mixing forward into workspace.
+        {
+            let norm1_out = workspace
+                .norm1_out()
+                .expect("norm1_out workspace buffer must be allocated")
+                .to_owned();
+            let temporal_out_buf = workspace
+                .temporal_out_mut()
+                .expect("temporal_out workspace buffer must be allocated");
+            self.temporal_mixing
+                .forward_with_titan_fusion_default_into(
+                    &norm1_out,
+                    temporal_out_buf,
+                    &self.config.titan_memory,
+                    &mut self.titan_memory_workspace,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("TransformerBlock temporal forward_into failed: {err}")
+                });
         }
+        let mix_out = workspace
+            .temporal_out()
+            .expect("temporal_out workspace buffer must be allocated")
+            .to_owned();
 
         // Update per-layer similarity representation matrix (input→mix-output channel similarity).
         self.context.update_outgoing_context(
@@ -1061,10 +947,10 @@ impl Layer for TransformerBlock {
         );
 
         // Head activity ratio from MoH (avg active heads / num_heads).
-        let (head_activity_ratio_opt, head_activity_vec) =
-            self.temporal_mixing.get_head_activity_metrics();
-        let head_activity_ratio = head_activity_ratio_opt.unwrap_or(1.0);
-        let token_head_activity_vec = self.temporal_mixing.get_token_head_activity_vec();
+        let head_activity = self.temporal_mixing.head_activity_summary();
+        let head_activity_ratio = head_activity.ratio;
+        let head_activity_vec = head_activity.head_activity;
+        let token_head_activity_vec = head_activity.token_head_activity;
 
         // In-place residual connection: use adaptive residuals if available
         let residual1 = if let Some(ref mut residuals) = self.adaptive_residuals {
@@ -1081,16 +967,39 @@ impl Layer for TransformerBlock {
             residual1
         };
 
-        // Pre-feedforward normalization
-        let norm2_out = self.pre_ffn_norm.forward(&residual1);
+        // Pre-feedforward normalization into workspace.
+        {
+            let norm2_out_buf = workspace
+                .norm2_out_mut()
+                .expect("norm2_out workspace buffer must be allocated");
+            self.pre_ffn_norm.normalize_into(&residual1, norm2_out_buf);
+        }
+        let norm2_out = workspace
+            .norm2_out()
+            .expect("norm2_out workspace buffer must be allocated")
+            .to_owned();
 
-        // Feedforward with residual connection
-        let mut ffn_out = self.feedforward.forward_with_token_head_activity(
-            &norm2_out,
-            Some(head_activity_ratio),
-            head_activity_vec,
-            token_head_activity_vec,
-        );
+        // Feedforward with residual connection into workspace.
+        {
+            let ffn_out_buf = workspace
+                .ffn_out_mut()
+                .expect("ffn_out workspace buffer must be allocated");
+            self.feedforward
+                .forward_with_token_head_activity_into(
+                    &norm2_out,
+                    ffn_out_buf,
+                    Some(head_activity_ratio),
+                    head_activity_vec,
+                    token_head_activity_vec,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("TransformerBlock feedforward forward_into failed: {err}")
+                });
+        }
+        let ffn_out = workspace
+            .ffn_out()
+            .expect("ffn_out workspace buffer must be allocated")
+            .to_owned();
 
         // Cache FFN output *before* the residual addition.
         let ffn_out_arc = if let Some(mut arc) = reuse_ffn_out_cache {
@@ -1107,27 +1016,31 @@ impl Layer for TransformerBlock {
             Arc::new(ffn_out.clone())
         };
 
-        // In-place final residual: reuse ffn_out allocation
-        ffn_out += &residual1;
-        let mut output = ffn_out;
-
-        // Apply E-Prop adaptation if enabled
-        if let Some(ref mut adaptor) = self.eprop_adaptor {
-            if let Ok(adaptation) = adaptor.forward(&output) {
-                output += &adaptation;
-            }
-        }
+        // Final residual path.
+        let output = if let Some(ref mut residuals) = self.adaptive_residuals {
+            residuals.apply_ffn_residual(&residual1, &ffn_out)
+        } else {
+            let mut out = ffn_out.clone();
+            out += &residual1;
+            out
+        };
 
         // Cache intermediates with Arc for zero-copy backward pass access
         *self.cached_intermediates.write().unwrap() = Some(CachedIntermediates {
             input_original: input_original_arc,
             input_used: input_used_arc,
-            norm1_out: Arc::new(norm1_out),
-            mix_out: Arc::new(mix_out),
+            norm1_out: Arc::new(
+                workspace
+                    .norm1_out()
+                    .expect("norm1_out workspace buffer must be allocated")
+                    .clone(),
+            ),
+            mix_out: Arc::new(mix_out.clone()),
             residual1: Arc::new(residual1),
-            norm2_out: Arc::new(norm2_out),
+            norm2_out: Arc::new(norm2_out.clone()),
             ffn_out: ffn_out_arc,
         });
+        self.unified_workspace = workspace;
 
         output
     }
@@ -1184,18 +1097,9 @@ impl Layer for TransformerBlock {
 
             // Compute gradients through the transformer block layers
 
-            // Handle E-Prop backward first (since it's the last operation in forward)
-            let (grads_at_ffn_sum, eprop_param_grads) =
-                if let Some(ref adaptor) = self.eprop_adaptor {
-                    let (d_adaptor_input, p_grads) = adaptor.compute_gradients(output_grads);
-                    (output_grads + &d_adaptor_input, p_grads)
-                } else {
-                    (output_grads.clone(), Vec::new())
-                };
-
             // Output = residual1 + ffn_out, so gradients split between residual1 and ffn_out
-            let ffn_grads = &grads_at_ffn_sum;
-            let residual1_grads = &grads_at_ffn_sum;
+            let ffn_grads = output_grads;
+            let residual1_grads = output_grads;
 
             // Get feedforward gradients
             let (ffn_input_grad, ffn_param_grads) = self.feedforward.backward(norm2_out, ffn_grads);
@@ -1214,10 +1118,7 @@ impl Layer for TransformerBlock {
             let (mut mix_input_grad, mix_param_grads) = self
                 .temporal_mixing
                 .compute_gradients(norm1_out, &residual1_total_grads);
-            if !matches!(
-                self.temporal_mixing.temporal_mixing,
-                TemporalMixingLayer::Attention(_) | TemporalMixingLayer::Titans(_)
-            ) {
+            if self.temporal_mixing.needs_external_titan_memory() {
                 self.config
                     .titan_memory
                     .add_input_grads_from_output_grads_into(
@@ -1261,7 +1162,6 @@ impl Layer for TransformerBlock {
                 pre_attn_norm: pre_attn_param_grads.len(),
                 context: 1,
                 adaptive_residuals: adaptive_grad_count,
-                eprop_adaptor: eprop_param_grads.len(),
             };
             // Release read lock before acquiring write lock
             drop(guard);
@@ -1277,7 +1177,6 @@ impl Layer for TransformerBlock {
             all_param_grads.extend(pre_attn_param_grads);
             all_param_grads.push(similarity_strength_grad);
             all_param_grads.extend(adaptive_param_grads);
-            all_param_grads.extend(eprop_param_grads);
 
             (final_input_grads, all_param_grads)
         } else {
@@ -1381,13 +1280,6 @@ impl Layer for TransformerBlock {
             },
         )?;
 
-        router.route_to_closure(partitions.eprop_adaptor, |grads| {
-            if let Some(ref mut adaptor) = self.eprop_adaptor {
-                adaptor.apply_gradients_ref(grads, lr)?;
-            }
-            Ok(())
-        })?;
-
         if let Ok(mut guard) = self.param_partitions.write() {
             *guard = None;
         }
@@ -1403,6 +1295,30 @@ impl Layer for TransformerBlock {
         if let Ok(mut guard) = self.cached_intermediates.write() {
             *guard = None;
         }
+    }
+}
+
+// Unified workspace management for memory optimization
+impl WorkspaceManaged for TransformerBlock {
+    /// Ensure workspace buffers are allocated with correct capacity.
+    ///
+    /// This consolidates the manual workspace allocation patterns used throughout
+    /// forward/backward passes into a single point of control.
+    fn ensure_capacity(&mut self, batch_size: usize, seq_len: usize, embed_dim: usize) {
+        self.unified_workspace
+            .ensure_capacity(batch_size, seq_len, embed_dim);
+    }
+
+    /// Clear all workspace buffers to free memory.
+    fn clear_workspace(&mut self) {
+        self.unified_workspace.clear_workspace();
+    }
+
+    /// Get memory statistics for all managed buffers.
+    fn workspace_stats(
+        &self,
+    ) -> crate::domain::layers::components::workspace_managed::WorkspaceStats {
+        self.unified_workspace.workspace_stats()
     }
 }
 
@@ -1440,7 +1356,6 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: None,
         };
 
         let block = TransformerBlock::new(config);
@@ -1484,7 +1399,6 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false, // Test basic mode
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: None,
         };
 
         let mut block = TransformerBlock::new(config);
@@ -1524,7 +1438,6 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1560,7 +1473,6 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1599,7 +1511,6 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: None,
         };
         let mut block = TransformerBlock::new(config);
         let input = Array2::<f32>::zeros((seq_len, embed_dim));
@@ -1645,7 +1556,6 @@ mod tests {
             entropy_ema_alpha: 0.2,
             use_advanced_adaptive_residuals: false,
             titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: None,
         };
 
         let mut block = TransformerBlock::new(config);
@@ -2122,177 +2032,78 @@ mod tests {
     }
 
     #[test]
-    fn test_transformer_block_with_eprop() {
-        use crate::domain::layers::transformer::components::eprop_adaptor::EPropAdaptorConfig;
-
-        let embed_dim = 32;
-        let seq_len = 5;
+    fn test_transformer_block_workspace_managed() {
         let config = TransformerBlockConfig {
-            embed_dim,
-            hidden_dim: 64,
+            embed_dim: 64,
+            hidden_dim: 128,
             num_heads: 4,
+            max_pos: 256,
             poly_degree: 3,
-            max_pos: 31,
-            window_size: None,
             use_moe: false,
             moe_config: None,
-            head_selection: HeadSelectionStrategy::Fixed { num_active: 4 },
-            moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
-            temporal_mixing: TemporalMixingType::Attention,
+            head_selection: HeadSelectionStrategy::SoftTopP {
+                top_p: 0.9,
+                soft_top_p_alpha: 15.0,
+            },
+            window_size: None,
             use_adaptive_window: false,
             min_window_size: 16,
-            max_window_size: 4096,
-            window_adaptation_strategy:
-                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
-            entropy_ema_alpha: 0.2,
+            max_window_size: 256,
+            window_adaptation_strategy: WindowAdaptationStrategy::AttentionEntropy,
+            entropy_ema_alpha: 0.01,
+            moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
+            titan_memory: Default::default(),
+            temporal_mixing: TemporalMixingType::Attention,
             use_advanced_adaptive_residuals: false,
-            titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: Some(EPropAdaptorConfig {
-                dim: embed_dim,
-                ..Default::default()
-            }),
         };
 
         let mut block = TransformerBlock::new(config);
 
-        // Check initial adaptation weights are 1.0 (via adaptor access if possible, or infer from
-        // behavior) Since we can't easily access internal state without making fields
-        // public, we'll rely on functional tests.
+        // Test initial workspace state
+        assert!(!block.is_workspace_allocated());
 
-        // Forward with non-zero input to ensure traces are active
-        let input = Array2::<f32>::from_elem((seq_len, embed_dim), 0.5);
-        let out = block.forward(&input);
-        assert_eq!(out.shape(), input.shape());
+        // Test capacity allocation
+        block.ensure_capacity(32, 64, 64);
+        assert!(block.is_workspace_allocated());
+        assert_eq!(block.current_workspace_shape(), Some((32, 64)));
 
-        // Backward
-        let grads = Array2::<f32>::ones((seq_len, embed_dim));
-        let (in_grad, param_grads) = block.compute_gradients(&input, &grads);
+        // Verify workspace stats
+        let stats = block.workspace_stats();
+        assert!(stats.buffer_count > 0);
+        assert!(stats.total_bytes > 0);
+        assert_eq!(stats.expected_shape, Some((32, 64)));
 
-        assert_eq!(in_grad.shape(), input.shape());
-        assert!(!param_grads.is_empty());
+        // Test reuse on same size
+        let initial_count = stats.buffer_count;
+        block.ensure_capacity(32, 64, 64);
+        let stats_after_reuse = block.workspace_stats();
+        assert_eq!(stats_after_reuse.buffer_count, initial_count);
 
-        // Verify we have gradients for the adaptor
-        // The last gradient should be for the eprop adaptor if it's appended last, or we check if
-        // any gradient corresponds to it. E-Prop adaptor returns a Vec<Array2> but
-        // flattened into the block's param_grads list. We just check that *some* gradients
-        // are non-zero.
-        let has_nonzero_grads = param_grads
-            .iter()
-            .any(|g| g.iter().any(|&x| x.abs() > 1e-6));
-        assert!(
-            has_nonzero_grads,
-            "Should have non-zero gradients with active input"
-        );
+        // Test resize
+        block.ensure_capacity(64, 128, 64);
+        let stats_resized = block.workspace_stats();
+        assert_eq!(stats_resized.expected_shape, Some((64, 128)));
 
-        // Apply gradients
-        block.apply_gradients(&param_grads, 1e-1).unwrap();
+        // Test clear
+        block.clear_workspace();
+        assert!(!block.is_workspace_allocated());
+        assert_eq!(block.workspace_stats().buffer_count, 0);
 
-        // Run forward again - output should be different due to updated weights
-        let out_new = block.forward(&input);
-
-        // Check difference
-        let diff = (&out_new - &out).mapv(|x| x.abs()).sum();
-        assert!(
-            diff > 1e-6,
-            "Output should change after applying gradients (diff: {})",
-            diff
-        );
+        println!("✅ WorkspaceManaged tests passed for TransformerBlock!");
     }
 
     #[test]
-    fn test_transformer_block_with_eprop_moe_and_learned_heads() {
-        use crate::domain::{
-            layers::transformer::components::eprop_adaptor::EPropAdaptorConfig,
-            mixtures::{
-                gating::{GatingStrategy, GatingTrainingMode},
-                moe::ExpertRouterConfig,
-            },
-        };
+    fn test_transformer_block_set_compute_backend_checked_cpu() {
+        let config = ModelConfig::transformer(32, 64, 1, 64, None, Some(4));
+        let mut block = TransformerBlock::from_model_config(&config, 0);
 
-        let embed_dim = 32;
-        let seq_len = 6;
+        block
+            .set_compute_backend_checked(crate::domain::compute_backend::ComputeBackend::Cpu)
+            .expect("CPU backend should always be accepted");
 
-        let mut moe_config = ExpertRouterConfig::default();
-        moe_config.num_experts = 4;
-        moe_config.expert_hidden_dim = 16;
-        moe_config.use_head_conditioning = true;
-        moe_config.use_learned_k_adaptation = true;
-        moe_config.metrics_avg_routing_prob = vec![0.0; moe_config.num_experts];
-        moe_config.gating = crate::domain::mixtures::gating::GatingConfig::from_strategy(
-            &GatingStrategy::Learned {
-                num_active: 2,
-                load_balance_weight: 0.01,
-                complexity_loss_weight: 0.005,
-                sparsity_weight: 0.001,
-                importance_loss_weight: 0.0,
-                switch_balance_weight: 0.0,
-                training_mode: GatingTrainingMode::Coupled,
-            },
-            moe_config.num_experts,
+        assert_eq!(
+            block.compute_backend(),
+            crate::domain::compute_backend::ComputeBackend::Cpu
         );
-
-        let config = TransformerBlockConfig {
-            embed_dim,
-            hidden_dim: 64,
-            num_heads: 4,
-            poly_degree: 3,
-            max_pos: 31,
-            window_size: None,
-            use_moe: true,
-            moe_config: Some(moe_config),
-            head_selection: HeadSelectionStrategy::Learned {
-                num_active: 2,
-                load_balance_weight: 0.01,
-                complexity_loss_weight: 0.005,
-                sparsity_weight: 0.001,
-                importance_loss_weight: 0.0,
-                switch_balance_weight: 0.0,
-                training_mode: GatingTrainingMode::Coupled,
-            },
-            moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
-            temporal_mixing: TemporalMixingType::Attention,
-            use_adaptive_window: false,
-            min_window_size: 16,
-            max_window_size: 4096,
-            window_adaptation_strategy:
-                crate::domain::models::config::WindowAdaptationStrategy::Fixed,
-            entropy_ema_alpha: 0.2,
-            use_advanced_adaptive_residuals: false,
-            titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
-            eprop_adaptor: Some(EPropAdaptorConfig {
-                dim: embed_dim,
-                ..Default::default()
-            }),
-        };
-
-        let mut block = TransformerBlock::new(config);
-
-        let input = Array2::<f32>::from_shape_fn((seq_len, embed_dim), |(i, j)| {
-            ((i * embed_dim + j) as f32 * 0.01).sin()
-        });
-        let out = block.forward(&input);
-        assert_eq!(out.shape(), input.shape());
-
-        let TemporalMixingLayer::Attention(attn) = &block.temporal_mixing.temporal_mixing else {
-            panic!("expected attention temporal mixing");
-        };
-        assert!(attn.last_tau_metrics.is_some());
-        assert!(attn.last_pred_norm.is_some());
-
-        let grads = Array2::<f32>::from_shape_fn((seq_len, embed_dim), |(i, j)| {
-            ((i + j) as f32 * 0.0007).cos()
-        });
-        let (in_grad, param_grads) = block.compute_gradients(&input, &grads);
-        assert_eq!(in_grad.shape(), input.shape());
-        assert!(!param_grads.is_empty());
-
-        let has_non_finite = in_grad.iter().any(|x| !x.is_finite())
-            || param_grads.iter().any(|g| g.iter().any(|x| !x.is_finite()));
-        assert!(!has_non_finite);
-
-        block.apply_gradients(&param_grads, 1e-2).unwrap();
-        let out_new = block.forward(&input);
-        let diff = (&out_new - &out).mapv(|x| x.abs()).sum();
-        assert!(diff > 1e-6);
     }
 }

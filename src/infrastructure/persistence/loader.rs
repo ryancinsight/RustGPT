@@ -3,8 +3,8 @@
 //! Defines a common interface for loading different types of datasets
 //! (audio, image, text, etc.) from storage.
 
-use std::path::Path;
 use crate::common::errors::Result;
+use std::path::Path;
 
 /// A generic trait for loading datasets from a source path.
 ///

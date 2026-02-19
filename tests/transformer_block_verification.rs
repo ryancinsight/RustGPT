@@ -1,6 +1,8 @@
 use llm::domain::layers::transformer::{TransformerBlock, TransformerBlockConfig};
 use llm::domain::mixtures::moh::HeadSelectionStrategy;
-use llm::domain::models::config::{TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy};
+use llm::domain::models::config::{
+    TemporalMixingType, TitanMemoryConfig, WindowAdaptationStrategy,
+};
 use llm::domain::network::Layer;
 use llm::domain::richards::adaptive::AdaptiveScalar;
 use ndarray::Array2;
@@ -13,7 +15,7 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
     let hidden_dim = 32;
     let num_heads = 2;
     let seq_len = 20;
-    
+
     let config = TransformerBlockConfig {
         embed_dim,
         hidden_dim,
@@ -23,7 +25,9 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
         window_size: Some(4), // Short window
         use_moe,
         moe_config: None,
-        head_selection: HeadSelectionStrategy::Fixed { num_active: num_heads },
+        head_selection: HeadSelectionStrategy::Fixed {
+            num_active: num_heads,
+        },
         moh_threshold_modulation: AdaptiveScalar::default(),
         temporal_mixing: mixing_type,
         use_adaptive_window: false,
@@ -33,20 +37,21 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
         entropy_ema_alpha: 0.1,
         use_advanced_adaptive_residuals: false, // Start with basic
         titan_memory: TitanMemoryConfig {
-            enabled: true, // Test Titan Memory
+            enabled: true,  // Test Titan Memory
             segment_len: 1, // Force segment length 1 for streaming consistency check
             scale: 0.1,
             eta: 0.5,
             decay: 0.1,
             ..TitanMemoryConfig::default()
         },
-        eprop_adaptor: None,
     };
 
     let block = TransformerBlock::new(config);
 
     let mut rng = rand::rng();
-    let input_data: Vec<f32> = (0..seq_len * embed_dim).map(|_| rng.random_range(-0.5..0.5)).collect();
+    let input_data: Vec<f32> = (0..seq_len * embed_dim)
+        .map(|_| rng.random_range(-0.5..0.5))
+        .collect();
     let input = Array2::from_shape_vec((seq_len, embed_dim), input_data).unwrap();
 
     // 1. Batch Forward
@@ -54,12 +59,14 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
     let batch_output = block_batch.forward(&input);
 
     // Capture global normalization parameters from batch run
-    let norm1_overrides = block_batch.pre_attention_norm().cached_adjusted_richards().map(|r| {
-        (r.temperature, r.m, r.beta)
-    });
-    let norm2_overrides = block_batch.pre_ffn_norm().cached_adjusted_richards().map(|r| {
-        (r.temperature, r.m, r.beta)
-    });
+    let norm1_overrides = block_batch
+        .pre_attention_norm()
+        .cached_adjusted_richards()
+        .map(|r| (r.temperature, r.m, r.beta));
+    let norm2_overrides = block_batch
+        .pre_ffn_norm()
+        .cached_adjusted_richards()
+        .map(|r| (r.temperature, r.m, r.beta));
 
     // Capture MoH overrides from batch run (for SSMs)
     let moh_overrides = match &block_batch.temporal_mixing().temporal_mixing {
@@ -87,7 +94,7 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
     for i in 0..seq_len {
         let batch_row = batch_output.row(i);
         let stream_row = &stream_outputs[i];
-        
+
         let diff = (&batch_row - stream_row).mapv(|x: f32| x.abs()).sum();
         if diff > max_diff {
             max_diff = diff;
@@ -95,7 +102,11 @@ fn run_consistency_test(mixing_type: TemporalMixingType, use_moe: bool, threshol
     }
 
     println!("Max diff: {}", max_diff);
-    assert!(max_diff < threshold, "Streaming output diverged from batch output. Max diff: {}", max_diff);
+    assert!(
+        max_diff < threshold,
+        "Streaming output diverged from batch output. Max diff: {}",
+        max_diff
+    );
 }
 
 #[test]

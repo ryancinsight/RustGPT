@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::errors::Result;
 use crate::common::rng::get_rng;
-use crate::domain::multimodal::patch::{get_1d_sincos_pos_embed, PatchEmbed};
+use crate::domain::multimodal::patch::{PatchEmbed, get_1d_sincos_pos_embed};
 
 /// Configuration for audio processing
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -198,11 +198,7 @@ impl AudioSample {
     }
 
     /// Create a new audio sample with transcript
-    pub fn with_transcript(
-        waveform: Vec<f32>,
-        sample_rate: usize,
-        transcript: String,
-    ) -> Self {
+    pub fn with_transcript(waveform: Vec<f32>, sample_rate: usize, transcript: String) -> Self {
         let duration = waveform.len() as f32 / sample_rate as f32;
         Self {
             waveform,
@@ -438,7 +434,9 @@ impl AudioAugmentation {
         // Time masking
         if self.rng.random::<f32>() < self.config.time_mask_prob {
             for _ in 0..self.config.num_time_masks {
-                let width = self.rng.random_range(1..=self.config.time_mask_max_width.min(num_frames));
+                let width = self
+                    .rng
+                    .random_range(1..=self.config.time_mask_max_width.min(num_frames));
                 let start = self.rng.random_range(0..num_frames.saturating_sub(width));
                 for t in start..(start + width).min(num_frames) {
                     for f in 0..num_bins {
@@ -451,7 +449,9 @@ impl AudioAugmentation {
         // Frequency masking
         if self.rng.random::<f32>() < self.config.freq_mask_prob {
             for _ in 0..self.config.num_freq_masks {
-                let width = self.rng.random_range(1..=self.config.freq_mask_max_width.min(num_bins));
+                let width = self
+                    .rng
+                    .random_range(1..=self.config.freq_mask_max_width.min(num_bins));
                 let start = self.rng.random_range(0..num_bins.saturating_sub(width));
                 for f in start..(start + width).min(num_bins) {
                     for t in 0..num_frames {
@@ -773,7 +773,7 @@ mod tests {
             sample_rate: 8000,
             n_fft: 256,
             hop_length: 128,
-            n_mels: 64, // 64 bins divides evenly by freq_patch_size of 8
+            n_mels: 64,              // 64 bins divides evenly by freq_patch_size of 8
             temporal_patch_size: 61, // 61 time frames / 61 = 1
             freq_patch_size: 8,
             embedding_dim: 64,
@@ -794,7 +794,11 @@ mod tests {
         assert_eq!(sample.waveform.len(), 16000);
 
         sample.normalize();
-        let max_abs = sample.waveform.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+        let max_abs = sample
+            .waveform
+            .iter()
+            .map(|&x| x.abs())
+            .fold(0.0f32, f32::max);
         assert!((max_abs - 1.0).abs() < 1e-6 || max_abs == 0.0);
 
         sample.pad_or_truncate(8000);
@@ -820,7 +824,7 @@ mod tests {
             sample_rate: 8000,
             n_fft: 256,
             hop_length: 128,
-            n_mels: 64, // Use mel scale so freq_dim = 64, which divides by 8
+            n_mels: 64,              // Use mel scale so freq_dim = 64, which divides by 8
             temporal_patch_size: 61, // 61 time frames divides by 61
             freq_patch_size: 8,
             embedding_dim: 64,
@@ -842,7 +846,7 @@ mod tests {
             sample_rate: 8000,
             n_fft: 256,
             hop_length: 128,
-            n_mels: 64, // Use mel scale: freq_dim = 64, divides by 8
+            n_mels: 64,              // Use mel scale: freq_dim = 64, divides by 8
             temporal_patch_size: 30, // 30 time frames divides by 30
             freq_patch_size: 8,
             embedding_dim: 32,

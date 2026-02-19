@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     application::encoding::Vocab,
-    infrastructure::optimizer::adam::Adam,
+    common::rng::get_rng,
     domain::{
         models::config::{ModelConfig, TitanMemoryConfig},
         network::Layer,
     },
-    common::rng::get_rng,
+    infrastructure::optimizer::adam::Adam,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -17,9 +17,8 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
     let embedding_dim = llm::domain::models::config::ModelConfig::default().embedding_dim;
     let mut emb = TokenEmbeddings::new_with_titan_memory(vocab, titan_memory, embedding_dim);
     // Make embeddings deterministic for assertions.
-    emb.token_embeddings = Array2::from_shape_fn((vocab_size, embedding_dim), |(i, j)| {
-        (i * 1000 + j) as f32
-    });
+    emb.token_embeddings =
+        Array2::from_shape_fn((vocab_size, embedding_dim), |(i, j)| (i * 1000 + j) as f32);
 
     let input = Array2::from_shape_vec((1, 3), vec![-1.0, f32::NAN, 999.0]).unwrap();
     let out = emb.forward(&input);
@@ -28,16 +27,10 @@ fn token_embeddings_forward_clamps_and_sanitizes_token_ids() {
     let last = vocab_size - 1;
 
     assert_eq!(out[[0, 0]], 0.0);
-    assert_eq!(
-        out[[0, embedding_dim - 1]],
-        (embedding_dim - 1) as f32
-    );
+    assert_eq!(out[[0, embedding_dim - 1]], (embedding_dim - 1) as f32);
 
     assert_eq!(out[[1, 0]], 0.0);
-    assert_eq!(
-        out[[1, embedding_dim - 1]],
-        (embedding_dim - 1) as f32
-    );
+    assert_eq!(out[[1, embedding_dim - 1]], (embedding_dim - 1) as f32);
 
     assert_eq!(out[[2, 0]], (last * 1000) as f32);
     assert_eq!(

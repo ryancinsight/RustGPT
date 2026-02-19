@@ -1,16 +1,11 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    domain::{
-        embeddings::TokenEmbeddings,
-        layers::{
-            output::OutputProjection, recurrence::LRM, spiking::{AlifLayer, LifLayer},
-            transformer::TransformerBlock,
-        },
-        memory::titans::NeuralMemory,
-        richards::{RichardsGlu, RichardsNorm},
-    },
+use crate::domain::{
+    embeddings::TokenEmbeddings,
+    layers::{output::OutputProjection, transformer::TransformerBlock},
+    memory::titans::NeuralMemory,
+    richards::{RichardsGlu, RichardsNorm},
 };
 
 /// Layer trait for neural network components
@@ -55,10 +50,7 @@ pub enum LayerEnum {
     PolyAttention(Box<crate::domain::attention::poly_attention::PolyAttention>),
     TransformerBlock(Box<TransformerBlock>),
     DiffusionBlock(Box<crate::domain::layers::diffusion::DiffusionBlock>),
-    LRM(Box<LRM>),
     TitansMemory(Box<NeuralMemory>),
-    LifLayer(Box<LifLayer>),
-    AlifLayer(Box<AlifLayer>),
 }
 
 /// Macro to reduce boilerplate in LayerEnum trait implementations
@@ -73,10 +65,7 @@ macro_rules! delegate_to_variant {
             LayerEnum::PolyAttention(layer) => layer.$method($($arg),*),
             LayerEnum::TransformerBlock(layer) => layer.$method($($arg),*),
             LayerEnum::DiffusionBlock(layer) => layer.$method($($arg),*),
-            LayerEnum::LRM(layer) => layer.$method($($arg),*),
             LayerEnum::TitansMemory(layer) => layer.$method($($arg),*),
-            LayerEnum::LifLayer(layer) => layer.$method($($arg),*),
-            LayerEnum::AlifLayer(layer) => layer.$method($($arg),*),
         }
     };
 }

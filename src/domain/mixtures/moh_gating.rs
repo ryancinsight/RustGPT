@@ -1,18 +1,18 @@
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s, Zip, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, Zip, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    infrastructure::optimizer::adam::Adam,
+    common::rng::get_rng,
     domain::{
         mixtures::{
             moh::{HeadSelectionConfig, HeadSelectionStrategy},
             routing::{RoutingConfig, SelectionAlgorithm, apply_selection_algorithm},
             threshold::ThresholdPredictor,
         },
-        richards::RichardsGate,
+        richards::{RichardsCurve, RichardsGate},
     },
-    common::rng::get_rng,
+    infrastructure::optimizer::adam::Adam,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -75,7 +75,9 @@ fn enforce_min_max_heads_inplace(
             }
 
             // Sort descending by score
-            candidates.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             // Determine which heads to keep
             // 1. Must include all 'always' heads
@@ -83,21 +85,21 @@ fn enforce_min_max_heads_inplace(
             // 3. Ensure at least min_h heads are active (if possible)
 
             // Start by selecting top max_h candidates
-            
+
             // First pass: add top candidates until we hit max_h, but prioritize always-on later?
             // Actually, simply taking top max_h is the base strategy.
             // But we MUST have always-on heads.
-            
+
             // Let's identify the set of heads to be active.
             // Strategy:
             // - Start with always-on heads.
             // - Add top-scoring heads that are not in always-on, until we reach max_h.
             // - But wait, if an always-on head has very low score, does it displace a high-scoring head? Yes, "always on".
-            
+
             let mut count = 0;
             // Mark which heads are selected
             let mut keep_mask = vec![false; h_total];
-            
+
             // 1. Force always-on
             for &h in &always {
                 keep_mask[h] = true;
@@ -117,7 +119,7 @@ fn enforce_min_max_heads_inplace(
                 }
             }
 
-            // 3. If we still have fewer than min_h (e.g. because max_h < min_h which shouldn't happen due to checks, 
+            // 3. If we still have fewer than min_h (e.g. because max_h < min_h which shouldn't happen due to checks,
             //    OR because we didn't find enough candidates? No, we iterated all h_total).
             //    Wait, logic above: max_h >= min_h. And we iterate all heads. So count should be max_h (or h_total).
             //    The only case count < min_h is if h_total < min_h, but we clamped min_h.
@@ -126,20 +128,20 @@ fn enforce_min_max_heads_inplace(
             //    The original code had logic: "keep only top max_h heads by g_mat".
             //    But it also had: "also ensure at least min_h are on".
             //    The previous logic was: select top max_h. Then ensure always-on. Then ensure min_h. Then clamp to max_h.
-            
+
             //    Let's stick to the previous logic's intent but cleaner:
             //    Goal: Active set S.
             //    Constraint 1: always \subset S
             //    Constraint 2: |S| <= max_h
             //    Constraint 3: |S| >= min_h
             //    Preference: Maximize sum(scores in S)
-            
+
             //    Algorithm:
             //    a. Start with S = always.
-            //    b. If |S| > max_h, remove lowest scoring from S until |S| == max_h (But always-on are forced? 
+            //    b. If |S| > max_h, remove lowest scoring from S until |S| == max_h (But always-on are forced?
             //       Original code: "Strictly enforce the max-heads cap even after forcing always-on heads... drop the lowest-score non-always heads")
             //       My pre-check ensures always.len() <= max_h. So this won't happen.
-            
+
             //    c. Add highest scoring non-S heads until |S| == min_h.
             //    d. If we allow more heads (up to max_h), should we add them?
             //       Original code: "For each token: keep only top max_h heads... ensure at least min_h".
@@ -149,11 +151,11 @@ fn enforce_min_max_heads_inplace(
             //       2. Add always-on (might exceed max_h).
             //       3. Force min_h (from best).
             //       4. If active > max_h, drop lowest non-always.
-            
+
             //    So effectively: Take union of (Top max_h) and (Always).
             //    Then if size > max_h, remove worst non-always.
             //    Also ensure size >= min_h (which is covered if we start with Top max_h and max_h >= min_h).
-            
+
             //    Revised Clean Algorithm:
             //    1. Take all candidates.
             //    2. Separate into "Always" and "Others".
@@ -182,21 +184,21 @@ fn enforce_min_max_heads_inplace(
             //       If `m_mat` (predictor) says "activate head 5", but head 5 is not in top-k of `g_mat`, it gets zeroed?
             //       YES. This is a "Hard Top-K" enforcement on top of whatever the predictor says.
             //       UNLESS `max_heads` is very large (== num_heads), in which case it does nothing.
-            
+
             //       So, `m_mat` preserves its *values* (weights), but entries are zeroed if they are not in the allowed set.
             //       The allowed set is determined by `g_mat` scores + always_on.
-            
+
             //       So my "Revised Clean Algorithm" is correct for determining the *mask*.
             //       Then we apply this mask to `m_mat`.
-            
+
             // Reset mask
             keep_mask.fill(false);
-            
+
             // 1. Mark always-on
             for &h in &always {
                 keep_mask[h] = true;
             }
-            
+
             // 2. Select others from candidates (which are sorted by score)
             let mut slots_left = max_h.saturating_sub(always.len());
             for &(_score, h) in &candidates {
@@ -208,7 +210,7 @@ fn enforce_min_max_heads_inplace(
                     slots_left -= 1;
                 }
             }
-            
+
             // 3. Apply mask to m_row
             for h in 0..h_total {
                 if !keep_mask[h] {
@@ -217,7 +219,7 @@ fn enforce_min_max_heads_inplace(
                     // If it was already 0.0, should we force it to 1.0?
                     // Original line 138: "Force always-on heads to be active... m_mat[[i, ah]] = 1.0;"
                     // Original line 149: "m_mat[[i, h]] = 1.0;" (for min_h enforcement)
-                    // So YES, if selected, ensure it's at least 1.0? 
+                    // So YES, if selected, ensure it's at least 1.0?
                     // Wait, if predictor output was 0.5, and it's selected, should it stay 0.5 or become 1.0?
                     // Line 138 forces always-on to 1.0.
                     // Line 149 forces min_h additions to 1.0.
@@ -225,13 +227,13 @@ fn enforce_min_max_heads_inplace(
                     // Original line 132: "m_mat[[i, h]] = 0.0" (if not kept).
                     // It does NOT say "m_mat[[i, h]] = 1.0" for the kept ones generally.
                     // ONLY for always-on and forced min_h.
-                    
+
                     // So:
                     // - If always-on: set to 1.0 (override predictor).
-                    // - If kept because of top-k: keep predictor value? 
+                    // - If kept because of top-k: keep predictor value?
                     //   The original code didn't change m_mat values for the `best` list, only zeroed others.
                     //   EXCEPT for the explicit "Force always-on" loop and "Ensure min_h" loop.
-                    
+
                     // So my logic:
                     // If always-on: m_row[h] = 1.0.
                     // Else if kept: leave as is?
@@ -239,9 +241,9 @@ fn enforce_min_max_heads_inplace(
                     // Original code would keep it in `best`, so it wouldn't be zeroed.
                     // But if `m_mat` was 0.0, it stays 0.0.
                     // UNLESS min_h logic forces it to 1.0.
-                    
+
                     if always.contains(&h) {
-                         m_row[h] = 1.0;
+                        m_row[h] = 1.0;
                     }
                     // For others, we only zero if NOT in mask.
                     // But we might need to force to 1.0 if we fall below min_h?
@@ -255,16 +257,16 @@ fn enforce_min_max_heads_inplace(
                     // It iterates `best` (sorted).
                     // So the top `min_h` heads (including always-on) get forced to 1.0?
                     // YES.
-                    
+
                     // So:
                     // 1. Top `min_h` heads (by g_mat score) -> Force to 1.0 (if not always-on, which is also 1.0).
                     // 2. Heads between `min_h` and `max_h` (by g_mat score) -> Keep original `m_mat` value (don't zero, don't force).
                     // 3. Heads below `max_h` -> Zero out.
-                    
+
                     // Let's refine the loop logic.
                 }
             }
-            
+
             // Re-apply logic strictly:
             // 1. Identify Top `max_h` heads from candidates.
             //    Note: always-on heads might NOT be in Top `max_h` of scores.
@@ -276,33 +278,33 @@ fn enforce_min_max_heads_inplace(
             //      d. Force `always` to 1.0.
             //      e. Force top `min_h` from `best` to 1.0.
             //      f. If active (`m_mat > 0`) > `max_h`: Drop lowest score non-always.
-            
+
             //    This is complex "active" definition.
             //    "Active" means `m_mat > 0`.
             //    If predictor output `m_mat` has zeros for everything, then step (f) sees active=0 (or just always/min_h).
-            
+
             //    Let's replicate the effect exactly:
             //    Set S = Top `max_h` (by score).
             //    S = S U always.
             //    For h not in S: m_row[h] = 0.0.
             //    For h in always: m_row[h] = 1.0.
-            //    
+            //
             //    For h in Top `min_h` (by score) AND in S: m_row[h] = 1.0. (Wait, Top min_h is subset of Top max_h, so in S).
             //    So: Top `min_h` -> 1.0.
-            
+
             //    Finally, check active count.
             //    Active = { h | m_row[h] > 0.0 }.
             //    If |Active| > max_h:
             //       Remove h from Active with lowest score (non-always) until |Active| == max_h.
             //       Set m_row[h] = 0.0.
-            
+
             //    Let's implement this per row.
-            
+
             // 1. Identify Top max_h and Top min_h
             // candidates is already sorted descending.
             let top_max_indices: Vec<usize> = candidates.iter().take(max_h).map(|x| x.1).collect();
             let top_min_indices: Vec<usize> = candidates.iter().take(min_h).map(|x| x.1).collect();
-            
+
             // 2. Zero out if not in top_max AND not always
             //    (Original step 123)
             for h in 0..h_total {
@@ -312,19 +314,19 @@ fn enforce_min_max_heads_inplace(
                     m_row[h] = 0.0;
                 }
             }
-            
+
             // 3. Force always to 1.0
             for &h in &always {
                 m_row[h] = 1.0;
             }
-            
+
             // 4. Force top min_h to 1.0
             for &h in &top_min_indices {
                 // Original: if always.contains(&h) continue; m_mat=1.0.
                 // Since always is already 1.0, we can just set it.
                 m_row[h] = 1.0;
             }
-            
+
             // 5. Enforce max_h cap on Active heads
             let mut active_heads: Vec<(f32, usize)> = Vec::new();
             for h in 0..h_total {
@@ -334,39 +336,48 @@ fn enforce_min_max_heads_inplace(
                     // Linear scan of candidates is fine for small h.
                     // Or better, build a lookup or just iterate candidates?
                     // Since we iterate h, let's just find score.
-                    let score = candidates.iter().find(|&&x| x.1 == h).map(|x| x.0).unwrap_or(f32::NEG_INFINITY);
+                    let score = candidates
+                        .iter()
+                        .find(|&&x| x.1 == h)
+                        .map(|x| x.0)
+                        .unwrap_or(f32::NEG_INFINITY);
                     active_heads.push((score, h));
                 }
             }
-            
+
             if active_heads.len() > max_h {
                 // Sort ascending by score to drop lowest
-                active_heads.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                
+                active_heads
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
                 let mut to_drop = active_heads.len() - max_h;
                 for (_s, h) in active_heads {
-                    if to_drop == 0 { break; }
+                    if to_drop == 0 {
+                        break;
+                    }
                     if !always.contains(&h) {
                         m_row[h] = 0.0;
                         to_drop -= 1;
                     }
                 }
             }
-            
+
             // Renormalize if needed
             if let Some(k_target) = renormalize_to_k {
                 let k_val = (k_target.max(1).min(h_total)) as f32;
                 let mut sum = 0.0f32;
                 for h in 0..h_total {
                     let v = m_row[h];
-                     if v.is_finite() { sum += v.max(0.0); }
+                    if v.is_finite() {
+                        sum += v.max(0.0);
+                    }
                 }
                 let eps = 1e-6f32;
                 if sum > eps && sum.is_finite() {
                     let s = k_val / sum;
                     for h in 0..h_total {
                         let v = m_row[h];
-                         let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+                        let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
                         m_row[h] = v * s;
                     }
                 }
@@ -391,6 +402,9 @@ pub struct MoHGating {
 
     /// Learnable Richards gate used to map z -> g in (0,1)
     pub gate: RichardsGate,
+
+    /// Learnable Richards curve for low-rank query gating
+    pub low_rank_query_gate: RichardsCurve,
 
     /// Head selection configuration and metrics
     pub head_selection_config: HeadSelectionConfig,
@@ -448,6 +462,7 @@ impl MoHGating {
             opt_alpha_g,
             opt_beta_g,
             gate: RichardsGate::new(),
+            low_rank_query_gate: RichardsCurve::sigmoid(true),
             head_selection_config: HeadSelectionConfig::default(),
             threshold_predictor: None,
             opt_w_tau: None,
@@ -583,7 +598,7 @@ impl MoHGating {
 
         // Compute raw gate values g (tokens x heads) using Richards gate.
         let mut g_mat = Array2::<f32>::zeros((n, num_heads));
-        
+
         // Helper arrays for outputs
         let mut head_sq_sums = Array1::<f32>::zeros(num_heads);
         let mut head_max_abs_z = Array1::<f64>::zeros(num_heads);
@@ -615,7 +630,7 @@ impl MoHGating {
                         max_z = overrides[h];
                     }
                 }
-                
+
                 *sq_sum_out = sq_sum;
                 *max_z_out = max_z;
 
@@ -644,12 +659,13 @@ impl MoHGating {
                         }
                     }
                 }
-                let mut t = predictor.predict_with_condition(
-                    &cond_input.view(),
-                    token_latent_features,
-                );
+                let mut t =
+                    predictor.predict_with_condition(&cond_input.view(), token_latent_features);
 
-                let m = self.head_selection_config.threshold_modulation.value(self.training_progress);
+                let m = self
+                    .head_selection_config
+                    .threshold_modulation
+                    .value(self.training_progress);
                 t.mapv_inplace(|v| {
                     let v = if v.is_finite() { v } else { 0.0 };
                     (v * m).max(0.0)
@@ -800,11 +816,8 @@ impl MoHGating {
         let scale_2d = token_threshold_scale.map(|s| ndarray::Array2::from_elem((1, 1), s));
         let features_2d = token_latent_features.map(|f| f.view().insert_axis(ndarray::Axis(0)));
 
-        let out_2d = self.forward_weights_view(
-            &input_2d,
-            scale_2d.as_ref().map(|x| x.view()),
-            features_2d,
-        );
+        let out_2d =
+            self.forward_weights_view(&input_2d, scale_2d.as_ref().map(|x| x.view()), features_2d);
 
         out_2d.row(0).to_owned()
     }
@@ -1020,7 +1033,10 @@ impl MoHGating {
             let mut weights = apply_selection_algorithm(&g_mat.view(), &cfg);
             let activation_scale = self.head_selection_config.max_heads.max(1) as f32;
             weights.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
-            let m = self.head_selection_config.threshold_modulation.value(self.training_progress);
+            let m = self
+                .head_selection_config
+                .threshold_modulation
+                .value(self.training_progress);
             weights.mapv_inplace(|v| (v * m).clamp(0.0, 1.0));
             m_mat.assign(&weights);
 
@@ -1234,26 +1250,26 @@ impl MoHGating {
         if workspace.m.len() != num_heads {
             workspace.m = Array1::zeros(num_heads);
         }
-        
+
         // 1. Projection: xw = input * w_g
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_g.t(), input, 0.0, &mut workspace.xw);
-        
+
         // 2. Gate activation (Richards)
         let alpha = self.alpha_g.row(0);
         let beta = self.beta_g.row(0);
-        
+
         for h in 0..num_heads {
             let z = alpha[h] * workspace.xw[h] + beta[h];
-            
+
             // Direct application without dynamic scaling for streaming parity
             workspace.g[h] = self.gate.curve.forward_scalar_f32(z);
         }
-        
+
         // 3. Selection
         // Use 2D view for compatibility with existing routing logic
         let g_view = workspace.g.view();
         let g_view_2d = g_view.to_shape((1, num_heads)).unwrap();
-        
+
         if self.head_selection_config.gating.use_soft_top_p {
             let cfg = RoutingConfig {
                 algorithm: SelectionAlgorithm::SoftTopP {
@@ -1269,7 +1285,10 @@ impl MoHGating {
             let activation_scale = self.head_selection_config.max_heads.max(1) as f32;
             weights_2d.mapv_inplace(|v| (v * activation_scale).clamp(0.0, 1.0));
 
-            let m_val = self.head_selection_config.threshold_modulation.value(self.training_progress);
+            let m_val = self
+                .head_selection_config
+                .threshold_modulation
+                .value(self.training_progress);
             weights_2d.mapv_inplace(|v| (v * m_val).clamp(0.0, 1.0));
 
             workspace.m.assign(&weights_2d.row(0));
@@ -1311,7 +1330,11 @@ impl MoHGating {
         }
     }
 
-    pub fn apply_gradients(&mut self, grads: &[Array2<f32>], lr: f32) -> crate::common::errors::Result<()> {
+    pub fn apply_gradients(
+        &mut self,
+        grads: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::common::errors::Result<()> {
         // grads ordering described in compute_gradients_from_eff.
         if grads.len() < 4 {
             return Err(crate::common::errors::ModelError::GradientError {

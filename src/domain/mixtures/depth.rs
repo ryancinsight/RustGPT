@@ -41,7 +41,7 @@ impl Default for MixtureOfDepthsConfig {
     fn default() -> Self {
         Self {
             // Enabled by default: this acts like a mild stochastic-depth mechanism for
-            // the TRM refinement loop, but it only applies during training.
+            // a latent refinement loop, but it only applies during training.
             enabled: true,
             min_steps: default_min_steps(),
             // 0 means "use the caller's max".

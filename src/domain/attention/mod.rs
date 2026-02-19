@@ -35,15 +35,17 @@
 //! - **Ring Attention**: Liu et al. (2023) - arXiv:2309.01809
 //! - **Flash Attention**: Dao et al. (2022) - Memory-efficient attention
 //! - **vLLM PagedAttention**: Kwon et al. (2023) - KV cache management
+//!
 
 pub mod cache;
 pub mod config;
 pub mod forward;
 pub mod head;
 pub mod memory;
-pub mod params;
 pub mod paged_attention;
+pub mod params;
 pub mod poly_attention;
+pub mod poly_attention_gpu;
 pub mod position;
 pub mod ring_attention;
 pub mod sliding_window_attention;

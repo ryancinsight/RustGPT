@@ -50,13 +50,7 @@ mod tests {
         let memory_hidden_dim = 8;
         let window_size = 2;
 
-        let mut mal = TitansMAL::new(
-            input_dim,
-            key_dim,
-            val_dim,
-            memory_hidden_dim,
-            window_size,
-        );
+        let mut mal = TitansMAL::new(input_dim, key_dim, val_dim, memory_hidden_dim, window_size);
 
         let seq_len = 5;
         let input = Array2::<f32>::zeros((seq_len, input_dim));

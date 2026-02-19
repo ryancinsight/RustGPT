@@ -14,6 +14,8 @@ pub struct PolyAttentionParamInfo {
     pub gating_params: usize,
     /// Richards curve parameters for gating
     pub gate_poly_params: usize,
+    /// Richards parameters for dynamic low-rank query gating
+    pub low_rank_gate_params: usize,
     /// Threshold predictor parameters (if present)
     pub threshold_predictor_params: usize,
     /// CoPE parameters
@@ -29,6 +31,7 @@ impl PolyAttentionParamInfo {
         num_heads: usize,
         head_params_per_head: usize,
         gate_poly_params: usize,
+        low_rank_gate_params: usize,
         threshold_predictor_params: usize,
         cope_params: usize,
     ) -> Self {
@@ -42,6 +45,7 @@ impl PolyAttentionParamInfo {
             + polynomial_params
             + gating_params
             + gate_poly_params
+            + low_rank_gate_params
             + threshold_predictor_params
             + cope_params;
 
@@ -52,6 +56,7 @@ impl PolyAttentionParamInfo {
             polynomial_params,
             gating_params,
             gate_poly_params,
+            low_rank_gate_params,
             threshold_predictor_params,
             cope_params,
             total_params,
@@ -68,6 +73,7 @@ impl PolyAttentionParamInfo {
              • Polynomial parameters: {}\n\
              • Gating parameters: {}\n\
              • Gate polynomial: {}\n\
+             • Low-rank gate: {}\n\
              • Threshold predictor: {}\n\
              • CoPE parameters: {}\n\
              • Total parameters: {}",
@@ -77,6 +83,7 @@ impl PolyAttentionParamInfo {
             self.polynomial_params,
             self.gating_params,
             self.gate_poly_params,
+            self.low_rank_gate_params,
             self.threshold_predictor_params,
             self.cope_params,
             self.total_params

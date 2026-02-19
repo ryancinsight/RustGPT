@@ -2,10 +2,10 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
-use super::traits::PositionEmbedding;
 use super::cope::{CoPE, CoPEGradients};
 use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
+use super::traits::PositionEmbedding;
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gradients container for GatedCoPE
 #[derive(Clone, Debug)]
@@ -115,7 +115,7 @@ impl PositionEmbedding for GatedCoPE {
 
         // Recompute forward pass values for gradients
         let cope_contrib = self.base_cope.contribution(q, k, query_pos, key_pos, None);
-        
+
         let mut gate_input = Array1::zeros(self.embed_dim * 2);
         gate_input.slice_mut(s![0..self.embed_dim]).assign(q);
         gate_input.slice_mut(s![self.embed_dim..]).assign(k);
@@ -126,19 +126,27 @@ impl PositionEmbedding for GatedCoPE {
 
         // dL/d(gate) = dL/ds * cope_contrib
         let d_gate = d_s_ij * cope_contrib;
-        
+
         // dL/d(cope_contrib) = dL/ds * gate
         let d_cope = d_s_ij * gate;
 
         // 1. Backprop through base CoPE
         // We use d_cope as the gradient for the base contribution
-        let (dq_base, dk_base) = self.base_cope.backward(q, k, query_pos, key_pos, inputs, d_cope, &mut grads.base_grads);
+        let (dq_base, dk_base) = self.base_cope.backward(
+            q,
+            k,
+            query_pos,
+            key_pos,
+            inputs,
+            d_cope,
+            &mut grads.base_grads,
+        );
 
         // 2. Backprop through gate
         // gate = sigmoid(scaled_logit)
         // d(gate)/d(scaled_logit) = gate * (1 - gate)
         let d_scaled_logit = d_gate * gate * (1.0 - gate);
-        
+
         // scaled_logit = logit / temp
         // d(logit) = d(scaled_logit) / temp
         let d_logit = d_scaled_logit / self.gate_temperature;
@@ -179,11 +187,11 @@ impl PositionEmbedding for GatedCoPE {
 
     fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
         self.base_cope.apply_gradients(&grads.base_grads, lr);
-        
+
         if let Some(wg) = &grads.w_gate_grads {
             self.opt_w_gate.step(&mut self.w_gate, wg, lr);
         }
-        
+
         if let Some(bg) = &grads.b_gate_grads {
             self.opt_b_gate.step(&mut self.b_gate, bg, lr);
         }

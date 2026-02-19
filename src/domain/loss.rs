@@ -283,10 +283,7 @@ pub fn info_nce_loss_and_grads(
         logits.push(*sim / tau);
     }
 
-    let max_logit = logits
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let mut exp_sum = 0.0f64;
     let mut exp_logits: Vec<f64> = Vec::with_capacity(logits.len());
     for &l in &logits {
@@ -330,7 +327,11 @@ pub fn info_nce_loss_and_grads(
             } else {
                 0.0
             };
-            let b = if neg[j].is_finite() { neg[j] as f64 } else { 0.0 };
+            let b = if neg[j].is_finite() {
+                neg[j] as f64
+            } else {
+                0.0
+            };
             let grad_a = (b / (na * nb)) - ((*dot / (na * nb)) / (na * na)) * a;
             grad_anchor[j] += (dlogit * inv_tau * grad_a) as f32;
         }
@@ -773,7 +774,8 @@ mod tests {
         let anchor = [1.0f32, 0.0f32];
         let positive = [1.0f32, 0.0f32];
         let negatives = vec![vec![0.0f32, 1.0f32], vec![-1.0f32, 0.0f32]];
-        let (loss, grad_a, grad_p) = info_nce_loss_and_grads(&anchor, &positive, &negatives, 2, 0.1);
+        let (loss, grad_a, grad_p) =
+            info_nce_loss_and_grads(&anchor, &positive, &negatives, 2, 0.1);
         assert!(loss < 0.01);
         assert!(grad_a.iter().all(|&v| v.is_finite()));
         assert!(grad_p.iter().all(|&v| v.is_finite()));
@@ -784,7 +786,8 @@ mod tests {
         let anchor = [1.0f32, 2.0f32];
         let positive = [2.0f32, 1.0f32];
         let negatives = vec![vec![-1.0f32, 0.5f32], vec![0.1f32, -0.3f32]];
-        let (_loss, grad_a, grad_p) = info_nce_loss_and_grads(&anchor, &positive, &negatives, 2, 0.5);
+        let (_loss, grad_a, grad_p) =
+            info_nce_loss_and_grads(&anchor, &positive, &negatives, 2, 0.5);
         assert!(grad_a.iter().all(|&v| v.is_finite()));
         assert!(grad_p.iter().all(|&v| v.is_finite()));
         let nonzero_a = grad_a.iter().any(|&v| v.abs() > 1e-8);

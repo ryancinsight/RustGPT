@@ -18,19 +18,19 @@ pub struct NeuralMemoryStreamingWorkspace {
     // For update
     pub k: Array1<f32>,
     pub v: Array1<f32>,
-    
+
     // For update_memory_step internal
     pub z_upd: Array1<f32>,
     pub h_upd: Array1<f32>,
     pub v_pred: Array1<f32>,
     pub grad_output: Array1<f32>,
-    
+
     pub grad_w2: Array2<f32>,
     pub grad_b2: Array1<f32>,
-    
+
     pub grad_h: Array1<f32>,
     pub grad_z: Array1<f32>,
-    
+
     pub grad_w1: Array2<f32>,
     pub grad_b1: Array1<f32>,
 }
@@ -248,8 +248,15 @@ impl NeuralMemory {
         memory_mut.add(momentum);
 
         if cfg!(debug_assertions) {
-             println!("Batch Update: k[0]={:.6} alpha={:.6} theta={:.6} Grad_w1_sum={:.6} M_w1_sum={:.6} Mem_w1_sum={:.6}", 
-                k[0], alpha, theta, grad_w1.sum(), self.momentum.as_ref().unwrap().w1.sum(), self.curr_memory.as_ref().unwrap().w1.sum());
+            println!(
+                "Batch Update: k[0]={:.6} alpha={:.6} theta={:.6} Grad_w1_sum={:.6} M_w1_sum={:.6} Mem_w1_sum={:.6}",
+                k[0],
+                alpha,
+                theta,
+                grad_w1.sum(),
+                self.momentum.as_ref().unwrap().w1.sum(),
+                self.curr_memory.as_ref().unwrap().w1.sum()
+            );
         }
     }
 
@@ -267,7 +274,7 @@ impl NeuralMemory {
             let x_t = input.row(t);
             let q_t = self.w_q.dot(&x_t);
             let (y_t, h) = Self::mlp_forward(memory, &q_t); // Modified mlp_forward to return h too
-            
+
             if cfg!(debug_assertions) {
                 println!("Batch Retrieve Step {}:", t);
                 println!("  q: {:.6?}", q_t.slice(ndarray::s![0..4]));
@@ -299,35 +306,35 @@ impl NeuralMemory {
 
     /// Retrieve memory for a single step into output buffer (zero allocation)
     pub fn retrieve_step_into(
-        &self, 
-        input: &ndarray::ArrayView1<f32>, 
+        &self,
+        input: &ndarray::ArrayView1<f32>,
         output: &mut Array1<f32>,
-        ws: &mut NeuralMemoryStreamingWorkspace
+        ws: &mut NeuralMemoryStreamingWorkspace,
     ) {
         let memory = self.curr_memory.as_ref().unwrap_or(&self.init_memory);
-        
+
         // q = W_q * input
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_q, input, 0.0, &mut ws.q);
-        
+
         // MLP Forward with workspace
         // z = W1 * q + b1
         ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
         ws.z_ret += &memory.b1;
-        
+
         // h = ReLU(z)
         ws.h_ret.assign(&ws.z_ret);
         ws.h_ret.mapv_inplace(|x| x.max(0.0));
-        
+
         // y = W2 * h + b2
         ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
         ws.y_ret += &memory.b2;
-        
+
         if cfg!(debug_assertions) {
-             println!("Stream Retrieve Step:");
-             println!("  q: {:.6?}", ws.q.slice(ndarray::s![0..4]));
-             println!("  z: {:.6?}", ws.z_ret.slice(ndarray::s![0..4]));
-             println!("  h: {:.6?}", ws.h_ret.slice(ndarray::s![0..4]));
-             println!("  y: {:.6?}", ws.y_ret.slice(ndarray::s![0..4]));
+            println!("Stream Retrieve Step:");
+            println!("  q: {:.6?}", ws.q.slice(ndarray::s![0..4]));
+            println!("  z: {:.6?}", ws.z_ret.slice(ndarray::s![0..4]));
+            println!("  h: {:.6?}", ws.h_ret.slice(ndarray::s![0..4]));
+            println!("  y: {:.6?}", ws.y_ret.slice(ndarray::s![0..4]));
         }
 
         output.assign(&ws.y_ret);
@@ -371,9 +378,9 @@ impl NeuralMemory {
     }
 
     pub fn update_step_with_workspace(
-        &mut self, 
-        input: &ndarray::ArrayView1<f32>, 
-        ws: &mut NeuralMemoryStreamingWorkspace
+        &mut self,
+        input: &ndarray::ArrayView1<f32>,
+        ws: &mut NeuralMemoryStreamingWorkspace,
     ) {
         if self.curr_memory.is_none() {
             self.reset_memory();
@@ -381,7 +388,7 @@ impl NeuralMemory {
 
         // k = W_k * input
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_k, input, 0.0, &mut ws.k);
-        
+
         // v = W_v * input
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w_v, input, 0.0, &mut ws.v);
 
@@ -430,21 +437,29 @@ impl NeuralMemory {
             &ws.grad_output.view().insert_axis(Axis(1)),
             &ws.h_upd.view().insert_axis(Axis(0)),
             0.0,
-            &mut ws.grad_w2
+            &mut ws.grad_w2,
         );
 
         // grad_b2 = grad_output
         ws.grad_b2.assign(&ws.grad_output);
 
         // grad_h = W2^T * grad_output
-        ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2.t(), &ws.grad_output, 0.0, &mut ws.grad_h);
+        ndarray::linalg::general_mat_vec_mul(
+            1.0,
+            &memory.w2.t(),
+            &ws.grad_output,
+            0.0,
+            &mut ws.grad_h,
+        );
 
         // grad_z = grad_h * step(z)
         ws.grad_z.assign(&ws.grad_h);
         ndarray::Zip::from(&mut ws.grad_z)
             .and(&ws.z_upd)
             .for_each(|gz, &z| {
-                if z <= 0.0 { *gz = 0.0; }
+                if z <= 0.0 {
+                    *gz = 0.0;
+                }
             });
 
         // grad_w1 = grad_z * k^T (Outer Product)
@@ -454,7 +469,7 @@ impl NeuralMemory {
             &ws.grad_z.view().insert_axis(Axis(1)),
             &ws.k.view().insert_axis(Axis(0)),
             0.0,
-            &mut ws.grad_w1
+            &mut ws.grad_w1,
         );
 
         // grad_b1 = grad_z
@@ -475,8 +490,15 @@ impl NeuralMemory {
         memory_mut.add(momentum);
 
         if cfg!(debug_assertions) {
-             println!("Stream Update: k[0]={:.6} alpha={:.6} theta={:.6} Grad_w1_sum={:.6} M_w1_sum={:.6} Mem_w1_sum={:.6}", 
-                ws.k[0], alpha, theta, ws.grad_w1.sum(), self.momentum.as_ref().unwrap().w1.sum(), self.curr_memory.as_ref().unwrap().w1.sum());
+            println!(
+                "Stream Update: k[0]={:.6} alpha={:.6} theta={:.6} Grad_w1_sum={:.6} M_w1_sum={:.6} Mem_w1_sum={:.6}",
+                ws.k[0],
+                alpha,
+                theta,
+                ws.grad_w1.sum(),
+                self.momentum.as_ref().unwrap().w1.sum(),
+                self.curr_memory.as_ref().unwrap().w1.sum()
+            );
         }
     }
 
@@ -642,7 +664,7 @@ impl NeuralMemory {
 
         y
     }
-    
+
     /// Process a single time step into pre-allocated output buffer (zero-allocation hot path).
     ///
     /// This is the most efficient method for streaming inference, requiring no allocations
@@ -673,19 +695,19 @@ impl NeuralMemory {
 
         // 2. Retrieve from current memory into output (inline to avoid recomputing ws.q)
         let memory = self.curr_memory.as_ref().unwrap();
-        
+
         // z = W1 * q + b1 (using pre-computed ws.q)
         ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
         ws.z_ret += &memory.b1;
-        
+
         // h = ReLU(z)
         ws.h_ret.assign(&ws.z_ret);
         ws.h_ret.mapv_inplace(|x| x.max(0.0));
-        
+
         // y = W2 * h + b2
         ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
         ws.y_ret += &memory.b2;
-        
+
         output.assign(&ws.y_ret);
 
         // 3. Update memory using workspace
@@ -789,45 +811,45 @@ impl NeuralMemory {
         }
 
         let seq_len = input.nrows();
-        
+
         // 1. Vectorized Projections
         // (T, In) x (In, K)^T -> (T, K)
         let q_all = input.dot(&self.w_q.t());
         let k_all = input.dot(&self.w_k.t());
         let v_all = input.dot(&self.w_v.t());
-        
+
         let mut alpha_all = input.dot(&self.w_alpha); // (T)
-        let mut eta_all = input.dot(&self.w_eta);     // (T)
+        let mut eta_all = input.dot(&self.w_eta); // (T)
         let mut theta_all = input.dot(&self.w_theta); // (T)
-        
+
         // Apply sigmoid activation
         alpha_all.mapv_inplace(Self::sigmoid);
         eta_all.mapv_inplace(Self::sigmoid);
         theta_all.mapv_inplace(Self::sigmoid);
 
         let mut output = Array2::<f32>::zeros((seq_len, self.val_dim));
-        
+
         // Workspace for inner loop to avoid allocations
         let mut ws = NeuralMemoryStreamingWorkspace {
             q: Array1::zeros(self.key_dim),
             z_ret: Array1::zeros(self.memory_hidden_dim),
             h_ret: Array1::zeros(self.memory_hidden_dim),
             y_ret: Array1::zeros(self.val_dim),
-            
+
             k: Array1::zeros(self.key_dim),
             v: Array1::zeros(self.val_dim), // v dim is val_dim!
-            
+
             z_upd: Array1::zeros(self.memory_hidden_dim),
             h_upd: Array1::zeros(self.memory_hidden_dim),
             v_pred: Array1::zeros(self.val_dim),
             grad_output: Array1::zeros(self.val_dim),
-            
+
             grad_w2: Array2::zeros((self.val_dim, self.memory_hidden_dim)),
             grad_b2: Array1::zeros(self.val_dim),
-            
+
             grad_h: Array1::zeros(self.memory_hidden_dim),
             grad_z: Array1::zeros(self.memory_hidden_dim),
-            
+
             grad_w1: Array2::zeros((self.memory_hidden_dim, self.key_dim)),
             grad_b1: Array1::zeros(self.memory_hidden_dim),
         };
@@ -836,37 +858,37 @@ impl NeuralMemory {
         for t in 0..seq_len {
             // Retrieve inputs from pre-calculated arrays
             ws.q.assign(&q_all.row(t));
-            
+
             // Retrieve: y = Memory(q)
             let memory = self.curr_memory.as_ref().unwrap();
-            
+
             // MLP Forward (Retrieve)
             // z = W1 * q + b1
             ndarray::linalg::general_mat_vec_mul(1.0, &memory.w1, &ws.q, 0.0, &mut ws.z_ret);
             ws.z_ret += &memory.b1;
-            
+
             // h = ReLU(z)
             ws.h_ret.assign(&ws.z_ret);
             ws.h_ret.mapv_inplace(|x| x.max(0.0));
-            
+
             // y = W2 * h + b2
             ndarray::linalg::general_mat_vec_mul(1.0, &memory.w2, &ws.h_ret, 0.0, &mut ws.y_ret);
             ws.y_ret += &memory.b2;
-            
+
             // Store output
             output.row_mut(t).assign(&ws.y_ret);
-            
+
             // Update: Memory.update(k, v, alpha, eta, theta)
             ws.k.assign(&k_all.row(t));
             ws.v.assign(&v_all.row(t));
-            
+
             let alpha = alpha_all[t];
             let eta = eta_all[t];
             let theta = theta_all[t];
-            
+
             self.update_memory_step_with_workspace(alpha, eta, theta, &mut ws);
         }
-        
+
         output
     }
 

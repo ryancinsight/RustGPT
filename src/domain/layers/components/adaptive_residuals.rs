@@ -7,6 +7,7 @@
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
+use super::adaptive_residuals_workspace::AdaptiveResidualsWorkspace;
 use crate::infrastructure::optimizer::adam::Adam;
 
 /// Configuration for adaptive residuals
@@ -24,6 +25,17 @@ pub struct AdaptiveResidualConfig {
     pub contrastive_temperature: f32,
     pub contrastive_margin: f32,
     pub contrastive_grad_weight: f32,
+    /// Enable manifold-constrained hyperconnections (mHC-style) on residual paths.
+    /// When enabled, per-group Sinkhorn projection enforces doubly-stochastic mixing.
+    pub manifold_hyperconnections: bool,
+    /// Group size for local manifold mixing across channels.
+    pub manifold_group_size: usize,
+    /// Number of Sinkhorn-Knopp normalization iterations.
+    pub manifold_sinkhorn_iters: usize,
+    /// Off-diagonal strength for manifold mixing logits before Sinkhorn.
+    pub manifold_offdiag_strength: f32,
+    /// Diagonal bias for manifold mixing logits before Sinkhorn.
+    pub manifold_diag_bias: f32,
 }
 
 impl Default for AdaptiveResidualConfig {
@@ -40,6 +52,11 @@ impl Default for AdaptiveResidualConfig {
             contrastive_temperature: 0.6,
             contrastive_margin: 0.0,
             contrastive_grad_weight: 0.01,
+            manifold_hyperconnections: true,
+            manifold_group_size: 16,
+            manifold_sinkhorn_iters: 20,
+            manifold_offdiag_strength: 0.15,
+            manifold_diag_bias: 2.5,
         }
     }
 }
@@ -95,11 +112,27 @@ pub struct AdaptiveResiduals {
     scratch_dot: Vec<f64>,
     #[serde(skip, default)]
     scratch_z: Vec<f64>,
+
+    /// Optional shared workspace for reducing allocations across multiple layers.
+    /// When provided, uses workspace buffers instead of internal scratch_* fields.
+    #[serde(skip, default)]
+    workspace: Option<AdaptiveResidualsWorkspace>,
 }
 
 impl AdaptiveResiduals {
     /// Create a new adaptive residuals component with full configuration
     pub fn new(config: AdaptiveResidualConfig) -> Self {
+        Self::new_with_workspace(config, None)
+    }
+
+    /// Create a new adaptive residuals component with optional shared workspace
+    ///
+    /// If a workspace is provided, buffers are reused from it during forward/backward passes,
+    /// reducing allocations across multiple layers.
+    pub fn new_with_workspace(
+        config: AdaptiveResidualConfig,
+        workspace: Option<AdaptiveResidualsWorkspace>,
+    ) -> Self {
         let embed_dim = config.embed_dim;
         let max_seq_len = config.max_seq_len;
 
@@ -137,6 +170,8 @@ impl AdaptiveResiduals {
             scratch_channel_scales: Vec::new(),
             scratch_dot: Vec::new(),
             scratch_z: Vec::new(),
+
+            workspace,
         }
     }
 
@@ -151,8 +186,132 @@ impl AdaptiveResiduals {
             contrastive_temperature: 0.6,
             contrastive_margin: 0.0,
             contrastive_grad_weight: 0.01,
+            manifold_hyperconnections: true,
+            manifold_group_size: 16,
+            manifold_sinkhorn_iters: 20,
+            manifold_offdiag_strength: 0.15,
+            manifold_diag_bias: 2.5,
         };
         Self::new(config)
+    }
+
+    /// Set or update the workspace for buffer reuse across layers
+    pub fn set_workspace(&mut self, workspace: Option<AdaptiveResidualsWorkspace>) {
+        self.workspace = workspace;
+    }
+
+    /// Get mutable reference to channel_scales buffer (from workspace if available, else internal)
+    #[inline]
+    fn get_channel_scales_mut(&mut self, embed_dim: usize) -> &mut Vec<f32> {
+        if let Some(ref mut ws) = self.workspace {
+            ws.resize_for_dim(embed_dim);
+            &mut ws.channel_scales
+        } else {
+            self.scratch_channel_scales.resize(embed_dim, 1.0);
+            &mut self.scratch_channel_scales
+        }
+    }
+
+    /// Get mutable reference to nx buffer (from workspace if available, else internal)
+    #[inline]
+    #[allow(dead_code)]
+    fn get_nx_mut(&mut self, embed_dim: usize) -> &mut Vec<f64> {
+        if let Some(ref mut ws) = self.workspace {
+            ws.resize_for_dim(embed_dim);
+            &mut ws.nx
+        } else {
+            self.scratch_nx.resize(embed_dim, 0.0);
+            &mut self.scratch_nx
+        }
+    }
+
+    /// Get mutable reference to mean_z buffer (from workspace if available, else internal)
+    #[inline]
+    #[allow(dead_code)]
+    fn get_mean_z_mut(&mut self, embed_dim: usize) -> &mut Vec<f64> {
+        if let Some(ref mut ws) = self.workspace {
+            ws.resize_for_dim(embed_dim);
+            &mut ws.mean_z
+        } else {
+            self.scratch_mean_z.resize(embed_dim, 0.0);
+            &mut self.scratch_mean_z
+        }
+    }
+
+    #[inline]
+    fn manifold_hyperconnections_enabled(&self, embed_dim: usize) -> bool {
+        self.config.manifold_hyperconnections
+            && embed_dim > 1
+            && self.config.manifold_group_size > 1
+            && self.config.manifold_sinkhorn_iters > 0
+    }
+
+    fn build_manifold_group_matrix(
+        &self,
+        start_channel: usize,
+        len: usize,
+        matrix: &mut [f32],
+        row_sums: &mut [f32],
+        col_sums: &mut [f32],
+    ) {
+        if len == 0 {
+            return;
+        }
+
+        let diag_bias = self.config.manifold_diag_bias.max(0.0);
+        let offdiag_strength = self.config.manifold_offdiag_strength.max(0.0);
+        let temperature = self.config.contrastive_temperature.max(1e-6);
+        let contrast_alpha = self.config.contrastive_strength.max(0.0);
+        let sinkhorn_iters = self.config.manifold_sinkhorn_iters.max(1);
+        let eps = 1e-6f32;
+
+        // Build positive logits then project to the Birkhoff polytope via Sinkhorn.
+        for i in 0..len {
+            let ci = start_channel + i;
+            let margin_i = self.contrastive_margin(ci);
+            for j in 0..len {
+                let cj = start_channel + j;
+                let margin_j = self.contrastive_margin(cj);
+                let pair_margin = 0.5 * (margin_i + margin_j);
+                let pair_signal = (pair_margin / temperature).tanh();
+
+                let logit = if i == j {
+                    diag_bias + contrast_alpha * pair_signal.max(0.0)
+                } else {
+                    offdiag_strength * (0.5 * (pair_signal + 1.0))
+                };
+
+                matrix[i * len + j] = logit.clamp(-20.0, 20.0).exp();
+            }
+        }
+
+        for _ in 0..sinkhorn_iters {
+            col_sums[..len].fill(0.0);
+            for i in 0..len {
+                for j in 0..len {
+                    col_sums[j] += matrix[i * len + j];
+                }
+            }
+            for j in 0..len {
+                let inv = 1.0 / (col_sums[j] + eps);
+                for i in 0..len {
+                    matrix[i * len + j] *= inv;
+                }
+            }
+
+            row_sums[..len].fill(0.0);
+            for i in 0..len {
+                for j in 0..len {
+                    row_sums[i] += matrix[i * len + j];
+                }
+            }
+            for i in 0..len {
+                let inv = 1.0 / (row_sums[i] + eps);
+                for j in 0..len {
+                    matrix[i * len + j] *= inv;
+                }
+            }
+        }
     }
 
     pub fn apply_attention_residual_step_into(
@@ -165,8 +324,11 @@ impl AdaptiveResiduals {
     ) {
         let embed_dim = input.len();
 
-        self.scratch_channel_scales.resize(embed_dim, 1.0f32);
-        self.scratch_channel_scales.fill(1.0f32);
+        // Cache config values to avoid borrow conflicts
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+        let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
+        let contrast_alpha = self.config.contrastive_strength;
 
         // If there is no head-conditioning signal, use the simplest (and most learnable)
         // per-channel scaling path.
@@ -208,12 +370,8 @@ impl AdaptiveResiduals {
             1.0
         };
 
-        let threshold = self.config.residual_stability_threshold.max(0.0);
-        let min_scale = 0.1f32;
-
-        let contrast_temperature = self.config.contrastive_temperature.max(1e-6);
-        let contrast_alpha = self.config.contrastive_strength;
-
+        // Compute scale values for each channel first (before borrowing mutable buffers)
+        let mut scales_to_assign = Vec::with_capacity(embed_dim);
         for channel in 0..embed_dim {
             let mut base_scale = self.attention_residual_scales[[channel, 0]];
             base_scale = if base_scale.is_finite() {
@@ -224,7 +382,7 @@ impl AdaptiveResiduals {
             base_scale = base_scale.clamp(min_scale, threshold);
 
             if !enable_contrast_conditioning {
-                self.scratch_channel_scales[channel] = base_scale;
+                scales_to_assign.push(base_scale);
                 continue;
             }
 
@@ -233,27 +391,79 @@ impl AdaptiveResiduals {
 
             let final_scale =
                 (base_scale * contrast_factor * moh_scale_factor).clamp(min_scale, threshold);
-            self.scratch_channel_scales[channel] = final_scale;
+            scales_to_assign.push(final_scale);
         }
 
-        // Apply position-aware scaling with contrast enhancement
+        // Now use workspace or internal scratch buffer for channel_scales
+        let channel_scales = self.get_channel_scales_mut(embed_dim);
+        channel_scales.fill(1.0f32);
+
+        // Assign the pre-computed scales to the channel_scales buffer
+        for (channel, &scale) in scales_to_assign.iter().enumerate() {
+            if channel < channel_scales.len() {
+                channel_scales[channel] = scale;
+            }
+        }
+        let channel_scales_snapshot = channel_scales.clone();
+
+        // Apply position-aware scaling with optional manifold-constrained channel mixing.
         output.zip_mut_with(input, |o, &i| *o = i);
+
+        if self.manifold_hyperconnections_enabled(embed_dim) {
+            let group_size = self.config.manifold_group_size.min(embed_dim);
+            let mut group_matrix = vec![0.0f32; group_size * group_size];
+            let mut row_sums = vec![0.0f32; group_size];
+            let mut col_sums = vec![0.0f32; group_size];
+            let mut mixed_vals = vec![0.0f32; group_size];
+
+            let mut start = 0usize;
+            while start < embed_dim {
+                let len = (embed_dim - start).min(group_size);
+                self.build_manifold_group_matrix(
+                    start,
+                    len,
+                    &mut group_matrix[..len * len],
+                    &mut row_sums[..len],
+                    &mut col_sums[..len],
+                );
+
+                for i in 0..len {
+                    let mut acc = 0.0f32;
+                    for j in 0..len {
+                        let channel = start + j;
+                        let v = if attn_out[channel].is_finite() {
+                            attn_out[channel]
+                        } else {
+                            0.0
+                        };
+                        let scaled = v * if channel < channel_scales_snapshot.len() {
+                            channel_scales_snapshot[channel]
+                        } else {
+                            1.0
+                        };
+                        acc += group_matrix[i * len + j] * scaled;
+                    }
+                    mixed_vals[i] = acc;
+                }
+
+                for i in 0..len {
+                    output[start + i] += mixed_vals[i];
+                }
+
+                start += len;
+            }
+            return;
+        }
 
         for channel in 0..embed_dim {
             let attn_val = attn_out[channel];
             let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
-
-            let scale = if channel < self.scratch_channel_scales.len() {
-                self.scratch_channel_scales[channel]
+            let scale = if channel < channel_scales_snapshot.len() {
+                channel_scales_snapshot[channel]
             } else {
                 1.0
             };
-
-            // Apply scaled attention output
-            let scaled_attn = attn_val * scale;
-
-            // Add residual
-            output[channel] += scaled_attn;
+            output[channel] += attn_val * scale;
         }
     }
 
@@ -361,9 +571,58 @@ impl AdaptiveResiduals {
             self.scratch_channel_scales[channel] = final_scale;
         }
 
-        // Apply position-aware scaling with contrast enhancement
         let mut output = Array2::zeros((seq_len, embed_dim));
 
+        if self.manifold_hyperconnections_enabled(embed_dim) {
+            let group_size = self.config.manifold_group_size.min(embed_dim);
+            let mut group_matrix = vec![0.0f32; group_size * group_size];
+            let mut row_sums = vec![0.0f32; group_size];
+            let mut col_sums = vec![0.0f32; group_size];
+
+            // Initialize output with sanitized input.
+            for seq in 0..seq_len {
+                for channel in 0..embed_dim {
+                    let v = input[[seq, channel]];
+                    output[[seq, channel]] = if v.is_finite() { v } else { 0.0 };
+                }
+            }
+
+            let mut start = 0usize;
+            while start < embed_dim {
+                let len = (embed_dim - start).min(group_size);
+                self.build_manifold_group_matrix(
+                    start,
+                    len,
+                    &mut group_matrix[..len * len],
+                    &mut row_sums[..len],
+                    &mut col_sums[..len],
+                );
+
+                for seq in 0..seq_len {
+                    for i in 0..len {
+                        let mut acc = 0.0f32;
+                        for j in 0..len {
+                            let channel = start + j;
+                            let attn_val = attn_out[[seq, channel]];
+                            let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
+                            let scale = if channel < self.scratch_channel_scales.len() {
+                                self.scratch_channel_scales[channel]
+                            } else {
+                                1.0
+                            };
+                            acc += group_matrix[i * len + j] * (attn_val * scale);
+                        }
+                        output[[seq, start + i]] += acc;
+                    }
+                }
+
+                start += len;
+            }
+
+            return output;
+        }
+
+        // Apply position-aware scaling with contrast enhancement.
         for seq in 0..seq_len {
             for channel in 0..embed_dim {
                 let attn_val = attn_out[[seq, channel]];
@@ -379,12 +638,7 @@ impl AdaptiveResiduals {
                 } else {
                     1.0
                 };
-
-                // Apply scaled attention output
-                let scaled_attn = attn_val * scale;
-
-                // Add residual with contrast-preserving addition
-                output[[seq, channel]] = input_val + scaled_attn;
+                output[[seq, channel]] = input_val + attn_val * scale;
             }
         }
 
@@ -431,6 +685,54 @@ impl AdaptiveResiduals {
         let rows = ffn_out.nrows().min(residual1.nrows());
         let cols = ffn_out.ncols().min(residual1.ncols());
         let mut output = Array2::zeros((rows, cols));
+
+        if self.manifold_hyperconnections_enabled(cols) {
+            let group_size = self.config.manifold_group_size.min(cols);
+            let mut group_matrix = vec![0.0f32; group_size * group_size];
+            let mut row_sums = vec![0.0f32; group_size];
+            let mut col_sums = vec![0.0f32; group_size];
+
+            for i in 0..rows {
+                for j in 0..cols {
+                    let r = residual1[[i, j]];
+                    output[[i, j]] = if r.is_finite() { r } else { 0.0 };
+                }
+            }
+
+            let mut start = 0usize;
+            while start < cols {
+                let len = (cols - start).min(group_size);
+                self.build_manifold_group_matrix(
+                    start,
+                    len,
+                    &mut group_matrix[..len * len],
+                    &mut row_sums[..len],
+                    &mut col_sums[..len],
+                );
+
+                for i in 0..rows {
+                    for out_idx in 0..len {
+                        let mut acc = 0.0f32;
+                        for j in 0..len {
+                            let channel = start + j;
+                            let scale = if channel < self.scratch_channel_scales.len() {
+                                self.scratch_channel_scales[channel]
+                            } else {
+                                1.0
+                            };
+                            let v = ffn_out[[i, channel]];
+                            let v = if v.is_finite() { v } else { 0.0 };
+                            acc += group_matrix[out_idx * len + j] * (v * scale);
+                        }
+                        output[[i, start + out_idx]] += acc;
+                    }
+                }
+
+                start += len;
+            }
+
+            return output;
+        }
 
         for i in 0..rows {
             for j in 0..cols {
@@ -488,13 +790,48 @@ impl AdaptiveResiduals {
                 (base_scale * contrast_factor).clamp(min_scale, threshold);
         }
 
-        // Compute output directly
-        // output = residual1 + ffn_out * scale
-
-        // Initialize output with residual1
+        // output = residual1 + manifold_mix(ffn_out * scale)
         output.zip_mut_with(residual1, |o, &r| *o = r);
 
-        // Add scaled ffn_out
+        if self.manifold_hyperconnections_enabled(embed_dim) {
+            let group_size = self.config.manifold_group_size.min(embed_dim);
+            let mut group_matrix = vec![0.0f32; group_size * group_size];
+            let mut row_sums = vec![0.0f32; group_size];
+            let mut col_sums = vec![0.0f32; group_size];
+            let mut mixed_vals = vec![0.0f32; group_size];
+
+            let mut start = 0usize;
+            while start < embed_dim {
+                let len = (embed_dim - start).min(group_size);
+                self.build_manifold_group_matrix(
+                    start,
+                    len,
+                    &mut group_matrix[..len * len],
+                    &mut row_sums[..len],
+                    &mut col_sums[..len],
+                );
+
+                for i in 0..len {
+                    let mut acc = 0.0f32;
+                    for j in 0..len {
+                        let channel = start + j;
+                        let scale = self.scratch_channel_scales[channel];
+                        let v = ffn_out[channel];
+                        let v = if v.is_finite() { v } else { 0.0 };
+                        acc += group_matrix[i * len + j] * (v * scale);
+                    }
+                    mixed_vals[i] = acc;
+                }
+
+                for i in 0..len {
+                    output[start + i] += mixed_vals[i];
+                }
+
+                start += len;
+            }
+            return;
+        }
+
         for channel in 0..embed_dim {
             let scale = self.scratch_channel_scales[channel];
             let v = ffn_out[channel];
@@ -882,56 +1219,137 @@ impl AdaptiveResiduals {
         let mut attention_scale_grads = Array2::zeros((embed_dim, 1));
         let mut ffn_scale_grads = Array2::zeros((embed_dim, 1));
 
-        // Compute gradients for attention residual scales using similarity-based contrast
-        for channel in 0..embed_dim {
-            // Scale parameter (multiplicative)
+        let use_manifold_attn = self.manifold_hyperconnections_enabled(embed_dim);
+        if use_manifold_attn {
+            let group_size = self.config.manifold_group_size.min(embed_dim);
+            let mut group_matrix = vec![0.0f32; group_size * group_size];
+            let mut row_sums = vec![0.0f32; group_size];
+            let mut col_sums = vec![0.0f32; group_size];
 
-            // Contrast regularization is intentionally disabled here.
-            // The library unit tests validate simple, stable gradient descent behavior
-            // for a synthetic objective; adding extra regularizers makes the update
-            // direction brittle in that setting.
+            let mut start = 0usize;
+            while start < embed_dim {
+                let len = (embed_dim - start).min(group_size);
+                self.build_manifold_group_matrix(
+                    start,
+                    len,
+                    &mut group_matrix[..len * len],
+                    &mut row_sums[..len],
+                    &mut col_sums[..len],
+                );
 
-            // Add gradient from output loss (standard backprop through scaling)
-            let mut output_grad_sum = 0.0f32;
-            for seq in 0..seq_len {
-                let attn_val = attn_out[[seq, channel]];
-                let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
-                let res_grad = attn_residual_grads[[seq, channel]];
-                let res_grad = if res_grad.is_finite() { res_grad } else { 0.0 };
-                // dL/dscale = attn_out * dL/doutput (chain rule through scaling)
-                output_grad_sum += attn_val * res_grad;
+                for j in 0..len {
+                    let channel = start + j;
+                    let mut output_grad_sum = 0.0f32;
+                    for seq in 0..seq_len {
+                        let attn_val = attn_out[[seq, channel]];
+                        let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
+
+                        let mut mixed_res_grad = 0.0f32;
+                        for i in 0..len {
+                            let grad = attn_residual_grads[[seq, start + i]];
+                            let grad = if grad.is_finite() { grad } else { 0.0 };
+                            mixed_res_grad += group_matrix[i * len + j] * grad;
+                        }
+
+                        // dL/dscale_j = attn_j * sum_i(P_ij * dL/dy_i)
+                        output_grad_sum += attn_val * mixed_res_grad;
+                    }
+
+                    let mut g = output_grad_sum + self.contrastive_grad(channel);
+                    if g.abs() < 1e-6 {
+                        g = 1e-4 * ((channel as f32 + 1.0) * 0.731).sin();
+                    }
+                    attention_scale_grads[[channel, 0]] = g;
+                }
+
+                start += len;
             }
+        } else {
+            // Compute gradients for attention residual scales using similarity-based contrast
+            for channel in 0..embed_dim {
+                let mut output_grad_sum = 0.0f32;
+                for seq in 0..seq_len {
+                    let attn_val = attn_out[[seq, channel]];
+                    let attn_val = if attn_val.is_finite() { attn_val } else { 0.0 };
+                    let res_grad = attn_residual_grads[[seq, channel]];
+                    let res_grad = if res_grad.is_finite() { res_grad } else { 0.0 };
+                    output_grad_sum += attn_val * res_grad;
+                }
 
-            // Pure supervised gradient for the scale parameter.
-            // If the supervised signal is exactly zero (can happen in synthetic tests where
-            // the target matches output), inject a tiny bounded exploration term so gradient
-            // norms don't collapse to 0.
-            let mut g = output_grad_sum + self.contrastive_grad(channel);
-            if g.abs() < 1e-6 {
-                g = 1e-4 * ((channel as f32 + 1.0) * 0.731).sin();
+                let mut g = output_grad_sum + self.contrastive_grad(channel);
+                if g.abs() < 1e-6 {
+                    g = 1e-4 * ((channel as f32 + 1.0) * 0.731).sin();
+                }
+                attention_scale_grads[[channel, 0]] = g;
             }
-            attention_scale_grads[[channel, 0]] = g;
         }
 
-        // Compute gradients for FFN residual scales (same chain rule: dL/dscale = ffn_out *
-        // dL/doutput)
         let ffn_rows = ffn_out.nrows().min(ffn_residual_grads.nrows());
         let ffn_cols = ffn_out.ncols().min(ffn_residual_grads.ncols());
-        for channel in 0..embed_dim.min(ffn_cols) {
-            let mut output_grad_sum = 0.0f32;
-            for seq in 0..ffn_rows {
-                let ffn_val = ffn_out[[seq, channel]];
-                let ffn_val = if ffn_val.is_finite() { ffn_val } else { 0.0 };
-                let res_grad = ffn_residual_grads[[seq, channel]];
-                let res_grad = if res_grad.is_finite() { res_grad } else { 0.0 };
-                output_grad_sum += ffn_val * res_grad;
-            }
+        let ffn_embed_dim = embed_dim.min(ffn_cols);
+        let use_manifold_ffn = self.manifold_hyperconnections_enabled(ffn_embed_dim);
+        if use_manifold_ffn {
+            let group_size = self.config.manifold_group_size.min(ffn_embed_dim);
+            let mut group_matrix = vec![0.0f32; group_size * group_size];
+            let mut row_sums = vec![0.0f32; group_size];
+            let mut col_sums = vec![0.0f32; group_size];
 
-            let mut g = output_grad_sum + self.contrastive_grad(channel);
-            if g.abs() < 1e-6 {
-                g = 1e-4 * ((channel as f32 + 1.0) * 0.517).cos();
+            let mut start = 0usize;
+            while start < ffn_embed_dim {
+                let len = (ffn_embed_dim - start).min(group_size);
+                self.build_manifold_group_matrix(
+                    start,
+                    len,
+                    &mut group_matrix[..len * len],
+                    &mut row_sums[..len],
+                    &mut col_sums[..len],
+                );
+
+                for j in 0..len {
+                    let channel = start + j;
+                    let mut output_grad_sum = 0.0f32;
+                    for seq in 0..ffn_rows {
+                        let ffn_val = ffn_out[[seq, channel]];
+                        let ffn_val = if ffn_val.is_finite() { ffn_val } else { 0.0 };
+
+                        let mut mixed_res_grad = 0.0f32;
+                        for i in 0..len {
+                            let grad = ffn_residual_grads[[seq, start + i]];
+                            let grad = if grad.is_finite() { grad } else { 0.0 };
+                            mixed_res_grad += group_matrix[i * len + j] * grad;
+                        }
+
+                        output_grad_sum += ffn_val * mixed_res_grad;
+                    }
+
+                    let mut g = output_grad_sum + self.contrastive_grad(channel);
+                    if g.abs() < 1e-6 {
+                        g = 1e-4 * ((channel as f32 + 1.0) * 0.517).cos();
+                    }
+                    ffn_scale_grads[[channel, 0]] = g;
+                }
+
+                start += len;
             }
-            ffn_scale_grads[[channel, 0]] = g;
+        } else {
+            // Compute gradients for FFN residual scales (same chain rule: dL/dscale = ffn_out *
+            // dL/doutput)
+            for channel in 0..ffn_embed_dim {
+                let mut output_grad_sum = 0.0f32;
+                for seq in 0..ffn_rows {
+                    let ffn_val = ffn_out[[seq, channel]];
+                    let ffn_val = if ffn_val.is_finite() { ffn_val } else { 0.0 };
+                    let res_grad = ffn_residual_grads[[seq, channel]];
+                    let res_grad = if res_grad.is_finite() { res_grad } else { 0.0 };
+                    output_grad_sum += ffn_val * res_grad;
+                }
+
+                let mut g = output_grad_sum + self.contrastive_grad(channel);
+                if g.abs() < 1e-6 {
+                    g = 1e-4 * ((channel as f32 + 1.0) * 0.517).cos();
+                }
+                ffn_scale_grads[[channel, 0]] = g;
+            }
         }
 
         vec![attention_scale_grads, ffn_scale_grads]
@@ -1051,6 +1469,66 @@ impl AdaptiveResiduals {
             weight * (margin / temp).tanh()
         } else {
             0.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array1;
+
+    #[test]
+    fn manifold_projection_is_doubly_stochastic() {
+        let mut config = AdaptiveResidualConfig::default();
+        config.embed_dim = 8;
+        config.manifold_group_size = 4;
+        config.manifold_sinkhorn_iters = 20;
+
+        let residuals = AdaptiveResiduals::new(config);
+        let mut matrix = vec![0.0f32; 16];
+        let mut row_sums = vec![0.0f32; 4];
+        let mut col_sums = vec![0.0f32; 4];
+
+        residuals.build_manifold_group_matrix(0, 4, &mut matrix, &mut row_sums, &mut col_sums);
+
+        for i in 0..4 {
+            let mut row_sum = 0.0f32;
+            for j in 0..4 {
+                let v = matrix[i * 4 + j];
+                assert!(v >= 0.0);
+                row_sum += v;
+            }
+            assert!((row_sum - 1.0).abs() < 1e-3);
+        }
+
+        for j in 0..4 {
+            let mut col_sum = 0.0f32;
+            for i in 0..4 {
+                col_sum += matrix[i * 4 + j];
+            }
+            assert!((col_sum - 1.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn manifold_step_mixing_preserves_uniform_signal() {
+        let mut residuals = AdaptiveResiduals::new_minimal(8);
+        let input = Array1::<f32>::zeros(8);
+        let attn_out = Array1::<f32>::ones(8);
+        let mut output = Array1::<f32>::zeros(8);
+
+        residuals.apply_attention_residual_step_into(
+            &input.view(),
+            &attn_out.view(),
+            &mut output,
+            None,
+            None,
+        );
+
+        for &v in &output {
+            assert!(v.is_finite());
+            assert!((v - 1.0).abs() < 1e-3);
         }
     }
 }

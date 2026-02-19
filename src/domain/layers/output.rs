@@ -1,15 +1,8 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    infrastructure::optimizer::adam::Adam,
-    domain::{
-        eprop::{EPropError, context::EpropContext, utils::outer_product_into},
-        network::Layer,
-    },
-    common::rng::get_rng,
-};
+use crate::{common::rng::get_rng, domain::network::Layer, infrastructure::optimizer::adam::Adam};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OutputProjection {
@@ -31,32 +24,6 @@ impl OutputProjection {
             optimizer: Adam::new((embedding_dim, vocab_size)),
             cached_input: None,
         }
-    }
-
-    pub fn apply_eprop_gradients(
-        &mut self,
-        layer_idx: usize,
-        learning_signal: &Array1<f32>,
-        lr: f32,
-    ) -> crate::domain::eprop::Result<()> {
-        let (modulated_eps_f, eps_x) =
-            EpropContext::compute_layer_gradients(layer_idx, learning_signal)?;
-
-        let input_dim = self.w_out.nrows();
-        let output_dim = self.w_out.ncols();
-
-        if eps_x.len() != input_dim || modulated_eps_f.len() != output_dim {
-            return Err(EPropError::ShapeMismatch {
-                expected: format!("({}, {})", input_dim, output_dim),
-                got: format!("({}, {})", eps_x.len(), modulated_eps_f.len()),
-            });
-        }
-
-        let mut weight_grad = Array2::zeros(self.w_out.raw_dim());
-        outer_product_into(&mut weight_grad, &eps_x, &modulated_eps_f);
-        self.optimizer.step(&mut self.w_out, &weight_grad, lr);
-
-        Ok(())
     }
 }
 

@@ -117,11 +117,7 @@ impl Dataset {
         chat_training_data_path: String,
         type_of_data: DatasetType,
     ) -> Result<Self> {
-        let mut dataset = Self::new(
-            pretraining_data_path,
-            chat_training_data_path,
-            type_of_data,
-        )?;
+        let mut dataset = Self::new(pretraining_data_path, chat_training_data_path, type_of_data)?;
 
         // Load image training data if available
         let image_path = "data/image_training_data.json";
@@ -164,11 +160,8 @@ impl Dataset {
         mnist_max_samples: Option<usize>,
         speech_max_per_class: Option<usize>,
     ) -> Result<Self> {
-        let mut dataset = Self::with_multimodal(
-            pretraining_data_path,
-            chat_training_data_path,
-            type_of_data,
-        )?;
+        let mut dataset =
+            Self::with_multimodal(pretraining_data_path, chat_training_data_path, type_of_data)?;
 
         // Load MNIST image data
         let mnist_dir = "data/mnist";
@@ -178,10 +171,7 @@ impl Dataset {
                 mnist_max_samples,
             ) {
                 Ok(mut image_examples) => {
-                    tracing::info!(
-                        count = image_examples.len(),
-                        "Loaded MNIST training data"
-                    );
+                    tracing::info!(count = image_examples.len(), "Loaded MNIST training data");
                     dataset.image_training_data.append(&mut image_examples);
                 }
                 Err(e) => {

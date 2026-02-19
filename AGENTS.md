@@ -3,13 +3,18 @@
 ## Build & Test Commands
 
 - **Build**: `cargo build --release`
+- **Build with GPU (WGPU)**: `cargo build --release --features gpu-wgpu`
+- **Build with GPU (CUDA)**: `cargo build --release --features gpu-cuda`
+- **Build with all GPU backends**: `cargo build --release --features gpu-all`
 - **Test all**: `cargo test --lib`
 - **Test single**: `cargo test --lib [test_name] -- --exact`
 - **Test integration**: `cargo test --test [test_file]` (e.g., `cargo test --test transformer_block_verification`)
+- **Test GPU components**: `cargo test --test gpu_shared_components_phase56` (Phase 5.6)
 - **Lint**: `cargo clippy --all-targets`
 - **Format check**: `cargo fmt -- --check`
 - **Format fix**: `cargo fmt`
 - **Benchmark**: `cargo bench --bench [bench_name]`
+- **Check compilation**: `cargo check --lib`
 
 ## Architecture & Codebase
 

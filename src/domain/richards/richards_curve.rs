@@ -263,7 +263,8 @@ impl<V: VariantMarkerF32> RichardsKernelF32<V> {
         m_override: Option<f64>,
         beta_override: Option<f64>,
     ) -> Self {
-        let (nu, k, mut m, mut beta, mut temp, output_gain, output_bias, scale, shift) = curve.get_all_params();
+        let (nu, k, mut m, mut beta, mut temp, output_gain, output_bias, scale, shift) =
+            curve.get_all_params();
         let (adaptive_scale, adaptive_shift) = curve.get_adaptive_scaling();
 
         if let Some(t) = temp_override {
@@ -604,9 +605,9 @@ pub struct RichardsCurve {
     count: Option<u64>, // Number of samples seen
     pub momentum: f64, // Momentum for running statistics (0.01 typical)
     #[serde(skip_serializing, skip_deserializing)]
-    adaptive_scale: Option<f64>, // Automatically computed scale factor
+    adaptive_scale_opt: Option<f64>, // Automatically computed scale factor
     #[serde(skip_serializing, skip_deserializing)]
-    adaptive_shift: Option<f64>, // Automatically computed shift factor
+    adaptive_shift_opt: Option<f64>, // Automatically computed shift factor
 
     // Optimization
     #[serde(skip_serializing, skip_deserializing)]
@@ -684,7 +685,9 @@ impl RichardsCurve {
         assert_eq!(x.len(), y.len(), "Input and output lengths must match");
         assert_eq!(x.len(), dy.len(), "Input and derivative lengths must match");
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.eval_kernel_into_f32::<TanhLike>(x, y, dy),
+            crate::domain::richards::Variant::Tanh => {
+                self.eval_kernel_into_f32::<TanhLike>(x, y, dy)
+            }
             _ => self.eval_kernel_into_f32::<SigmoidLike>(x, y, dy),
         }
     }
@@ -697,6 +700,37 @@ impl RichardsCurve {
                 RichardsKernel::<TanhLike>::from_curve(self).eval_one_f64(x)
             }
             _ => RichardsKernel::<SigmoidLike>::from_curve(self).eval_one_f64(x),
+        }
+    }
+
+    /// Convert to GPU parameters for uniform buffer
+    pub fn as_gpu_params(
+        &self,
+        _num_heads: u32,
+    ) -> crate::domain::compute::gpu_ops::RichardsCurveParams {
+        let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = self.get_all_params();
+        let (adaptive_scale, adaptive_shift) = self.get_adaptive_scaling();
+
+        // Ensure valid params (avoid division by zero)
+        let safe_temp = if temp.abs() < 1e-6 { 1.0 } else { temp };
+
+        crate::domain::compute::gpu_ops::RichardsCurveParams {
+            nu: nu as f32,
+            k: k as f32,
+            m: m as f32,
+            beta: beta as f32,
+            temp_reciprocal: (1.0 / safe_temp) as f32,
+            output_gain: output_gain as f32,
+            output_bias: output_bias as f32,
+            scale: scale as f32,
+            shift: shift as f32,
+            adaptive_scale: adaptive_scale as f32,
+            adaptive_shift: adaptive_shift as f32,
+            input_scale: 1.0,
+            gate_scale: 1.0,
+            gate_bias: 0.0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 
@@ -720,7 +754,9 @@ impl RichardsCurve {
         assert_eq!(x.len(), y.len(), "Input and output lengths must match");
         assert_eq!(x.len(), dy.len(), "Input and derivative lengths must match");
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.eval_kernel_into_f64::<TanhLike>(x, y, dy),
+            crate::domain::richards::Variant::Tanh => {
+                self.eval_kernel_into_f64::<TanhLike>(x, y, dy)
+            }
             _ => self.eval_kernel_into_f64::<SigmoidLike>(x, y, dy),
         }
     }
@@ -799,7 +835,7 @@ impl RichardsCurve {
 
         let polynomial_initialized = match variant {
             crate::domain::richards::Variant::Polynomial => true, // Enable polynomial transformation
-            _ => false,                                   // Disable polynomial for other variants
+            _ => false, // Disable polynomial for other variants
         };
 
         // Enable Birch-inspired exponential tail by default for sigmoid-like generalized logistic
@@ -874,12 +910,12 @@ impl RichardsCurve {
             },
             count: if adaptive_initialized { Some(0) } else { None },
             momentum,
-            adaptive_scale: if adaptive_initialized {
+            adaptive_scale_opt: if adaptive_initialized {
                 Some(1.0)
             } else {
                 None
             },
-            adaptive_shift: if adaptive_initialized {
+            adaptive_shift_opt: if adaptive_initialized {
                 Some(0.0)
             } else {
                 None
@@ -936,8 +972,8 @@ impl RichardsCurve {
             running_sq_sum: None,
             count: None,
             momentum: 0.0,
-            adaptive_scale: None,
-            adaptive_shift: None,
+            adaptive_scale_opt: None,
+            adaptive_shift_opt: None,
             optimizer: Some(Adam::new((6, 1))),
             l2_reg: 1e-4,
             adaptive_lr_scale: 0.01,
@@ -991,8 +1027,8 @@ impl RichardsCurve {
                 running_sq_sum: None,
                 count: None,
                 momentum: 0.0,
-                adaptive_scale: None,
-                adaptive_shift: None,
+                adaptive_scale_opt: None,
+                adaptive_shift_opt: None,
                 optimizer: Some(Adam::new((6, 1))),
                 l2_reg: 1e-4,
                 adaptive_lr_scale: 0.01,
@@ -1047,8 +1083,8 @@ impl RichardsCurve {
                 running_sq_sum: None,
                 count: None,
                 momentum: 0.0,
-                adaptive_scale: None,
-                adaptive_shift: None,
+                adaptive_scale_opt: None,
+                adaptive_shift_opt: None,
                 optimizer: Some(Adam::new((6, 1))),
                 l2_reg: 1e-4,
                 adaptive_lr_scale: 0.01,
@@ -1103,8 +1139,8 @@ impl RichardsCurve {
                 running_sq_sum: None,
                 count: None,
                 momentum: 0.0,
-                adaptive_scale: None,
-                adaptive_shift: None,
+                adaptive_scale_opt: None,
+                adaptive_shift_opt: None,
                 optimizer: Some(Adam::new((6, 1))),
                 l2_reg: 1e-4,
                 adaptive_lr_scale: 0.01,
@@ -1165,8 +1201,8 @@ impl RichardsCurve {
                 scale, // Updated
                 shift, // Updated
                 birch_exponential_tail: self.birch_exponential_tail,
-                gamma: None,      // Heavy, unused for scalar forward
-                bias: None,       // Heavy, unused for scalar forward
+                gamma: None, // Heavy, unused for scalar forward
+                bias: None,  // Heavy, unused for scalar forward
                 poly_power: self.poly_power,
                 poly_coeffs: None, // Heavy, unused for scalar forward (mostly)
                 learned_nu: self.learned_nu,
@@ -1194,8 +1230,8 @@ impl RichardsCurve {
                 running_sq_sum: None, // Unused for scalar forward
                 count: None,          // Unused for scalar forward
                 momentum: self.momentum,
-                adaptive_scale: self.adaptive_scale,
-                adaptive_shift: self.adaptive_shift,
+                adaptive_scale_opt: self.adaptive_scale_opt,
+                adaptive_shift_opt: self.adaptive_shift_opt,
                 optimizer: None, // Heavy
                 l2_reg: self.l2_reg,
                 adaptive_lr_scale: self.adaptive_lr_scale,
@@ -1337,6 +1373,34 @@ impl RichardsCurve {
         scale / temp
     }
 
+    /// Convert to GPU-compatible parameters struct
+    pub fn to_gpu_params(
+        &self,
+        _num_heads: usize,
+    ) -> crate::domain::compute::gpu_ops::RichardsCurveParams {
+        let (nu, k, m, beta, temp, output_gain, output_bias, scale, shift) = self.get_all_params();
+        let (adaptive_scale, adaptive_shift) = self.get_adaptive_scaling();
+
+        crate::domain::compute::gpu_ops::RichardsCurveParams {
+            nu: nu as f32,
+            k: k as f32,
+            m: m as f32,
+            beta: beta as f32,
+            temp_reciprocal: (1.0 / temp) as f32,
+            output_gain: output_gain as f32,
+            output_bias: output_bias as f32,
+            scale: scale as f32,
+            shift: shift as f32,
+            adaptive_scale: adaptive_scale as f32,
+            adaptive_shift: adaptive_shift as f32,
+            input_scale: 1.0,
+            gate_scale: 1.0,
+            gate_bias: 0.0,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+
     /// Vectorized forward pass: f(x) = output_gain * gate(x) + output_bias (elementwise), writing
     /// to output slice. Optimized for zero-copy usage. Uses extended Richards with beta and
     /// temperature parameters.
@@ -1345,7 +1409,9 @@ impl RichardsCurve {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.forward_kernel_into_f64::<TanhLike>(x, out),
+            crate::domain::richards::Variant::Tanh => {
+                self.forward_kernel_into_f64::<TanhLike>(x, out)
+            }
             _ => self.forward_kernel_into_f64::<SigmoidLike>(x, out),
         }
     }
@@ -1355,7 +1421,9 @@ impl RichardsCurve {
     pub fn forward_into_f32(&self, x: &[f32], out: &mut [f32]) {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.forward_kernel_into_f32::<TanhLike>(x, out),
+            crate::domain::richards::Variant::Tanh => {
+                self.forward_kernel_into_f32::<TanhLike>(x, out)
+            }
             _ => self.forward_kernel_into_f32::<SigmoidLike>(x, out),
         }
     }
@@ -1370,13 +1438,14 @@ impl RichardsCurve {
     ) {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.forward_kernel_with_overrides_into_f32::<TanhLike>(
-                x,
-                out,
-                temp_override,
-                m_override,
-                beta_override,
-            ),
+            crate::domain::richards::Variant::Tanh => self
+                .forward_kernel_with_overrides_into_f32::<TanhLike>(
+                    x,
+                    out,
+                    temp_override,
+                    m_override,
+                    beta_override,
+                ),
             _ => self.forward_kernel_with_overrides_into_f32::<SigmoidLike>(
                 x,
                 out,
@@ -1456,11 +1525,9 @@ impl RichardsCurve {
                         out[i] = k.forward_one_f32(x[i]);
                     }
                 } else {
-                    out.par_iter_mut()
-                        .zip(x.par_iter())
-                        .for_each(|(o, &xi)| {
-                            *o = k.forward_one_f32(xi);
-                        });
+                    out.par_iter_mut().zip(x.par_iter()).for_each(|(o, &xi)| {
+                        *o = k.forward_one_f32(xi);
+                    });
                 }
             }
         }
@@ -1477,7 +1544,9 @@ impl RichardsCurve {
     /// Vectorized forward pass for matrix input, writing to output array
     pub fn forward_matrix_into(&self, x: &Array2<f64>, out: &mut Array2<f64>) {
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.forward_matrix_kernel_into::<TanhLike>(x, out),
+            crate::domain::richards::Variant::Tanh => {
+                self.forward_matrix_kernel_into::<TanhLike>(x, out)
+            }
             _ => self.forward_matrix_kernel_into::<SigmoidLike>(x, out),
         }
     }
@@ -1535,7 +1604,6 @@ impl RichardsCurve {
         }
     }
 
-
     pub fn forward_matrix_f32_with_overrides_into(
         &self,
         x: &Array2<f32>,
@@ -1546,13 +1614,14 @@ impl RichardsCurve {
     ) {
         assert_eq!(x.dim(), out.dim(), "Input/output dims must match");
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.forward_matrix_kernel_with_overrides_into::<TanhLike>(
-                x,
-                out,
-                temp_override,
-                m_override,
-                beta_override,
-            ),
+            crate::domain::richards::Variant::Tanh => self
+                .forward_matrix_kernel_with_overrides_into::<TanhLike>(
+                    x,
+                    out,
+                    temp_override,
+                    m_override,
+                    beta_override,
+                ),
             _ => self.forward_matrix_kernel_with_overrides_into::<SigmoidLike>(
                 x,
                 out,
@@ -1771,26 +1840,88 @@ impl RichardsCurve {
 
         // Initial accumulators
         let init_scalar = vec![0.0f64; scalar_param_count];
-        let init_gamma = if needs_gamma_grad { Some(vec![0.0f64; embedding_dim]) } else { None };
-        let init_bias = if needs_bias_grad { Some(vec![0.0f64; embedding_dim]) } else { None };
+        let init_gamma = if needs_gamma_grad {
+            Some(vec![0.0f64; embedding_dim])
+        } else {
+            None
+        };
+        let init_bias = if needs_bias_grad {
+            Some(vec![0.0f64; embedding_dim])
+        } else {
+            None
+        };
 
-        let (mut scalar_acc, gamma_acc, bias_acc) = if let (Some(x_slice), Some(grad_slice)) =
-            (x.as_slice(), output_grads.as_slice())
-        {
-            let gamma_slice = gamma_row.as_ref().map(|r| r.as_slice().unwrap());
+        let (mut scalar_acc, gamma_acc, bias_acc) =
+            if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
+                let gamma_slice = gamma_row.as_ref().map(|r| r.as_slice().unwrap());
 
-            x_slice
-                .par_chunks_exact(embedding_dim)
-                .zip(grad_slice.par_chunks_exact(embedding_dim))
-                .fold(
-                    || (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
+                x_slice
+                    .par_chunks_exact(embedding_dim)
+                    .zip(grad_slice.par_chunks_exact(embedding_dim))
+                    .fold(
+                        || (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
+                        |mut acc, (x_row, grad_row)| {
+                            let mut buf = [0.0f64; MAX_SCALAR_PARAMS];
+                            let (s_acc, g_acc, b_acc) = &mut acc;
+
+                            for j in 0..embedding_dim {
+                                let dy = grad_row[j];
+                                let eff_dy = if let Some(g) = gamma_slice {
+                                    dy * (g[j] as f64)
+                                } else {
+                                    dy
+                                };
+
+                                let forward_val = self.grad_weights_scalar_into(
+                                    x_row[j],
+                                    eff_dy,
+                                    &mut buf[..scalar_param_count],
+                                );
+
+                                for i in 0..scalar_param_count {
+                                    s_acc[i] += buf[i];
+                                }
+
+                                if let Some(ga) = g_acc {
+                                    ga[j] += forward_val * dy;
+                                }
+                                if let Some(ba) = b_acc {
+                                    ba[j] += dy;
+                                }
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
+                        |mut a, b| {
+                            for (dst, src) in a.0.iter_mut().zip(b.0.iter()) {
+                                *dst += src;
+                            }
+                            if let (Some(ga), Some(gb)) = (&mut a.1, &b.1) {
+                                for (dst, src) in ga.iter_mut().zip(gb.iter()) {
+                                    *dst += src;
+                                }
+                            }
+                            if let (Some(ba), Some(bb)) = (&mut a.2, &b.2) {
+                                for (dst, src) in ba.iter_mut().zip(bb.iter()) {
+                                    *dst += src;
+                                }
+                            }
+                            a
+                        },
+                    )
+            } else {
+                // Fallback for non-contiguous arrays
+                x.outer_iter().zip(output_grads.outer_iter()).fold(
+                    (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
                     |mut acc, (x_row, grad_row)| {
                         let mut buf = [0.0f64; MAX_SCALAR_PARAMS];
                         let (s_acc, g_acc, b_acc) = &mut acc;
 
                         for j in 0..embedding_dim {
                             let dy = grad_row[j];
-                            let eff_dy = if let Some(g) = gamma_slice {
+                            let eff_dy = if let Some(g) = &gamma_row {
                                 dy * (g[j] as f64)
                             } else {
                                 dy
@@ -1816,62 +1947,7 @@ impl RichardsCurve {
                         acc
                     },
                 )
-                .reduce(
-                    || (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
-                    |mut a, b| {
-                        for (dst, src) in a.0.iter_mut().zip(b.0.iter()) {
-                            *dst += src;
-                        }
-                        if let (Some(ga), Some(gb)) = (&mut a.1, &b.1) {
-                            for (dst, src) in ga.iter_mut().zip(gb.iter()) {
-                                *dst += src;
-                            }
-                        }
-                        if let (Some(ba), Some(bb)) = (&mut a.2, &b.2) {
-                            for (dst, src) in ba.iter_mut().zip(bb.iter()) {
-                                *dst += src;
-                            }
-                        }
-                        a
-                    },
-                )
-        } else {
-            // Fallback for non-contiguous arrays
-            x.outer_iter().zip(output_grads.outer_iter()).fold(
-                (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
-                |mut acc, (x_row, grad_row)| {
-                    let mut buf = [0.0f64; MAX_SCALAR_PARAMS];
-                    let (s_acc, g_acc, b_acc) = &mut acc;
-
-                    for j in 0..embedding_dim {
-                        let dy = grad_row[j];
-                        let eff_dy = if let Some(g) = &gamma_row {
-                            dy * (g[j] as f64)
-                        } else {
-                            dy
-                        };
-
-                        let forward_val = self.grad_weights_scalar_into(
-                            x_row[j],
-                            eff_dy,
-                            &mut buf[..scalar_param_count],
-                        );
-
-                        for i in 0..scalar_param_count {
-                            s_acc[i] += buf[i];
-                        }
-
-                        if let Some(ga) = g_acc {
-                            ga[j] += forward_val * dy;
-                        }
-                        if let Some(ba) = b_acc {
-                            ba[j] += dy;
-                        }
-                    }
-                    acc
-                },
-            )
-        };
+            };
 
         // Average scalar parameters across batch and features
         for g in scalar_acc.iter_mut() {
@@ -1919,9 +1995,7 @@ impl RichardsCurve {
             crate::domain::richards::Variant::Tanh => {
                 self.backward_matrix_kernel_into_f32::<TanhLike>(x, output_grads, grad_input)
             }
-            _ => {
-                self.backward_matrix_kernel_into_f32::<SigmoidLike>(x, output_grads, grad_input)
-            }
+            _ => self.backward_matrix_kernel_into_f32::<SigmoidLike>(x, output_grads, grad_input),
         }
     }
 
@@ -1968,76 +2042,102 @@ impl RichardsCurve {
         let batch_denom = batch_size as f32;
 
         debug_assert!(scalar_param_count <= MAX_SCALAR_PARAMS);
-        
+
         let gamma_row = if let Some(gamma) = &self.gamma {
             Some(gamma.row(0))
         } else {
             None
         };
-        
+
         // Accumulator: (scalar_grads, gamma_grads, bias_grads)
         // We use Option for gamma/bias buffers to avoid allocation if not needed
         let init_scalar = vec![0.0f32; scalar_param_count];
-        let init_gamma = if self.gamma_learnable { Some(vec![0.0f32; embedding_dim]) } else { None };
-        let init_bias = if self.bias_learnable { Some(vec![0.0f32; embedding_dim]) } else { None };
+        let init_gamma = if self.gamma_learnable {
+            Some(vec![0.0f32; embedding_dim])
+        } else {
+            None
+        };
+        let init_bias = if self.bias_learnable {
+            Some(vec![0.0f32; embedding_dim])
+        } else {
+            None
+        };
 
-        let (scalar_acc, gamma_acc, bias_acc) = if let (Some(x_slice), Some(grad_slice)) = (x.as_slice(), output_grads.as_slice()) {
-             x_slice.par_chunks_exact(embedding_dim)
+        let (scalar_acc, gamma_acc, bias_acc) = if let (Some(x_slice), Some(grad_slice)) =
+            (x.as_slice(), output_grads.as_slice())
+        {
+            x_slice
+                .par_chunks_exact(embedding_dim)
                 .zip(grad_slice.par_chunks_exact(embedding_dim))
                 .fold(
                     || (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
                     |mut acc, (x_row, grad_row)| {
                         let (ref mut s_acc, ref mut g_acc, ref mut b_acc) = acc;
                         let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
-                        
+
                         let g_row = gamma_row;
-                        
+
                         match self.variant {
-                             crate::domain::richards::Variant::Tanh => {
-                                 for j in 0..embedding_dim {
+                            crate::domain::richards::Variant::Tanh => {
+                                for j in 0..embedding_dim {
                                     let dy = grad_row[j];
-                                    let eff_dy = if let Some(g) = g_row { dy * (g[j] as f32) } else { dy };
-                                    
-                                    let forward_val = self.grad_weights_scalar_into_kernel_f32::<TanhLike>(
-                                        x_row[j], eff_dy, &mut buf[..scalar_param_count]
-                                    );
-                                    
+                                    let eff_dy = if let Some(g) = g_row {
+                                        dy * (g[j] as f32)
+                                    } else {
+                                        dy
+                                    };
+
+                                    let forward_val = self
+                                        .grad_weights_scalar_into_kernel_f32::<TanhLike>(
+                                            x_row[j],
+                                            eff_dy,
+                                            &mut buf[..scalar_param_count],
+                                        );
+
                                     for i in 0..scalar_param_count {
                                         s_acc[i] += buf[i];
                                     }
-                                    
+
                                     if let Some(ga) = g_acc {
                                         ga[j] += forward_val * dy;
                                     }
                                     if let Some(ba) = b_acc {
                                         ba[j] += dy;
                                     }
-                                 }
-                             },
-                             _ => { // SigmoidLike
-                                 for j in 0..embedding_dim {
+                                }
+                            }
+                            _ => {
+                                // SigmoidLike
+                                for j in 0..embedding_dim {
                                     let dy = grad_row[j];
-                                    let eff_dy = if let Some(g) = g_row { dy * (g[j] as f32) } else { dy };
-                                    
-                                    let forward_val = self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(
-                                        x_row[j], eff_dy, &mut buf[..scalar_param_count]
-                                    );
-                                    
+                                    let eff_dy = if let Some(g) = g_row {
+                                        dy * (g[j] as f32)
+                                    } else {
+                                        dy
+                                    };
+
+                                    let forward_val = self
+                                        .grad_weights_scalar_into_kernel_f32::<SigmoidLike>(
+                                            x_row[j],
+                                            eff_dy,
+                                            &mut buf[..scalar_param_count],
+                                        );
+
                                     for i in 0..scalar_param_count {
                                         s_acc[i] += buf[i];
                                     }
-                                    
+
                                     if let Some(ga) = g_acc {
                                         ga[j] += forward_val * dy;
                                     }
                                     if let Some(ba) = b_acc {
                                         ba[j] += dy;
                                     }
-                                 }
-                             }
+                                }
+                            }
                         }
                         acc
-                    }
+                    },
                 )
                 .reduce(
                     || (init_scalar.clone(), init_gamma.clone(), init_bias.clone()),
@@ -2048,102 +2148,117 @@ impl RichardsCurve {
                         }
                         // Merge gamma
                         if let (Some(ga), Some(gb)) = (&mut a.1, &b.1) {
-                             for i in 0..embedding_dim {
-                                 ga[i] += gb[i];
-                             }
+                            for i in 0..embedding_dim {
+                                ga[i] += gb[i];
+                            }
                         }
                         // Merge bias
                         if let (Some(ba), Some(bb)) = (&mut a.2, &b.2) {
-                             for i in 0..embedding_dim {
-                                 ba[i] += bb[i];
-                             }
+                            for i in 0..embedding_dim {
+                                ba[i] += bb[i];
+                            }
                         }
                         a
-                    }
+                    },
                 )
         } else {
-             // Fallback for non-contiguous arrays (rare but possible)
-             let mut s_acc = init_scalar;
-             let mut g_acc = init_gamma;
-             let mut b_acc = init_bias;
-             let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
-             
-             let g_row = gamma_row;
-             
-             match self.variant {
-                 crate::domain::richards::Variant::Tanh => {
-                     for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
-                         for j in 0..embedding_dim {
+            // Fallback for non-contiguous arrays (rare but possible)
+            let mut s_acc = init_scalar;
+            let mut g_acc = init_gamma;
+            let mut b_acc = init_bias;
+            let mut buf = [0.0f32; MAX_SCALAR_PARAMS];
+
+            let g_row = gamma_row;
+
+            match self.variant {
+                crate::domain::richards::Variant::Tanh => {
+                    for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
+                        for j in 0..embedding_dim {
                             let dy = grad_row[j];
-                            let eff_dy = if let Some(g) = g_row { dy * (g[j] as f32) } else { dy };
-                            
+                            let eff_dy = if let Some(g) = g_row {
+                                dy * (g[j] as f32)
+                            } else {
+                                dy
+                            };
+
                             let forward_val = self.grad_weights_scalar_into_kernel_f32::<TanhLike>(
-                                x_row[j], eff_dy, &mut buf[..scalar_param_count]
+                                x_row[j],
+                                eff_dy,
+                                &mut buf[..scalar_param_count],
                             );
-                            
+
                             for i in 0..scalar_param_count {
                                 s_acc[i] += buf[i];
                             }
-                            
+
                             if let Some(ga) = &mut g_acc {
                                 ga[j] += forward_val * dy;
                             }
                             if let Some(ba) = &mut b_acc {
                                 ba[j] += dy;
                             }
-                         }
-                     }
-                 },
-                 _ => {
-                     for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
-                         for j in 0..embedding_dim {
+                        }
+                    }
+                }
+                _ => {
+                    for (x_row, grad_row) in x.outer_iter().zip(output_grads.outer_iter()) {
+                        for j in 0..embedding_dim {
                             let dy = grad_row[j];
-                            let eff_dy = if let Some(g) = g_row { dy * (g[j] as f32) } else { dy };
-                            
-                            let forward_val = self.grad_weights_scalar_into_kernel_f32::<SigmoidLike>(
-                                x_row[j], eff_dy, &mut buf[..scalar_param_count]
-                            );
-                            
+                            let eff_dy = if let Some(g) = g_row {
+                                dy * (g[j] as f32)
+                            } else {
+                                dy
+                            };
+
+                            let forward_val = self
+                                .grad_weights_scalar_into_kernel_f32::<SigmoidLike>(
+                                    x_row[j],
+                                    eff_dy,
+                                    &mut buf[..scalar_param_count],
+                                );
+
                             for i in 0..scalar_param_count {
                                 s_acc[i] += buf[i];
                             }
-                            
+
                             if let Some(ga) = &mut g_acc {
                                 ga[j] += forward_val * dy;
                             }
                             if let Some(ba) = &mut b_acc {
                                 ba[j] += dy;
                             }
-                         }
-                     }
-                 }
-             }
-             (s_acc, g_acc, b_acc)
+                        }
+                    }
+                }
+            }
+            (s_acc, g_acc, b_acc)
         };
 
         // Finalize results
         let mut grads_accum_f64: Vec<f64> = Vec::with_capacity(self.weights_len());
-        
+
         for &gi in scalar_acc.iter() {
             let mut g = (gi as f64) / total_elements;
-            if !g.is_finite() { g = 0.0; }
+            if !g.is_finite() {
+                g = 0.0;
+            }
             grads_accum_f64.push(g);
         }
-        
+
         if let Some(ga) = gamma_acc {
-             grads_accum_f64.extend(ga.into_iter().map(|v| {
-                 let g = (v / batch_denom) as f64;
-                 if g.is_finite() { g } else { 0.0 }
-             }));
+            grads_accum_f64.extend(ga.into_iter().map(|v| {
+                let g = (v / batch_denom) as f64;
+                if g.is_finite() { g } else { 0.0 }
+            }));
         }
-        
+
         if let Some(ba) = bias_acc {
-             grads_accum_f64.extend(ba.into_iter().map(|v| {
-                 let g = (v / batch_denom) as f64;
-                 if g.is_finite() { g } else { 0.0 }
-             }));
+            grads_accum_f64.extend(ba.into_iter().map(|v| {
+                let g = (v / batch_denom) as f64;
+                if g.is_finite() { g } else { 0.0 }
+            }));
         }
-        
+
         grads_accum_f64
     }
 
@@ -2153,7 +2268,9 @@ impl RichardsCurve {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
 
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.derivative_kernel_into_f64::<TanhLike>(x, out),
+            crate::domain::richards::Variant::Tanh => {
+                self.derivative_kernel_into_f64::<TanhLike>(x, out)
+            }
             _ => self.derivative_kernel_into_f64::<SigmoidLike>(x, out),
         }
     }
@@ -2184,7 +2301,9 @@ impl RichardsCurve {
     pub fn derivative_into_f32(&self, x: &[f32], out: &mut [f32]) {
         assert_eq!(x.len(), out.len(), "Input and output lengths must match");
         match self.variant {
-            crate::domain::richards::Variant::Tanh => self.derivative_kernel_into_f32::<TanhLike>(x, out),
+            crate::domain::richards::Variant::Tanh => {
+                self.derivative_kernel_into_f32::<TanhLike>(x, out)
+            }
             _ => self.derivative_kernel_into_f32::<SigmoidLike>(x, out),
         }
     }
@@ -2915,8 +3034,8 @@ impl RichardsCurve {
             let std = variance.sqrt().max(1e-6); // Minimum std for numerical stability
 
             // Adaptive normalization: center at mean, scale to unit variance
-            self.adaptive_scale = Some(1.0 / std);
-            self.adaptive_shift = Some(-mean / std);
+            self.adaptive_scale_opt = Some(1.0 / std);
+            self.adaptive_shift_opt = Some(-mean / std);
         }
     }
 
@@ -2924,8 +3043,8 @@ impl RichardsCurve {
     fn get_adaptive_scaling(&self) -> (f64, f64) {
         if self.variant == crate::domain::richards::Variant::Adaptive {
             (
-                self.adaptive_scale.unwrap_or(1.0),
-                self.adaptive_shift.unwrap_or(0.0),
+                self.adaptive_scale_opt.unwrap_or(1.0),
+                self.adaptive_shift_opt.unwrap_or(0.0),
             )
         } else {
             (1.0, 0.0) // Identity transformation for non-adaptive variants
@@ -2938,8 +3057,8 @@ impl RichardsCurve {
             self.running_sum = Some(0.0);
             self.running_sq_sum = Some(0.0);
             self.count = Some(0);
-            self.adaptive_scale = Some(1.0);
-            self.adaptive_shift = Some(0.0);
+            self.adaptive_scale_opt = Some(1.0);
+            self.adaptive_shift_opt = Some(0.0);
         }
     }
 

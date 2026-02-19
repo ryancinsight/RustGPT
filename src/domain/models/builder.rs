@@ -1,16 +1,18 @@
 use crate::{
     application::encoding::Vocab,
     domain::{
+        compute::GpuDevice,
+        compute_backend::ComputeBackend,
         embeddings::TokenEmbeddings,
+        layers::output::OutputProjection,
         layers::{
-            diffusion::{DiffusionBlock, DiffusionBlockConfig, EDM_SIGMA_DATA_DEFAULT, NoiseSchedule},
-            recurrence::LRM,
-            spiking::{AlifLayer, LifLayer},
+            diffusion::{
+                DiffusionBlock, DiffusionBlockConfig, EDM_SIGMA_DATA_DEFAULT, NoiseSchedule,
+            },
             transformer::TransformerBlock,
         },
         models::config::{ArchitectureType, ModelConfig},
         network::{Layer, LayerEnum},
-        layers::output::OutputProjection,
         richards::RichardsNorm,
     },
 };
@@ -28,6 +30,15 @@ use crate::{
 /// # Returns
 /// Vector of layers that form the complete network
 pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
+    let resolved_backend = config.resolve_compute_backend().unwrap_or_else(|err| {
+        panic!(
+            "Unable to resolve compute backend from preference '{}': {}",
+            config.compute_backend.as_str(),
+            err
+        )
+    });
+    validate_gpu_backend(resolved_backend);
+
     let mut layers = Vec::new();
 
     // Add embedding layer (common to all architectures)
@@ -40,27 +51,13 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         ),
     ));
 
-    if let Some(model) = config.spiking_neuron_model {
-        match model {
-            crate::domain::eprop::NeuronModel::LIF => layers.push(LayerEnum::LifLayer(Box::new(
-                LifLayer::new(config.embedding_dim),
-            ))),
-            crate::domain::eprop::NeuronModel::ALIF => layers.push(LayerEnum::AlifLayer(Box::new(
-                AlifLayer::new(config.embedding_dim),
-            ))),
-        }
-    }
-
     // Build architecture-specific layers
     match config.architecture {
         ArchitectureType::Autoregressive => {
-            build_transformer_layers(&mut layers, config);
-        }
-        ArchitectureType::TRM => {
-            build_trm_layers(&mut layers, config);
+            build_transformer_layers(&mut layers, config, resolved_backend);
         }
         ArchitectureType::Diffusion => {
-            build_diffusion_layers(&mut layers, config, vocab);
+            build_diffusion_layers(&mut layers, config, vocab, resolved_backend);
         }
     }
 
@@ -70,14 +67,23 @@ pub fn build_network(config: &ModelConfig, vocab: &Vocab) -> Vec<LayerEnum> {
         vocab.size(),
     )));
 
-    // Set TRM/LRM layers to inference mode by default for speed
-    for layer in &mut layers {
-        if let LayerEnum::LRM(lrm) = layer {
-            lrm.set_training_mode(false);
-        }
+    layers
+}
+
+#[inline]
+fn validate_gpu_backend(compute_backend: ComputeBackend) {
+    if !compute_backend.is_gpu() {
+        return;
     }
 
-    layers
+    let device = GpuDevice::new(compute_backend).unwrap_or_else(|err| {
+        panic!(
+            "Failed to initialize requested GPU backend '{}': {}",
+            compute_backend.as_str(),
+            err
+        )
+    });
+    println!("GPU backend ready: {}", device.format_info());
 }
 
 /// Build Diffusion Transformer architecture layers
@@ -90,6 +96,7 @@ fn build_diffusion_layers(
     layers: &mut Vec<LayerEnum>,
     config: &ModelConfig,
     vocab: &crate::application::encoding::Vocab,
+    compute_backend: ComputeBackend,
 ) {
     for _layer_idx in 0..config.num_layers {
         // Build LLaDA-style masked diffusion block config
@@ -145,7 +152,16 @@ fn build_diffusion_layers(
             ddim_steps_policy: Default::default(),
         };
 
-        let diffusion_block = DiffusionBlock::new(block_cfg);
+        let mut diffusion_block = DiffusionBlock::new(block_cfg);
+        diffusion_block
+            .set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set DiffusionBlock backend '{}' during model build: {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
         layers.push(LayerEnum::DiffusionBlock(Box::new(diffusion_block)));
     }
 
@@ -164,26 +180,27 @@ fn build_diffusion_layers(
 /// - Pre-feedforward normalization
 /// - Feedforward network (RichardsGlu or MixtureOfExperts)
 /// - Residual connections
-fn build_transformer_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
+fn build_transformer_layers(
+    layers: &mut Vec<LayerEnum>,
+    config: &ModelConfig,
+    compute_backend: ComputeBackend,
+) {
     for layer_idx in 0..config.num_layers {
         // Create a complete transformer block that encapsulates all components
-        let transformer_block = TransformerBlock::from_model_config(config, layer_idx);
+        let mut transformer_block = TransformerBlock::from_model_config(config, layer_idx);
+        transformer_block
+            .set_compute_backend_checked(compute_backend)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to set TransformerBlock backend '{}' during model build: {}",
+                    compute_backend.as_str(),
+                    err
+                )
+            });
         layers.push(LayerEnum::TransformerBlock(Box::new(transformer_block)));
     }
 
     // Final normalization layer prior to logits projection (typical Pre-LN pattern)
-    layers.push(LayerEnum::DynamicTanhNorm(Box::new(RichardsNorm::new(
-        config.embedding_dim,
-    ))));
-}
-
-/// Build TRM (Tiny Recursive Model) layers
-///
-/// Creates a single TRM layer that handles recursive reasoning internally.
-/// TRM uses shared weights across recursive operations for efficient reasoning.
-fn build_trm_layers(layers: &mut Vec<LayerEnum>, config: &ModelConfig) {
-    let lrm = LRM::from_model_config(config);
-    layers.push(LayerEnum::LRM(Box::new(lrm)));
     layers.push(LayerEnum::DynamicTanhNorm(Box::new(RichardsNorm::new(
         config.embedding_dim,
     ))));
@@ -200,25 +217,20 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     println!("\n📐 Base Configuration:");
     println!("  Architecture Type: {:?}", config.architecture);
+    println!(
+        "  Compute Backend Preference: {}",
+        config.compute_backend.as_str()
+    );
+    match config.resolve_compute_backend() {
+        Ok(resolved) => println!("  Resolved Backend: {}", resolved.as_str()),
+        Err(err) => println!("  Resolved Backend: <error: {}>", err),
+    }
     println!("  Embedding Dimension: {}", config.embedding_dim);
     println!("  Hidden Dimension: {}", config.hidden_dim);
 
     match config.architecture {
         ArchitectureType::Autoregressive => {
             println!("  Number of Layers: {}", config.num_layers);
-        }
-        ArchitectureType::TRM => {
-            println!("  Recursions per Step: {}", 2); // From TRM config
-            println!("  Max Supervision Steps: {}", 16); // Training mode
-            println!("  Max Inference Steps: {}", 3); // Inference mode (much faster)
-            println!(
-                "  TRM Mode: {}",
-                if config.trm_use_diffusion {
-                    "Diffusion"
-                } else {
-                    "Autoregressive"
-                }
-            );
         }
         ArchitectureType::Diffusion => {
             println!("  Number of Layers: {}", config.num_layers);
@@ -239,7 +251,7 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
 
     println!("  Max Sequence Length: {}", config.max_seq_len);
 
-    // Temporal mixing (applies to Transformer/Diffusion blocks and TRM internals).
+    // Temporal mixing (applies to Transformer/Diffusion blocks).
     println!("  Temporal Mixing: {:?}", config.temporal_mixing);
 
     // Modern LLM Enhancements
@@ -293,49 +305,11 @@ pub fn print_architecture_summary(config: &ModelConfig, layers: &[LayerEnum]) {
     for (i, layer) in layers.iter().enumerate() {
         match layer {
             LayerEnum::TransformerBlock(tb) => {
-                let tm = match &tb.temporal_mixing().temporal_mixing {
-                    crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
-                        "Attention"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
-                        "RgLruMoH"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::RgLru(_) => "RgLru",
-                    crate::domain::layers::components::common::TemporalMixingLayer::MambaMoH(_) => {
-                        "MambaMoH"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba(_) => "Mamba",
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
-                        "Mamba2MoH"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
-                    crate::domain::layers::components::common::TemporalMixingLayer::Titans(_) => {
-                        "TitansMAC"
-                    }
-                };
+                let tm = tb.temporal_mixing().layer_type();
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
             }
             LayerEnum::DiffusionBlock(db) => {
-                let tm = match &db.temporal_mixing.temporal_mixing {
-                    crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
-                        "Attention"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
-                        "RgLruMoH"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::RgLru(_) => "RgLru",
-                    crate::domain::layers::components::common::TemporalMixingLayer::MambaMoH(_) => {
-                        "MambaMoH"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba(_) => "Mamba",
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
-                        "Mamba2MoH"
-                    }
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2(_) => "Mamba2",
-                    crate::domain::layers::components::common::TemporalMixingLayer::Titans(_) => {
-                        "TitansMAC"
-                    }
-                };
+                let tm = db.temporal_mixing.layer_type();
                 println!("  {}: {} (temporal_mixing = {})", i, layer.layer_type(), tm);
             }
             _ => {

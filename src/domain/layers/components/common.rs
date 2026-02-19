@@ -6,6 +6,7 @@ use crate::domain::{
         poly_attention::PolyAttention,
         position::config::{CoPEConfig, CoPEVariant},
     },
+    compute_backend::ComputeBackend,
     layers::ssm::{
         Mamba, Mamba2, MoHMamba, MoHMamba2,
         rg_lru::{MoHRgLru, RgLru},
@@ -270,6 +271,91 @@ impl Layer for TemporalMixingLayer {
 }
 
 impl TemporalMixingLayer {
+    /// Set runtime compute backend for temporal-mixing variants that carry explicit backend state.
+    ///
+    /// Variants without GPU kernels currently keep CPU-only execution and fail fast in shared
+    /// wrappers when a GPU backend is requested.
+    pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
+        match self {
+            TemporalMixingLayer::RgLru(layer) => layer.set_compute_backend(compute_backend),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.set_compute_backend(compute_backend),
+            TemporalMixingLayer::Mamba(layer) => layer.set_compute_backend(compute_backend),
+            TemporalMixingLayer::Mamba2(layer) => layer.set_compute_backend(compute_backend),
+            TemporalMixingLayer::MambaMoH(layer) => layer.set_compute_backend(compute_backend),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.set_compute_backend(compute_backend),
+            _ => {}
+        }
+    }
+
+    /// Set GPU device for GPU-accelerated execution.
+    ///
+    /// Only Attention variant currently supports GPU execution.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        match self {
+            TemporalMixingLayer::Attention(layer) => {
+                use crate::domain::compute::GpuComponent;
+                layer.set_gpu_device(device);
+            }
+            _ => {
+                // Other variants don't support GPU yet
+            }
+        }
+    }
+
+    /// Get the number of attention heads (only valid for Attention variant).
+    ///
+    /// Returns 1 for non-attention variants (for buffer sizing purposes).
+    pub fn num_heads(&self) -> usize {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.num_heads(),
+            _ => 1,
+        }
+    }
+
+    pub fn forward_gpu(
+        &mut self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::RgLru(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::Mamba(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::Mamba2(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::MambaMoH(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward_gpu(input),
+            TemporalMixingLayer::Titans(_) => Err(crate::common::errors::ModelError::Backend {
+                message: "GPU forward not yet implemented for Titans".to_string(),
+            }),
+        }
+    }
+
+    /// Ensure GPU execution context is attached for variants that support GPU kernels.
+    ///
+    /// Uses strict automatic GPU detection and does not silently fallback to CPU.
+    /// Currently implemented for Attention, Mamba, Mamba2, RgLru variants.
+    pub fn ensure_gpu_device_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => layer.ensure_gpu_device_auto_detect(),
+            TemporalMixingLayer::RgLru(_) => {
+                // RgLru: GPU device auto-detection OK (no specialized GPU device setup needed)
+                Ok(())
+            }
+            TemporalMixingLayer::RgLruMoH(layer) => layer.enable_gpu_auto_detect(),
+            TemporalMixingLayer::Mamba(layer) => layer.enable_gpu_auto_detect(),
+            TemporalMixingLayer::Mamba2(layer) => layer.enable_gpu_auto_detect(),
+            TemporalMixingLayer::MambaMoH(layer) => layer.enable_gpu_auto_detect(),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.enable_gpu_auto_detect(),
+            TemporalMixingLayer::Titans(_) => Err(crate::common::errors::ModelError::Backend {
+                message: "GPU device attachment not yet implemented for Titans".to_string(),
+            }),
+        }
+    }
+
     /// Streaming forward step for token-by-token inference.
     ///
     /// Implemented for all temporal mixing variants.
@@ -294,6 +380,66 @@ impl TemporalMixingLayer {
             other => {
                 let _ = causal; // Non-attention variants ignore explicit causal flag.
                 other.forward(input)
+            }
+        }
+    }
+
+    /// Forward pass with in-place output buffer (Zero Allocation)
+    ///
+    /// Writes output directly to the provided buffer, eliminating intermediate allocations.
+    /// This is the preferred method for batch processing where output buffers are pre-allocated.
+    pub fn forward_into(
+        &mut self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => {
+                layer.forward_into(input, output);
+                Ok(())
+            }
+            TemporalMixingLayer::RgLru(layer) => layer.forward_into(input, output),
+            TemporalMixingLayer::Mamba(layer) => layer.forward_into(input, output),
+            TemporalMixingLayer::Mamba2(layer) => layer.inner.forward_into(input, output),
+            TemporalMixingLayer::RgLruMoH(layer) => layer.forward_into(input, output),
+            TemporalMixingLayer::MambaMoH(layer) => layer.forward_into(input, output),
+            TemporalMixingLayer::Mamba2MoH(layer) => layer.forward_into(input, output),
+            other => {
+                // Fallback path for any remaining variants (e.g., Titans).
+                let out = other.forward(input);
+                if output.raw_dim() == out.raw_dim() {
+                    output.assign(&out);
+                } else {
+                    *output = out;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Forward pass with causal control and in-place output (Zero Allocation)
+    ///
+    /// Writes output directly to the provided buffer with explicit causal masking control.
+    pub fn forward_with_causal_into(
+        &mut self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+        causal: bool,
+    ) -> crate::common::errors::Result<()> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => {
+                layer.forward_into_with_causal(input, output, causal);
+                Ok(())
+            }
+            other => {
+                let _ = causal; // Non-attention variants ignore explicit causal flag.
+                let out = other.forward(input);
+                if output.raw_dim() == out.raw_dim() {
+                    output.assign(&out);
+                } else {
+                    *output = out;
+                }
+                Ok(())
             }
         }
     }
@@ -598,6 +744,74 @@ impl FeedForwardVariant {
         delegate_ffn_method!(self, forward, input)
     }
 
+    pub fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        match self {
+            FeedForwardVariant::RichardsGlu(layer) => layer.set_gpu_device(device),
+            FeedForwardVariant::MixtureOfExperts(layer) => {
+                layer.set_gpu_device(device);
+            }
+        }
+    }
+
+    pub fn forward_gpu(
+        &mut self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        match self {
+            FeedForwardVariant::RichardsGlu(layer) => layer.forward_gpu(input),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward_gpu(input),
+        }
+    }
+
+    /// Ensure GPU execution context is attached for variants that support GPU kernels.
+    ///
+    /// Uses strict automatic GPU detection and does not silently fallback to CPU.
+    pub fn ensure_gpu_device_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        match self {
+            FeedForwardVariant::RichardsGlu(layer) => {
+                if layer.gpu_device.is_none() {
+                    let device = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::domain::compute::GpuDevice::auto_detect()?,
+                    ));
+                    layer.set_gpu_device(device);
+                }
+                Ok(())
+            }
+            FeedForwardVariant::MixtureOfExperts(layer) => {
+                if layer.gpu_device.is_none() {
+                    let device = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::domain::compute::GpuDevice::auto_detect()?,
+                    ));
+                    layer.set_gpu_device(device);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Forward pass with in-place output buffer (Zero Allocation)
+    ///
+    /// Writes output directly to the provided buffer, eliminating intermediate
+    /// allocations. This is the preferred method for batch processing where
+    /// output buffers are pre-allocated from UnifiedLayerWorkspace.
+    ///
+    /// # Implementation Details
+    /// - RichardsGlu: True zero-allocation (Phase 5.1.1) using batch_workspace
+    /// - MixtureOfExperts: True zero-allocation using expert computation buffers
+    pub fn forward_into(
+        &mut self,
+        input: &Array2<f32>,
+        output: &mut Array2<f32>,
+    ) -> crate::common::errors::Result<()> {
+        match self {
+            FeedForwardVariant::RichardsGlu(layer) => layer.forward_into(input, output),
+            FeedForwardVariant::MixtureOfExperts(layer) => layer.forward_into(input, output),
+        }
+    }
+
     /// Streaming forward step for token-by-token inference.
     pub fn forward_step(&mut self, input: &ndarray::Array1<f32>) -> ndarray::Array1<f32> {
         let mut output = ndarray::Array1::zeros(input.raw_dim());
@@ -624,6 +838,9 @@ impl FeedForwardVariant {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         delegate_ffn_method!(self, compute_gradients, input, output_grads)
     }
+
+    // Note: forward_into will be added in Phase 5.1b for RichardsGlu and MixtureOfExperts
+    // This will enable in-place feedforward computation for memory efficiency
 
     pub fn apply_gradients(
         &mut self,

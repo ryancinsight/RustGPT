@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
+    compute_backend::{ComputeBackend, ComputeBackendPreference, resolve_compute_backend},
     layers::diffusion::{DiffusionPredictionTarget, NoiseSchedule},
     mixtures::{moe::ExpertRouter, moe::ExpertRoutingMode, moh::HeadSelectionStrategy},
     multimodal::MultiModalConfig,
@@ -63,9 +64,6 @@ pub enum ArchitectureType {
     /// outer training/generation paradigm (next-token prediction), not the mixer.
     #[serde(alias = "Transformer")]
     Autoregressive,
-
-    /// Tiny Recursive Model (LRM) - recursive reasoning with shared weights
-    TRM,
 
     /// Diffusion Transformer - generative model using denoising diffusion process
     Diffusion,
@@ -133,6 +131,14 @@ pub enum DiffusionTimestepStrategy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    /// Execution backend selection.
+    ///
+    /// `AutoGpu` prefers GPU when available, otherwise uses CPU.
+    /// If a GPU is detected but unavailable due to build-feature mismatch,
+    /// backend resolution fails to surface the GPU setup issue.
+    #[serde(default = "compute_backend_default")]
+    pub compute_backend: ComputeBackendPreference,
+
     /// Type of architecture to use
     pub architecture: ArchitectureType,
 
@@ -170,16 +176,6 @@ pub struct ModelConfig {
     /// Example: num_heads=8, num_kv_heads=Some(4) → 2 query heads per KV head
     /// Default: None (use MHA for backward compatibility)
     pub num_kv_heads: Option<usize>,
-
-    /// Enable E-Prop (Eligibility Propagation) trace-based adaptation
-    /// This adds an EPropAdaptor to each transformer block
-    #[serde(default)]
-    pub eprop_enabled: bool,
-
-    /// Configuration for neurons used in E-Prop adaptor
-    /// If None, defaults to LIF neurons
-    #[serde(default)]
-    pub eprop_neuron_config: Option<crate::domain::eprop::config::NeuronConfig>,
 
     /// Sliding window size for attention (Sliding Window Attention)
     ///
@@ -261,20 +257,6 @@ pub struct ModelConfig {
 
     #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
-
-    #[serde(default)]
-    pub spiking_neuron_model: Option<crate::domain::eprop::NeuronModel>,
-
-    /// Use diffusion-conditioned blocks inside TRM when architecture=TRM
-    pub trm_use_diffusion: bool,
-
-    pub trm_num_recursions: Option<usize>,
-    pub trm_max_supervision_steps: Option<usize>,
-    pub trm_max_inference_steps: Option<usize>,
-    pub trm_latent_update_alpha: Option<f32>,
-    pub trm_latent_moh_enabled: Option<bool>,
-    pub trm_latent_moh_top_p_min: Option<f32>,
-    pub trm_latent_moh_top_p_max: Option<f32>,
 
     /// Target parameterization for diffusion blocks (ε vs v prediction)
     pub diffusion_prediction_target: DiffusionPredictionTarget,
@@ -366,6 +348,7 @@ impl ModelConfig {
     ) -> Self {
         let default_num_heads = num_heads.unwrap_or(8).max(1);
         Self {
+            compute_backend: compute_backend_default(),
             architecture: ArchitectureType::Autoregressive,
             embedding_dim,
             hidden_dim,
@@ -401,27 +384,24 @@ impl ModelConfig {
                 load_balance_weight: 0.01,
                 sparsity_weight: 0.001,
                 diversity_weight: 0.005,
+                expert_specialization_weight: 0.002,
                 routing_mode: ExpertRoutingMode::TokenChoiceTopK,
                 capacity_factor: 0.0,
                 min_expert_capacity: 0,
                 renormalize_after_capacity: true,
                 z_loss_weight: 0.0,
                 use_head_conditioning: true,
+                cap_experts_by_head_activity: true,
                 use_learned_k_adaptation: true,
+                head_expert_proximity_scale: 0.15,
+                head_expert_proximity_sigma: 0.35,
+                parallel_expert_execution: true,
+                parallel_expert_min_tokens: 16,
                 shared_experts: vec![],
                 shared_expert_scale: 0.0,
                 moh_moe_contrastive_weight: 0.01,
             }),
             titan_memory: TitanMemoryConfig::default(),
-            spiking_neuron_model: None,
-            trm_use_diffusion: false,
-            trm_num_recursions: None,
-            trm_max_supervision_steps: None,
-            trm_max_inference_steps: None,
-            trm_latent_update_alpha: None,
-            trm_latent_moh_enabled: Some(true),
-            trm_latent_moh_top_p_min: Some(0.6),
-            trm_latent_moh_top_p_max: Some(0.95),
             diffusion_prediction_target: DiffusionPredictionTarget::Epsilon,
             diffusion_min_snr_gamma: 3.0,
             diffusion_noise_schedule: NoiseSchedule::Cosine { s: 0.008 },
@@ -434,8 +414,6 @@ impl ModelConfig {
             residual_hardneg_margin: residual_hardneg_margin_default(),
             residual_hardneg_temperature: residual_hardneg_temperature_default(),
             residual_hardneg_bank_size: residual_hardneg_bank_size_default(),
-            eprop_enabled: false,
-            eprop_neuron_config: None,
             multimodal: None,
         }
     }
@@ -443,7 +421,8 @@ impl ModelConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self::transformer(128, 256, 3, 80, None, Some(4))
+        // Minimal debug configuration
+        Self::transformer(128, 256, 1, 80, None, Some(4))
     }
 }
 
@@ -536,6 +515,10 @@ fn residual_hardneg_bank_size_default() -> usize {
     512
 }
 
+fn compute_backend_default() -> ComputeBackendPreference {
+    ComputeBackendPreference::Cpu
+}
+
 impl ModelConfig {
     pub fn get_num_heads(&self) -> usize {
         self.num_heads.unwrap_or(8)
@@ -563,5 +546,26 @@ impl ModelConfig {
             AttentionType::PolyAttention { degree_p } => degree_p,
             _ => 3,
         }
+    }
+
+    /// Resolve the effective runtime backend from this configuration.
+    ///
+    /// `AutoGpu` prefers GPU and resolves to CPU only when no supported GPU backend
+    /// is detected at runtime.
+    pub fn resolve_compute_backend(&self) -> crate::common::errors::Result<ComputeBackend> {
+        resolve_compute_backend(self.compute_backend)
+    }
+
+    /// Resolve backend and panic on failure.
+    ///
+    /// Used by constructor paths that do not return `Result`.
+    pub fn resolve_compute_backend_or_panic(&self) -> ComputeBackend {
+        self.resolve_compute_backend().unwrap_or_else(|err| {
+            panic!(
+                "Failed to resolve compute backend from preference '{}': {}",
+                self.compute_backend.as_str(),
+                err
+            )
+        })
     }
 }

@@ -9,10 +9,10 @@ use tracing::{info, warn};
 use crate::infrastructure::persistence::model_storage::ModelStorage;
 
 use super::{
+    WebUiError, WebUiResult,
     config::WebUiConfig,
     routes::{create_router, create_router_with_auth},
     state::AppState,
-    WebUiError, WebUiResult,
 };
 
 /// Run the web UI server
@@ -62,8 +62,22 @@ pub async fn run_server(
     // Log configuration
     info!("Web UI Configuration:");
     info!("  Address: {}", addr);
-    info!("  CORS: {}", if config.cors_enabled { "enabled" } else { "disabled" });
-    info!("  WebSocket: {}", if config.websocket_enabled { "enabled" } else { "disabled" });
+    info!(
+        "  CORS: {}",
+        if config.cors_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    info!(
+        "  WebSocket: {}",
+        if config.websocket_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     info!("  Max body size: {} MB", config.max_body_size / 1024 / 1024);
     info!("  Model directory: {}", config.model_dir);
 
@@ -86,10 +100,7 @@ pub async fn run_server(
 }
 
 /// Run server with custom state (for testing or advanced use cases)
-pub async fn run_server_with_state(
-    config: WebUiConfig,
-    state: AppState,
-) -> WebUiResult<()> {
+pub async fn run_server_with_state(config: WebUiConfig, state: AppState) -> WebUiResult<()> {
     let addr = config.socket_addr();
 
     let app = if config.auth_enabled {
@@ -180,14 +191,11 @@ impl ServerBuilder {
     }
 
     /// Build and run the server
-    pub async fn run(
-        self,
-        storage: impl ModelStorage + 'static,
-    ) -> WebUiResult<()> {
+    pub async fn run(self, storage: impl ModelStorage + 'static) -> WebUiResult<()> {
         let addr = self.config.socket_addr();
-        let state = self.state.unwrap_or_else(|| {
-            AppState::new(self.config.clone(), Arc::new(storage))
-        });
+        let state = self
+            .state
+            .unwrap_or_else(|| AppState::new(self.config.clone(), Arc::new(storage)));
 
         let mut app = create_router(state, &self.config);
 

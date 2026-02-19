@@ -1,21 +1,27 @@
 use clap::Parser;
 use llm::{
-    presentation::cli::{
-        args::Args,
-        config::build_model_config,
-        interactive::run_interactive_mode,
-    },
-    infrastructure::persistence::dataset::{Dataset, DatasetType},
     application::{
         encoding::Vocab,
         training::pipeline::{configure_speculative_sampling_from_args, run_training_pipeline},
     },
     common::{errors::Result, rng::set_seed},
     domain::models::{
-        llm::LLM,
         builder::{build_network, print_architecture_summary},
+        config::{ArchitectureType, ModelConfig},
+        llm::LLM,
+    },
+    infrastructure::persistence::dataset::{Dataset, DatasetType},
+    presentation::cli::{
+        args::Args, config::build_model_config, interactive::run_interactive_mode,
     },
 };
+
+fn default_model_save_path(config: &ModelConfig) -> &'static str {
+    match config.architecture {
+        ArchitectureType::Diffusion => "models/rustgpt-diffusion.bin",
+        ArchitectureType::Autoregressive => "models/rustgpt.bin",
+    }
+}
 
 fn main() -> crate::Result<()> {
     let args = Args::parse();
@@ -93,7 +99,8 @@ fn main() -> crate::Result<()> {
 
     // Save trained model to disk for inference
     std::fs::create_dir_all("models").ok();
-    let save_path = "models/rustgpt.bin";
+    let default_save_path = default_model_save_path(&config);
+    let save_path = args.continue_from.as_deref().unwrap_or(default_save_path);
     llm.save_versioned(save_path, Some("RustGPT trained model".to_string()))?;
     println!("Saved model to {}", save_path);
 

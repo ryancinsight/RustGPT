@@ -51,7 +51,10 @@ impl AdaptiveScalar {
     pub fn value(&self, x: f64) -> f32 {
         match self {
             Self::Fixed(v) => *v,
-            Self::Richards { curve, output_scale } => {
+            Self::Richards {
+                curve,
+                output_scale,
+            } => {
                 let (val, _) = curve.eval_scalar(x);
                 (val as f32) * output_scale
             }
@@ -86,7 +89,7 @@ mod tests {
             let scalar = AdaptiveScalar::learned_curve();
             let v = scalar.value(progress);
             prop_assert!(v.is_finite());
-            
+
             // Default richards curve params
             let params = scalar.parameters();
             prop_assert!(!params.is_empty());

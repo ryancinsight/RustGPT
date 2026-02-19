@@ -97,9 +97,15 @@ impl UnifiedCoPE {
         let inner = match config.variant {
             CoPEVariant::Standard => UnifiedCoPE::Standard(CoPE::new(max_pos, embed_dim)),
             CoPEVariant::Gated => UnifiedCoPE::Gated(GatedCoPE::new(max_pos, embed_dim)),
-            CoPEVariant::Factorized { rank } => UnifiedCoPE::Factorized(FactorizedCoPE::new(max_pos, embed_dim, rank)),
-            CoPEVariant::Hierarchical { num_chunks } => UnifiedCoPE::Hierarchical(HierarchicalCoPE::new(max_pos, embed_dim, num_chunks)),
-            CoPEVariant::Optimized { rank } => UnifiedCoPE::Optimized(OptimizedCoPE::new(max_pos, embed_dim, rank)),
+            CoPEVariant::Factorized { rank } => {
+                UnifiedCoPE::Factorized(FactorizedCoPE::new(max_pos, embed_dim, rank))
+            }
+            CoPEVariant::Hierarchical { num_chunks } => {
+                UnifiedCoPE::Hierarchical(HierarchicalCoPE::new(max_pos, embed_dim, num_chunks))
+            }
+            CoPEVariant::Optimized { rank } => {
+                UnifiedCoPE::Optimized(OptimizedCoPE::new(max_pos, embed_dim, rank))
+            }
             CoPEVariant::Path => UnifiedCoPE::Path(PathCoPE::new(max_pos, embed_dim)),
         };
 
@@ -187,19 +193,31 @@ impl PositionEmbedding for UnifiedCoPE {
             UnifiedCoPE::Hierarchical(c) => UnifiedCoPEGradients::Hierarchical(c.init_gradients()),
             UnifiedCoPE::Optimized(c) => UnifiedCoPEGradients::Optimized(c.init_gradients()),
             UnifiedCoPE::Path(c) => UnifiedCoPEGradients::Path(c.init_gradients()),
-            UnifiedCoPE::WindowAware(c) => UnifiedCoPEGradients::WindowAware(Box::new(c.init_gradients())),
+            UnifiedCoPE::WindowAware(c) => {
+                UnifiedCoPEGradients::WindowAware(Box::new(c.init_gradients()))
+            }
         }
     }
 
     fn apply_gradients(&mut self, grads: &Self::Gradients, lr: f32) {
         match (self, grads) {
-            (UnifiedCoPE::Standard(c), UnifiedCoPEGradients::Standard(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Standard(c), UnifiedCoPEGradients::Standard(g)) => {
+                c.apply_gradients(g, lr)
+            }
             (UnifiedCoPE::Gated(c), UnifiedCoPEGradients::Gated(g)) => c.apply_gradients(g, lr),
-            (UnifiedCoPE::Factorized(c), UnifiedCoPEGradients::Factorized(g)) => c.apply_gradients(g, lr),
-            (UnifiedCoPE::Hierarchical(c), UnifiedCoPEGradients::Hierarchical(g)) => c.apply_gradients(g, lr),
-            (UnifiedCoPE::Optimized(c), UnifiedCoPEGradients::Optimized(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::Factorized(c), UnifiedCoPEGradients::Factorized(g)) => {
+                c.apply_gradients(g, lr)
+            }
+            (UnifiedCoPE::Hierarchical(c), UnifiedCoPEGradients::Hierarchical(g)) => {
+                c.apply_gradients(g, lr)
+            }
+            (UnifiedCoPE::Optimized(c), UnifiedCoPEGradients::Optimized(g)) => {
+                c.apply_gradients(g, lr)
+            }
             (UnifiedCoPE::Path(c), UnifiedCoPEGradients::Path(g)) => c.apply_gradients(g, lr),
-            (UnifiedCoPE::WindowAware(c), UnifiedCoPEGradients::WindowAware(g)) => c.apply_gradients(g, lr),
+            (UnifiedCoPE::WindowAware(c), UnifiedCoPEGradients::WindowAware(g)) => {
+                c.apply_gradients(g, lr)
+            }
             _ => panic!("Gradient type mismatch in UnifiedCoPE::apply_gradients"),
         }
     }

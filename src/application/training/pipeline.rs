@@ -1,4 +1,5 @@
 use std::num::NonZeroUsize;
+use sysinfo::System;
 use tracing::warn;
 
 use crate::{
@@ -10,6 +11,192 @@ use crate::{
 };
 
 use crate::domain::richards::AdaptiveScalar;
+
+const DEFAULT_BATCH_SIZE: usize = 4;
+const DEFAULT_GRAD_ACCUM_STEPS: usize = 1;
+
+#[derive(Clone, Copy, Debug)]
+enum BatchingStage {
+    Pretrain,
+    Instruction,
+    Diffusion,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StageBatchingConfig {
+    batch_size: usize,
+    grad_accum_steps: usize,
+}
+
+impl StageBatchingConfig {
+    #[inline]
+    fn effective_batch(self) -> usize {
+        self.batch_size.saturating_mul(self.grad_accum_steps)
+    }
+}
+
+#[inline]
+fn ceil_div(a: usize, b: usize) -> usize {
+    (a + b.saturating_sub(1)) / b.max(1)
+}
+
+#[inline]
+fn normalize_memory_units(bytes_or_kib: u64) -> u64 {
+    // Handle older sysinfo unit behavior (KiB) without depending on crate internals.
+    if bytes_or_kib < 1_000_000_000 {
+        bytes_or_kib.saturating_mul(1024)
+    } else {
+        bytes_or_kib
+    }
+}
+
+fn detect_available_memory_bytes() -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_memory();
+    let available = normalize_memory_units(system.available_memory());
+    if available > 0 { Some(available) } else { None }
+}
+
+fn resolve_memory_budget_gib(args: &Args) -> f32 {
+    let detected_gib = detect_available_memory_bytes()
+        .map(|bytes| (bytes as f64 / (1024.0 * 1024.0 * 1024.0)) as f32)
+        .unwrap_or(8.0);
+
+    // Keep training comfortably below RAM ceilings to avoid paging.
+    let auto_budget = (detected_gib * 0.5).max(1.0);
+    if let Some(user_budget) = args.memory_budget_gb {
+        auto_budget.min(user_budget.max(1.0))
+    } else {
+        auto_budget
+    }
+}
+
+fn pretraining_text_count(dataset: &Dataset) -> usize {
+    let mut total = dataset.pretraining_data.len();
+    for img in &dataset.image_training_data {
+        total = total.saturating_add(1 + img.conversations.len());
+    }
+    for vid in &dataset.video_training_data {
+        total = total.saturating_add(1 + vid.conversations.len());
+    }
+    for aud in &dataset.speech_training_data {
+        total = total.saturating_add(1 + aud.conversations.len());
+    }
+    total
+}
+
+fn estimated_training_state_gib(model_params: usize) -> f32 {
+    // Rough Adam footprint: params + grads + m + v (all f32) => 16 bytes per parameter.
+    let bytes = (model_params as f64) * 16.0;
+    (bytes / (1024.0 * 1024.0 * 1024.0)) as f32
+}
+
+fn model_size_batch_scale(model_params: usize, stage: BatchingStage) -> f32 {
+    let params_m = (model_params as f64 / 1_000_000.0) as f32;
+    let base: f32 = match params_m {
+        x if x <= 5.0 => 1.0,
+        x if x <= 20.0 => 0.85,
+        x if x <= 50.0 => 0.70,
+        x if x <= 100.0 => 0.55,
+        x if x <= 250.0 => 0.40,
+        _ => 0.30,
+    };
+    let stage_scale: f32 = match stage {
+        BatchingStage::Pretrain => 0.9,
+        BatchingStage::Instruction => 1.0,
+        // Diffusion usually needs extra headroom.
+        BatchingStage::Diffusion => 0.8,
+    };
+    (base * stage_scale).clamp(0.1_f32, 1.0_f32)
+}
+
+fn tune_stage_batching(
+    stage: BatchingStage,
+    num_examples: usize,
+    memory_budget_gib: f32,
+    model_params: usize,
+) -> StageBatchingConfig {
+    let data_target = match num_examples {
+        0..=50_000 => 16,
+        50_001..=250_000 => 32,
+        250_001..=1_000_000 => 64,
+        1_000_001..=5_000_000 => 128,
+        _ => 256,
+    };
+
+    let estimated_model_state_gib = estimated_training_state_gib(model_params);
+    let usable_memory_gib = (memory_budget_gib - estimated_model_state_gib).max(1.0);
+    let model_scale = model_size_batch_scale(model_params, stage);
+
+    let memory_effective_cap = match usable_memory_gib {
+        x if x < 4.0 => 8,
+        x if x < 8.0 => 16,
+        x if x < 16.0 => 32,
+        x if x < 32.0 => 64,
+        _ => 128,
+    };
+
+    let memory_micro_cap = match usable_memory_gib {
+        x if x < 4.0 => 1,
+        x if x < 8.0 => 2,
+        x if x < 16.0 => 4,
+        x if x < 32.0 => 8,
+        x if x < 64.0 => 16,
+        _ => 32,
+    };
+
+    let stage_scale = match stage {
+        BatchingStage::Pretrain => 1.0,
+        BatchingStage::Instruction => 1.0,
+        // Diffusion path generally carries heavier per-sample compute/memory.
+        BatchingStage::Diffusion => 0.5,
+    };
+
+    let mut effective_target = ((data_target as f32) * stage_scale * model_scale).round() as usize;
+    effective_target = effective_target.max(1).min(memory_effective_cap.max(1));
+    if num_examples > 0 {
+        effective_target = effective_target.min(num_examples.max(1));
+    }
+
+    let mut micro_batch = ((memory_micro_cap as f32) * stage_scale * model_scale).round() as usize;
+    micro_batch = micro_batch.max(1).min(effective_target.max(1));
+    if num_examples > 0 {
+        micro_batch = micro_batch.min(num_examples.max(1));
+    }
+
+    let grad_accum_steps = ceil_div(effective_target.max(1), micro_batch.max(1)).clamp(1, 128);
+    StageBatchingConfig {
+        batch_size: micro_batch.max(1),
+        grad_accum_steps,
+    }
+}
+
+fn resolve_stage_batching(
+    stage: BatchingStage,
+    requested_batch_size: Option<usize>,
+    requested_grad_accum_steps: Option<usize>,
+    num_examples: usize,
+    args: &Args,
+    memory_budget_gib: f32,
+    model_params: usize,
+) -> StageBatchingConfig {
+    if args.auto_tune_batching {
+        let tuned = tune_stage_batching(stage, num_examples, memory_budget_gib, model_params);
+        StageBatchingConfig {
+            batch_size: requested_batch_size.unwrap_or(tuned.batch_size).max(1),
+            grad_accum_steps: requested_grad_accum_steps
+                .unwrap_or(tuned.grad_accum_steps)
+                .max(1),
+        }
+    } else {
+        StageBatchingConfig {
+            batch_size: requested_batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1),
+            grad_accum_steps: requested_grad_accum_steps
+                .unwrap_or(DEFAULT_GRAD_ACCUM_STEPS)
+                .max(1),
+        }
+    }
+}
 
 pub fn configure_speculative_sampling_from_args(
     args: &Args,
@@ -93,6 +280,8 @@ pub fn run_training_pipeline(
     config: &crate::domain::models::config::ModelConfig,
     mut llm: LLM,
 ) -> Result<LLM> {
+    let model_params = llm.total_parameters();
+
     // Training-only auxiliary objectives.
     llm.set_residual_decorrelation_training(
         config.residual_decorrelation_weight,
@@ -114,84 +303,22 @@ pub fn run_training_pipeline(
     }
 
     // Run training based on architecture
-    if args.trm {
-        run_trm_training(args, dataset, &mut llm)?;
-        llm.set_trm_inference_mode();
-    } else if args.diffusion {
-        run_diffusion_training(args, dataset, &mut llm)?;
+    if args.diffusion {
+        run_diffusion_training(args, dataset, &mut llm, model_params)?;
     } else {
-        run_standard_training(args, dataset, &mut llm)?;
+        run_standard_training(args, dataset, &mut llm, model_params)?;
     }
 
     Ok(llm)
 }
 
-/// Run TRM (Tiny Recursive Model) training
-fn run_trm_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Result<()> {
-    // Use all text data including multimodal captions/transcripts
-    let all_text_data = dataset.get_all_text_data();
-    let pre_texts: Vec<&str> = all_text_data
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let chat_texts: Vec<&str> = dataset
-        .chat_training_data
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    // Log multimodal data usage
-    let multimodal_stats = format!(
-        "Training data: {} pretraining, {} chat, {} images, {} speech, {} video",
-        dataset.pretraining_data.len(),
-        dataset.chat_training_data.len(),
-        dataset.image_training_data.len(),
-        dataset.speech_training_data.len(),
-        dataset.video_training_data.len()
-    );
-    println!("{}", multimodal_stats);
-    tracing::info!("{}", multimodal_stats);
-
-    llm.set_trm_training_mode();
-
-    if let Some(n) = args.trm_recursions {
-        llm.set_trm_recursions(n);
-    }
-    llm.set_trm_steps(args.trm_supervision_steps, args.trm_inference_steps);
-
-    println!(
-        "\n=== PRE-TRAINING LRM (CE) ===\nPre-training on {} examples for {} epochs",
-        pre_texts.len(),
-        args.pretrain_epochs
-    );
-    if args.eprop {
-        llm.train_with_warmup_eprop(pre_texts, args.pretrain_epochs, 0.0005, 4, 15)?;
-    } else {
-        llm.train_with_warmup(pre_texts, args.pretrain_epochs, 0.0005, 4, 15)?;
-    }
-
-    println!(
-        "\n=== INSTRUCTION TUNING LRM (CE) ===\nInstruction tuning on {} examples for {} epochs",
-        chat_texts.len(),
-        args.instruction_epochs
-    );
-    if args.eprop {
-        llm.train_with_warmup_eprop(chat_texts, args.instruction_epochs, 0.0005, 4, 15)?;
-    } else {
-        llm.train_with_warmup(chat_texts, args.instruction_epochs, 0.0005, 4, 15)?;
-    }
-
-    Ok(())
-}
-
 /// Run diffusion model training
-fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Result<()> {
-    if args.eprop {
-        return Err(crate::common::errors::ModelError::Training {
-            message: "--eprop is not supported for --diffusion training".to_string(),
-        });
-    }
-
+fn run_diffusion_training(
+    args: &Args,
+    dataset: &Dataset,
+    llm: &mut LLM,
+    model_params: usize,
+) -> Result<()> {
     // Construct adaptive scalars for diffusion hyperparameters
     let ce_weight = if args.diffusion_ce_weight_adaptive {
         let mut curve = RichardsCurve::new_default();
@@ -225,12 +352,35 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Resu
         .iter()
         .map(|s| s.as_str())
         .collect();
+    let memory_budget_gib = resolve_memory_budget_gib(args);
+    let pretrain_batching = resolve_stage_batching(
+        BatchingStage::Diffusion,
+        args.diffusion_batch_size,
+        args.diffusion_gradient_accumulation_steps,
+        pre_texts.len(),
+        args,
+        memory_budget_gib,
+        model_params,
+    );
+    tracing::info!(
+        stage = "diffusion-pretrain",
+        auto_tune = args.auto_tune_batching,
+        memory_budget_gib,
+        model_params_m = (model_params as f64) / 1_000_000.0,
+        est_training_state_gib = estimated_training_state_gib(model_params),
+        dataset_examples = pre_texts.len(),
+        batch_size = pretrain_batching.batch_size,
+        grad_accum_steps = pretrain_batching.grad_accum_steps,
+        effective_batch = pretrain_batching.effective_batch(),
+        "Resolved training batching"
+    );
 
-    llm.train_diffusion_ce(
+    llm.train_diffusion_ce_with_accumulation(
         pre_texts,
         args.pretrain_epochs,
         0.0005,
-        4,
+        pretrain_batching.batch_size,
+        pretrain_batching.grad_accum_steps,
         ce_weight.clone(),
         args.validation_ratio,
         min_snr_gamma.clone(),
@@ -244,12 +394,34 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Resu
         .iter()
         .map(|s| s.as_str())
         .collect();
+    let instruction_batching = resolve_stage_batching(
+        BatchingStage::Diffusion,
+        args.diffusion_batch_size,
+        args.diffusion_gradient_accumulation_steps,
+        chat_texts.len(),
+        args,
+        memory_budget_gib,
+        model_params,
+    );
+    tracing::info!(
+        stage = "diffusion-instruction",
+        auto_tune = args.auto_tune_batching,
+        memory_budget_gib,
+        model_params_m = (model_params as f64) / 1_000_000.0,
+        est_training_state_gib = estimated_training_state_gib(model_params),
+        dataset_examples = chat_texts.len(),
+        batch_size = instruction_batching.batch_size,
+        grad_accum_steps = instruction_batching.grad_accum_steps,
+        effective_batch = instruction_batching.effective_batch(),
+        "Resolved training batching"
+    );
 
-    llm.train_diffusion_ce(
+    llm.train_diffusion_ce_with_accumulation(
         chat_texts,
         args.instruction_epochs,
         0.0005,
-        4,
+        instruction_batching.batch_size,
+        instruction_batching.grad_accum_steps,
         ce_weight,
         args.validation_ratio,
         min_snr_gamma,
@@ -262,7 +434,12 @@ fn run_diffusion_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Resu
 }
 
 /// Run standard transformer training
-fn run_standard_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Result<()> {
+fn run_standard_training(
+    args: &Args,
+    dataset: &Dataset,
+    llm: &mut LLM,
+    model_params: usize,
+) -> Result<()> {
     // Log multimodal data usage
     let multimodal_stats = format!(
         "Training data: {} pretraining, {} chat, {} images, {} speech, {} video",
@@ -275,26 +452,99 @@ fn run_standard_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Resul
     println!("{}", multimodal_stats);
     tracing::info!("{}", multimodal_stats);
 
-    // Use all text data including multimodal captions/transcripts
-    let all_text_data = dataset.get_all_text_data();
-    
+    let memory_budget_gib = resolve_memory_budget_gib(args);
+    let pretrain_example_count = pretraining_text_count(dataset);
+    let pretrain_batching = resolve_stage_batching(
+        BatchingStage::Pretrain,
+        args.pretrain_batch_size,
+        args.pretrain_gradient_accumulation_steps,
+        pretrain_example_count,
+        args,
+        memory_budget_gib,
+        model_params,
+    );
+    let instruction_batching = resolve_stage_batching(
+        BatchingStage::Instruction,
+        args.instruction_batch_size,
+        args.instruction_gradient_accumulation_steps,
+        dataset.chat_training_data.len(),
+        args,
+        memory_budget_gib,
+        model_params,
+    );
+    tracing::info!(
+        stage = "pretrain",
+        auto_tune = args.auto_tune_batching,
+        memory_budget_gib,
+        model_params_m = (model_params as f64) / 1_000_000.0,
+        est_training_state_gib = estimated_training_state_gib(model_params),
+        dataset_examples = pretrain_example_count,
+        batch_size = pretrain_batching.batch_size,
+        grad_accum_steps = pretrain_batching.grad_accum_steps,
+        effective_batch = pretrain_batching.effective_batch(),
+        "Resolved training batching"
+    );
+    tracing::info!(
+        stage = "instruction",
+        auto_tune = args.auto_tune_batching,
+        memory_budget_gib,
+        model_params_m = (model_params as f64) / 1_000_000.0,
+        est_training_state_gib = estimated_training_state_gib(model_params),
+        dataset_examples = dataset.chat_training_data.len(),
+        batch_size = instruction_batching.batch_size,
+        grad_accum_steps = instruction_batching.grad_accum_steps,
+        effective_batch = instruction_batching.effective_batch(),
+        "Resolved training batching"
+    );
+
     if args.continue_from.is_none() {
         println!("\n=== PRE-TRAINING MODEL ===");
-        println!(
-            "Pre-training on {} text examples (including {} multimodal captions/transcripts) for {} epochs with learning rate {}",
-            all_text_data.len(),
-            dataset.image_training_data.len() + dataset.speech_training_data.len() + dataset.video_training_data.len(),
-            args.pretrain_epochs,
-            0.0005
-        );
-        let pre_texts: Vec<&str> = all_text_data
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        if args.eprop {
-            llm.train_with_warmup_eprop(pre_texts, args.pretrain_epochs, 0.0005, 4, 15)?;
+        if dataset.has_multimodal_data() {
+            let all_text_data = dataset.get_all_text_data();
+            println!(
+                "Pre-training on {} text examples (including {} multimodal captions/transcripts) for {} epochs with learning rate {}, batch size {}, grad accumulation {}, effective batch {}",
+                all_text_data.len(),
+                dataset.image_training_data.len()
+                    + dataset.speech_training_data.len()
+                    + dataset.video_training_data.len(),
+                args.pretrain_epochs,
+                0.0005,
+                pretrain_batching.batch_size,
+                pretrain_batching.grad_accum_steps,
+                pretrain_batching.effective_batch()
+            );
+            let pre_texts: Vec<&str> = all_text_data.iter().map(|s| s.as_str()).collect();
+            llm.train_with_warmup_with_accumulation(
+                pre_texts,
+                args.pretrain_epochs,
+                0.0005,
+                pretrain_batching.batch_size,
+                15,
+                pretrain_batching.grad_accum_steps,
+            )?;
         } else {
-            llm.train_with_warmup(pre_texts, args.pretrain_epochs, 0.0005, 4, 15)?;
+            println!(
+                "Pre-training on {} text examples for {} epochs with learning rate {}, batch size {}, grad accumulation {}, effective batch {}",
+                dataset.pretraining_data.len(),
+                args.pretrain_epochs,
+                0.0005,
+                pretrain_batching.batch_size,
+                pretrain_batching.grad_accum_steps,
+                pretrain_batching.effective_batch()
+            );
+            let pre_texts: Vec<&str> = dataset
+                .pretraining_data
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            llm.train_with_warmup_with_accumulation(
+                pre_texts,
+                args.pretrain_epochs,
+                0.0005,
+                pretrain_batching.batch_size,
+                15,
+                pretrain_batching.grad_accum_steps,
+            )?;
         }
     } else {
         println!("\n=== SKIPPING PRE-TRAINING ===");
@@ -306,83 +556,32 @@ fn run_standard_training(args: &Args, dataset: &Dataset, llm: &mut LLM) -> Resul
     let instruction_epochs = args.instruction_epochs;
     let chat_count = dataset.chat_training_data.len();
     println!(
-        "Instruction tuning on {} examples for {} epochs with learning rate {}",
-        chat_count, instruction_epochs, instruction_lr
+        "Instruction tuning on {} examples for {} epochs with learning rate {}, batch size {}, grad accumulation {}, effective batch {}",
+        chat_count,
+        instruction_epochs,
+        instruction_lr,
+        instruction_batching.batch_size,
+        instruction_batching.grad_accum_steps,
+        instruction_batching.effective_batch()
     );
     let chat_texts: Vec<&str> = dataset
         .chat_training_data
         .iter()
         .map(|s| s.as_str())
         .collect();
-    if args.eprop {
-        llm.train_with_warmup_eprop(chat_texts, instruction_epochs, instruction_lr, 4, 15)?;
-    } else {
-        llm.train_with_warmup(chat_texts, instruction_epochs, instruction_lr, 4, 15)?;
-    }
+    llm.train_with_warmup_with_accumulation(
+        chat_texts,
+        instruction_epochs,
+        instruction_lr,
+        instruction_batching.batch_size,
+        15,
+        instruction_batching.grad_accum_steps,
+    )?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    use super::*;
-
-    #[test]
-    fn eprop_flag_allows_standard_llm_pipeline() {
-        let args = Args::parse_from([
-            "llm",
-            "--eprop",
-            "--pretrain-epochs",
-            "0",
-            "--instruction-epochs",
-            "0",
-        ]);
-        let dataset = Dataset {
-            pretraining_data: vec!["hello world".to_string()],
-            chat_training_data: vec!["hello".to_string()],
-            image_training_data: Vec::new(),
-            video_training_data: Vec::new(),
-            speech_training_data: Vec::new(),
-        };
-        let vocab = Vocab::default();
-        let config = crate::domain::models::config::ModelConfig::transformer(8, 16, 1, 16, None, Some(1));
-        let network = crate::domain::models::builder::build_network(&config, &vocab);
-        let llm = LLM::new(vocab.clone(), network);
-
-        let res = run_training_pipeline(&args, &dataset, &vocab, &config, llm);
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn eprop_flag_rejects_diffusion_pipeline() {
-        let args = Args::parse_from([
-            "llm",
-            "--eprop",
-            "--diffusion",
-            "--pretrain-epochs",
-            "0",
-            "--instruction-epochs",
-            "0",
-        ]);
-        let dataset = Dataset {
-            pretraining_data: vec!["hello world".to_string()],
-            chat_training_data: vec!["hello".to_string()],
-            image_training_data: Vec::new(),
-            video_training_data: Vec::new(),
-            speech_training_data: Vec::new(),
-        };
-        let vocab = Vocab::default();
-        let mut config = crate::domain::models::config::ModelConfig::transformer(8, 16, 1, 16, None, Some(1));
-        config.architecture = crate::domain::models::config::ArchitectureType::Diffusion;
-        let network = crate::domain::models::builder::build_network(&config, &vocab);
-        let llm = LLM::new(vocab.clone(), network);
-
-        let res = run_training_pipeline(&args, &dataset, &vocab, &config, llm);
-        assert!(matches!(
-            res,
-            Err(crate::common::errors::ModelError::Training { .. })
-        ));
-    }
+    // Legacy pipeline tests removed during training-path simplification.
 }

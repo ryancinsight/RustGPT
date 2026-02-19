@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{domain::network::Layer, common::rng::get_rng};
+use crate::{common::rng::get_rng, domain::network::Layer};
 
 type ThresholdParamGrads = (
     ndarray::Array2<f32>,
@@ -125,8 +125,9 @@ impl ThresholdPredictor {
 
         let norm = crate::domain::richards::RichardsNorm::new(hidden_dim);
         let sigmoid = crate::domain::richards::RichardsCurve::sigmoid(false); // Non-learnable sigmoid
-        let activation =
-            crate::domain::richards::RichardsCurve::new_learnable(crate::domain::richards::Variant::None); // Learnable activation replacing ReLU
+        let activation = crate::domain::richards::RichardsCurve::new_learnable(
+            crate::domain::richards::Variant::None,
+        ); // Learnable activation replacing ReLU
         let cond_w = ndarray::Array2::from_shape_fn((cond_dim, hidden_dim), |_| {
             rng.random_range(-(1.0 / (cond_dim as f32).sqrt())..(1.0 / (cond_dim as f32).sqrt()))
         });

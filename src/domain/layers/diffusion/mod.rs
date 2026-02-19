@@ -8,7 +8,7 @@ pub(crate) mod solvers;
 
 pub use block::{
     DiffusionBlock, DiffusionBlockConfig, DiffusionCachedIntermediates, DiffusionPredictionTarget,
-    DiffusionSampler, NoiseSchedule,
+    DiffusionSampler, GuidanceConfig, GuidanceType, LossWeighting, NoiseSchedule,
 };
 pub use edm::EDM_SIGMA_DATA_DEFAULT;
 pub use sampling::{DdimStepsPolicy, map_step_to_timestep};

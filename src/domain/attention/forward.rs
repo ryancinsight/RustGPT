@@ -3,9 +3,12 @@ use ndarray::{Array2, s};
 use crate::domain::{
     attention::{
         memory::{with_tls_acc_f64, with_tls_phi},
-        position::unified::UnifiedCoPE,
         position::traits::PositionEmbedding,
-        utils::{smooth_clip_tanh, smooth_saturate_01},
+        position::unified::UnifiedCoPE,
+        utils::{
+            dynamic_blr_components, dynamic_blr_query_coeffs, dynamic_blr_rank, dynamic_blr_scale,
+            smooth_clip_tanh, smooth_saturate_01,
+        },
     },
     mixtures::{moh::HeadSelectionConfig, threshold::ThresholdPredictor},
     richards::RichardsGate,
@@ -23,6 +26,7 @@ pub struct ForwardContext<'a> {
     pub alpha_g: &'a Array2<f32>,
     pub beta_g: &'a Array2<f32>,
     pub gate: &'a RichardsGate,
+    pub low_rank_query_gate: &'a crate::domain::richards::RichardsCurve,
     pub cope: &'a UnifiedCoPE,
     pub head_selection_config: &'a mut HeadSelectionConfig,
     pub threshold_predictor: &'a mut Option<ThresholdPredictor>,
@@ -144,7 +148,10 @@ pub fn compute_poly_attention_forward_into(
                 &input_view,
                 ctx.token_latent_features.as_ref().map(|f| f.view()),
             );
-            let m = ctx.head_selection_config.threshold_modulation.value(ctx.training_progress);
+            let m = ctx
+                .head_selection_config
+                .threshold_modulation
+                .value(ctx.training_progress);
             t.mapv_inplace(|v| v * m);
             let k = ctx.head_selection_config.gating.num_active as f32;
             let n = t.nrows();
@@ -200,7 +207,10 @@ pub fn compute_poly_attention_forward_into(
         let activation_scale = ctx.head_selection_config.max_heads.max(1) as f32;
         soft_weights.mapv_inplace(|v| smooth_saturate_01(v * activation_scale));
 
-        let m = ctx.head_selection_config.threshold_modulation.value(ctx.training_progress);
+        let m = ctx
+            .head_selection_config
+            .threshold_modulation
+            .value(ctx.training_progress);
         soft_weights.mapv_inplace(|v| v * m);
         if let Some(scale) = ctx.token_threshold_scale.as_ref() {
             let n = soft_weights.nrows();
@@ -229,7 +239,7 @@ pub fn compute_poly_attention_forward_into(
     // Gating Projections
     // xw_all: (N, H)
     ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_g, 0.0, &mut workspace.xw_all);
-    
+
     workspace.gate_values.fill(0.0);
 
     let mut tau_min_global = f32::INFINITY;
@@ -247,7 +257,7 @@ pub fn compute_poly_attention_forward_into(
         // Reuse workspace.z_col
         workspace.z_col.assign(&xw_col_view);
         workspace.z_col.mapv_inplace(|v| a_h * v + b_h);
-        
+
         for i in 0..n {
             let z = workspace.z_col[[i, 0]];
             // Match streaming behavior: dynamic scaling per token
@@ -265,9 +275,7 @@ pub fn compute_poly_attention_forward_into(
 
             // Update metrics
             let threshold_sum: f32 = head_thresholds.iter().sum();
-            let threshold_min = head_thresholds
-                .iter()
-                .fold(f32::INFINITY, |m, &z| m.min(z));
+            let threshold_min = head_thresholds.iter().fold(f32::INFINITY, |m, &z| m.min(z));
             let threshold_max = head_thresholds
                 .iter()
                 .fold(f32::NEG_INFINITY, |m, &z| m.max(z));
@@ -286,7 +294,10 @@ pub fn compute_poly_attention_forward_into(
             }
         }
 
-        workspace.gate_values.slice_mut(s![.., h_idx..h_idx + 1]).assign(&workspace.g_col);
+        workspace
+            .gate_values
+            .slice_mut(s![.., h_idx..h_idx + 1])
+            .assign(&workspace.g_col);
     }
 
     // Reuse a single head-output buffer across heads to reduce allocations.
@@ -314,11 +325,14 @@ pub fn compute_poly_attention_forward_into(
             let b = ctx.b[[0, 0]];
             let scale = ctx.scale[[0, 0]];
             let p_i32 = ctx.p as i32;
+            let blr_rank = dynamic_blr_rank(ctx.head_dim);
+            let blr_scale = dynamic_blr_scale(blr_rank);
             let start = h_idx * ctx.head_dim;
             let end = start + ctx.head_dim;
             let w_block = ctx.w_out.slice(s![start..end, ..]);
             workspace.y_head.fill(0.0);
-            workspace.y_head
+            workspace
+                .y_head
                 .axis_iter_mut(ndarray::Axis(0))
                 // .into_par_iter()
                 .enumerate()
@@ -333,20 +347,26 @@ pub fn compute_poly_attention_forward_into(
                     };
                     let j_end_excl = if causal { i + 1 } else { n };
                     let _max_pos = usize::min(ctx.cope.max_pos(), i.saturating_sub(j_start));
-                    
+
                     // Slice Q for this head
                     let q_row_i = q.row(i);
+                    let mut q_comp = vec![0.0f32; blr_rank];
+                    let mut q_h = vec![0.0f32; blr_rank];
+                    let mut q_dh = vec![0.0f32; blr_rank];
+                    dynamic_blr_components(&q_row_i, blr_rank, &mut q_comp);
+                    dynamic_blr_query_coeffs(&q_comp, ctx.low_rank_query_gate, &mut q_h, &mut q_dh);
 
                     // Slice K for this head
                     let k_slice = k.slice(s![j_start..j_end_excl, ..]);
                     let k_slice_t = k_slice.t();
                     let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
+                    let mut k_comp = vec![0.0f32; blr_rank];
 
                     let mlen = j_end_excl.saturating_sub(j_start);
                     with_tls_phi(mlen, |phi_row| {
                         for idx in 0..mlen {
                             let j = j_start + idx;
-                            
+
                             // Get position embedding contribution
                             // Uses static dispatch via UnifiedCoPE enum
                             let pe_contrib = ctx.cope.contribution(
@@ -354,58 +374,64 @@ pub fn compute_poly_attention_forward_into(
                                 &k_slice.row(idx),
                                 i,
                                 j,
-                                Some(&ctx.input.view())
+                                Some(&ctx.input.view()),
                             );
 
-                            let s_val = scores_row[idx] + pe_contrib;
+                            dynamic_blr_components(&k_slice.row(idx), blr_rank, &mut k_comp);
+                            let mut blr = 0.0f32;
+                            for m in 0..blr_rank {
+                                blr += q_h[m] * k_comp[m];
+                            }
+
+                            let s_val = scores_row[idx] + pe_contrib + blr_scale * blr;
 
                             let s_stable = smooth_clip_tanh(s_val, 8.0);
-                                let sp = if p_i32 <= 3 {
-                                    match p_i32 {
-                                        1 => s_stable,
-                                        2 => s_stable * s_stable,
-                                        3 => s_stable * s_stable * s_stable,
-                                        _ => unreachable!(),
-                                    }
-                                } else {
-                                    // With smooth saturation, `s_stable` is bounded so this is
-                                    // safe.
-                                    let mut result: f32 = 1.0;
-                                    for _ in 0..p_i32 {
-                                        result *= s_stable;
-                                    }
-                                    result
-                                };
+                            let sp = if p_i32 <= 3 {
+                                match p_i32 {
+                                    1 => s_stable,
+                                    2 => s_stable * s_stable,
+                                    3 => s_stable * s_stable * s_stable,
+                                    _ => unreachable!(),
+                                }
+                            } else {
+                                // With smooth saturation, `s_stable` is bounded so this is
+                                // safe.
+                                let mut result: f32 = 1.0;
+                                for _ in 0..p_i32 {
+                                    result *= s_stable;
+                                }
+                                result
+                            };
 
-                                phi_row[idx] = scale * (a * sp + b);
-                            }
-                            
-                            if let Some(dump) = scores_dump.as_mut() {
-                                // Capture scores for Last Token (i == n-1) for ALL heads
-                                if i == n - 1 {
-                                    let mut effective_scores = ndarray::Array1::zeros(mlen);
-                                    for idx in 0..mlen {
-                                        effective_scores[idx] = phi_row[idx] * eff_i;
-                                    }
-                                    dump[h_idx] = effective_scores;
-                                }
-                            }
-                            
-                            // Slice V for this head
-                            let v_slice = v.slice(s![j_start..j_end_excl, ..]);
-                            with_tls_acc_f64(ctx.head_dim, |acc| {
-                                acc.fill(0.0);
-                                let eff = eff_i as f64;
+                            phi_row[idx] = scale * (a * sp + b);
+                        }
+
+                        if let Some(dump) = scores_dump.as_mut() {
+                            // Capture scores for Last Token (i == n-1) for ALL heads
+                            if i == n - 1 {
+                                let mut effective_scores = ndarray::Array1::zeros(mlen);
                                 for idx in 0..mlen {
-                                    let phi = (phi_row[idx] as f64) * eff;
-                                    for h in 0..ctx.head_dim {
-                                        acc[h] += phi * (v_slice[[idx, h]] as f64);
-                                    }
+                                    effective_scores[idx] = phi_row[idx] * eff_i;
                                 }
+                                dump[h_idx] = effective_scores;
+                            }
+                        }
+
+                        // Slice V for this head
+                        let v_slice = v.slice(s![j_start..j_end_excl, ..]);
+                        with_tls_acc_f64(ctx.head_dim, |acc| {
+                            acc.fill(0.0);
+                            let eff = eff_i as f64;
+                            for idx in 0..mlen {
+                                let phi = (phi_row[idx] as f64) * eff;
                                 for h in 0..ctx.head_dim {
-                                    y_row[h] = acc[h] as f32;
+                                    acc[h] += phi * (v_slice[[idx, h]] as f64);
                                 }
-                            });
+                            }
+                            for h in 0..ctx.head_dim {
+                                y_row[h] = acc[h] as f32;
+                            }
+                        });
                     });
                 });
             // Accumulate directly into `output` to avoid allocating an intermediate block.
@@ -440,10 +466,13 @@ pub fn compute_poly_attention_forward_into(
         None
     };
 
-    let avg_active_heads = if workspace.gate_values.nrows() > 0 && workspace.gate_values.ncols() > 0 {
-        Some(crate::domain::mixtures::routing::compute_avg_active_components(
-            &workspace.gate_values.view(),
-        ))
+    let avg_active_heads = if workspace.gate_values.nrows() > 0 && workspace.gate_values.ncols() > 0
+    {
+        Some(
+            crate::domain::mixtures::routing::compute_avg_active_components(
+                &workspace.gate_values.view(),
+            ),
+        )
     } else {
         None
     };
@@ -592,6 +621,8 @@ pub fn compute_poly_attention_forward_baseline(
         let b = ctx.b[[0, 0]];
         let scale = ctx.scale[[0, 0]];
         let p_i32 = ctx.p as i32;
+        let blr_rank = dynamic_blr_rank(ctx.head_dim);
+        let blr_scale = dynamic_blr_scale(blr_rank);
         let start = h_idx * ctx.head_dim;
         let end = start + ctx.head_dim;
         let w_block = ctx.w_out.slice(s![start..end, ..]);
@@ -614,50 +645,68 @@ pub fn compute_poly_attention_forward_baseline(
                 let j_end_excl = if causal { i + 1 } else { n };
                 // max_pos unused
                 let q_row_i = q.row(i);
+                let mut q_comp = vec![0.0f32; blr_rank];
+                let mut q_h = vec![0.0f32; blr_rank];
+                let mut q_dh = vec![0.0f32; blr_rank];
+                dynamic_blr_components(&q_row_i, blr_rank, &mut q_comp);
+                dynamic_blr_query_coeffs(&q_comp, ctx.low_rank_query_gate, &mut q_h, &mut q_dh);
 
                 let k_slice = k.slice(s![j_start..j_end_excl, ..]);
                 let k_slice_t = k_slice.t();
                 let scores_row = q_row_i.dot(&k_slice_t) * dk_scale;
                 let mlen = j_end_excl.saturating_sub(j_start);
+                let mut k_comp = vec![0.0f32; blr_rank];
                 with_tls_phi(mlen, |phi_row| {
                     for idx in 0..mlen {
                         let j = j_start + idx;
                         let mut s_val = scores_row[idx];
-                        let cope_val = ctx.cope.contribution(&q_row_i, &k_slice.row(idx), i, j, Some(&ctx.input.view()));
+                        let cope_val = ctx.cope.contribution(
+                            &q_row_i,
+                            &k_slice.row(idx),
+                            i,
+                            j,
+                            Some(&ctx.input.view()),
+                        );
                         s_val += cope_val;
-                        let s_stable = smooth_clip_tanh(s_val, 8.0);
-                            let sp = if p_i32 <= 3 {
-                                match p_i32 {
-                                    1 => s_stable,
-                                    2 => s_stable * s_stable,
-                                    3 => s_stable * s_stable * s_stable,
-                                    _ => unreachable!(),
-                                }
-                            } else {
-                                let mut result: f32 = 1.0;
-                                for _ in 0..p_i32 {
-                                    result *= s_stable;
-                                }
-                                result
-                            };
-                            phi_row[idx] = scale * (a * sp + b);
+                        dynamic_blr_components(&k_slice.row(idx), blr_rank, &mut k_comp);
+                        let mut blr = 0.0f32;
+                        for m in 0..blr_rank {
+                            blr += q_h[m] * k_comp[m];
                         }
+                        s_val += blr_scale * blr;
+                        let s_stable = smooth_clip_tanh(s_val, 8.0);
+                        let sp = if p_i32 <= 3 {
+                            match p_i32 {
+                                1 => s_stable,
+                                2 => s_stable * s_stable,
+                                3 => s_stable * s_stable * s_stable,
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            let mut result: f32 = 1.0;
+                            for _ in 0..p_i32 {
+                                result *= s_stable;
+                            }
+                            result
+                        };
+                        phi_row[idx] = scale * (a * sp + b);
+                    }
 
-                        let v_slice = v.slice(s![j_start..j_end_excl, ..]);
-                        with_tls_acc_f64(ctx.head_dim, |acc| {
-                            acc.fill(0.0);
-                            let eff = eff_i as f64;
-                            for idx in 0..mlen {
-                                let phi = (phi_row[idx] as f64) * eff;
-                                for h in 0..ctx.head_dim {
-                                    acc[h] += phi * (v_slice[[idx, h]] as f64);
-                                }
-                            }
+                    let v_slice = v.slice(s![j_start..j_end_excl, ..]);
+                    with_tls_acc_f64(ctx.head_dim, |acc| {
+                        acc.fill(0.0);
+                        let eff = eff_i as f64;
+                        for idx in 0..mlen {
+                            let phi = (phi_row[idx] as f64) * eff;
                             for h in 0..ctx.head_dim {
-                                y_row[h] = acc[h] as f32;
+                                acc[h] += phi * (v_slice[[idx, h]] as f64);
                             }
-                        });
+                        }
+                        for h in 0..ctx.head_dim {
+                            y_row[h] = acc[h] as f32;
+                        }
                     });
+                });
             });
 
         ndarray::linalg::general_mat_mul(1.0, &y_head, &w_block, 1.0, &mut out);
@@ -666,9 +715,7 @@ pub fn compute_poly_attention_forward_baseline(
     let avg_active_heads = if gate_values.nrows() > 0 && gate_values.ncols() > 0 {
         ctx.head_selection_config
             .update_metrics(&gate_values.view());
-        Some(crate::domain::mixtures::routing::compute_avg_active_components(
-            &gate_values.view(),
-        ))
+        Some(crate::domain::mixtures::routing::compute_avg_active_components(&gate_values.view()))
     } else {
         None
     };

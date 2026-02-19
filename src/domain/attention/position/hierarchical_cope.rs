@@ -2,9 +2,9 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
-use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
-use super::traits::PositionEmbedding;
 use super::gradient_ops::{accumulate_optional_arrays, append_optional_array_to_vec};
+use super::traits::PositionEmbedding;
+use crate::{common::rng::get_rng, infrastructure::optimizer::adam::Adam};
 
 /// Gradients container for HierarchicalCoPE
 #[derive(Clone, Debug)]
@@ -30,8 +30,14 @@ impl HierarchicalCoPEGradients {
     pub fn accumulate(&mut self, other: &Self) {
         accumulate_optional_arrays(&mut self.local_cope_grads, &other.local_cope_grads);
         accumulate_optional_arrays(&mut self.global_cope_grads, &other.global_cope_grads);
-        accumulate_optional_arrays(&mut self.chunk_predictor_w_grads, &other.chunk_predictor_w_grads);
-        accumulate_optional_arrays(&mut self.chunk_predictor_b_grads, &other.chunk_predictor_b_grads);
+        accumulate_optional_arrays(
+            &mut self.chunk_predictor_w_grads,
+            &other.chunk_predictor_w_grads,
+        );
+        accumulate_optional_arrays(
+            &mut self.chunk_predictor_b_grads,
+            &other.chunk_predictor_b_grads,
+        );
     }
 
     /// Serialize gradients to a flat vector.
@@ -143,7 +149,7 @@ impl PositionEmbedding for HierarchicalCoPE {
 
         let local_row = self.local_cope.row(local_pos);
         let global_row = self.global_cope.row(chunk_idx);
-        
+
         let local_contrib = q.dot(&local_row);
         let global_contrib = q.dot(&global_row);
         let mixed = self.alpha_local * local_contrib + self.alpha_global * global_contrib;
@@ -151,21 +157,21 @@ impl PositionEmbedding for HierarchicalCoPE {
         // Gradients
         // Output = mixed * (1 + 0.1 * gate)
         // dL/dOutput = d_s_ij
-        
+
         let d_output = d_s_ij;
-        
+
         // dOutput/dMixed = 1 + 0.1 * gate
         let d_mixed = d_output * (1.0 + 0.1 * boundary_gate);
-        
+
         // dOutput/dGate = mixed * 0.1
         let d_gate = d_output * mixed * 0.1;
-        
+
         // dGate/dLogit = gate * (1 - gate)
         let d_logit = d_gate * boundary_gate * (1.0 - boundary_gate);
 
         // dMixed/dLocalContrib = alpha_local
         let d_local_contrib = d_mixed * self.alpha_local;
-        
+
         // dMixed/dGlobalContrib = alpha_global
         let d_global_contrib = d_mixed * self.alpha_global;
 
@@ -174,7 +180,7 @@ impl PositionEmbedding for HierarchicalCoPE {
         if let Some(lg) = &mut grads.local_cope_grads {
             let mut row = lg.row_mut(local_pos);
             // row += q * d_local_contrib
-             for (r, &q_val) in row.iter_mut().zip(q.iter()) {
+            for (r, &q_val) in row.iter_mut().zip(q.iter()) {
                 *r += q_val * d_local_contrib;
             }
         }
@@ -188,14 +194,14 @@ impl PositionEmbedding for HierarchicalCoPE {
 
         // Gradients for predictor
         // Logit = q . w_col0 + sim * w_col1 + b
-        
+
         // dLogit/dw_col0 = q
         if let Some(wg) = &mut grads.chunk_predictor_w_grads {
             let mut col0 = wg.column_mut(0);
             for (w, &q_val) in col0.iter_mut().zip(q.iter()) {
                 *w += q_val * d_logit;
             }
-            
+
             // dLogit/dw_col1 = sim
             wg[[0, 1]] += content_sim * d_logit;
         }
@@ -208,14 +214,14 @@ impl PositionEmbedding for HierarchicalCoPE {
         // Gradients w.r.t q and k
         // dMixed/dq = alpha_local * local_row + alpha_global * global_row
         let d_mixed_dq = &local_row * self.alpha_local + &global_row * self.alpha_global;
-        
+
         // dLogit/dq = w_col0 + w_col1 * dSim/dq
         // dSim/dq = k
         // dLogit/dq = w_col0 + w_col1 * k
         let w_col0 = self.chunk_predictor_w.column(0);
         let w_col1 = self.chunk_predictor_w[[0, 1]];
         let d_logit_dq = &w_col0 + &(&k.to_owned() * w_col1);
-        
+
         let dq = &d_mixed_dq * d_mixed + &d_logit_dq * d_logit;
 
         // dSim/dk = q
@@ -237,10 +243,12 @@ impl PositionEmbedding for HierarchicalCoPE {
             self.opt_global_cope.step(&mut self.global_cope, gg, lr);
         }
         if let Some(wg) = &grads.chunk_predictor_w_grads {
-            self.opt_chunk_predictor_w.step(&mut self.chunk_predictor_w, wg, lr);
+            self.opt_chunk_predictor_w
+                .step(&mut self.chunk_predictor_w, wg, lr);
         }
         if let Some(bg) = &grads.chunk_predictor_b_grads {
-            self.opt_chunk_predictor_b.step(&mut self.chunk_predictor_b, bg, lr);
+            self.opt_chunk_predictor_b
+                .step(&mut self.chunk_predictor_b, bg, lr);
         }
     }
 
@@ -253,7 +261,10 @@ impl PositionEmbedding for HierarchicalCoPE {
     }
 
     fn parameters(&self) -> usize {
-        self.local_cope.len() + self.global_cope.len() + self.chunk_predictor_w.len() + self.chunk_predictor_b.len()
+        self.local_cope.len()
+            + self.global_cope.len()
+            + self.chunk_predictor_w.len()
+            + self.chunk_predictor_b.len()
     }
 
     fn weight_norm(&self) -> f32 {
@@ -377,16 +388,16 @@ mod tests {
         // Test various positions
         // contribution(q, k, query_pos, key_pos, inputs)
         // pos = query_pos - key_pos
-        
+
         // pos = 0
         let contrib0 = hcope.contribution(&q.view(), &k.view(), 0, 0, None);
-        
+
         // pos = 63 (local boundary)
         let contrib63 = hcope.contribution(&q.view(), &k.view(), 63, 0, None);
-        
+
         // pos = 64 (new chunk)
         let contrib64 = hcope.contribution(&q.view(), &k.view(), 64, 0, None);
-        
+
         // pos = 1000
         let contrib1000 = hcope.contribution(&q.view(), &k.view(), 1000, 0, None);
 

@@ -177,36 +177,6 @@ fn test_linear_projection_gradients() {
 }
 
 #[test]
-fn test_linear_projection_eprop_gradients() {
-    let input_dim = 8;
-    let output_dim = 6;
-    let config = ProjectionConfig::default();
-    let mut projection = LinearProjection::new(input_dim, output_dim, config);
-    projection.weight.fill(0.0);
-    if let Some(bias) = &mut projection.bias {
-        bias.fill(0.0);
-    }
-
-    crate::domain::eprop::context::EpropContext::init_for_layers(vec![(output_dim, input_dim)]);
-    crate::domain::eprop::context::EpropContext::with_traces(|traces| {
-        traces[0].eps_x.fill(0.5);
-        traces[0].eps_f.fill(0.2);
-    })
-    .unwrap();
-
-    let learning_signal = Array1::from_elem(output_dim, 1.0);
-    projection
-        .apply_eprop_gradients(0, &learning_signal, 0.1)
-        .unwrap();
-
-    assert!(projection.weight.iter().any(|&v| v != 0.0));
-    if let Some(bias) = &projection.bias {
-        assert!(bias.iter().any(|&v| v != 0.0));
-    }
-    crate::domain::eprop::context::EpropContext::clear();
-}
-
-#[test]
 fn test_depthwise_conv1d() {
     let config = ProjectionConfig::default();
     let conv = DepthwiseConv1D::new(64, 3, config);

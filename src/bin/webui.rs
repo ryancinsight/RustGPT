@@ -1,5 +1,5 @@
-use llm::presentation::webui::{run_server, WebUiConfig};
 use llm::infrastructure::persistence::FileModelStorage;
+use llm::presentation::webui::{WebUiConfig, run_server};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,7 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // File-based storage (models/ directory)
     let storage = FileModelStorage::new("models");
 
-    println!("Starting RustGPT Web UI at http://{}:{}", config.host, config.port);
+    println!(
+        "Starting RustGPT Web UI at http://{}:{}",
+        config.host, config.port
+    );
 
     run_server(config, storage).await?;
 

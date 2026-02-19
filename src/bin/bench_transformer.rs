@@ -1,9 +1,7 @@
 use std::time::Instant;
 
 use llm::domain::{
-    network::Layer,
-    layers::transformer::TransformerBlock,
-    models::config::ModelConfig,
+    layers::transformer::TransformerBlock, models::config::ModelConfig, network::Layer,
 };
 use ndarray::Array2;
 

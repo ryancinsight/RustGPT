@@ -545,7 +545,11 @@ impl Layer for TitansMAG {
         (input_grads, all_grads)
     }
 
-    fn apply_gradients(&mut self, gradients: &[Array2<f32>], lr: f32) -> crate::common::errors::Result<()> {
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        lr: f32,
+    ) -> crate::common::errors::Result<()> {
         let swa_params = 3;
         let memory_params = 10;
         let gate_params = 2;

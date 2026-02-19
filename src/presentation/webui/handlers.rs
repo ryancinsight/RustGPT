@@ -15,9 +15,9 @@ use serde::Deserialize;
 use std::time::Instant;
 
 use super::{
+    WebUiError, WebUiResult,
     models::*,
     state::{AppState, Message},
-    WebUiError, WebUiResult,
 };
 use crate::domain::network::Layer;
 
@@ -44,7 +44,11 @@ pub async fn create_chat_completion(
         Some(name) => name,
         None => match current_model_opt {
             Some(ref m) => m.name.clone(),
-            None => return Err(WebUiError::InvalidConfig("No model specified. Please select a model.".to_string())),
+            None => {
+                return Err(WebUiError::InvalidConfig(
+                    "No model specified. Please select a model.".to_string(),
+                ));
+            }
         },
     };
 
@@ -55,7 +59,7 @@ pub async fn create_chat_completion(
         match crate::domain::models::llm::LLM::load_versioned(&model_path) {
             Ok(llm) => {
                 let llm_arc = std::sync::Arc::new(tokio::sync::RwLock::new(llm));
-                
+
                 let model_info = super::state::ModelInfo {
                     name: model_name.clone(),
                     config: crate::domain::models::config::ModelConfig::default(),
@@ -97,26 +101,16 @@ pub async fn create_chat_completion(
 
     if request.stream {
         // Streaming response
-        let stream = create_chat_completion_stream(
-            state,
-            request,
-            conversation_id,
-            model_name,
-            start_time,
-        )
-        .await?;
+        let stream =
+            create_chat_completion_stream(state, request, conversation_id, model_name, start_time)
+                .await?;
 
         Ok(Sse::new(stream).into_response())
     } else {
         // Non-streaming response
-        let response = generate_chat_completion(
-            &state,
-            &request,
-            &conversation_id,
-            &model_name,
-            start_time,
-        )
-        .await?;
+        let response =
+            generate_chat_completion(&state, &request, &conversation_id, &model_name, start_time)
+                .await?;
 
         // Add assistant response to conversation
         if let Some(choice) = response.choices.first() {
@@ -152,7 +146,7 @@ async fn generate_chat_completion(
 ) -> WebUiResult<ChatCompletionResponse> {
     // Try to use the actual inference engine if a model is loaded
     let llm_arc = state.get_loaded_llm().await;
-    
+
     let prompt_tokens: usize = request
         .messages
         .iter()
@@ -162,20 +156,23 @@ async fn generate_chat_completion(
     let generated_content = if let Some(llm_arc) = llm_arc {
         // Use the actual inference engine
         let prompt = build_prompt_from_messages(&request.messages);
-        
+
         // Perform inference
         let max_new_tokens = if request.max_tokens > 0 {
             request.max_tokens
         } else {
             256
         };
-        
+
         let prediction = {
             let mut llm = llm_arc.write().await;
             llm.predict_with_limit(&prompt, max_new_tokens)
         };
-        
-        prediction.strip_prefix("Generated text: ").unwrap_or(&prediction).to_string()
+
+        prediction
+            .strip_prefix("Generated text: ")
+            .unwrap_or(&prediction)
+            .to_string()
     } else {
         // Fallback to mock response when no model is loaded
         let last_user_message = request
@@ -184,7 +181,7 @@ async fn generate_chat_completion(
             .rfind(|m| m.role == "user")
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        
+
         format!(
             "This is a mock response (demo mode - no model loaded). You said: {}\n\n[Model: {} | Temp: {:.1} | Max tokens: {}]",
             last_user_message, model_name, request.temperature, request.max_tokens
@@ -223,7 +220,7 @@ async fn generate_chat_completion(
 /// Build a prompt string from a list of chat messages
 fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
     let mut prompt_parts = Vec::new();
-    
+
     for msg in messages {
         let role_prefix = match msg.role.as_str() {
             "system" => "System: ",
@@ -233,10 +230,10 @@ fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
         };
         prompt_parts.push(format!("{}{}", role_prefix, msg.content));
     }
-    
+
     // Add assistant prefix for the response
     prompt_parts.push("Assistant: ".to_string());
-    
+
     prompt_parts.join("\n")
 }
 
@@ -247,8 +244,9 @@ async fn create_chat_completion_stream(
     conversation_id: String,
     model_name: String,
     start_time: Instant,
-) -> WebUiResult<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
-{
+) -> WebUiResult<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     use axum::response::sse::Event;
     use futures::stream;
     use tokio::sync::mpsc;
@@ -260,7 +258,7 @@ async fn create_chat_completion_stream(
 
     // Build prompt from messages
     let prompt = build_prompt_from_messages(&request.messages);
-    
+
     // Set generation parameters
     let max_new_tokens = if request.max_tokens > 0 {
         request.max_tokens
@@ -270,51 +268,54 @@ async fn create_chat_completion_stream(
 
     let completion_id = generate_id("chatcmpl");
     let model_name_clone = model_name.clone();
-    
+
     // Create channel for streaming tokens
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
-    
+
     // Spawn inference task
     tokio::spawn(async move {
         // Send initial role delta
-        let _ = tx.send(Ok(Event::default().data(
-            serde_json::to_string(&ChatCompletionChunk {
-                id: completion_id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created: current_timestamp(),
-                model: model_name_clone.clone(),
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta: ChatMessageDelta {
-                        role: Some("assistant".to_string()),
-                        content: None,
-                    },
-                    finish_reason: None,
-                }],
-            }).unwrap(),
-        ))).await;
+        let _ = tx
+            .send(Ok(Event::default().data(
+                serde_json::to_string(&ChatCompletionChunk {
+                    id: completion_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: current_timestamp(),
+                    model: model_name_clone.clone(),
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatMessageDelta {
+                            role: Some("assistant".to_string()),
+                            content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                })
+                .unwrap(),
+            )))
+            .await;
 
         // Perform token-by-token generation
         let mut tokens_generated = 0usize;
         let mut accumulated_text = String::new();
-        
+
         // Acquire lock and generate tokens incrementally
         {
             let mut llm = llm_arc.write().await;
-            
+
             // Tokenize the prompt
             let mut tokenized = Vec::new();
             llm.tokenize_into(&prompt, &mut tokenized);
             let input_len = tokenized.len();
-            
+
             // Get EOS token
             let eos_token = llm.vocab.encode("</s>");
             let max_seq_len = llm.max_sequence_len().max(input_len.max(1));
-            
+
             if input_len < max_seq_len {
                 let available_steps = max_seq_len.saturating_sub(input_len);
                 let generation_steps = available_steps.min(max_new_tokens);
-                
+
                 for _ in 0..generation_steps {
                     // Check if we're approaching the maximum sequence length
                     if tokens_generated >= max_seq_len.saturating_sub(1) {
@@ -323,34 +324,37 @@ async fn create_chat_completion_stream(
 
                     // Generate next token
                     let next_token = generate_next_token(&mut llm, &tokenized).await;
-                    
+
                     // Decode the token to text
                     if let Some(token_text) = llm.vocab.decode(next_token) {
                         accumulated_text.push_str(token_text);
-                        
+
                         // Stream the token text
-                        let _ = tx.send(Ok(Event::default().data(
-                            serde_json::to_string(&ChatCompletionChunk {
-                                id: completion_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created: current_timestamp(),
-                                model: model_name_clone.clone(),
-                                choices: vec![ChatCompletionChunkChoice {
-                                    index: 0,
-                                    delta: ChatMessageDelta {
-                                        role: None,
-                                        content: Some(token_text.to_string()),
-                                    },
-                                    finish_reason: None,
-                                }],
-                            }).unwrap(),
-                        ))).await;
-                        
+                        let _ = tx
+                            .send(Ok(Event::default().data(
+                                serde_json::to_string(&ChatCompletionChunk {
+                                    id: completion_id.clone(),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created: current_timestamp(),
+                                    model: model_name_clone.clone(),
+                                    choices: vec![ChatCompletionChunkChoice {
+                                        index: 0,
+                                        delta: ChatMessageDelta {
+                                            role: None,
+                                            content: Some(token_text.to_string()),
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                })
+                                .unwrap(),
+                            )))
+                            .await;
+
                         tokens_generated += 1;
                     }
-                    
+
                     tokenized.push(next_token);
-                    
+
                     // Check for EOS
                     if eos_token.is_some_and(|eos| next_token == eos) {
                         break;
@@ -360,37 +364,44 @@ async fn create_chat_completion_stream(
         }
 
         // Send final chunk with finish_reason
-        let _ = tx.send(Ok(Event::default().data(
-            serde_json::to_string(&ChatCompletionChunk {
-                id: completion_id,
-                object: "chat.completion.chunk".to_string(),
-                created: current_timestamp(),
-                model: model_name_clone,
-                choices: vec![ChatCompletionChunkChoice {
-                    index: 0,
-                    delta: ChatMessageDelta {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some("stop".to_string()),
-                }],
-            }).unwrap(),
-        ))).await;
+        let _ = tx
+            .send(Ok(Event::default().data(
+                serde_json::to_string(&ChatCompletionChunk {
+                    id: completion_id,
+                    object: "chat.completion.chunk".to_string(),
+                    created: current_timestamp(),
+                    model: model_name_clone,
+                    choices: vec![ChatCompletionChunkChoice {
+                        index: 0,
+                        delta: ChatMessageDelta {
+                            role: None,
+                            content: None,
+                        },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                })
+                .unwrap(),
+            )))
+            .await;
 
         // Record metrics
         let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-        state.record_success(tokens_generated as u64, latency_ms).await;
-        
+        state
+            .record_success(tokens_generated as u64, latency_ms)
+            .await;
+
         // Add assistant response to conversation
         if !accumulated_text.is_empty() {
-            state.add_message(
-                &conversation_id,
-                super::state::Message {
-                    role: "assistant".to_string(),
-                    content: accumulated_text,
-                    timestamp: chrono::Utc::now(),
-                },
-            ).await;
+            state
+                .add_message(
+                    &conversation_id,
+                    super::state::Message {
+                        role: "assistant".to_string(),
+                        content: accumulated_text,
+                        timestamp: chrono::Utc::now(),
+                    },
+                )
+                .await;
         }
     });
 
@@ -406,48 +417,45 @@ async fn create_chat_completion_stream(
 }
 
 /// Generate a single next token given the current token sequence
-async fn generate_next_token(llm: &mut crate::domain::models::llm::LLM, tokenized: &[usize]) -> usize {
+async fn generate_next_token(
+    llm: &mut crate::domain::models::llm::LLM,
+    tokenized: &[usize],
+) -> usize {
     use ndarray::Array2;
-    
+
     // Prepare input tensor
     let mut token_input = Array2::zeros((1, tokenized.len()));
     for (i, &token_id) in tokenized.iter().enumerate() {
         token_input[[0, i]] = token_id as f32;
     }
-    
+
     // Forward pass through all layers
     let mut input = token_input;
     let mut similarity_ctx: Option<Array2<f32>> = None;
-    
+
     for layer in llm.network.iter_mut() {
         input = match layer {
             crate::domain::network::LayerEnum::TransformerBlock(block) => {
                 block.set_incoming_similarity_context(similarity_ctx.as_ref());
                 let out = block.forward(&input);
-                if let Some(existing) = similarity_ctx.as_mut() {
-                    existing.assign(block.activation_similarity_matrix());
-                } else {
-                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                if let Some(outgoing) = block.activation_similarity_matrix() {
+                    if let Some(existing) = similarity_ctx.as_mut() {
+                        existing.assign(outgoing);
+                    } else {
+                        similarity_ctx = Some(outgoing.clone());
+                    }
                 }
                 out
             }
             crate::domain::network::LayerEnum::DiffusionBlock(block) => {
                 block.set_incoming_similarity_context(similarity_ctx.as_ref());
                 let out = block.forward(&input);
-                if let Some(existing) = similarity_ctx.as_mut() {
-                    existing.assign(block.activation_similarity_matrix());
-                } else {
-                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
-                }
-                out
-            }
-            crate::domain::network::LayerEnum::LRM(block) => {
-                block.set_incoming_similarity_context(similarity_ctx.as_ref());
-                let out = block.forward(&input);
-                if let Some(existing) = similarity_ctx.as_mut() {
-                    existing.assign(block.activation_similarity_matrix());
-                } else {
-                    similarity_ctx = Some(block.activation_similarity_matrix().clone());
+                if let Some(outgoing) = block.activation_similarity_matrix() {
+                    if let Some(existing) = similarity_ctx.as_mut() {
+                        existing.assign(outgoing);
+                    } else {
+                        similarity_ctx = Some(outgoing.clone());
+                    }
                 }
                 out
             }
@@ -457,15 +465,15 @@ async fn generate_next_token(llm: &mut crate::domain::models::llm::LLM, tokenize
             }
         };
     }
-    
+
     // Get logits and decode
     let logits = input;
     if logits.shape()[0] == 0 {
         return 0;
     }
-    
+
     let last_logit_row = logits.row(logits.shape()[0] - 1);
-    
+
     // Use greedy decoding
     use crate::application::decoding::GreedyDecoder;
     let decoder = GreedyDecoder::new();
@@ -503,7 +511,7 @@ pub async fn create_completion(
     // Perform inference using the actual model
     let generated_text = {
         let mut llm = llm_arc.write().await;
-        
+
         // Set max tokens limit if specified
         let max_new_tokens = if request.max_tokens > 0 {
             request.max_tokens
@@ -520,9 +528,12 @@ pub async fn create_completion(
             // Use standard prediction with token limit
             llm.predict_with_limit(&request.prompt, max_new_tokens)
         };
-        
+
         // Clean up the prediction
-        prediction.strip_prefix("Generated text: ").unwrap_or(&prediction).to_string()
+        prediction
+            .strip_prefix("Generated text: ")
+            .unwrap_or(&prediction)
+            .to_string()
     };
 
     let completion_tokens = generated_text.split_whitespace().count();
@@ -566,7 +577,7 @@ pub async fn list_models(State(state): State<AppState>) -> WebUiResult<impl Into
 
     // Scan models directory for available model files
     let mut models = Vec::new();
-    
+
     // Check if models directory exists
     if let Ok(entries) = std::fs::read_dir(model_dir) {
         for entry in entries.flatten() {
@@ -575,27 +586,36 @@ pub async fn list_models(State(state): State<AppState>) -> WebUiResult<impl Into
                 if let Some(ext) = path.extension() {
                     // Accept common model file extensions
                     if ext == "bin" || ext == "safetensors" || ext == "pt" || ext == "ckpt" {
-                        let file_name = path.file_stem()
+                        let file_name = path
+                            .file_stem()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown")
                             .to_string();
-                        
+
                         let metadata = std::fs::metadata(&path).ok();
                         let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                        let is_loaded = current_model.as_ref()
+                        let is_loaded = current_model
+                            .as_ref()
                             .map(|m| m.name == file_name)
                             .unwrap_or(false);
-                        
+
                         // Get loaded_at timestamp if loaded
                         let created_at = if is_loaded {
-                            current_model.as_ref().and_then(|m| Some(m.loaded_at.to_rfc3339()))
+                            current_model
+                                .as_ref()
+                                .and_then(|m| Some(m.loaded_at.to_rfc3339()))
                         } else {
-                            metadata.and_then(|m| m.modified().ok())
-                                .and_then(|t| chrono::DateTime::from_timestamp(
-                                    t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64, 0
-                                ).map(|dt| dt.to_rfc3339()))
+                            metadata.and_then(|m| m.modified().ok()).and_then(|t| {
+                                chrono::DateTime::from_timestamp(
+                                    t.duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as i64,
+                                    0,
+                                )
+                                .map(|dt| dt.to_rfc3339())
+                            })
                         };
-                        
+
                         models.push(ModelInfoResponse {
                             id: file_name.clone(),
                             name: file_name.clone(),
@@ -697,7 +717,7 @@ pub async fn load_model(
 
     // Load the model using versioned loading for compatibility
     let model_path = format!("{}/{}.bin", state.config.model_dir, request.model);
-    
+
     let llm = match crate::domain::models::llm::LLM::load_versioned(&model_path) {
         Ok(model) => model,
         Err(e) => {
@@ -847,7 +867,10 @@ pub async fn list_conversations(State(state): State<AppState>) -> WebUiResult<im
 
     let total = data.len();
 
-    Ok((StatusCode::OK, Json(ListConversationsResponse { data, total })))
+    Ok((
+        StatusCode::OK,
+        Json(ListConversationsResponse { data, total }),
+    ))
 }
 
 /// GET /v1/conversations/:id
@@ -904,12 +927,18 @@ use axum::extract::Query;
 use std::collections::HashMap;
 
 /// Serve static files (HTML, CSS, JS for the web UI)
-pub async fn serve_static(State(state): State<AppState>, Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
-    let path = params.get("path").map(|p| p.as_str()).unwrap_or("index.html");
-    
+pub async fn serve_static(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let path = params
+        .get("path")
+        .map(|p| p.as_str())
+        .unwrap_or("index.html");
+
     // Sanitize path to prevent directory traversal attacks
     let safe_path = path.trim_start_matches('/').replace("..", "");
-    
+
     // Determine content type based on file extension
     let content_type = if safe_path.ends_with(".css") {
         "text/css"
@@ -926,11 +955,11 @@ pub async fn serve_static(State(state): State<AppState>, Query(params): Query<Ha
     } else {
         "application/octet-stream"
     };
-    
+
     // Try to serve from configured static directory
     if let Some(static_dir) = &state.config.static_dir {
         let file_path = std::path::Path::new(static_dir).join(&safe_path);
-        
+
         // Security check: ensure the resolved path is within the static directory
         match tokio::fs::read(&file_path).await {
             Ok(contents) => {
@@ -957,7 +986,7 @@ pub async fn serve_static(State(state): State<AppState>, Query(params): Query<Ha
             }
         }
     }
-    
+
     // Default: serve embedded index.html
     (
         StatusCode::OK,

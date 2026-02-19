@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use llm::richards::{RichardsCurve, Variant};
 use ndarray::Array2;
 use rand::Rng;
@@ -40,7 +40,7 @@ fn bench_grad_weights_matrix(c: &mut Criterion) {
 
     c.bench_function("grad_weights_matrix", |b| {
         b.iter(|| {
-             black_box(curve.grad_weights_matrix(black_box(&x), black_box(&grad)));
+            black_box(curve.grad_weights_matrix(black_box(&x), black_box(&grad)));
         })
     });
 }

@@ -299,16 +299,12 @@ impl LLM {
 
     /// Get the architecture name for metadata
     fn get_architecture_name(&self) -> String {
-        // Architecture is the *outer* model form (Transformer/TRM/Diffusion), while
+        // Architecture is the *outer* model form (Transformer/Diffusion), while
         // temporal mixing is an *internal* choice (Attention/RG-LRU/Mamba/etc.).
         let has_diffusion = self
             .network
             .iter()
             .any(|l| matches!(l, LayerEnum::DiffusionBlock(_)));
-        let has_trm = self
-            .network
-            .iter()
-            .any(|l| matches!(l, LayerEnum::LRM(_)));
         let has_transformer = self
             .network
             .iter()
@@ -316,8 +312,6 @@ impl LLM {
 
         let base = if has_diffusion {
             "Diffusion"
-        } else if has_trm {
-            "TRM"
         } else if has_transformer {
             "Transformer"
         } else {
@@ -344,9 +338,9 @@ impl LLM {
         for layer in &self.network {
             let tm = match layer {
                 LayerEnum::TransformerBlock(tb) => match &tb.temporal_mixing().temporal_mixing {
-                    crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
-                        Some(TM::Attention)
-                    }
+                    crate::domain::layers::components::common::TemporalMixingLayer::Attention(
+                        _,
+                    ) => Some(TM::Attention),
                     crate::domain::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
                         Some(TM::RgLruMoH)
                     }
@@ -362,17 +356,17 @@ impl LLM {
                     crate::domain::layers::components::common::TemporalMixingLayer::Mamba2(_) => {
                         Some(TM::Mamba2)
                     }
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
-                        Some(TM::Mamba2MoH)
-                    }
+                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(
+                        _,
+                    ) => Some(TM::Mamba2MoH),
                     crate::domain::layers::components::common::TemporalMixingLayer::Titans(_) => {
                         Some(TM::Titans)
                     }
                 },
                 LayerEnum::DiffusionBlock(db) => match &db.temporal_mixing.temporal_mixing {
-                    crate::domain::layers::components::common::TemporalMixingLayer::Attention(_) => {
-                        Some(TM::Attention)
-                    }
+                    crate::domain::layers::components::common::TemporalMixingLayer::Attention(
+                        _,
+                    ) => Some(TM::Attention),
                     crate::domain::layers::components::common::TemporalMixingLayer::RgLruMoH(_) => {
                         Some(TM::RgLruMoH)
                     }
@@ -388,9 +382,9 @@ impl LLM {
                     crate::domain::layers::components::common::TemporalMixingLayer::Mamba2(_) => {
                         Some(TM::Mamba2)
                     }
-                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(_) => {
-                        Some(TM::Mamba2MoH)
-                    }
+                    crate::domain::layers::components::common::TemporalMixingLayer::Mamba2MoH(
+                        _,
+                    ) => Some(TM::Mamba2MoH),
                     crate::domain::layers::components::common::TemporalMixingLayer::Titans(_) => {
                         Some(TM::Titans)
                     }

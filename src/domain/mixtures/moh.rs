@@ -120,19 +120,28 @@ impl HeadSelectionConfig {
                 importance_loss_weight: _importance_loss_weight,
                 switch_balance_weight: _switch_balance_weight,
                 training_mode: _,
-            } => Self {
-                gating: GatingConfig::from_strategy(strategy, num_heads),
-                min_heads: 1, // Default min, could be parameterized
-                max_heads: *num_active,
-                always_on_heads: Vec::new(),
-                threshold_modulation: AdaptiveScalar::Fixed(1.0),
-                metrics_tau_min: f32::INFINITY,
-                metrics_tau_max: f32::NEG_INFINITY,
-                metrics_tau_sum: 0.0,
-                metrics_tau_count: 0,
-                metrics_g_sq_sum: 0.0,
-                metrics_g_count: 0,
-            },
+            } => {
+                // Keep at least two heads active in multi-head regimes to preserve diversity.
+                // This reduces early collapse to a single dominant head.
+                let learned_min_heads = if num_heads >= 4 {
+                    2usize.min(*num_active).max(1)
+                } else {
+                    1usize.min(*num_active).max(1)
+                };
+                Self {
+                    gating: GatingConfig::from_strategy(strategy, num_heads),
+                    min_heads: learned_min_heads,
+                    max_heads: *num_active,
+                    always_on_heads: Vec::new(),
+                    threshold_modulation: AdaptiveScalar::Fixed(1.0),
+                    metrics_tau_min: f32::INFINITY,
+                    metrics_tau_max: f32::NEG_INFINITY,
+                    metrics_tau_sum: 0.0,
+                    metrics_tau_count: 0,
+                    metrics_g_sq_sum: 0.0,
+                    metrics_g_count: 0,
+                }
+            }
             GatingStrategy::SoftTopP {
                 top_p: _top_p,
                 soft_top_p_alpha: _,
@@ -274,8 +283,10 @@ impl Router for HeadRouter {
         };
 
         // Apply selection algorithm
-        let routing_weights =
-            crate::domain::mixtures::routing::apply_selection_algorithm(&raw_gates.view(), &self.config);
+        let routing_weights = crate::domain::mixtures::routing::apply_selection_algorithm(
+            &raw_gates.view(),
+            &self.config,
+        );
 
         RoutingResult {
             routing_weights,
@@ -316,7 +327,7 @@ mod tests {
 
         let config = HeadSelectionConfig::from_strategy(&strategy, 8);
         assert!(config.gating.use_learned_predictor);
-        assert_eq!(config.min_heads, 1);
+        assert_eq!(config.min_heads, 2);
         assert_eq!(config.max_heads, 6);
         assert_eq!(config.gating.load_balance_weight, 0.1);
         assert_eq!(config.gating.complexity_loss_weight, 0.05);

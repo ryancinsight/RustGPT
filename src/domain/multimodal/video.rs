@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::errors::Result;
 use crate::domain::multimodal::{
     image::{ImageConfig, ImageSample},
-    patch::{get_1d_sincos_pos_embed, PatchEmbed},
+    patch::{PatchEmbed, get_1d_sincos_pos_embed},
 };
 
 /// Configuration for video processing
@@ -56,8 +56,7 @@ impl Default for VideoConfig {
 impl VideoConfig {
     /// Calculate number of spatial patches per frame
     pub fn num_spatial_patches(&self) -> usize {
-        (self.frame_height / self.spatial_patch_size)
-            * (self.frame_width / self.spatial_patch_size)
+        (self.frame_height / self.spatial_patch_size) * (self.frame_width / self.spatial_patch_size)
     }
 
     /// Calculate number of temporal patches
@@ -184,12 +183,7 @@ pub struct VideoSample {
 
 impl VideoSample {
     /// Create a new video sample
-    pub fn new(
-        frames: Vec<Vec<f32>>,
-        height: usize,
-        width: usize,
-        channels: usize,
-    ) -> Self {
+    pub fn new(frames: Vec<Vec<f32>>, height: usize, width: usize, channels: usize) -> Self {
         let num_frames = frames.len();
         Self {
             frames,
@@ -223,7 +217,11 @@ impl VideoSample {
     }
 
     /// Sample frames according to the specified strategy
-    pub fn sample_frames(&self, num_frames: usize, strategy: FrameSamplingStrategy) -> Vec<Vec<f32>> {
+    pub fn sample_frames(
+        &self,
+        num_frames: usize,
+        strategy: FrameSamplingStrategy,
+    ) -> Vec<Vec<f32>> {
         if self.num_frames <= num_frames {
             return self.frames.clone();
         }
@@ -249,21 +247,29 @@ impl VideoSample {
                 indices.iter().map(|&i| self.frames[i].clone()).collect()
             }
             FrameSamplingStrategy::Start => self.frames.iter().take(num_frames).cloned().collect(),
-            FrameSamplingStrategy::End => {
-                self.frames.iter().skip(self.num_frames.saturating_sub(num_frames)).cloned().collect()
-            }
+            FrameSamplingStrategy::End => self
+                .frames
+                .iter()
+                .skip(self.num_frames.saturating_sub(num_frames))
+                .cloned()
+                .collect(),
             FrameSamplingStrategy::Middle => {
                 let start = (self.num_frames - num_frames) / 2;
-                self.frames.iter().skip(start).take(num_frames).cloned().collect()
+                self.frames
+                    .iter()
+                    .skip(start)
+                    .take(num_frames)
+                    .cloned()
+                    .collect()
             }
         }
     }
 
     /// Extract a single frame as an ImageSample
     pub fn get_frame(&self, frame_idx: usize) -> Option<ImageSample> {
-        self.frames.get(frame_idx).map(|pixels| {
-            ImageSample::new(pixels.clone(), self.height, self.width, self.channels)
-        })
+        self.frames
+            .get(frame_idx)
+            .map(|pixels| ImageSample::new(pixels.clone(), self.height, self.width, self.channels))
     }
 }
 
@@ -286,7 +292,10 @@ impl VideoEncoder {
 
         let temporal_position_embeddings = if config.use_temporal_embeddings {
             let num_temporal_tokens = config.num_temporal_patches();
-            Some(get_1d_sincos_pos_embed(config.embedding_dim, num_temporal_tokens))
+            Some(get_1d_sincos_pos_embed(
+                config.embedding_dim,
+                num_temporal_tokens,
+            ))
         } else {
             None
         };
@@ -333,10 +342,7 @@ impl VideoEncoder {
     }
 
     /// Extract spatio-temporal patches from frame sequence
-    fn extract_spatiotemporal_patches(
-        &self,
-        frames: &[Vec<f32>],
-    ) -> Result<Array2<f32>> {
+    fn extract_spatiotemporal_patches(&self, frames: &[Vec<f32>]) -> Result<Array2<f32>> {
         if frames.len() != self.config.num_frames {
             return Err(crate::common::errors::ModelError::InvalidInput {
                 message: format!(
@@ -375,13 +381,10 @@ impl VideoEncoder {
 
                     // Iterate over temporal dimension (frames in chunk)
                     for frame in temporal_chunk {
-                        let frame_array = Array4::from_shape_vec(
-                            (1, h, w, c),
-                            frame.clone(),
-                        )
-                        .map_err(|e| crate::common::errors::ModelError::InvalidInput {
-                            message: format!("Failed to reshape frame: {}", e),
-                        })?;
+                        let frame_array = Array4::from_shape_vec((1, h, w, c), frame.clone())
+                            .map_err(|e| crate::common::errors::ModelError::InvalidInput {
+                                message: format!("Failed to reshape frame: {}", e),
+                            })?;
 
                         // Extract spatial patch from this frame
                         for i in 0..p_s {
@@ -428,7 +431,12 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
 
-    fn create_test_video(num_frames: usize, height: usize, width: usize, channels: usize) -> VideoSample {
+    fn create_test_video(
+        num_frames: usize,
+        height: usize,
+        width: usize,
+        channels: usize,
+    ) -> VideoSample {
         let frames: Vec<Vec<f32>> = (0..num_frames)
             .map(|f| {
                 (0..height * width * channels)
