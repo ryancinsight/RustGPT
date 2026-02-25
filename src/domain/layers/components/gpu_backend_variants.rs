@@ -46,9 +46,6 @@
 //! | TransformerGpu   | Multi-head attn   | 40ms     | 1.3ms      | 30x     |
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
-use std::sync::{Arc, Mutex};
-
-#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use ndarray::{Array1, Array2};
 
 use crate::common::errors::{ModelError, Result};
@@ -183,18 +180,27 @@ impl NoiseScheduleParams {
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 impl DiffusionGpuBackend {
+    /// Create a new Diffusion GPU backend for an explicit backend (strict no-fallback).
+    pub fn with_backend(
+        num_steps: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<Self> {
+        let kernels = UnifiedGpuKernels::new(backend)?;
+        Ok(Self {
+            kernels,
+            noise_schedule: NoiseScheduleParams::cosine(num_steps),
+            num_steps,
+        })
+    }
+
     /// Create a new Diffusion GPU backend with automatic GPU detection.
     ///
     /// # Errors
     ///
     /// Returns an error if no GPU is detected (strict no-fallback).
     pub fn auto_detect(num_steps: usize) -> Result<Self> {
-        let kernels = UnifiedGpuKernels::auto_detect()?;
-        Ok(Self {
-            kernels,
-            noise_schedule: NoiseScheduleParams::cosine(num_steps),
-            num_steps,
-        })
+        let backend = crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu()?;
+        Self::with_backend(num_steps, backend)
     }
 
     /// Create with a specific noise schedule.
@@ -236,29 +242,25 @@ impl DiffusionGpuBackend {
         let sqrt_alpha_bar = alpha_bar_t.sqrt();
         let sqrt_one_minus_alpha_bar = (1.0 - alpha_bar_t).sqrt();
 
-        // Use provided noise or generate random
+        // Use provided noise or generate pseudo-random tensor.
         let noise_tensor = match noise {
-            Some(n) => n.clone(),
-            None => {
-                // Generate random noise (simple implementation)
-                // In production, use proper RNG
-                Array2::from_shape_fn(x_0.dim(), |_| {
-                    // Simple pseudo-random based on position
-                    let val = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as f32)
-                        .sin();
-                    val * 2.0 - 1.0 // Range [-1, 1]
-                })
+            Some(n) => {
+                if n.dim() != x_0.dim() {
+                    return Err(ModelError::InvalidInput {
+                        message: format!(
+                            "Noise shape {:?} must match input shape {:?}",
+                            n.dim(),
+                            x_0.dim()
+                        ),
+                    });
+                }
+                n.clone()
             }
+            None => Self::generate_noise_tensor(x_0.dim()),
         };
 
-        // Compute: x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * noise
-        let x_t =
-            x_0.mapv(|x| x * sqrt_alpha_bar) + noise_tensor.mapv(|n| n * sqrt_one_minus_alpha_bar);
-
-        Ok(x_t)
+        // Compute on GPU: x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * noise
+        self.axpy_gpu(x_0, sqrt_alpha_bar, &noise_tensor, sqrt_one_minus_alpha_bar)
     }
 
     /// Predict noise from noisy input.
@@ -283,17 +285,22 @@ impl DiffusionGpuBackend {
         let (batch_size, embed_dim) = x_t.dim();
 
         // Time embedding (simplified)
-        let t_emb = self.get_time_embedding(t, embed_dim)?;
+        let t_emb = self.get_time_embedding(t, batch_size, embed_dim)?;
 
         // Placeholder: return scaled input as "predicted noise"
         // Real implementation would use model forward pass
-        let predicted_noise = x_t.mapv(|x| x * 0.1) + t_emb;
+        let predicted_noise = x_t.mapv(|x| x * 0.1) + &t_emb;
 
         Ok(predicted_noise)
     }
 
     /// Get time embedding for timestep.
-    fn get_time_embedding(&self, t: usize, embed_dim: usize) -> Result<Array2<f32>> {
+    fn get_time_embedding(
+        &self,
+        t: usize,
+        batch_size: usize,
+        embed_dim: usize,
+    ) -> Result<Array2<f32>> {
         let half_dim = embed_dim / 2;
         let mut emb = Array1::zeros(embed_dim);
 
@@ -305,10 +312,88 @@ impl DiffusionGpuBackend {
         }
 
         // Expand to batch dimension
-        let batch_size = 1; // Default batch size
         Ok(Array2::from_shape_fn((batch_size, embed_dim), |(_, j)| {
             emb[j]
         }))
+    }
+
+    /// Compute weighted sum on GPU: out = a * left + b * right.
+    fn axpy_gpu(
+        &mut self,
+        left: &Array2<f32>,
+        a: f32,
+        right: &Array2<f32>,
+        b: f32,
+    ) -> Result<Array2<f32>> {
+        if left.dim() != right.dim() {
+            return Err(ModelError::InvalidInput {
+                message: format!(
+                    "AXPY input shape mismatch: left {:?}, right {:?}",
+                    left.dim(),
+                    right.dim()
+                ),
+            });
+        }
+        let dims = left.dim();
+        let total = left.len();
+        if total == 0 {
+            return Ok(Array2::zeros(dims));
+        }
+
+        let left_slice = left.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "Diffusion AXPY left tensor must be contiguous".to_string(),
+        })?;
+        let right_slice = right.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "Diffusion AXPY right tensor must be contiguous".to_string(),
+        })?;
+
+        let device_arc = self.kernels.device();
+        let mut device = device_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to lock DiffusionGpuBackend GPU device".to_string(),
+        })?;
+
+        let mut left_buf = device.allocate_f32(total)?;
+        let mut right_buf = device.allocate_f32(total)?;
+        let mut output_buf = device.allocate_f32(total)?;
+
+        device.upload(left_slice, &mut left_buf)?;
+        device.upload(right_slice, &mut right_buf)?;
+        device.axpy(a, &left_buf, b, &right_buf, &mut output_buf, total)?;
+
+        let mut host_output = vec![0.0f32; total];
+        device.download(&output_buf, &mut host_output)?;
+
+        device.deallocate(left_buf);
+        device.deallocate(right_buf);
+        device.deallocate(output_buf);
+
+        Array2::from_shape_vec(dims, host_output).map_err(|err| ModelError::InvalidInput {
+            message: format!("Failed to reshape Diffusion AXPY output: {err}"),
+        })
+    }
+
+    /// Fast pseudo-random noise in [-1, 1], seeded from system time once per call.
+    fn generate_noise_tensor(shape: (usize, usize)) -> Array2<f32> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let total = shape.0.saturating_mul(shape.1);
+        let mut data = Vec::with_capacity(total);
+        let mut state = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+            ^ 0x9E37_79B9_7F4A_7C15_u64;
+
+        for _ in 0..total {
+            // Xorshift64* style update
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let unit = (state as f64 / u64::MAX as f64) as f32;
+            data.push(unit * 2.0 - 1.0);
+        }
+
+        Array2::from_shape_vec(shape, data).unwrap_or_else(|_| Array2::zeros(shape))
     }
 
     /// Denoising step: predict x_{t-1} from x_t.
@@ -328,6 +413,21 @@ impl DiffusionGpuBackend {
         t: usize,
         predicted_noise: &Array2<f32>,
     ) -> Result<Array2<f32>> {
+        if t >= self.num_steps {
+            return Err(ModelError::InvalidInput {
+                message: format!("Timestep {} out of range [0, {})", t, self.num_steps),
+            });
+        }
+        if predicted_noise.dim() != x_t.dim() {
+            return Err(ModelError::InvalidInput {
+                message: format!(
+                    "predicted_noise shape {:?} must match x_t shape {:?}",
+                    predicted_noise.dim(),
+                    x_t.dim()
+                ),
+            });
+        }
+
         if t == 0 {
             return Ok(x_t.clone());
         }
@@ -341,19 +441,20 @@ impl DiffusionGpuBackend {
             1.0
         };
 
-        // Compute mean: mu = (1/sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * predicted_noise)
+        // Compute mean on GPU:
+        // mu = (1/sqrt(alpha_t)) * x_t - (beta_t / sqrt(1 - alpha_bar_t) / sqrt(alpha_t)) * predicted_noise
         let sqrt_alpha_t = alpha_t.sqrt();
         let sqrt_one_minus_alpha_bar = (1.0 - alpha_bar_t).sqrt();
+        let coeff_x = 1.0 / sqrt_alpha_t;
+        let coeff_noise = -beta_t / sqrt_one_minus_alpha_bar / sqrt_alpha_t;
 
-        let mean = x_t.mapv(|x| x / sqrt_alpha_t)
-            - predicted_noise.mapv(|n| n * beta_t / sqrt_one_minus_alpha_bar / sqrt_alpha_t);
+        let mean = self.axpy_gpu(x_t, coeff_x, predicted_noise, coeff_noise)?;
 
         // Add noise for t > 1
         if t > 1 {
             let sigma_t = (beta_t * (1.0 - alpha_bar_t1) / (1.0 - alpha_bar_t)).sqrt();
-            // Add random noise (placeholder)
-            let noise = Array2::from_shape_fn(x_t.dim(), |_| 0.01); // Small noise
-            Ok(mean + noise.mapv(|n| n * sigma_t))
+            let noise = Self::generate_noise_tensor(x_t.dim());
+            self.axpy_gpu(&mean, 1.0, &noise, sigma_t)
         } else {
             Ok(mean)
         }
@@ -449,13 +550,15 @@ impl SsmGpuBackend {
         batch_size: usize,
         temporal_type: GpuTemporalType,
     ) -> Result<Self> {
-        let kernels = UnifiedGpuKernels::auto_detect()?;
-        let params = SsmParams::new(state_dim, embed_dim, seq_len, batch_size);
-        Ok(Self {
-            kernels,
-            params,
+        let backend = crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu()?;
+        Self::with_backend(
+            state_dim,
+            embed_dim,
+            seq_len,
+            batch_size,
             temporal_type,
-        })
+            backend,
+        )
     }
 
     /// Create for Mamba architecture.
@@ -534,6 +637,20 @@ impl SsmGpuBackend {
             .ssm_forward(input, &self.params, self.temporal_type)
     }
 
+    /// Backward pass through SSM.
+    ///
+    /// Returns `(input_grads, param_grads)` where parameter gradient ordering depends on temporal type:
+    /// - `Mamba`: `[dA, dB, dC, dD]`
+    /// - `RgLru`: `[dW_f, dW_r, dW_o]`
+    pub fn backward(
+        &mut self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        self.kernels
+            .ssm_backward(input, output_grads, &self.params, self.temporal_type)
+    }
+
     /// Get SSM parameters.
     pub fn params(&self) -> &SsmParams {
         &self.params
@@ -557,6 +674,38 @@ impl SsmGpuBackend {
     /// Get mutable access to GPU kernels.
     pub fn kernels_mut(&mut self) -> &mut UnifiedGpuKernels {
         &mut self.kernels
+    }
+
+    /// Set explicit Mamba kernel matrices for SSM forward/backward kernels.
+    pub fn set_mamba_kernel_matrices(
+        &mut self,
+        a: Array2<f32>,
+        b: Array2<f32>,
+        c: Array2<f32>,
+        d: Array2<f32>,
+        h_init: Array2<f32>,
+    ) {
+        self.kernels.set_mamba_kernel_matrices(a, b, c, d, h_init);
+    }
+
+    /// Set explicit RG-LRU kernel matrices for SSM forward/backward kernels.
+    pub fn set_rg_lru_kernel_matrices(
+        &mut self,
+        w_f: Array2<f32>,
+        w_r: Array2<f32>,
+        w_o: Array2<f32>,
+        h_init: Array2<f32>,
+    ) {
+        self.kernels
+            .set_rg_lru_kernel_matrices(w_f, w_r, w_o, h_init);
+    }
+
+    pub fn clear_mamba_kernel_matrices(&mut self) {
+        self.kernels.clear_mamba_kernel_matrices();
+    }
+
+    pub fn clear_rg_lru_kernel_matrices(&mut self) {
+        self.kernels.clear_rg_lru_kernel_matrices();
     }
 }
 
@@ -587,6 +736,23 @@ pub struct TransformerGpuBackend {
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 impl TransformerGpuBackend {
+    /// Create a new Transformer GPU backend for an explicit backend (strict no-fallback).
+    pub fn with_backend(
+        num_heads: usize,
+        embed_dim: usize,
+        seq_len: usize,
+        batch_size: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<Self> {
+        let kernels = UnifiedGpuKernels::new(backend)?;
+        let attention_params = AttentionParams::new(num_heads, embed_dim, seq_len, batch_size);
+        Ok(Self {
+            kernels,
+            attention_params,
+            activation: GpuActivation::Gelu,
+        })
+    }
+
     /// Create a new Transformer GPU backend with automatic GPU detection.
     ///
     /// # Errors
@@ -598,13 +764,8 @@ impl TransformerGpuBackend {
         seq_len: usize,
         batch_size: usize,
     ) -> Result<Self> {
-        let kernels = UnifiedGpuKernels::auto_detect()?;
-        let attention_params = AttentionParams::new(num_heads, embed_dim, seq_len, batch_size);
-        Ok(Self {
-            kernels,
-            attention_params,
-            activation: GpuActivation::Gelu,
-        })
+        let backend = crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu()?;
+        Self::with_backend(num_heads, embed_dim, seq_len, batch_size, backend)
     }
 
     /// Set causal attention mode.
@@ -735,6 +896,14 @@ impl GpuBackendFactory {
         DiffusionGpuBackend::auto_detect(num_steps)
     }
 
+    /// Create a Diffusion GPU backend for an explicit backend variant.
+    pub fn diffusion_with_backend(
+        num_steps: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<DiffusionGpuBackend> {
+        DiffusionGpuBackend::with_backend(num_steps, backend)
+    }
+
     /// Create an SSM GPU backend for Mamba.
     pub fn ssm_mamba(
         state_dim: usize,
@@ -743,6 +912,17 @@ impl GpuBackendFactory {
         batch_size: usize,
     ) -> Result<SsmGpuBackend> {
         SsmGpuBackend::mamba(state_dim, embed_dim, seq_len, batch_size)
+    }
+
+    /// Create an SSM GPU backend for Mamba with explicit backend variant.
+    pub fn ssm_mamba_with_backend(
+        state_dim: usize,
+        embed_dim: usize,
+        seq_len: usize,
+        batch_size: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<SsmGpuBackend> {
+        SsmGpuBackend::mamba_with_backend(state_dim, embed_dim, seq_len, batch_size, backend)
     }
 
     /// Create an SSM GPU backend for RG-LRU.
@@ -755,6 +935,17 @@ impl GpuBackendFactory {
         SsmGpuBackend::rg_lru(state_dim, embed_dim, seq_len, batch_size)
     }
 
+    /// Create an SSM GPU backend for RG-LRU with explicit backend variant.
+    pub fn ssm_rg_lru_with_backend(
+        state_dim: usize,
+        embed_dim: usize,
+        seq_len: usize,
+        batch_size: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<SsmGpuBackend> {
+        SsmGpuBackend::rg_lru_with_backend(state_dim, embed_dim, seq_len, batch_size, backend)
+    }
+
     /// Create a Transformer GPU backend.
     pub fn transformer(
         num_heads: usize,
@@ -765,6 +956,17 @@ impl GpuBackendFactory {
         TransformerGpuBackend::auto_detect(num_heads, embed_dim, seq_len, batch_size)
     }
 
+    /// Create a Transformer GPU backend for an explicit backend variant.
+    pub fn transformer_with_backend(
+        num_heads: usize,
+        embed_dim: usize,
+        seq_len: usize,
+        batch_size: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<TransformerGpuBackend> {
+        TransformerGpuBackend::with_backend(num_heads, embed_dim, seq_len, batch_size, backend)
+    }
+
     /// Create a MoE GPU backend.
     pub fn moe(
         num_experts: usize,
@@ -773,6 +975,23 @@ impl GpuBackendFactory {
         expert_hidden_dim: usize,
     ) -> Result<MoeGpuBackend> {
         MoeGpuBackend::auto_detect(num_experts, num_active, embed_dim, expert_hidden_dim)
+    }
+
+    /// Create a MoE GPU backend for an explicit backend variant.
+    pub fn moe_with_backend(
+        num_experts: usize,
+        num_active: usize,
+        embed_dim: usize,
+        expert_hidden_dim: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<MoeGpuBackend> {
+        MoeGpuBackend::with_backend(
+            num_experts,
+            num_active,
+            embed_dim,
+            expert_hidden_dim,
+            backend,
+        )
     }
 }
 
@@ -848,18 +1067,15 @@ impl MoeParams {
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 impl MoeGpuBackend {
-    /// Create a new MoE GPU backend with automatic GPU detection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no GPU is detected (strict no-fallback).
-    pub fn auto_detect(
+    /// Create a new MoE GPU backend for an explicit backend (strict no-fallback).
+    pub fn with_backend(
         num_experts: usize,
         num_active: usize,
         embed_dim: usize,
         expert_hidden_dim: usize,
+        backend: crate::domain::compute_backend::ComputeBackend,
     ) -> Result<Self> {
-        let kernels = UnifiedGpuKernels::auto_detect()?;
+        let kernels = UnifiedGpuKernels::new(backend)?;
 
         // Initialize with random weights (in practice, these would be loaded)
         let router_weights = Array2::from_shape_fn((embed_dim, num_experts), |_| {
@@ -896,6 +1112,27 @@ impl MoeGpuBackend {
             expert_weights_w1,
             expert_weights_w2,
         })
+    }
+
+    /// Create a new MoE GPU backend with automatic GPU detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no GPU is detected (strict no-fallback).
+    pub fn auto_detect(
+        num_experts: usize,
+        num_active: usize,
+        embed_dim: usize,
+        expert_hidden_dim: usize,
+    ) -> Result<Self> {
+        let backend = crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu()?;
+        Self::with_backend(
+            num_experts,
+            num_active,
+            embed_dim,
+            expert_hidden_dim,
+            backend,
+        )
     }
 
     /// Create with pre-trained weights.
@@ -959,61 +1196,239 @@ impl MoeGpuBackend {
             });
         }
 
-        // 1. Router GEMM: Compute routing logits
-        // routing_logits = input @ router_weights [batch, num_experts]
-        let routing_logits = input.dot(&self.router_weights);
+        let input_slice = input.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "MoeGpuBackend input must be contiguous".to_string(),
+        })?;
+        let router_slice =
+            self.router_weights
+                .as_slice()
+                .ok_or_else(|| ModelError::InvalidInput {
+                    message: "MoeGpuBackend router weights must be contiguous".to_string(),
+                })?;
 
-        // 2. Top-k selection and softmax
-        // For each token, select top-k experts and compute softmax
-        let mut output = Array2::zeros((batch_size, embed_dim));
+        let device_arc = self.kernels.device();
+        let mut device = device_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to lock MoeGpuBackend GPU device".to_string(),
+        })?;
 
+        let total_input = batch_size * embed_dim;
+        let total_logits = batch_size * self.num_experts;
+        let total_output = batch_size * embed_dim;
+
+        let mut input_buf = device.allocate_f32(total_input)?;
+        device.upload(input_slice, &mut input_buf)?;
+
+        let mut router_w_buf = device.allocate_f32(self.router_weights.len())?;
+        device.upload(router_slice, &mut router_w_buf)?;
+
+        // 1. Router GEMM on GPU: routing_logits = input @ router_weights
+        let mut routing_logits_buf = device.allocate_f32(total_logits)?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &router_w_buf,
+            0.0,
+            &mut routing_logits_buf,
+            batch_size,
+            self.num_experts,
+            embed_dim,
+            false,
+            false,
+        )?;
+
+        let mut routing_logits_host = vec![0.0f32; total_logits];
+        device.download(&routing_logits_buf, &mut routing_logits_host)?;
+        let routing_logits =
+            Array2::from_shape_vec((batch_size, self.num_experts), routing_logits_host).map_err(
+                |err| ModelError::InvalidInput {
+                    message: format!("Failed to reshape MoeGpuBackend routing logits: {err}"),
+                },
+            )?;
+
+        // 2. Top-k selection and softmax on CPU
+        let mut gates = Array2::<f32>::zeros((batch_size, self.num_experts));
+        let top_k = self.num_active.clamp(1, self.num_experts);
         for token_idx in 0..batch_size {
-            // Get routing logits for this token
-            let token_logits: Vec<(usize, f32)> = routing_logits
-                .row(token_idx)
-                .iter()
-                .enumerate()
-                .map(|(i, &logit)| (i, logit))
-                .collect();
+            let row = routing_logits.row(token_idx);
 
-            // Sort by logit (descending) and select top-k
-            let mut sorted_logits = token_logits;
-            sorted_logits
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top_k: Vec<(usize, f32)> =
-                sorted_logits.into_iter().take(self.num_active).collect();
-
-            // Compute softmax over top-k
-            let max_logit = top_k
-                .iter()
-                .map(|(_, l)| *l)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let exp_sum: f32 = top_k.iter().map(|(_, l)| (l - max_logit).exp()).sum();
-
-            // 3. For each selected expert, compute output and accumulate
-            for (expert_idx, logit) in &top_k {
-                let gate = (logit - max_logit).exp() / exp_sum;
-
-                // Expert forward: input -> w1 -> activation -> w2 -> output
-                let token_input = input.row(token_idx).to_owned();
-
-                // w1: [embed_dim, hidden_dim]
-                let hidden = token_input.dot(&self.expert_weights_w1[*expert_idx]);
-
-                // Activation (ReLU)
-                let hidden_activated: Array1<f32> = hidden.mapv(|x| x.max(0.0));
-
-                // w2: [hidden_dim, embed_dim]
-                let expert_output = hidden_activated.dot(&self.expert_weights_w2[*expert_idx]);
-
-                // Accumulate weighted output
-                for (i, &val) in expert_output.iter().enumerate() {
-                    output[[token_idx, i]] += gate * val;
+            // Maintain top-k without allocating/sorting full expert list.
+            let mut best: Vec<(f32, usize)> = Vec::with_capacity(top_k);
+            for (expert_idx, &logit) in row.iter().enumerate() {
+                let score = if logit.is_finite() {
+                    logit
+                } else {
+                    f32::NEG_INFINITY
+                };
+                if best.len() < top_k {
+                    best.push((score, expert_idx));
+                    continue;
                 }
+
+                let mut min_pos = 0usize;
+                let mut min_score = best[0].0;
+                for (pos, (s, _)) in best.iter().enumerate().skip(1) {
+                    if *s < min_score {
+                        min_score = *s;
+                        min_pos = pos;
+                    }
+                }
+
+                if score > min_score {
+                    best[min_pos] = (score, expert_idx);
+                }
+            }
+
+            best.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut max_logit = f32::NEG_INFINITY;
+            let mut any_finite = false;
+            for &(score, _) in &best {
+                if score.is_finite() {
+                    any_finite = true;
+                    max_logit = max_logit.max(score);
+                }
+            }
+
+            if !any_finite {
+                let uniform = 1.0 / best.len().max(1) as f32;
+                for &(_, expert_idx) in &best {
+                    gates[[token_idx, expert_idx]] = uniform;
+                }
+                continue;
+            }
+
+            let mut exp_sum = 0.0f64;
+            let mut exp_vals = vec![0.0f32; best.len()];
+            for (i, &(score, _)) in best.iter().enumerate() {
+                if score.is_finite() {
+                    let e = (score - max_logit).exp();
+                    exp_vals[i] = e;
+                    exp_sum += e as f64;
+                }
+            }
+
+            if exp_sum <= 0.0 || !exp_sum.is_finite() {
+                let uniform = 1.0 / best.len().max(1) as f32;
+                for &(_, expert_idx) in &best {
+                    gates[[token_idx, expert_idx]] = uniform;
+                }
+                continue;
+            }
+
+            let inv_sum = 1.0 / exp_sum as f32;
+            for (i, &(_, expert_idx)) in best.iter().enumerate() {
+                gates[[token_idx, expert_idx]] = exp_vals[i] * inv_sum;
             }
         }
 
-        Ok(output)
+        // 3. Expert projections on GPU + weighted accumulation in output buffer.
+        let mut output_buf = device.allocate_f32(total_output)?;
+        let zero_output = vec![0.0f32; total_output];
+        device.upload(&zero_output, &mut output_buf)?;
+        let mut gate_expand = vec![0.0f32; total_output];
+        let w1_elems = self.embed_dim * self.expert_hidden_dim;
+        let w2_elems = self.expert_hidden_dim * self.embed_dim;
+        let hidden_elems = batch_size * self.expert_hidden_dim;
+        let mut w1_buf = device.allocate_f32(w1_elems)?;
+        let mut w2_buf = device.allocate_f32(w2_elems)?;
+        let mut hidden_buf = device.allocate_f32(hidden_elems)?;
+        let mut hidden_relu_buf = device.allocate_f32(hidden_elems)?;
+        let mut expert_out_buf = device.allocate_f32(total_output)?;
+        let mut gate_buf = device.allocate_f32(total_output)?;
+        let mut scaled_expert_buf = device.allocate_f32(total_output)?;
+
+        for expert_idx in 0..self.num_experts {
+            let gate_col = gates.column(expert_idx);
+            if gate_col.iter().all(|&g| g == 0.0) {
+                continue;
+            }
+
+            let w1_slice = self.expert_weights_w1[expert_idx]
+                .as_slice()
+                .ok_or_else(|| ModelError::InvalidInput {
+                    message: format!("MoE expert {expert_idx} w1 must be contiguous"),
+                })?;
+            let w2_slice = self.expert_weights_w2[expert_idx]
+                .as_slice()
+                .ok_or_else(|| ModelError::InvalidInput {
+                    message: format!("MoE expert {expert_idx} w2 must be contiguous"),
+                })?;
+
+            device.upload(w1_slice, &mut w1_buf)?;
+            device.upload(w2_slice, &mut w2_buf)?;
+
+            // hidden = input @ w1_e
+            device.gemm_f32(
+                1.0,
+                &input_buf,
+                &w1_buf,
+                0.0,
+                &mut hidden_buf,
+                batch_size,
+                self.expert_hidden_dim,
+                self.embed_dim,
+                false,
+                false,
+            )?;
+            // Activation (ReLU)
+            device.relu(
+                &hidden_buf,
+                &mut hidden_relu_buf,
+                batch_size * self.expert_hidden_dim,
+            )?;
+
+            // expert_output = hidden @ w2_e
+            device.gemm_f32(
+                1.0,
+                &hidden_relu_buf,
+                &w2_buf,
+                0.0,
+                &mut expert_out_buf,
+                batch_size,
+                self.embed_dim,
+                self.expert_hidden_dim,
+                false,
+                false,
+            )?;
+
+            // Expand per-token gate weights to matrix shape for element-wise scaling.
+            for token_idx in 0..batch_size {
+                let g = gate_col[token_idx];
+                let row_offset = token_idx * self.embed_dim;
+                for j in 0..self.embed_dim {
+                    gate_expand[row_offset + j] = g;
+                }
+            }
+            device.upload(&gate_expand, &mut gate_buf)?;
+            device.mul(
+                &expert_out_buf,
+                &gate_buf,
+                &mut scaled_expert_buf,
+                total_output,
+            )?;
+            device.add_scaled(1.0, &scaled_expert_buf, &mut output_buf, total_output)?;
+        }
+
+        let mut output_host = vec![0.0f32; total_output];
+        device.download(&output_buf, &mut output_host)?;
+
+        device.deallocate(input_buf);
+        device.deallocate(router_w_buf);
+        device.deallocate(routing_logits_buf);
+        device.deallocate(output_buf);
+        device.deallocate(w1_buf);
+        device.deallocate(w2_buf);
+        device.deallocate(hidden_buf);
+        device.deallocate(hidden_relu_buf);
+        device.deallocate(expert_out_buf);
+        device.deallocate(gate_buf);
+        device.deallocate(scaled_expert_buf);
+
+        Array2::from_shape_vec((batch_size, embed_dim), output_host).map_err(|err| {
+            ModelError::InvalidInput {
+                message: format!("Failed to reshape MoeGpuBackend output: {err}"),
+            }
+        })
     }
 
     /// Get MoE parameters.

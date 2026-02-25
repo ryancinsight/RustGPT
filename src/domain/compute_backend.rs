@@ -16,6 +16,8 @@ pub enum ComputeBackend {
     Metal,
     /// Vulkan compute backend.
     Vulkan,
+    /// Intel NPU via Vulkan/WGPU adapter selection.
+    Npu,
 }
 
 impl ComputeBackend {
@@ -26,6 +28,7 @@ impl ComputeBackend {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Vulkan => "vulkan",
+            Self::Npu => "npu",
         }
     }
 
@@ -65,6 +68,8 @@ pub enum ComputeBackendPreference {
     Metal,
     /// Require Vulkan.
     Vulkan,
+    /// Require Intel NPU via Vulkan/WGPU backend.
+    Npu,
 }
 
 impl ComputeBackendPreference {
@@ -76,6 +81,7 @@ impl ComputeBackendPreference {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Vulkan => "vulkan",
+            Self::Npu => "npu",
         }
     }
 }
@@ -91,6 +97,9 @@ pub fn resolve_compute_backend(preference: ComputeBackendPreference) -> Result<C
         ComputeBackendPreference::Cuda => require_backend(ComputeBackend::Cuda, "CUDA"),
         ComputeBackendPreference::Metal => require_backend(ComputeBackend::Metal, "Metal"),
         ComputeBackendPreference::Vulkan => require_backend(ComputeBackend::Vulkan, "Vulkan"),
+        ComputeBackendPreference::Npu => {
+            require_backend(ComputeBackend::Npu, "Intel NPU (Vulkan/WGPU)")
+        }
         ComputeBackendPreference::AutoGpu => {
             let runtime_detected = detect_available_gpu_backends_runtime();
             let detected = detect_available_gpu_backends();
@@ -135,6 +144,14 @@ pub fn resolve_compute_backend_strict_auto_gpu() -> Result<ComputeBackend> {
     }
 }
 
+/// Resolve strict Intel NPU execution (no fallback).
+///
+/// This helper requires an Intel NPU-capable adapter via the WGPU backend.
+/// It never falls back to non-NPU GPU or CPU backends.
+pub fn resolve_compute_backend_strict_auto_npu() -> Result<ComputeBackend> {
+    require_backend(ComputeBackend::Npu, "Intel NPU (Vulkan/WGPU)")
+}
+
 /// Detect supported GPU backends in priority order.
 ///
 /// Priority: CUDA > Metal > Vulkan.
@@ -175,11 +192,23 @@ pub fn detect_available_and_compiled_gpu_backends() -> Vec<ComputeBackend> {
 
 #[inline]
 fn require_backend(backend: ComputeBackend, display_name: &str) -> Result<ComputeBackend> {
+    if !backend_feature_enabled(backend) {
+        return Err(ModelError::Backend {
+            message: format!(
+                "Requested backend '{}' is not compiled in this binary. \
+                 Enable {}. No fallback is enabled.",
+                display_name,
+                backend_feature_hint(backend)
+            ),
+        });
+    }
+
     let runtime_supported = match backend {
         ComputeBackend::Cpu => true,
         ComputeBackend::Cuda => detect_cuda(),
         ComputeBackend::Metal => detect_metal(),
         ComputeBackend::Vulkan => detect_vulkan(),
+        ComputeBackend::Npu => detect_intel_npu_runtime(),
     };
 
     if !runtime_supported {
@@ -187,15 +216,6 @@ fn require_backend(backend: ComputeBackend, display_name: &str) -> Result<Comput
             message: format!(
                 "Requested backend '{}' is unavailable on this machine. No fallback is enabled.",
                 display_name
-            ),
-        })
-    } else if !backend_feature_enabled(backend) {
-        Err(ModelError::Backend {
-            message: format!(
-                "Requested backend '{}' is runtime-detected but not compiled in this binary. \
-                 Enable {}. No fallback is enabled.",
-                display_name,
-                backend_feature_hint(backend)
             ),
         })
     } else {
@@ -210,6 +230,7 @@ fn backend_feature_enabled(backend: ComputeBackend) -> bool {
         ComputeBackend::Cuda => cfg!(feature = "gpu-cuda"),
         ComputeBackend::Metal => cfg!(all(feature = "gpu-metal", target_os = "macos")),
         ComputeBackend::Vulkan => cfg!(feature = "gpu-wgpu") || cfg!(feature = "wgpu"),
+        ComputeBackend::Npu => cfg!(feature = "gpu-wgpu") || cfg!(feature = "wgpu"),
     }
 }
 
@@ -220,6 +241,7 @@ fn backend_feature_hint(backend: ComputeBackend) -> &'static str {
         ComputeBackend::Cuda => "`--features gpu-cuda`",
         ComputeBackend::Metal => "`--features gpu-metal`",
         ComputeBackend::Vulkan => "`--features gpu-wgpu`",
+        ComputeBackend::Npu => "`--features gpu-wgpu`",
     }
 }
 
@@ -233,6 +255,8 @@ fn env_backend_override() -> Option<ComputeBackendPreference> {
 fn parse_backend_preference(raw: &str) -> Option<ComputeBackendPreference> {
     match raw.to_ascii_lowercase().as_str() {
         "auto" | "auto-gpu" | "autogpu" => Some(ComputeBackendPreference::AutoGpu),
+        // NPU routing uses WGPU/Vulkan with strict adapter-level NPU prioritization.
+        "npu" | "intel-npu" | "intel_npu" => Some(ComputeBackendPreference::Npu),
         "cpu" => Some(ComputeBackendPreference::Cpu),
         "cuda" => Some(ComputeBackendPreference::Cuda),
         "metal" => Some(ComputeBackendPreference::Metal),
@@ -288,9 +312,42 @@ fn detect_vulkan() -> bool {
 #[cfg(feature = "wgpu")]
 #[inline]
 fn detect_wgpu_direct() -> bool {
-    // If WGPU is compiled, assume GPU may be available
-    // The actual GpuDevice::new() will fail if GPU is not present at runtime
-    true
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    instance
+        .enumerate_adapters(wgpu::Backends::all())
+        .into_iter()
+        .any(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+}
+
+#[cfg(feature = "wgpu")]
+#[inline]
+fn is_intel_npu_adapter(info: &wgpu::AdapterInfo) -> bool {
+    let name = info.name.to_ascii_lowercase();
+    let intel = info.vendor == 0x8086 || name.contains("intel");
+    let npu_like = name.contains(" npu")
+        || name.ends_with("npu")
+        || name.contains("neural")
+        || name.contains("ai boost");
+    intel && npu_like
+}
+
+/// Detect whether an Intel NPU-capable adapter is available at runtime.
+#[inline]
+pub fn detect_intel_npu_runtime() -> bool {
+    #[cfg(feature = "wgpu")]
+    {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        return instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .into_iter()
+            .any(|adapter| {
+                let info = adapter.get_info();
+                info.device_type != wgpu::DeviceType::Cpu && is_intel_npu_adapter(&info)
+            });
+    }
+
+    #[allow(unreachable_code)]
+    false
 }
 
 #[inline]
@@ -338,6 +395,10 @@ mod tests {
             Some(ComputeBackendPreference::AutoGpu)
         );
         assert_eq!(
+            parse_backend_preference("intel-npu"),
+            Some(ComputeBackendPreference::Npu)
+        );
+        assert_eq!(
             parse_backend_preference("cuda"),
             Some(ComputeBackendPreference::Cuda)
         );
@@ -354,6 +415,24 @@ mod tests {
             Some(ComputeBackendPreference::Cpu)
         );
         assert_eq!(parse_backend_preference("invalid"), None);
+    }
+
+    #[test]
+    fn npu_preference_resolves_or_reports_strict_error() {
+        match resolve_compute_backend(ComputeBackendPreference::Npu) {
+            Ok(backend) => assert_eq!(backend, ComputeBackend::Npu),
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("npu")
+                        || msg.contains("vulkan")
+                        || msg.contains("gpu")
+                        || msg.contains("fallback"),
+                    "NPU resolution error should mention backend constraints, got: {}",
+                    msg
+                );
+            }
+        }
     }
 
     #[test]
@@ -398,6 +477,24 @@ mod tests {
                 assert!(
                     msg.contains("gpu") || msg.contains("fallback"),
                     "strict auto-gpu error should mention GPU/fallback, got: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_auto_npu_requires_npu_or_errors() {
+        match resolve_compute_backend_strict_auto_npu() {
+            Ok(backend) => assert_eq!(backend, ComputeBackend::Npu),
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("npu")
+                        || msg.contains("gpu")
+                        || msg.contains("fallback")
+                        || msg.contains("compiled"),
+                    "strict auto-npu error should mention backend constraints, got: {}",
                     msg
                 );
             }

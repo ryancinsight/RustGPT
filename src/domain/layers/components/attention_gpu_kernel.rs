@@ -221,10 +221,26 @@ pub fn forward_gpu(
     let batch_size = params.batch_size;
     let num_heads = params.num_heads;
     let head_dim = params.head_dim;
+    if total_tokens == 0 || embed_dim == 0 {
+        return Err(ModelError::InvalidInput {
+            message: "attention_gpu_kernel::forward_gpu received empty input dimensions"
+                .to_string(),
+        });
+    }
+    if seq_len == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(ModelError::InvalidInput {
+            message:
+                "attention_gpu_kernel::forward_gpu requires seq_len, num_heads, and head_dim > 0"
+                    .to_string(),
+        });
+    }
 
     // Allocate intermediate buffers
     let qkv_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
-    let scores_size = batch_size * num_heads * seq_len * seq_len * std::mem::size_of::<f32>();
+    // Current kernel computes a single dense score matrix over flattened tokens:
+    // scores = Q(total_tokens, embed) @ K^T(embed, total_tokens)
+    // so the score/softmax buffer must be (total_tokens x total_tokens).
+    let scores_size = total_tokens * total_tokens * std::mem::size_of::<f32>();
     let output_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
 
     let mut q_buf = device.allocate(qkv_size)?;
@@ -297,13 +313,8 @@ pub fn forward_gpu(
     // Step 3: Apply softmax to attention scores
     // Each row of scores is softmaxed independently
     // Allocate a separate output buffer for softmax (in-place not supported)
-    let mut softmax_buf = device.allocate_f32(scores_size)?;
-    device.softmax(
-        &scores_buf,
-        &mut softmax_buf,
-        batch_size * num_heads,
-        seq_len,
-    )?;
+    let mut softmax_buf = device.allocate(scores_size)?;
+    device.softmax(&scores_buf, &mut softmax_buf, total_tokens, total_tokens)?;
 
     // Step 4: Apply attention weights to V
     // attn_out = softmax(scores) @ V

@@ -257,6 +257,13 @@ impl MoHRgLru {
 
     /// Set runtime compute backend with strict validation.
     pub fn set_compute_backend_checked(&mut self, compute_backend: ComputeBackend) -> Result<()> {
+        if self
+            .heads
+            .iter()
+            .all(|head| head.compute_backend() == compute_backend)
+        {
+            return Ok(());
+        }
         for head in &mut self.heads {
             head.set_compute_backend_checked(compute_backend)?;
         }
@@ -531,11 +538,46 @@ impl MoHRgLru {
         Ok(output)
     }
 
+    /// GPU-aware backward gradients for MoH RG-LRU.
+    ///
+    /// This path is strict: it errors when GPU backend is not selected.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        let backend = self
+            .heads
+            .first()
+            .map(|h| h.compute_backend())
+            .unwrap_or(ComputeBackend::Cpu);
+        if !backend.is_gpu() {
+            return Err(ModelError::Backend {
+                message: "MoHRgLru::compute_gradients_gpu called without a GPU backend selected."
+                    .to_string(),
+            });
+        }
+        Ok(self.compute_gradients(input, output_grads))
+    }
+
     /// GPU forward on non-GPU builds (strict no-fallback error).
     #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
     pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
         Err(ModelError::Backend {
             message: "MoHRgLru GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
+    /// GPU-aware backward gradients on non-GPU builds (strict error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn compute_gradients_gpu(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        Err(ModelError::Backend {
+            message: "MoHRgLru GPU backward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
         })
     }
 
@@ -647,6 +689,10 @@ impl RgLru {
     /// Set runtime compute backend with strict validation.
     #[inline]
     pub fn set_compute_backend_checked(&mut self, compute_backend: ComputeBackend) -> Result<()> {
+        if self.compute_backend == compute_backend {
+            return Ok(());
+        }
+
         if compute_backend.is_gpu() {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
@@ -689,6 +735,29 @@ impl RgLru {
     }
 
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn kernel_matrices_for_ssm_backend(
+        &self,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>) {
+        let d = self.embed_dim.max(1);
+        let w_f = self.w_a.clone();
+        let w_r = self.w_x.clone();
+        let mut w_o = Array2::<f32>::zeros((d, d));
+        for i in 0..d {
+            w_o[[i, i]] = 1.0;
+        }
+
+        let mut h_init = Array2::<f32>::zeros((1, d));
+        if let Some(hprev) = self.cached_hprev.as_ref()
+            && hprev.ncols() == d
+            && hprev.nrows() > 0
+        {
+            h_init.row_mut(0).assign(&hprev.row(hprev.nrows() - 1));
+        }
+
+        (w_f, w_r, w_o, h_init)
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     fn ensure_ssm_gpu_backend(&mut self, seq_len: usize) -> Result<Arc<Mutex<SsmGpuBackend>>> {
         if self.ssm_gpu_backend.is_none() {
             let backend = SsmGpuBackend::rg_lru_with_backend(
@@ -717,6 +786,8 @@ impl RgLru {
                 seq_len,
                 1,
             ));
+            let (w_f, w_r, w_o, h_init) = self.kernel_matrices_for_ssm_backend();
+            backend.set_rg_lru_kernel_matrices(w_f, w_r, w_o, h_init);
         }
 
         Ok(backend_arc)
@@ -793,14 +864,211 @@ impl RgLru {
             }
         }
 
+        Self::compute_decay_from_r_lambda(r, p.lambda, a);
+    }
+
+    #[inline]
+    fn compute_decay_from_r_lambda(r: &Array2<f32>, lambda: &Array2<f32>, a: &mut Array2<f32>) {
+        let (t, d) = r.dim();
+        if a.dim() != (t, d) {
+            *a = Array2::<f32>::zeros((t, d));
+        }
         let c: f32 = 8.0;
-        let log_base_a: Array1<f32> = p.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
+        let log_base_a: Array1<f32> = lambda.row(0).to_owned().mapv(|x| -softplus(-x));
         for ti in 0..t {
             for j in 0..d {
                 let lt = (c * r[[ti, j]] * log_base_a[j]).clamp(-80.0, 0.0);
                 a[[ti, j]] = crate::domain::pade::exp(lt);
             }
         }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn gpu_gemm_to_host(
+        device: &mut crate::domain::compute::GpuDevice,
+        lhs: &Array2<f32>,
+        rhs: &Array2<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_lhs: bool,
+        trans_rhs: bool,
+    ) -> Result<Array2<f32>> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(Array2::zeros((m, n)));
+        }
+
+        let lhs_slice = lhs.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru gpu_gemm_to_host lhs must be contiguous".to_string(),
+        })?;
+        let rhs_slice = rhs.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru gpu_gemm_to_host rhs must be contiguous".to_string(),
+        })?;
+
+        let mut lhs_buf = device.allocate_f32(lhs.len())?;
+        let mut rhs_buf = device.allocate_f32(rhs.len())?;
+        let mut out_buf = device.allocate_f32(m * n)?;
+        device.upload(lhs_slice, &mut lhs_buf)?;
+        device.upload(rhs_slice, &mut rhs_buf)?;
+        device.gemm_f32(
+            1.0,
+            &lhs_buf,
+            &rhs_buf,
+            0.0,
+            &mut out_buf,
+            m,
+            n,
+            k,
+            trans_lhs,
+            trans_rhs,
+        )?;
+
+        let mut host = vec![0.0f32; m * n];
+        device.download(&out_buf, &mut host)?;
+        device.deallocate(lhs_buf);
+        device.deallocate(rhs_buf);
+        device.deallocate(out_buf);
+
+        Array2::from_shape_vec((m, n), host).map_err(|err| ModelError::InvalidInput {
+            message: format!("RgLru gpu_gemm_to_host reshape failed: {err}"),
+        })
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn compute_gates_into_parts_gpu(
+        device: &mut crate::domain::compute::GpuDevice,
+        input: &Array2<f32>,
+        p: GatesParams<'_>,
+        r: &mut Array2<f32>,
+        i: &mut Array2<f32>,
+        a: &mut Array2<f32>,
+    ) -> Result<()> {
+        let (t, d) = input.dim();
+        if p.w_a.dim() != (d, d) || p.w_x.dim() != (d, d) {
+            return Err(ModelError::InvalidInput {
+                message: format!(
+                    "RgLru GPU gate weights must be ({d},{d}), got w_a={:?}, w_x={:?}",
+                    p.w_a.dim(),
+                    p.w_x.dim()
+                ),
+            });
+        }
+        if p.b_a.dim() != (1, d) || p.b_x.dim() != (1, d) || p.lambda.dim() != (1, d) {
+            return Err(ModelError::InvalidInput {
+                message: format!(
+                    "RgLru GPU gate biases/lambda must be (1,{d}), got b_a={:?}, b_x={:?}, lambda={:?}",
+                    p.b_a.dim(),
+                    p.b_x.dim(),
+                    p.lambda.dim()
+                ),
+            });
+        }
+        if r.dim() != (t, d) {
+            *r = Array2::<f32>::zeros((t, d));
+        }
+        if i.dim() != (t, d) {
+            *i = Array2::<f32>::zeros((t, d));
+        }
+        if a.dim() != (t, d) {
+            *a = Array2::<f32>::zeros((t, d));
+        }
+        if t == 0 || d == 0 {
+            return Ok(());
+        }
+
+        let input_slice = input.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates input must be contiguous".to_string(),
+        })?;
+        let wa_slice = p.w_a.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates w_a must be contiguous".to_string(),
+        })?;
+        let wx_slice = p.w_x.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates w_x must be contiguous".to_string(),
+        })?;
+
+        let mut input_buf = device.allocate_f32(t * d)?;
+        let mut wa_buf = device.allocate_f32(d * d)?;
+        let mut wx_buf = device.allocate_f32(d * d)?;
+        let mut r_logits_buf = device.allocate_f32(t * d)?;
+        let mut i_logits_buf = device.allocate_f32(t * d)?;
+        let mut r_sig_buf = device.allocate_f32(t * d)?;
+        let mut i_sig_buf = device.allocate_f32(t * d)?;
+
+        device.upload(input_slice, &mut input_buf)?;
+        device.upload(wa_slice, &mut wa_buf)?;
+        device.upload(wx_slice, &mut wx_buf)?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &wa_buf,
+            0.0,
+            &mut r_logits_buf,
+            t,
+            d,
+            d,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &wx_buf,
+            0.0,
+            &mut i_logits_buf,
+            t,
+            d,
+            d,
+            false,
+            false,
+        )?;
+
+        let b_a = p.b_a.row(0).to_owned();
+        let b_x = p.b_x.row(0).to_owned();
+        let mut b_a_expanded = vec![0.0f32; t * d];
+        let mut b_x_expanded = vec![0.0f32; t * d];
+        let b_a_slice = b_a.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates b_a must be contiguous".to_string(),
+        })?;
+        let b_x_slice = b_x.as_slice().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates b_x must be contiguous".to_string(),
+        })?;
+        for row in b_a_expanded.chunks_exact_mut(d) {
+            row.copy_from_slice(b_a_slice);
+        }
+        for row in b_x_expanded.chunks_exact_mut(d) {
+            row.copy_from_slice(b_x_slice);
+        }
+        let mut ba_buf = device.allocate_f32(t * d)?;
+        let mut bx_buf = device.allocate_f32(t * d)?;
+        device.upload(&b_a_expanded, &mut ba_buf)?;
+        device.upload(&b_x_expanded, &mut bx_buf)?;
+        device.add_scaled(1.0, &ba_buf, &mut r_logits_buf, t * d)?;
+        device.add_scaled(1.0, &bx_buf, &mut i_logits_buf, t * d)?;
+
+        device.sigmoid(&r_logits_buf, &mut r_sig_buf, t * d)?;
+        device.sigmoid(&i_logits_buf, &mut i_sig_buf, t * d)?;
+
+        let r_slice = r.as_slice_mut().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates output r must be contiguous".to_string(),
+        })?;
+        let i_slice = i.as_slice_mut().ok_or_else(|| ModelError::InvalidInput {
+            message: "RgLru GPU gates output i must be contiguous".to_string(),
+        })?;
+        device.download(&r_sig_buf, r_slice)?;
+        device.download(&i_sig_buf, i_slice)?;
+
+        device.deallocate(input_buf);
+        device.deallocate(wa_buf);
+        device.deallocate(wx_buf);
+        device.deallocate(r_logits_buf);
+        device.deallocate(i_logits_buf);
+        device.deallocate(r_sig_buf);
+        device.deallocate(i_sig_buf);
+        device.deallocate(ba_buf);
+        device.deallocate(bx_buf);
+
+        Self::compute_decay_from_r_lambda(r, p.lambda, a);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -877,18 +1145,101 @@ impl RgLru {
                     .to_string(),
             });
         }
-        let backend_name = self.compute_backend.as_str().to_string();
+
+        if self
+            .cached_r
+            .as_ref()
+            .is_none_or(|x| x.dim() != (seq_len, embed_dim))
+        {
+            self.cached_r = Some(Array2::<f32>::zeros((seq_len, embed_dim)));
+        }
+        if self
+            .cached_i
+            .as_ref()
+            .is_none_or(|x| x.dim() != (seq_len, embed_dim))
+        {
+            self.cached_i = Some(Array2::<f32>::zeros((seq_len, embed_dim)));
+        }
+        if self
+            .cached_a
+            .as_ref()
+            .is_none_or(|x| x.dim() != (seq_len, embed_dim))
+        {
+            self.cached_a = Some(Array2::<f32>::zeros((seq_len, embed_dim)));
+        }
+        if self
+            .cached_hprev
+            .as_ref()
+            .is_none_or(|x| x.dim() != (seq_len, embed_dim))
+        {
+            self.cached_hprev = Some(Array2::<f32>::zeros((seq_len, embed_dim)));
+        }
+
         let backend_arc = self.ensure_ssm_gpu_backend(seq_len)?;
-        let mut backend = backend_arc.lock().map_err(|_| ModelError::Backend {
-            message: "Failed to acquire RgLru cached GPU backend lock for forward dispatch"
-                .to_string(),
+        let device_arc = {
+            let backend = backend_arc.lock().map_err(|_| ModelError::Backend {
+                message: "Failed to acquire RgLru cached GPU backend lock for device".to_string(),
+            })?;
+            backend.kernels().device()
+        };
+        let mut device = device_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to lock RgLru GPU device".to_string(),
         })?;
-        backend.forward(input).map_err(|err| ModelError::Backend {
-            message: format!(
-                "RgLru GPU forward failed on backend '{}': {}",
-                backend_name, err
-            ),
-        })
+
+        let r = self
+            .cached_r
+            .as_mut()
+            .expect("cached_r must be initialized");
+        let i = self
+            .cached_i
+            .as_mut()
+            .expect("cached_i must be initialized");
+        let a = self
+            .cached_a
+            .as_mut()
+            .expect("cached_a must be initialized");
+        let hprev = self
+            .cached_hprev
+            .as_mut()
+            .expect("cached_hprev must be initialized");
+
+        Self::compute_gates_into_parts_gpu(
+            &mut device,
+            input,
+            GatesParams {
+                w_a: &self.w_a,
+                b_a: &self.b_a,
+                w_x: &self.w_x,
+                b_x: &self.b_x,
+                lambda: &self.lambda,
+            },
+            r,
+            i,
+            a,
+        )?;
+
+        let mut output = Array2::<f32>::zeros((seq_len, embed_dim));
+        Self::compute_state_into(input, i, a, hprev, &mut output);
+        self.cached_input = Some(input.clone());
+        Ok(output)
+    }
+
+    /// GPU-aware backward gradients for RG-LRU.
+    ///
+    /// This path is strict: it errors when GPU backend is not selected.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        if !self.compute_backend.is_gpu() {
+            return Err(ModelError::Backend {
+                message: "RgLru::compute_gradients_gpu called without a GPU backend selected."
+                    .to_string(),
+            });
+        }
+        self.compute_gradients_impl_gpu(input, output_grads)
     }
 
     /// GPU-accelerated forward pass on non-GPU builds (strict no-fallback error).
@@ -896,6 +1247,20 @@ impl RgLru {
     pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
         Err(ModelError::Backend {
             message: "RG-LRU GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
+    /// GPU-aware backward gradients on non-GPU builds (strict error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn compute_gradients_gpu(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        Err(ModelError::Backend {
+            message:
+                "RG-LRU GPU backward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal."
+                    .to_string(),
         })
     }
 
@@ -1094,13 +1459,13 @@ impl RgLru {
     /// ```
     pub fn forward_into(&mut self, input: &Array2<f32>, output: &mut Array2<f32>) -> Result<()> {
         if self.compute_backend.is_gpu() {
-            return Err(crate::common::errors::ModelError::Backend {
-                message: format!(
-                    "RgLru::forward_into has no GPU kernels for backend '{}'. \
-                     No CPU fallback is allowed.",
-                    self.compute_backend.as_str()
-                ),
-            });
+            let gpu_out = self.forward_gpu(input)?;
+            if output.raw_dim() == gpu_out.raw_dim() {
+                output.assign(&gpu_out);
+            } else {
+                *output = gpu_out;
+            }
+            return Ok(());
         }
         let (t, d) = input.dim();
 
@@ -1337,6 +1702,122 @@ impl RgLru {
         )
     }
 
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn compute_gradients_impl_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        let (r, i, a, hprev) = self.compute_gates_and_state_from_cache_or_recompute(input);
+        let r = r.as_ref();
+        let i = i.as_ref();
+        let a = a.as_ref();
+        let hprev = hprev.as_ref();
+
+        let (t, d) = input.dim();
+        if output_grads.dim() != (t, d) {
+            return Err(ModelError::DimensionMismatchDetailed {
+                expected: format!("output_grads shape ({t}, {d})"),
+                got: format!("{:?}", output_grads.dim()),
+            });
+        }
+        if t == 0 || d == 0 {
+            return Ok((Array2::zeros(input.raw_dim()), vec![]));
+        }
+
+        let c: f32 = 8.0;
+        let log_base_a: Array1<f32> = self.lambda.row(0).to_owned().mapv(|x| -softplus(-x));
+        let dlogsig_dlambda: Array1<f32> = {
+            let sigmoid = RichardsCurve::sigmoid(false);
+            self.lambda
+                .row(0)
+                .to_owned()
+                .mapv(|x| sigmoid.forward_scalar_f32(-x))
+        };
+
+        let mut dh_next = Array1::<f32>::zeros(d);
+        let mut dlogits_r = Array2::<f32>::zeros((t, d));
+        let mut dlogits_i = Array2::<f32>::zeros((t, d));
+        let mut dlog_base_a = Array1::<f32>::zeros(d);
+        let mut d_x_from_u = Array2::<f32>::zeros((t, d));
+
+        for ti in (0..t).rev() {
+            for j in 0..d {
+                let g = output_grads[[ti, j]];
+                let dh = g + dh_next[j];
+
+                let at = a[[ti, j]];
+                let it = i[[ti, j]];
+                let rt = r[[ti, j]];
+                let xt = input[[ti, j]];
+                let prev = hprev[[ti, j]];
+
+                let u = it * xt;
+                let one_minus_a = 1.0 - at;
+                let du = dh * one_minus_a;
+                d_x_from_u[[ti, j]] = du * it;
+                let di = du * xt;
+                let da = dh * (prev - u);
+
+                dh_next[j] = dh * at;
+
+                let k = c * rt * log_base_a[j];
+                let active = (-80.0..=0.0).contains(&k);
+                let dk = if active { da * at } else { 0.0 };
+
+                let dr = dk * c * log_base_a[j];
+                dlog_base_a[j] += dk * c * rt;
+
+                dlogits_r[[ti, j]] = dr * rt * (1.0 - rt);
+                dlogits_i[[ti, j]] = di * it * (1.0 - it);
+            }
+        }
+
+        let mut d_lambda = Array2::<f32>::zeros((1, d));
+        for j in 0..d {
+            d_lambda[[0, j]] = dlog_base_a[j] * dlogsig_dlambda[j];
+        }
+
+        let backend_arc = self
+            .ssm_gpu_backend
+            .as_ref()
+            .ok_or_else(|| ModelError::Backend {
+                message: format!(
+                    "RgLru GPU backward requires initialized cached GPU backend for '{}'. \
+                     Call forward_gpu before compute_gradients.",
+                    self.compute_backend.as_str()
+                ),
+            })?
+            .clone();
+        let device_arc = {
+            let backend = backend_arc.lock().map_err(|_| ModelError::Backend {
+                message: "Failed to lock RgLru cached GPU backend during backward".to_string(),
+            })?;
+            backend.kernels().device()
+        };
+        let mut device = device_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to lock RgLru GPU device during backward".to_string(),
+        })?;
+
+        let grad_w_a =
+            Self::gpu_gemm_to_host(&mut device, input, &dlogits_r, d, d, t, true, false)?;
+        let grad_w_x =
+            Self::gpu_gemm_to_host(&mut device, input, &dlogits_i, d, d, t, true, false)?;
+        let dx_gate_r =
+            Self::gpu_gemm_to_host(&mut device, &dlogits_r, &self.w_a, t, d, d, false, true)?;
+        let dx_gate_i =
+            Self::gpu_gemm_to_host(&mut device, &dlogits_i, &self.w_x, t, d, d, false, true)?;
+
+        let grad_b_a = dlogits_r.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_b_x = dlogits_i.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_input = &(&dx_gate_r + &dx_gate_i) + &d_x_from_u;
+
+        Ok((
+            grad_input,
+            vec![grad_w_a, grad_b_a, grad_w_x, grad_b_x, d_lambda],
+        ))
+    }
+
     #[inline]
     fn compute_gradients_view(
         &self,
@@ -1410,6 +1891,12 @@ impl Layer for RgLru {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            return self
+                .compute_gradients_impl_gpu(input, output_grads)
+                .unwrap_or_else(|err| panic!("RgLru GPU backward failed: {err}"));
+        }
         self.compute_gradients_impl(input, output_grads)
     }
 
@@ -2193,6 +2680,33 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_rg_lru_reapply_gpu_backend_preserves_cached_ssm_backend() {
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let mut rg = RgLru::new(8);
+        rg.set_compute_backend_checked(backend)
+            .expect("resolved GPU backend should be accepted");
+        let first_backend = rg
+            .ensure_ssm_gpu_backend(4)
+            .expect("should initialize cached SSM GPU backend");
+
+        rg.set_compute_backend_checked(backend)
+            .expect("re-applying same backend should be idempotent");
+        let second_backend = rg
+            .ensure_ssm_gpu_backend(4)
+            .expect("cached SSM GPU backend should still be available");
+
+        assert!(Arc::ptr_eq(&first_backend, &second_backend));
+    }
+
     #[test]
     fn test_moh_rg_lru_set_compute_backend_checked_gpu_is_strict_validation() {
         use crate::domain::mixtures::HeadSelectionStrategy;
@@ -2215,6 +2729,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_moh_rg_lru_reapply_gpu_backend_preserves_head_cached_ssm_backend() {
+        use crate::domain::mixtures::HeadSelectionStrategy;
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHRgLru::new(12, 3, &cfg);
+        moh.set_compute_backend_checked(backend)
+            .expect("resolved GPU backend should be accepted");
+        let first_backend = moh.heads[0]
+            .ensure_ssm_gpu_backend(4)
+            .expect("head should initialize cached SSM GPU backend");
+
+        moh.set_compute_backend_checked(backend)
+            .expect("re-applying same backend should be idempotent");
+        let second_backend = moh.heads[0]
+            .ensure_ssm_gpu_backend(4)
+            .expect("head cached SSM GPU backend should still be available");
+
+        assert!(Arc::ptr_eq(&first_backend, &second_backend));
     }
 
     #[test]

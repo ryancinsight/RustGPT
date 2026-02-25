@@ -263,6 +263,7 @@ pub struct Args {
     ///
     /// `auto-gpu` prefers GPU and falls back to CPU only when no GPU is detected.
     /// If a GPU is detected but not compiled in, startup fails so the GPU issue is visible.
+    /// `npu` requires Intel NPU adapter selection via WGPU/Vulkan (no fallback).
     #[arg(long, value_enum, default_value_t = ComputeBackendCli::AutoGpu)]
     pub compute_backend: ComputeBackendCli,
 
@@ -368,6 +369,9 @@ pub enum ComputeBackendCli {
     Metal,
     /// Require Vulkan backend.
     Vulkan,
+    /// Require Intel NPU through WGPU/Vulkan adapter selection.
+    #[value(alias = "intel-npu", alias = "intel_npu")]
+    Npu,
 }
 
 impl From<ComputeBackendCli> for ComputeBackendPreference {
@@ -378,6 +382,7 @@ impl From<ComputeBackendCli> for ComputeBackendPreference {
             ComputeBackendCli::Cuda => ComputeBackendPreference::Cuda,
             ComputeBackendCli::Metal => ComputeBackendPreference::Metal,
             ComputeBackendCli::Vulkan => ComputeBackendPreference::Vulkan,
+            ComputeBackendCli::Npu => ComputeBackendPreference::Npu,
         }
     }
 }

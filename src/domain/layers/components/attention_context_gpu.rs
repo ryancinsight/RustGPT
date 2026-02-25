@@ -73,6 +73,12 @@ impl SharedAttentionContext {
     ///
     /// Computes the activation similarity matrix from paired input/output data.
     /// This is more compute-intensive and benefits significantly from GPU acceleration.
+    ///
+    /// Full GPU kernel implementation:
+    /// 1. Upload input and output to GPU
+    /// 2. Compute covariance: input.T @ output / batch_size (GEMM on GPU)
+    /// 3. Apply exponential moving average with update_rate
+    /// 4. Download result and update internal state
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     pub fn update_outgoing_context_gpu(
         &mut self,
@@ -91,15 +97,63 @@ impl SharedAttentionContext {
         }
 
         // GPU path for context update:
-        // 1. Normalize input and output
-        // 2. Compute covariance: input.T @ output / batch_size
+        // 1. Normalize input and output (optional, can be done on GPU)
+        // 2. Compute covariance: input.T @ output / batch_size (full GPU GEMM)
         // 3. Apply exponential moving average with update_rate
         // 4. Return updated context
         //
-        // For now, compute on CPU and upload result
-        // TODO: Implement full GPU kernel for covariance computation
+        // Full GPU implementation:
+        // covariance = (input.T @ output) / batch_size
+        // This is: (embed_dim, seq_len) @ (seq_len, embed_dim) -> (embed_dim, embed_dim)
+        
+        // Get GPU device from backend
+        let device = backend.device();
+        let mut device = device.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to lock GPU device in update_outgoing_context_gpu".to_string(),
+        })?;
+
+        // Allocate GPU buffers
+        let input_size = seq_len * embed_dim * std::mem::size_of::<f32>();
+        let output_size = seq_len * embed_dim * std::mem::size_of::<f32>();
+        let cov_size = embed_dim * embed_dim * std::mem::size_of::<f32>();
+        
+        let mut input_buf = device.allocate(input_size)?;
+        let mut output_buf = device.allocate(output_size)?;
+        let mut cov_buf = device.allocate(cov_size)?;
+
+        // Upload input and output
+        // Note: input is (seq_len, embed_dim), we need it transposed for GEMM
+        // But GEMM supports transpose flags, so we upload as-is and use transposed operation
+        device.upload(input.as_slice().unwrap(), &mut input_buf)?;
+        device.upload(output.as_slice().unwrap(), &mut output_buf)?;
+
+        // Compute covariance on GPU: cov = input.T @ output
+        // GEMM: C = alpha * A @ B + beta * C
+        // A = input (seq_len, embed_dim), B = output (seq_len, embed_dim)
+        // We want: cov = input.T @ output
+        // So: A^T @ B with A = input, B = output
+        // trans_a = true, trans_b = false
+        device.gemm_f32(
+            1.0 / (seq_len as f32),  // alpha = 1/batch_size
+            &input_buf,
+            &output_buf,
+            0.0,
+            &mut cov_buf,
+            embed_dim,    // m = embed_dim (output rows)
+            embed_dim,    // n = embed_dim (output cols) 
+            seq_len,      // k = seq_len (input cols = output rows)
+            true,         // trans_a = true (input.T)
+            false,        // trans_b = false
+        )?;
+
+        // Download result
         let mut cov = Array2::<f32>::zeros((embed_dim, embed_dim));
-        general_mat_mul(1.0, &input.view().t().to_owned(), &output, 0.0, &mut cov);
+        device.download(&cov_buf, cov.as_slice_mut().unwrap())?;
+
+        // Cleanup GPU buffers
+        device.deallocate(input_buf);
+        device.deallocate(output_buf);
+        device.deallocate(cov_buf);
 
         // Apply update rate (EMA)
         cov.mapv_inplace(|x| x * update_rate);

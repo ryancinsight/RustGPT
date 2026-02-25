@@ -187,13 +187,13 @@ impl GpuMatrixOps for MetalMatrixOps {
         })
     }
 
-    fn sum(&self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
+    fn sum(&mut self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
         Err(ModelError::Backend {
             message: format!("Metal sum not yet implemented for size {}", size),
         })
     }
 
-    fn mean(&self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
+    fn mean(&mut self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
         Err(ModelError::Backend {
             message: format!("Metal mean not yet implemented for size {}", size),
         })
@@ -231,6 +231,23 @@ impl GpuMatrixOps for MetalMatrixOps {
         Err(ModelError::Backend {
             message: format!(
                 "Metal copy_within_device not yet implemented for size {}",
+                size
+            ),
+        })
+    }
+
+    fn copy_within_device_range(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _src: &GpuBuffer,
+        _src_offset: usize,
+        _dst: &mut GpuBuffer,
+        _dst_offset: usize,
+        size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: format!(
+                "Metal copy_within_device_range not yet implemented for size {}",
                 size
             ),
         })

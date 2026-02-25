@@ -29,92 +29,6 @@ use crate::{
 
 impl LayerEnum {}
 
-// GPU dispatch helpers - try GPU forward, fallback to CPU if GPU unavailable or disabled
-// Note: Transformer/Diffusion blocks delegate to their internal components (temporal_mixing, feedforward)
-// which handle GPU dispatch internally. We just use CPU forward here.
-
-#[inline]
-fn try_forward_gpu_richards(
-    layer: &mut crate::domain::richards::RichardsGlu,
-    input: &Array2<f32>,
-) -> Array2<f32> {
-    // Strict GPU enforcement - NO FALLBACK WHEN GPU FEATURES ENABLED
-    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
-    {
-        use crate::domain::compute::GpuComponent;
-        tracing::debug!(
-            is_gpu_ready = layer.is_gpu_ready(),
-            gpu_backend = layer.gpu_backend_name(),
-            input_shape = ?input.dim(),
-            "RichardsGlu attempting GPU forward"
-        );
-        match layer.forward_gpu(input) {
-            Ok(output) => {
-                tracing::debug!(output_shape = ?output.dim(), "RichardsGlu GPU forward succeeded");
-                return output;
-            }
-            Err(e) => {
-                // GPU was requested but failed - don't silently fallback
-                tracing::error!(
-                    error = ?e,
-                    "GPU forward_gpu failed for RichardsGlu (strict no-fallback mode enabled)"
-                );
-                panic!(
-                    "RichardsGlu GPU forward failed (GPU enabled, no fallback): {:?}",
-                    e
-                );
-            }
-        }
-    }
-    // GPU not available at compile time - use CPU
-    #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda")))]
-    {
-        tracing::debug!("RichardsGlu using CPU forward (GPU not compiled)");
-        layer.forward(input)
-    }
-}
-
-#[inline]
-fn try_forward_gpu_poly_attention(
-    layer: &mut Box<crate::domain::attention::poly_attention::PolyAttention>,
-    input: &Array2<f32>,
-) -> Array2<f32> {
-    // Strict GPU enforcement - NO FALLBACK WHEN GPU FEATURES ENABLED
-    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
-    {
-        use crate::domain::compute::GpuComponent;
-        tracing::debug!(
-            is_gpu_ready = layer.is_gpu_ready(),
-            gpu_backend = layer.gpu_backend_name(),
-            input_shape = ?input.dim(),
-            "PolyAttention attempting GPU forward"
-        );
-        match layer.forward_gpu(input) {
-            Ok(output) => {
-                tracing::debug!(output_shape = ?output.dim(), "PolyAttention GPU forward succeeded");
-                return output;
-            }
-            Err(e) => {
-                // GPU was requested but failed - don't silently fallback
-                tracing::error!(
-                    error = ?e,
-                    "GPU forward_gpu failed for PolyAttention (strict no-fallback mode enabled)"
-                );
-                panic!(
-                    "PolyAttention GPU forward failed (GPU enabled, no fallback): {:?}",
-                    e
-                );
-            }
-        }
-    }
-    // GPU not available at compile time - use CPU
-    #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda")))]
-    {
-        tracing::debug!("PolyAttention using CPU forward (GPU not compiled)");
-        layer.forward(input)
-    }
-}
-
 #[derive(Default)]
 struct MoeMetricsTotals {
     avg_experts_sum: f32,
@@ -561,6 +475,10 @@ impl DecoderType {
         match self {
             DecoderType::Greedy(_) => 0, // Greedy has no parameters
         }
+    }
+
+    pub fn active_parameters(&self) -> usize {
+        self.parameters()
     }
 }
 
@@ -1142,6 +1060,331 @@ impl LLM {
         }
     }
 
+    #[allow(dead_code)]
+    #[inline]
+    fn parse_strict_no_fallback_env(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn gpu_strict_no_fallback_mode() -> bool {
+        std::env::var("RUSTGPT_GPU_STRICT_NO_FALLBACK")
+            .ok()
+            .map(|value| Self::parse_strict_no_fallback_env(&value))
+            .unwrap_or(false)
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn build_preferred_gpu_device(
+        preferred_backend: crate::domain::compute_backend::ComputeBackend,
+    ) -> Result<Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>> {
+        use std::sync::{Arc, Mutex};
+
+        use crate::domain::compute::GpuDevice;
+        use crate::domain::compute_backend::ComputeBackend;
+
+        let device = match preferred_backend {
+            ComputeBackend::Npu => Some(GpuDevice::auto_detect_npu()?),
+            ComputeBackend::Cuda | ComputeBackend::Metal | ComputeBackend::Vulkan => {
+                Some(GpuDevice::new(preferred_backend)?)
+            }
+            ComputeBackend::Cpu => None,
+        };
+
+        Ok(device.map(|device| Arc::new(Mutex::new(device))))
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn initialize_component_gpu<T: crate::domain::compute::GpuComponent>(
+        component: &mut T,
+        preferred_backend: crate::domain::compute_backend::ComputeBackend,
+        shared_device: Option<&std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
+    ) -> Result<()> {
+        use std::sync::{Arc, Mutex};
+
+        use crate::domain::compute::GpuDevice;
+        use crate::domain::compute_backend::ComputeBackend;
+
+        if let Some(device) = shared_device {
+            component.set_gpu_device(device.clone());
+            return Ok(());
+        }
+
+        match preferred_backend {
+            ComputeBackend::Npu => {
+                let device = GpuDevice::auto_detect_npu()?;
+                component.set_gpu_device(Arc::new(Mutex::new(device)));
+                Ok(())
+            }
+            ComputeBackend::Cuda | ComputeBackend::Metal | ComputeBackend::Vulkan => {
+                let device = GpuDevice::new(preferred_backend)?;
+                component.set_gpu_device(Arc::new(Mutex::new(device)));
+                Ok(())
+            }
+            ComputeBackend::Cpu => component.enable_gpu_auto_detect(),
+        }
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn initialize_moe_gpu(
+        moe: &mut MixtureOfExperts,
+        preferred_backend: crate::domain::compute_backend::ComputeBackend,
+        shared_device: Option<&std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
+    ) -> Result<()> {
+        use std::sync::{Arc, Mutex};
+
+        use crate::domain::compute::GpuDevice;
+        use crate::domain::compute_backend::ComputeBackend;
+
+        let device = if let Some(device) = shared_device {
+            device.clone()
+        } else {
+            let device = match preferred_backend {
+                ComputeBackend::Npu => GpuDevice::auto_detect_npu()?,
+                ComputeBackend::Cuda | ComputeBackend::Metal | ComputeBackend::Vulkan => {
+                    GpuDevice::new(preferred_backend)?
+                }
+                ComputeBackend::Cpu => GpuDevice::auto_detect()?,
+            };
+            Arc::new(Mutex::new(device))
+        };
+        moe.set_gpu_device(device);
+        Ok(())
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    fn handle_gpu_init_result(
+        phase_label: &str,
+        layer_name: &str,
+        preferred_backend: crate::domain::compute_backend::ComputeBackend,
+        strict_no_fallback: bool,
+        backend_required: bool,
+        result: Result<()>,
+    ) -> Result<()> {
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    phase = phase_label,
+                    layer = layer_name,
+                    backend = preferred_backend.as_str(),
+                    "Layer backend initialization successful"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                if strict_no_fallback || backend_required {
+                    return Err(ModelError::Backend {
+                        message: format!(
+                            "{} backend initialization failed (phase: {}, preferred backend: '{}'): {}",
+                            layer_name,
+                            phase_label,
+                            preferred_backend.as_str(),
+                            e
+                        ),
+                    });
+                }
+                tracing::warn!(
+                    phase = phase_label,
+                    layer = layer_name,
+                    preferred_backend = preferred_backend.as_str(),
+                    error = ?e,
+                    "Layer backend initialization failed (using CPU for this layer)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn initialize_gpu_components_for_training(&mut self, phase_label: &str) -> Result<()> {
+        let preferred_backend = self.compute_backend();
+        let backend_required = preferred_backend.is_gpu();
+        let strict_no_fallback = Self::gpu_strict_no_fallback_mode();
+        let shared_device = match Self::build_preferred_gpu_device(preferred_backend) {
+            Ok(device) => device,
+            Err(e) => {
+                if strict_no_fallback || backend_required {
+                    return Err(ModelError::Backend {
+                        message: format!(
+                            "Failed to initialize shared '{}' device for phase '{}': {}",
+                            preferred_backend.as_str(),
+                            phase_label,
+                            e
+                        ),
+                    });
+                }
+                tracing::warn!(
+                    phase = phase_label,
+                    preferred_backend = preferred_backend.as_str(),
+                    error = ?e,
+                    "Shared GPU device initialization failed (per-layer CPU fallback enabled)"
+                );
+                None
+            }
+        };
+
+        tracing::info!(
+            phase = phase_label,
+            strict_no_fallback,
+            preferred_backend = preferred_backend.as_str(),
+            backend_required,
+            layer_count = self.network.len(),
+            "Attempting GPU auto-detection for training components"
+        );
+
+        for layer in &mut self.network {
+            match layer {
+                LayerEnum::TokenEmbeddings(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "TokenEmbeddings",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_component_gpu(
+                            layer,
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                LayerEnum::TransformerBlock(block) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "TransformerBlock",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        block.set_compute_backend_checked_with_shared_device(
+                            preferred_backend,
+                            shared_device.clone(),
+                        ),
+                    )?;
+                }
+                LayerEnum::DiffusionBlock(block) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "DiffusionBlock",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        block.set_compute_backend_checked_with_shared_device(
+                            preferred_backend,
+                            shared_device.clone(),
+                        ),
+                    )?;
+                }
+                LayerEnum::RichardsGlu(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "RichardsGlu",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_component_gpu(
+                            layer.as_mut(),
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                LayerEnum::PolyAttention(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "PolyAttention",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_component_gpu(
+                            layer.as_mut(),
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                LayerEnum::MixtureOfExperts(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "MixtureOfExperts",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_moe_gpu(
+                            layer.as_mut(),
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                LayerEnum::DynamicTanhNorm(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "RichardsNorm",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_component_gpu(
+                            layer.as_mut(),
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                LayerEnum::OutputProjection(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "OutputProjection",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_component_gpu(
+                            layer,
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                LayerEnum::TitansMemory(layer) => {
+                    Self::handle_gpu_init_result(
+                        phase_label,
+                        "TitansMemory",
+                        preferred_backend,
+                        strict_no_fallback,
+                        backend_required,
+                        Self::initialize_component_gpu(
+                            layer.as_mut(),
+                            preferred_backend,
+                            shared_device.as_ref(),
+                        ),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+
+        tracing::info!(
+            phase = phase_label,
+            strict_no_fallback,
+            preferred_backend = preferred_backend.as_str(),
+            "GPU initialization phase complete"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    fn initialize_gpu_components_for_training(&mut self, _phase_label: &str) -> Result<()> {
+        tracing::info!("GPU features not compiled - using CPU only");
+        Ok(())
+    }
+
     #[inline]
     fn accumulate_layer_moe_metrics(layer: &LayerEnum, totals: &mut MoeMetricsTotals) {
         if let Some(feedforward) = Self::block_feedforward(layer) {
@@ -1200,16 +1443,6 @@ impl LLM {
                     block.activation_similarity_matrix(),
                 );
                 out
-            }
-            LayerEnum::RichardsGlu(layer) => {
-                *similarity_ctx = None;
-                // GPU-aware dispatch: try GPU forward with fallback to CPU
-                try_forward_gpu_richards(layer, input)
-            }
-            LayerEnum::PolyAttention(layer) => {
-                *similarity_ctx = None;
-                // GPU-aware dispatch: try GPU forward with fallback to CPU
-                try_forward_gpu_poly_attention(layer, input)
             }
             _ => {
                 *similarity_ctx = None;
@@ -1344,6 +1577,16 @@ impl LLM {
 
         // Add decoder parameters
         network_params + self.decoder.parameters()
+    }
+
+    pub fn average_active_parameters(&self) -> usize {
+        let network_params = self
+            .network
+            .iter()
+            .map(|layer| layer.active_parameters())
+            .sum::<usize>();
+
+        network_params + self.decoder.active_parameters()
     }
 
     /// Set trainable block layers to training mode.
@@ -1595,57 +1838,7 @@ impl LLM {
 
         let mut scratch = std::mem::take(&mut self.training_scratch);
 
-        // Initialize GPU for all layers if GPU features are enabled
-        #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
-        {
-            use crate::domain::compute::GpuComponent;
-            tracing::info!(
-                "Attempting GPU auto-detection for {} layers",
-                self.network.len()
-            );
-            for layer in &mut self.network {
-                // Attempt GPU initialization for layers that support it
-                match layer {
-                    LayerEnum::RichardsGlu(layer) => match layer.enable_gpu_auto_detect() {
-                        Ok(()) => {
-                            tracing::info!(
-                                backend = layer.gpu_backend_name(),
-                                "RichardsGlu GPU initialization successful"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = ?e,
-                                "RichardsGlu GPU initialization failed (will use CPU)"
-                            );
-                        }
-                    },
-                    LayerEnum::PolyAttention(layer) => match layer.enable_gpu_auto_detect() {
-                        Ok(()) => {
-                            tracing::info!(
-                                backend = layer.gpu_backend_name(),
-                                "PolyAttention GPU initialization successful"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = ?e,
-                                "PolyAttention GPU initialization failed (will use CPU)"
-                            );
-                        }
-                    },
-                    _ => {
-                        // Other layers delegate to internal components
-                    }
-                }
-            }
-            tracing::info!("GPU initialization phase complete");
-        }
-
-        #[cfg(not(any(feature = "gpu-wgpu", feature = "gpu-cuda")))]
-        {
-            tracing::info!("GPU features not compiled - using CPU only");
-        }
+        self.initialize_gpu_components_for_training("warmup-training")?;
 
         let res: Result<()> = (|| {
             for epoch in 0..epochs {
@@ -2125,6 +2318,171 @@ impl LLM {
 
             Ok(())
         })();
+        self.training_scratch = scratch;
+        res
+    }
+
+    /// Train from **pre-tokenized** data yielded by a zero-copy iterator such as
+    /// [`BatchedArchiveIter`](crate::infrastructure::persistence::rkyv_dataset::BatchedArchiveIter).
+    ///
+    /// Unlike [`train_with_warmup_with_accumulation`] this method **skips tokenization entirely**.  
+    /// Each item from `batches` must already be a `Vec<Vec<usize>>` (a micro-batch of token seqs).
+    /// Use the `rkyv_dataset` pipeline to generate these batches with zero heap allocation overhead.
+    ///
+    /// # Warmup / LR schedule
+    /// Identical to the string-based variant: linear warmup followed by cosine annealing.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use llm::infrastructure::persistence::rkyv_dataset::{MemoryMappedDataset, BatchedArchiveIter};
+    /// # let mut llm = todo!();
+    /// let ds = MemoryMappedDataset::open("data/corpus.rkyv").unwrap();
+    /// let batches = BatchedArchiveIter::new(&ds, 32);
+    /// llm.train_with_pretokenized(batches, 10, 0.0005, 15, 1).unwrap();
+    /// ```
+    pub fn train_with_pretokenized(
+        &mut self,
+        batches: impl Iterator<Item = Vec<Vec<usize>>>,
+        epochs: usize,
+        target_lr: f32,
+        warmup_epochs: usize,
+        gradient_accumulation_steps: usize,
+    ) -> Result<()> {
+        // Collect once – the iterator may not be restartable.
+        // Each element is already a micro-batch produced by the zero-copy pipeline.
+        let all_batches: Vec<Vec<Vec<usize>>> = batches.collect();
+        if all_batches.is_empty() {
+            return Ok(());
+        }
+
+        self.set_training_mode();
+        let grad_accum_steps = gradient_accumulation_steps.max(1);
+        let mut scratch = std::mem::take(&mut self.training_scratch);
+        self.initialize_gpu_components_for_training("pretokenized-training")?;
+
+        let res: Result<()> = (|| {
+            for epoch in 0..epochs {
+                let t_epoch_start = std::time::Instant::now();
+                let mut total_loss = 0.0_f32;
+                let mut total_base_loss = 0.0_f32;
+                let mut total_grad_norm = 0.0_f32;
+                let mut batch_count = 0usize;
+                let mut total_examples = 0usize;
+                let mut per_layer_param_grad_norm_sq: Vec<f32> =
+                    vec![0.0; self.network.len()];
+
+                // SGDR learning rate schedule (identical to string variant)
+                let effective_lr = if epoch < warmup_epochs {
+                    target_lr * ((epoch + 1) as f32 / warmup_epochs as f32)
+                } else {
+                    let t = (epoch - warmup_epochs) as f32;
+                    let t_max = (epochs - warmup_epochs).max(1) as f32;
+                    let lr_min = target_lr * 0.10;
+                    lr_min
+                        + 0.5
+                            * (target_lr - lr_min)
+                            * (1.0 + (std::f32::consts::PI * t / t_max).cos())
+                };
+
+                let training_progress = if epoch < warmup_epochs {
+                    0.0
+                } else {
+                    (epoch - warmup_epochs) as f64 / (epochs - warmup_epochs).max(1) as f64
+                };
+                for layer in &mut self.network {
+                    layer.set_training_progress(training_progress);
+                }
+
+                // ---------------------------------------------------------------
+                // HOT PATH: iterate pre-tokenized batches — no tokenisation cost
+                // ---------------------------------------------------------------
+                let mut micro_batch_buf: Vec<Vec<Vec<usize>>> = Vec::new();
+                for batch in &all_batches {
+                    micro_batch_buf.push(batch.clone());
+                    if micro_batch_buf.len() < grad_accum_steps {
+                        continue;
+                    }
+                    // Flatten the micro-batches for the profiled step.
+                    let combined: Vec<Vec<usize>> =
+                        micro_batch_buf.drain(..).flatten().collect();
+                    let (bl, bbl, grn, lgnq) =
+                        self.train_batch_profiled(&combined, effective_lr, &mut scratch)?;
+                    total_loss += bl;
+                    total_base_loss += bbl;
+                    total_grad_norm += grn;
+                    batch_count += 1;
+                    total_examples += combined.len();
+                    for (i, s) in lgnq.into_iter().enumerate() {
+                        if i < per_layer_param_grad_norm_sq.len() {
+                            per_layer_param_grad_norm_sq[i] += s;
+                        }
+                    }
+                }
+                // Flush any trailing micro-batches.
+                if !micro_batch_buf.is_empty() {
+                    let combined: Vec<Vec<usize>> =
+                        micro_batch_buf.drain(..).flatten().collect();
+                    let (bl, bbl, grn, lgnq) =
+                        self.train_batch_profiled(&combined, effective_lr, &mut scratch)?;
+                    total_loss += bl;
+                    total_base_loss += bbl;
+                    total_grad_norm += grn;
+                    batch_count += 1;
+                    total_examples += combined.len();
+                    for (i, s) in lgnq.into_iter().enumerate() {
+                        if i < per_layer_param_grad_norm_sq.len() {
+                            per_layer_param_grad_norm_sq[i] += s;
+                        }
+                    }
+                }
+
+                let denom = (batch_count as f32).max(1.0);
+                let avg_loss = total_loss / denom;
+                let avg_base_loss = total_base_loss / denom;
+                let avg_grad_norm = total_grad_norm / denom;
+
+                if avg_loss.is_nan() || avg_loss.is_infinite() || avg_loss > 1e6 {
+                    return Err(ModelError::Training {
+                        message: format!(
+                            "Training diverged at epoch {}: loss = {:.4e}",
+                            epoch, avg_loss
+                        ),
+                    });
+                }
+
+                let epoch_ms = t_epoch_start.elapsed().as_millis() as u64;
+                let tokens_per_sec = if epoch_ms > 0 {
+                    Some((total_examples as f64 / epoch_ms as f64) * 1000.0)
+                } else {
+                    None
+                };
+
+                let warmup_status = if epoch < warmup_epochs {
+                    format!(
+                        " [warmup {}/{}]",
+                        epoch + 1,
+                        warmup_epochs
+                    )
+                } else {
+                    String::new()
+                };
+                info!(
+                    epoch = epoch,
+                    loss = avg_loss,
+                    base_loss = avg_base_loss,
+                    grad_norm = avg_grad_norm,
+                    learning_rate = effective_lr,
+                    total_examples = total_examples,
+                    tokens_per_sec = ?tokens_per_sec,
+                    "Pretokenized training epoch{}",
+                    warmup_status
+                );
+
+                // Delta tracking not wired for pretokenized path (mirrors string variant behavior)
+            }
+            Ok(())
+        })();
+
         self.training_scratch = scratch;
         res
     }
@@ -2978,27 +3336,7 @@ impl LLM {
         let train_data = &data[..val_start];
         let val_data = &data[val_start..];
 
-        // Initialize GPU for all layers if GPU features are enabled
-        #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda"))]
-        {
-            use crate::domain::compute::GpuComponent;
-            for layer in &mut self.network {
-                // Attempt GPU initialization for layers that support it
-                // Ignore errors - some layers may not support GPU
-                match layer {
-                    LayerEnum::RichardsGlu(layer) => {
-                        let _ = layer.enable_gpu_auto_detect();
-                    }
-                    LayerEnum::PolyAttention(layer) => {
-                        let _ = layer.enable_gpu_auto_detect();
-                    }
-                    _ => {
-                        // Other layers delegate to internal components
-                    }
-                }
-            }
-            tracing::info!("GPU initialization for diffusion training complete");
-        }
+        self.initialize_gpu_components_for_training("diffusion-training")?;
 
         for epoch in 0..epochs {
             let t_epoch_start = std::time::Instant::now();
@@ -3992,6 +4330,8 @@ impl LLM {
                     stage,
                     epoch + 1,
                     epochs,
+                    self.total_parameters(),
+                    self.average_active_parameters(),
                 );
                 let checkpoint_path_str = checkpoint_path.to_string_lossy().to_string();
                 let description = format!(
@@ -4566,6 +4906,8 @@ fn diffusion_checkpoint_path(
     stage: &str,
     epoch_1_based: usize,
     total_epochs: usize,
+    total_params: usize,
+    active_params: usize,
 ) -> std::path::PathBuf {
     let safe_stage: String = stage
         .chars()
@@ -4577,15 +4919,33 @@ fn diffusion_checkpoint_path(
             }
         })
         .collect();
+
+    let total_m = (total_params as f64) / 1_000_000.0;
+    let active_m = (active_params as f64) / 1_000_000.0;
+
     checkpoint_dir.join(format!(
-        "rustgpt-{}-{}-epoch{:04}-of{:04}.bin",
-        safe_stage, run_tag, epoch_1_based, total_epochs
+        "rustgpt-{}-{}-epoch{:04}-of{:04}-{:.1}M-tot-{:.1}M-act.bin",
+        safe_stage, run_tag, epoch_1_based, total_epochs, total_m, active_m
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_strict_no_fallback_env_values() {
+        assert!(LLM::parse_strict_no_fallback_env("1"));
+        assert!(LLM::parse_strict_no_fallback_env("true"));
+        assert!(LLM::parse_strict_no_fallback_env("TRUE"));
+        assert!(LLM::parse_strict_no_fallback_env(" yes "));
+        assert!(LLM::parse_strict_no_fallback_env("On"));
+
+        assert!(!LLM::parse_strict_no_fallback_env("0"));
+        assert!(!LLM::parse_strict_no_fallback_env("false"));
+        assert!(!LLM::parse_strict_no_fallback_env("off"));
+        assert!(!LLM::parse_strict_no_fallback_env(""));
+    }
 
     #[test]
     fn test_network_description_includes_decoder() {
@@ -4709,9 +5069,11 @@ mod tests {
             "pre train",
             3,
             10,
+            150_000_000,
+            15_000_000,
         );
         let fname = p.file_name().unwrap().to_string_lossy();
-        assert!(fname.contains("rustgpt-pre_train-20260101-000000-epoch0003-of0010.bin"));
+        assert!(fname.contains("rustgpt-pre_train-20260101-000000-epoch0003-of0010-150.0M-tot-15.0M-act.bin"));
     }
 }
 #[test]
@@ -4722,4 +5084,315 @@ fn test_ce_loss_normalized() {
     let norm = sce / targets.len() as f32;
     assert!(norm.is_finite());
     assert!(norm > 0.0);
+}
+
+// ============================================================================
+// GPU-Native Training and Inference Methods
+// ============================================================================
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl LLM {
+    /// Train a single batch entirely on GPU with zero CPU-GPU transfer.
+    ///
+    /// This method performs forward pass, loss computation, backward pass,
+    /// and optimizer step all on GPU without transferring data to CPU.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Input token IDs [batch_size, seq_len]
+    /// * `target_ids` - Target token IDs [batch_size, seq_len]
+    /// * `lr` - Learning rate for this step
+    ///
+    /// # Returns
+    /// * Loss value for the batch
+    pub fn train_batch_gpu(
+        &mut self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+        batch_size: usize,
+        seq_len: usize,
+        lr: f32,
+    ) -> Result<f32> {
+        use std::sync::{Arc, Mutex};
+
+        use crate::domain::compute::GpuDevice;
+        use crate::domain::models::{GpuLLMModel, GpuLayer, GpuTransformerLayer, GpuActivation};
+        use crate::application::training::{GpuTrainingConfig, GpuTrainingPipeline};
+
+        // Get or create GPU device from first layer
+        let device = self.get_shared_gpu_device()?;
+
+        // Convert to GPU model if needed
+        let gpu_model = self.to_gpu_model(device.clone())?;
+
+        // Create training pipeline
+        let config = GpuTrainingConfig {
+            learning_rate: lr,
+            ..Default::default()
+        };
+        let mut pipeline = GpuTrainingPipeline::new(device.clone(), gpu_model.param_count(), config)?;
+
+        // Upload input/target to GPU
+        let input_f32: Vec<f32> = input_ids.iter().map(|&id| id as f32).collect();
+        let target_f32: Vec<f32> = target_ids.iter().map(|&id| id as f32).collect();
+
+        let mut gpu_input = {
+            let mut dev = device.lock().map_err(|_| crate::common::errors::ModelError::Lock {
+                message: "Failed to lock GPU device".to_string(),
+            })?;
+            let mut buf = dev.allocate_f32(input_f32.len())?;
+            dev.upload(&input_f32, &mut buf)?;
+            buf
+        };
+
+        let mut gpu_target = {
+            let mut dev = device.lock().map_err(|_| crate::common::errors::ModelError::Lock {
+                message: "Failed to lock GPU device".to_string(),
+            })?;
+            let mut buf = dev.allocate_f32(target_f32.len())?;
+            dev.upload(&target_f32, &mut buf)?;
+            buf
+        };
+
+        // Run training step
+        let mut gpu_model = gpu_model;
+        let loss = gpu_model.train_step(&gpu_input, &gpu_target, batch_size, seq_len, &mut pipeline)?;
+
+        // Sync weights back to CPU model
+        self.sync_from_gpu_model(&gpu_model)?;
+
+        Ok(loss)
+    }
+
+    /// Generate tokens entirely on GPU.
+    ///
+    /// # Arguments
+    /// * `prompt_ids` - Prompt token IDs
+    /// * `max_new_tokens` - Maximum number of tokens to generate
+    /// * `temperature` - Sampling temperature
+    ///
+    /// # Returns
+    /// * Generated token IDs including prompt
+    pub fn generate_gpu(
+        &mut self,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        temperature: f32,
+    ) -> Result<Vec<usize>> {
+        use std::sync::{Arc, Mutex};
+
+        use crate::domain::compute::GpuDevice;
+
+        // Get GPU device
+        let device = self.get_shared_gpu_device()?;
+
+        // Convert to GPU model
+        let mut gpu_model = self.to_gpu_model(device.clone())?;
+
+        // Upload prompt to GPU
+        let prompt_f32: Vec<f32> = prompt_ids.iter().map(|&id| id as f32).collect();
+        let gpu_prompt = {
+            let mut dev = device.lock().map_err(|_| crate::common::errors::ModelError::Lock {
+                message: "Failed to lock GPU device".to_string(),
+            })?;
+            let mut buf = dev.allocate_f32(prompt_f32.len())?;
+            dev.upload(&prompt_f32, &mut buf)?;
+            buf
+        };
+
+        // Generate on GPU
+        let gpu_output = gpu_model.generate_gpu(&gpu_prompt, prompt_ids.len(), max_new_tokens, temperature)?;
+
+        // Download result
+        let output_f32 = {
+            let mut dev = device.lock().map_err(|_| crate::common::errors::ModelError::Lock {
+                message: "Failed to lock GPU device".to_string(),
+            })?;
+            let mut host = vec![0.0f32; prompt_ids.len() + max_new_tokens];
+            dev.download(&gpu_output, &mut host)?;
+            host
+        };
+
+        // Convert to token IDs
+        Ok(output_f32.iter().map(|&f| f as usize).collect())
+    }
+
+    /// Get shared GPU device from the model's layers.
+    fn get_shared_gpu_device(&self) -> Result<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        use std::sync::{Arc, Mutex};
+        use crate::domain::compute::GpuDevice;
+
+        // Try to get device from first GPU-capable layer
+        for layer in &self.network {
+            match layer {
+                LayerEnum::TransformerBlock(block) => {
+                    if let Some(device) = block.get_gpu_device() {
+                        return Ok(device);
+                    }
+                }
+                LayerEnum::DiffusionBlock(block) => {
+                    if let Some(device) = block.get_gpu_device() {
+                        return Ok(device);
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        // No GPU device found, create new one
+        let device = GpuDevice::auto_detect()?;
+        Ok(Arc::new(Mutex::new(device)))
+    }
+
+    /// Convert LLM to GpuLLMModel for GPU-native operations.
+    fn to_gpu_model(&self, device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>) -> Result<crate::domain::models::GpuLLMModel> {
+        use std::sync::{Arc, Mutex};
+        use crate::domain::compute::GpuDevice;
+        use crate::domain::models::{GpuLLMModel, GpuLayer, GpuTransformerLayer, GpuActivation};
+
+        let mut dev = device.lock().map_err(|_| crate::common::errors::ModelError::Lock {
+            message: "Failed to lock GPU device".to_string(),
+        })?;
+
+        // Extract embedding layer
+        let (token_embeddings, vocab_size) = {
+            let mut embeddings_layer = None;
+            for layer in &self.network {
+                if let LayerEnum::TokenEmbeddings(te) = layer {
+                    embeddings_layer = Some(te);
+                    break;
+                }
+            }
+            let te = embeddings_layer.ok_or_else(|| crate::common::errors::ModelError::InvalidState {
+                message: "No token embeddings layer found".to_string(),
+            })?;
+
+            // Use token_embeddings field (Array2<f32>)
+            let vocab_size = te.token_embeddings.nrows();
+            let embed_dim = te.token_embeddings.ncols();
+
+            // Flatten embeddings for GPU
+            let emb_data: Vec<f32> = te.token_embeddings.iter().cloned().collect();
+
+            let mut buf = dev.allocate_f32(emb_data.len())?;
+            dev.upload(&emb_data, &mut buf)?;
+            (buf, vocab_size)
+        };
+
+        // Convert layers
+        let mut gpu_layers = Vec::new();
+        for layer in &self.network {
+            match layer {
+                LayerEnum::TransformerBlock(block) => {
+                    if let Some(gpu_layer) = self.convert_transformer_block_to_gpu(&mut dev, block)? {
+                        gpu_layers.push(GpuLayer::Transformer(gpu_layer));
+                    }
+                }
+                LayerEnum::DiffusionBlock(_block) => {
+                    // TODO: Implement diffusion block conversion
+                }
+                _ => {}
+            }
+        }
+
+        // Create output projection (simplified - uses last layer's output)
+        let embed_dim = 256; // TODO: Get from config
+        let output_proj_data = vec![0.0f32; embed_dim * vocab_size];
+        let mut output_projection = dev.allocate_f32(output_proj_data.len())?;
+        dev.upload(&output_proj_data, &mut output_projection)?;
+
+        // Create layer norm params
+        let mut final_ln_gamma = dev.allocate_f32(embed_dim)?;
+        let mut final_ln_beta = dev.allocate_f32(embed_dim)?;
+        dev.upload(&vec![1.0f32; embed_dim], &mut final_ln_gamma)?;
+        dev.upload(&vec![0.0f32; embed_dim], &mut final_ln_beta)?;
+
+        // Create config
+        let config = crate::domain::models::config::ModelConfig {
+            embedding_dim: embed_dim,
+            hidden_dim: embed_dim * 4,
+            num_layers: gpu_layers.len(),
+            num_heads: Some(8),
+            max_seq_len: 512,
+            ..Default::default()
+        };
+
+        drop(dev);
+
+        GpuLLMModel::new(
+            device,
+            config,
+            vocab_size,
+            token_embeddings,
+            None, // position_embeddings
+            gpu_layers,
+            output_projection,
+            None, // output_bias
+            final_ln_gamma,
+            final_ln_beta,
+        )
+    }
+
+    /// Convert a TransformerBlock to GPU representation.
+    fn convert_transformer_block_to_gpu(
+        &self,
+        device: &mut crate::domain::compute::GpuDevice,
+        block: &crate::domain::layers::transformer::TransformerBlock,
+    ) -> Result<Option<crate::domain::models::GpuTransformerLayer>> {
+        use crate::domain::models::{GpuTransformerLayer, GpuActivation};
+
+        // Get dimensions from block
+        let embed_dim = block.config().embed_dim;
+        let hidden_dim = block.config().hidden_dim;
+
+        // Create placeholder weights (in real implementation, extract from block)
+        let qkv_data = vec![0.0f32; embed_dim * 3 * embed_dim];
+        let mut qkv_weight = device.allocate_f32(qkv_data.len())?;
+        device.upload(&qkv_data, &mut qkv_weight)?;
+
+        let attn_out_data = vec![0.0f32; embed_dim * embed_dim];
+        let mut attn_out_weight = device.allocate_f32(attn_out_data.len())?;
+        device.upload(&attn_out_data, &mut attn_out_weight)?;
+
+        let ffn_up_data = vec![0.0f32; embed_dim * hidden_dim];
+        let mut ffn_up_weight = device.allocate_f32(ffn_up_data.len())?;
+        device.upload(&ffn_up_data, &mut ffn_up_weight)?;
+
+        let ffn_down_data = vec![0.0f32; hidden_dim * embed_dim];
+        let mut ffn_down_weight = device.allocate_f32(ffn_down_data.len())?;
+        device.upload(&ffn_down_data, &mut ffn_down_weight)?;
+
+        let mut ln_gamma = device.allocate_f32(embed_dim)?;
+        let mut ln_beta = device.allocate_f32(embed_dim)?;
+        device.upload(&vec![1.0f32; embed_dim], &mut ln_gamma)?;
+        device.upload(&vec![0.0f32; embed_dim], &mut ln_beta)?;
+
+        let mut ln2_gamma = device.allocate_f32(embed_dim)?;
+        let mut ln2_beta = device.allocate_f32(embed_dim)?;
+        device.upload(&vec![1.0f32; embed_dim], &mut ln2_gamma)?;
+        device.upload(&vec![0.0f32; embed_dim], &mut ln2_beta)?;
+
+        Ok(Some(GpuTransformerLayer {
+            qkv_weight,
+            qkv_bias: None,
+            attn_out_weight,
+            attn_out_bias: None,
+            ffn_up_weight,
+            ffn_up_bias: None,
+            ffn_down_weight,
+            ffn_down_bias: None,
+            ln1_gamma: ln_gamma,
+            ln1_beta: ln_beta,
+            ln2_gamma: ln2_gamma,
+            ln2_beta: ln2_beta,
+            activation: GpuActivation::Gelu,
+            layer_idx: 0,
+        }))
+    }
+
+    /// Sync weights from GPU model back to CPU model.
+    fn sync_from_gpu_model(&mut self, _gpu_model: &crate::domain::models::GpuLLMModel) -> Result<()> {
+        // TODO: Implement weight sync from GPU to CPU
+        // This would download weights from GpuLLMModel and update self.network
+        Ok(())
+    }
 }

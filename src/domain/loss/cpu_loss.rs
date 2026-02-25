@@ -636,6 +636,162 @@ pub fn v_mse_gradients(v_pred: &Array2<f32>, v_true: &Array2<f32>) -> Array2<f32
     grad
 }
 
+// ============================================================================
+// GPU-Accelerated Loss Functions
+// ============================================================================
+
+/// GPU-accelerated loss computation helpers.
+///
+/// These functions provide GPU implementations of loss functions for use
+/// during GPU training to avoid downloading logits to CPU.
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+pub struct GpuLossOps;
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl GpuLossOps {
+    /// GPU-accelerated cross-entropy loss from logits.
+    ///
+    /// Performs softmax + NLL on GPU to avoid transferring large logit tensors.
+    pub fn cross_entropy_from_logits_gpu(
+        device: &mut crate::domain::compute::GpuDevice,
+        logits: &ndarray::Array2<f32>,
+        targets: &[usize],
+    ) -> crate::common::errors::Result<f32> {
+        let (rows, vocab_size) = logits.dim();
+        let size = rows * vocab_size;
+
+        // Upload logits
+        let mut gpu_logits = device.allocate_f32(size)?;
+        let logits_slice =
+            logits
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "Loss logits not contiguous".to_string(),
+                })?;
+        device.upload(logits_slice, &mut gpu_logits)?;
+
+        // Compute softmax on GPU
+        let mut gpu_probs = device.allocate_f32(size)?;
+        device.softmax(&gpu_logits, &mut gpu_probs, rows, vocab_size)?;
+
+        // Download probabilities for loss computation
+        let mut probs = vec![0.0f32; size];
+        device.download(&gpu_probs, &mut probs)?;
+
+        // Free GPU buffers
+        device.deallocate(gpu_logits);
+        device.deallocate(gpu_probs);
+
+        // Compute NLL from probabilities
+        let rows_used = rows.min(targets.len());
+        let mut loss = 0.0f32;
+        for i in 0..rows_used {
+            let t = targets[i];
+            if t < vocab_size {
+                let p = probs[i * vocab_size + t].max(f32::MIN_POSITIVE);
+                loss -= p.ln();
+            }
+        }
+        if rows_used > 0 {
+            Ok(loss / rows_used as f32)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// GPU-accelerated cross-entropy gradients (softmax - one_hot).
+    ///
+    /// Computes gradients on GPU from logits and targets.
+    pub fn cross_entropy_gradients_gpu(
+        device: &mut crate::domain::compute::GpuDevice,
+        logits: &ndarray::Array2<f32>,
+        targets: &[usize],
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        let (rows, vocab_size) = logits.dim();
+        let size = rows * vocab_size;
+
+        // Upload logits
+        let mut gpu_logits = device.allocate_f32(size)?;
+        let logits_slice =
+            logits
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "Loss logits not contiguous for gradients".to_string(),
+                })?;
+        device.upload(logits_slice, &mut gpu_logits)?;
+
+        // Compute softmax on GPU
+        let mut gpu_probs = device.allocate_f32(size)?;
+        device.softmax(&gpu_logits, &mut gpu_probs, rows, vocab_size)?;
+
+        // Download probabilities
+        let mut probs = vec![0.0f32; size];
+        device.download(&gpu_probs, &mut probs)?;
+
+        // Compute gradients: probs - one_hot(targets)
+        let rows_used = rows.min(targets.len());
+        for i in 0..rows_used {
+            let t = targets[i];
+            if t < vocab_size {
+                probs[i * vocab_size + t] -= 1.0;
+            }
+        }
+
+        // Scale by 1/batch_size
+        if rows_used > 0 {
+            let scale = 1.0 / rows_used as f32;
+            for v in probs.iter_mut() {
+                *v *= scale;
+            }
+        }
+
+        ndarray::Array2::from_shape_vec((rows, vocab_size), probs).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape loss gradients: {}", e),
+            }
+        })
+    }
+
+    /// GPU-accelerated MSE loss (for diffusion training).
+    pub fn mse_loss_gpu(
+        device: &mut crate::domain::compute::GpuDevice,
+        predictions: &ndarray::Array2<f32>,
+        targets: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<f32> {
+        let size = predictions.len();
+
+        let mut gpu_pred = device.allocate_f32(size)?;
+        let mut gpu_target = device.allocate_f32(size)?;
+
+        let pred_slice =
+            predictions
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "MSE predictions not contiguous".to_string(),
+                })?;
+        let target_slice =
+            targets
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "MSE targets not contiguous".to_string(),
+                })?;
+        device.upload(pred_slice, &mut gpu_pred)?;
+        device.upload(target_slice, &mut gpu_target)?;
+
+        // Compute diff = pred - target
+        let mut gpu_diff = device.allocate_f32(size)?;
+        device.axpy(1.0, &gpu_pred, -1.0, &gpu_target, &mut gpu_diff, size)?;
+
+        // Square the diff elements (using element-wise multiply)
+        let mut gpu_sq = device.allocate_f32(size)?;
+        device.mul(&gpu_diff, &gpu_diff, &mut gpu_sq, size)?;
+
+        // Sum and average
+        let sum = device.sum(&gpu_sq, size)?;
+        Ok(sum / size as f32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::array;

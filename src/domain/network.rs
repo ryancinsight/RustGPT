@@ -14,6 +14,10 @@ pub trait Layer {
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32>;
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
     fn parameters(&self) -> usize;
+    /// The average number of active parameters during a forward pass
+    fn active_parameters(&self) -> usize {
+        self.parameters()
+    }
     /// Frobenius norm of all learnable weights in the layer
     /// Used by LARS trust-ratio to balance update magnitude
     fn weight_norm(&self) -> f32;
@@ -77,6 +81,10 @@ impl Layer for LayerEnum {
 
     fn parameters(&self) -> usize {
         delegate_to_variant!(self, parameters)
+    }
+
+    fn active_parameters(&self) -> usize {
+        delegate_to_variant!(self, active_parameters)
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {

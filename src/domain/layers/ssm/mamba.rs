@@ -643,6 +643,10 @@ impl Mamba {
         &mut self,
         compute_backend: ComputeBackend,
     ) -> crate::common::errors::Result<()> {
+        if self.compute_backend == compute_backend {
+            return Ok(());
+        }
+
         if compute_backend.is_gpu() {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
@@ -694,6 +698,87 @@ impl Mamba {
     }
 
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub(crate) fn kernel_matrices_for_ssm_backend(
+        &mut self,
+        state_dim: usize,
+    ) -> crate::common::errors::Result<(
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+    )> {
+        let d = self.embed_dim;
+        if d == 0 || state_dim == 0 {
+            return Err(crate::common::errors::ModelError::InvalidInput {
+                message: "Mamba kernel matrices require non-zero embed_dim/state_dim".to_string(),
+            });
+        }
+
+        if self.a_matrix_type == AMatrixType::BlockDiagonal {
+            self.ensure_projections_mamba2(d);
+        } else {
+            self.ensure_projections(d);
+        }
+
+        let proj_state = self.cached_proj_state.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "Mamba missing cached_proj_state while building SSM kernel matrices"
+                    .to_string(),
+            }
+        })?;
+        let proj_a = self.cached_proj_a.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "Mamba missing cached_proj_a while building SSM kernel matrices"
+                    .to_string(),
+            }
+        })?;
+        if proj_state.dim() != (d, state_dim) || proj_a.dim() != (d, state_dim) {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("proj_state/proj_a dims: ({}, {})", d, state_dim),
+                    got: format!(
+                        "proj_state={:?}, proj_a={:?}",
+                        proj_state.dim(),
+                        proj_a.dim()
+                    ),
+                },
+            );
+        }
+
+        let mut a_logits_state = self.w_out.dot(proj_a);
+        let bias_d = self.a_log.row(0).to_owned() + self.b_out.row(0).to_owned();
+        for j in 0..d {
+            let bj = bias_d[j];
+            for k in 0..state_dim {
+                a_logits_state[[j, k]] += bj;
+            }
+        }
+
+        let a_scale_state = a_logits_state.mapv(|x| softplus(x) + 1e-6);
+        let mut a = Array2::<f32>::zeros((state_dim, state_dim));
+        for k in 0..state_dim {
+            let mut acc = 0.0f32;
+            for j in 0..d {
+                acc += a_scale_state[[j, k]];
+            }
+            let mean = acc / (d as f32);
+            let decay = (-mean).exp().clamp(1e-6, 0.999_999);
+            a[[k, k]] = if decay.is_finite() { decay } else { 0.5 };
+        }
+
+        let b = proj_state.t().to_owned();
+        let c = proj_state.to_owned();
+        let mut d_mat = Array2::<f32>::zeros((d, d));
+        let d_skip = self.d_skip.row(0);
+        for j in 0..d {
+            d_mat[[j, j]] = d_skip[j];
+        }
+        let h_init = Array2::<f32>::zeros((1, state_dim));
+        Ok((a, b, c, d_mat, h_init))
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     fn ensure_ssm_gpu_backend(
         &mut self,
         seq_len: usize,
@@ -725,9 +810,226 @@ impl Mamba {
                         message: "Failed to acquire Mamba cached GPU backend lock".to_string(),
                     })?;
             backend.set_params(SsmParams::new(state_dim, self.embed_dim, seq_len, 1));
+            let (a, b, c, d, h_init) = self.kernel_matrices_for_ssm_backend(state_dim)?;
+            backend.set_mamba_kernel_matrices(a, b, c, d, h_init);
         }
 
         Ok(backend_arc)
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn gpu_gemm_to_host(
+        device: &mut crate::domain::compute::GpuDevice,
+        lhs: &Array2<f32>,
+        rhs: &Array2<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+        trans_lhs: bool,
+        trans_rhs: bool,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(Array2::zeros((m, n)));
+        }
+
+        let lhs_slice =
+            lhs.as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "Mamba gpu_gemm_to_host lhs must be contiguous".to_string(),
+                })?;
+        let rhs_slice =
+            rhs.as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "Mamba gpu_gemm_to_host rhs must be contiguous".to_string(),
+                })?;
+
+        let mut lhs_buf = device.allocate_f32(lhs.len())?;
+        let mut rhs_buf = device.allocate_f32(rhs.len())?;
+        let mut out_buf = device.allocate_f32(m * n)?;
+        device.upload(lhs_slice, &mut lhs_buf)?;
+        device.upload(rhs_slice, &mut rhs_buf)?;
+        device.gemm_f32(
+            1.0,
+            &lhs_buf,
+            &rhs_buf,
+            0.0,
+            &mut out_buf,
+            m,
+            n,
+            k,
+            trans_lhs,
+            trans_rhs,
+        )?;
+
+        let mut host = vec![0.0f32; m * n];
+        device.download(&out_buf, &mut host)?;
+        device.deallocate(lhs_buf);
+        device.deallocate(rhs_buf);
+        device.deallocate(out_buf);
+
+        Array2::from_shape_vec((m, n), host).map_err(|err| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: format!("Mamba gpu_gemm_to_host reshape failed: {err}"),
+            }
+        })
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn gpu_linear_with_bias(
+        device: &mut crate::domain::compute::GpuDevice,
+        input: &Array2<f32>,
+        weight: &Array2<f32>,
+        bias: Option<&Array2<f32>>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let (rows, in_dim) = input.dim();
+        let (w_in, out_dim) = weight.dim();
+        if w_in != in_dim {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("weight rows: {}", in_dim),
+                    got: format!("{}", w_in),
+                },
+            );
+        }
+        let mut out =
+            Self::gpu_gemm_to_host(device, input, weight, rows, out_dim, in_dim, false, false)?;
+
+        if let Some(b) = bias {
+            if b.dim() != (1, out_dim) {
+                return Err(
+                    crate::common::errors::ModelError::DimensionMismatchDetailed {
+                        expected: format!("bias dims: (1, {})", out_dim),
+                        got: format!("{:?}", b.dim()),
+                    },
+                );
+            }
+            let b_row = b.row(0);
+            for mut row in out.outer_iter_mut() {
+                row += &b_row;
+            }
+        }
+        Ok(out)
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn forward_cached_gpu(
+        &mut self,
+        input: &Array2<f32>,
+        device: &mut crate::domain::compute::GpuDevice,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        self.cached_kind = MambaCachedKind::Mamba1;
+        self.cached_head_offsets = None;
+        self.cached_dt_head = None;
+        self.cached_a_head = None;
+        self.cached_a_scale_head = None;
+
+        let t = input.nrows();
+        let d = input.ncols();
+        if t == 0 || d == 0 {
+            self.cached_input = Some(input.clone());
+            return Ok(Array2::zeros((t, d)));
+        }
+
+        self.ensure_projections(d);
+        let n = self.cached_state_dim;
+        let proj_state = self
+            .cached_proj_state
+            .as_ref()
+            .expect("proj_state must exist");
+        let proj_a = self.cached_proj_a.as_ref().expect("proj_a must exist");
+
+        let in2 = Self::gpu_linear_with_bias(device, input, &self.w_in, Some(&self.b_in))?;
+        let u_pre = in2.slice(ndarray::s![.., 0..d]).to_owned();
+        let gate_logits = in2.slice(ndarray::s![.., d..2 * d]).to_owned();
+
+        let u_act = self.richards_act.forward_matrix_f32(&u_pre);
+        let gate = self.richards_gate.forward_const(&gate_logits);
+
+        let dt_logits = u_pre.clone();
+        let dt = dt_logits.mapv(|x| softplus(x) + 1e-6);
+
+        let b_full = Self::gpu_linear_with_bias(device, input, &self.w_b, Some(&self.b_b))?;
+        let b_logits = Self::gpu_gemm_to_host(device, &b_full, proj_state, t, n, d, false, false)?;
+        let mut b_t = Array2::<f32>::zeros(b_logits.raw_dim());
+        self.richards_tanh
+            .forward_matrix_f32_into(&b_logits, &mut b_t);
+
+        let c_full = Self::gpu_linear_with_bias(device, input, &self.w_c, Some(&self.b_c))?;
+        let c_logits = Self::gpu_gemm_to_host(device, &c_full, proj_state, t, n, d, false, false)?;
+        let mut c_t = Array2::<f32>::zeros(c_logits.raw_dim());
+        self.richards_tanh
+            .forward_matrix_f32_into(&c_logits, &mut c_t);
+
+        let mut a_logits_state = self.w_out.dot(proj_a);
+        let bias_d = self.a_log.row(0).to_owned() + self.b_out.row(0).to_owned();
+        for j in 0..d {
+            let bj = bias_d[j];
+            for k in 0..n {
+                a_logits_state[[j, k]] += bj;
+            }
+        }
+        let a_scale_state = a_logits_state.mapv(|x| softplus(x) + 1e-6);
+
+        let u_conv = self.depthwise_causal_conv(&u_act);
+
+        let mut state_prev = Array2::<f32>::zeros((t, d * n));
+        let mut state = Array2::<f32>::zeros((t, d * n));
+        let mut z = Array2::<f32>::zeros((t, d));
+        let mut y_pre = Array2::<f32>::zeros((t, d));
+
+        let d_skip_row = self.d_skip.row(0).to_owned();
+        let mut s = Array1::<f32>::zeros(d * n);
+        for ti in 0..t {
+            for j in 0..d {
+                let dtj = dt[[ti, j]];
+                let uj = u_conv[[ti, j]];
+                let mut zj = d_skip_row[j] * uj;
+
+                for k in 0..n {
+                    let idx = j * n + k;
+                    let prev = s[idx];
+                    state_prev[[ti, idx]] = prev;
+
+                    let a_scale = a_scale_state[[j, k]];
+                    let aj = crate::domain::pade::exp(-dtj * a_scale).clamp(0.0, 1.0);
+                    let inp = b_t[[ti, k]] * uj;
+                    let kk = (1.0 - aj) / a_scale;
+                    let sj = aj * prev + kk * inp;
+
+                    s[idx] = sj;
+                    state[[ti, idx]] = sj;
+                    zj += c_t[[ti, k]] * sj;
+                }
+
+                z[[ti, j]] = zj;
+                y_pre[[ti, j]] = gate[[ti, j]] * zj;
+            }
+        }
+
+        let out_pre = Self::gpu_linear_with_bias(device, &y_pre, &self.w_dt, Some(&self.b_dt))?;
+
+        self.cached_input = Some(input.clone());
+        self.cached_u_pre = Some(u_pre);
+        self.cached_u_act = Some(u_act);
+        self.cached_gate = Some(gate);
+        self.cached_gate_logits = Some(gate_logits);
+        self.cached_dt_logits = Some(dt_logits);
+        self.cached_dt = Some(dt);
+        self.cached_b_logits = Some(b_logits);
+        self.cached_b_t = Some(b_t);
+        self.cached_c_logits = Some(c_logits);
+        self.cached_c_t = Some(c_t);
+        self.cached_a_logits_state = Some(a_logits_state);
+        self.cached_a_scale_state = Some(a_scale_state);
+        self.cached_a = None;
+        self.cached_u_conv = Some(u_conv);
+        self.cached_state_prev = Some(state_prev);
+        self.cached_state = Some(state);
+        self.cached_z = Some(z);
+        self.cached_y_pre = Some(y_pre);
+        self.cached_out_pre = Some(out_pre.clone());
+
+        Ok(out_pre)
     }
 
     /// Create Mamba layer with enhanced configuration
@@ -932,18 +1234,36 @@ impl Mamba {
             });
         }
 
-        let backend_name = self.compute_backend.as_str().to_string();
         let backend_arc = self.ensure_ssm_gpu_backend(seq_len)?;
-        let mut backend = backend_arc.lock().map_err(|_| ModelError::Backend {
-            message: "Failed to acquire Mamba cached GPU backend lock for forward dispatch"
-                .to_string(),
+        let device_arc = {
+            let backend = backend_arc.lock().map_err(|_| ModelError::Backend {
+                message: "Failed to acquire Mamba cached GPU backend lock for device".to_string(),
+            })?;
+            backend.kernels().device()
+        };
+        let mut device = device_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to lock Mamba GPU device".to_string(),
         })?;
-        backend.forward(input).map_err(|err| ModelError::Backend {
-            message: format!(
-                "Mamba GPU forward failed on backend '{}': {}",
-                backend_name, err
-            ),
-        })
+
+        self.forward_cached_gpu(input, &mut device)
+    }
+
+    /// GPU-aware backward gradients for Mamba.
+    ///
+    /// This path is strict: it errors when GPU backend is not selected.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "Mamba::compute_gradients_gpu called without a GPU backend selected."
+                    .to_string(),
+            });
+        }
+        Ok(self.compute_gradients(input, output_grads))
     }
 
     /// GPU-accelerated forward pass on non-GPU builds (strict no-fallback error).
@@ -951,6 +1271,18 @@ impl Mamba {
     pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
         Err(crate::common::errors::ModelError::Backend {
             message: "Mamba GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
+    /// GPU-aware backward gradients on non-GPU builds (strict error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn compute_gradients_gpu(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "Mamba GPU backward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
         })
     }
 
@@ -2240,9 +2572,39 @@ impl Layer for Mamba {
             .expect("proj_state must exist");
         let proj_a = self.cached_proj_a.as_ref().expect("proj_a must exist");
 
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let gpu_device_arc = if self.compute_backend.is_gpu() {
+            self.ssm_gpu_backend.as_ref().and_then(|backend_arc| {
+                backend_arc
+                    .lock()
+                    .ok()
+                    .map(|backend| backend.kernels().device())
+            })
+        } else {
+            None
+        };
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let mut gpu_device = gpu_device_arc.as_ref().and_then(|arc| arc.lock().ok());
+
         // out = y_pre W_dt + b_dt
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let grad_w_dt = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, y_pre, output_grads, d, d, t, true, false)
+                .unwrap_or_else(|_| y_pre.t().dot(output_grads))
+        } else {
+            y_pre.t().dot(output_grads)
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let grad_w_dt = y_pre.t().dot(output_grads);
         let grad_b_dt = output_grads.sum_axis(Axis(0)).insert_axis(Axis(0));
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let d_y_pre = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, output_grads, &self.w_dt, t, d, d, false, true)
+                .unwrap_or_else(|_| output_grads.dot(&self.w_dt.t()))
+        } else {
+            output_grads.dot(&self.w_dt.t())
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let d_y_pre = output_grads.dot(&self.w_dt.t());
 
         let mut d_gate = Array2::<f32>::zeros((t, d));
@@ -2408,22 +2770,86 @@ impl Layer for Mamba {
             .slice_mut(ndarray::s![.., d..2 * d])
             .assign(&d_gate_logits);
 
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let grad_w_in = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, input, &d_in2, d, 2 * d, t, true, false)
+                .unwrap_or_else(|_| input.t().dot(&d_in2))
+        } else {
+            input.t().dot(&d_in2)
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let grad_w_in = input.t().dot(&d_in2);
         let grad_b_in = d_in2.sum_axis(Axis(0)).insert_axis(Axis(0));
 
         // B/C path gradients: B_logits = (input.dot(w_b) + b_b) dot proj_state
         // d_full = d_logits dot proj_state^T
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let d_b_full = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, &d_b_logits, proj_state, t, d, n, false, true)
+                .unwrap_or_else(|_| d_b_logits.dot(&proj_state.t()))
+        } else {
+            d_b_logits.dot(&proj_state.t())
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let d_b_full = d_b_logits.dot(&proj_state.t());
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let grad_w_b = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, input, &d_b_full, d, d, t, true, false)
+                .unwrap_or_else(|_| input.t().dot(&d_b_full))
+        } else {
+            input.t().dot(&d_b_full)
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let grad_w_b = input.t().dot(&d_b_full);
         let grad_b_b = d_b_full.sum_axis(Axis(0)).insert_axis(Axis(0));
 
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let d_c_full = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, &d_c_logits, proj_state, t, d, n, false, true)
+                .unwrap_or_else(|_| d_c_logits.dot(&proj_state.t()))
+        } else {
+            d_c_logits.dot(&proj_state.t())
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let d_c_full = d_c_logits.dot(&proj_state.t());
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let grad_w_c = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, input, &d_c_full, d, d, t, true, false)
+                .unwrap_or_else(|_| input.t().dot(&d_c_full))
+        } else {
+            input.t().dot(&d_c_full)
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let grad_w_c = input.t().dot(&d_c_full);
         let grad_b_c = d_c_full.sum_axis(Axis(0)).insert_axis(Axis(0));
 
         // input grads
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let dx_in = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, &d_in2, &self.w_in, t, d, 2 * d, false, true)
+                .unwrap_or_else(|_| d_in2.dot(&self.w_in.t()))
+        } else {
+            d_in2.dot(&self.w_in.t())
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let dx_in = d_in2.dot(&self.w_in.t());
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let dx_b = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, &d_b_full, &self.w_b, t, d, d, false, true)
+                .unwrap_or_else(|_| d_b_full.dot(&self.w_b.t()))
+        } else {
+            d_b_full.dot(&self.w_b.t())
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let dx_b = d_b_full.dot(&self.w_b.t());
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        let dx_c = if let Some(device) = gpu_device.as_mut() {
+            Self::gpu_gemm_to_host(device, &d_c_full, &self.w_c, t, d, d, false, true)
+                .unwrap_or_else(|_| d_c_full.dot(&self.w_c.t()))
+        } else {
+            d_c_full.dot(&self.w_c.t())
+        };
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         let dx_c = d_c_full.dot(&self.w_c.t());
         let grad_input = dx_in + dx_b + dx_c;
 
@@ -2789,6 +3215,10 @@ impl MoHMamba {
         &mut self,
         compute_backend: ComputeBackend,
     ) -> crate::common::errors::Result<()> {
+        if self.compute_backend == compute_backend {
+            return Ok(());
+        }
+
         if compute_backend.is_gpu() {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
@@ -2870,6 +3300,8 @@ impl MoHMamba {
                         message: "Failed to acquire MoHMamba cached GPU backend lock".to_string(),
                     })?;
             backend.set_params(SsmParams::new(state_dim, self.embed_dim, seq_len, 1));
+            let (a, b, c, d, h_init) = self.inner.kernel_matrices_for_ssm_backend(state_dim)?;
+            backend.set_mamba_kernel_matrices(a, b, c, d, h_init);
         }
 
         Ok(backend_arc)
@@ -3095,11 +3527,41 @@ impl MoHMamba {
         Ok(output)
     }
 
+    /// GPU-aware backward gradients for MoH Mamba.
+    ///
+    /// This path is strict: it errors when GPU backend is not selected.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "MoHMamba::compute_gradients_gpu called without a GPU backend selected."
+                    .to_string(),
+            });
+        }
+        Ok(self.compute_gradients(input, output_grads))
+    }
+
     /// GPU forward on non-GPU builds (strict no-fallback error).
     #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
     pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
         Err(crate::common::errors::ModelError::Backend {
             message: "MoHMamba GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
+    /// GPU-aware backward gradients on non-GPU builds (strict error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn compute_gradients_gpu(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "MoHMamba GPU backward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
         })
     }
 }
@@ -3532,6 +3994,34 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_moh_mamba_reapply_gpu_backend_preserves_cached_ssm_backend() {
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba::new(12, 3, &cfg);
+        moh.set_compute_backend_checked(backend)
+            .expect("resolved GPU backend should be accepted");
+        let first_backend = moh
+            .ensure_ssm_gpu_backend(6)
+            .expect("should initialize cached SSM GPU backend");
+
+        moh.set_compute_backend_checked(backend)
+            .expect("re-applying same backend should be idempotent");
+        let second_backend = moh
+            .ensure_ssm_gpu_backend(6)
+            .expect("cached SSM GPU backend should still be available");
+
+        assert!(Arc::ptr_eq(&first_backend, &second_backend));
+    }
+
     #[test]
     fn test_mamba_set_compute_backend_checked_cpu() {
         let mut mamba = Mamba::new(12);
@@ -3558,6 +4048,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_mamba_reapply_gpu_backend_preserves_cached_ssm_backend() {
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let mut mamba = Mamba::new(12);
+        mamba
+            .set_compute_backend_checked(backend)
+            .expect("resolved GPU backend should be accepted");
+        let first_backend = mamba
+            .ensure_ssm_gpu_backend(6)
+            .expect("should initialize cached SSM GPU backend");
+
+        mamba
+            .set_compute_backend_checked(backend)
+            .expect("re-applying same backend should be idempotent");
+        let second_backend = mamba
+            .ensure_ssm_gpu_backend(6)
+            .expect("cached SSM GPU backend should still be available");
+
+        assert!(Arc::ptr_eq(&first_backend, &second_backend));
     }
 
     #[test]

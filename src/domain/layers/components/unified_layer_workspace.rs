@@ -326,6 +326,28 @@ impl UnifiedLayerWorkspace {
         self.norm1_out.as_mut()
     }
 
+    /// Borrow `norm1_out` as input and `temporal_out` as output simultaneously.
+    ///
+    /// This avoids cloning intermediate tensors when chaining temporal operations.
+    #[inline]
+    pub fn norm1_out_and_temporal_out_mut(&mut self) -> Option<(&Array2<f32>, &mut Array2<f32>)> {
+        let norm1_out = self.norm1_out.as_ref()?;
+        let temporal_out = self.temporal_out.as_mut()?;
+        Some((norm1_out, temporal_out))
+    }
+
+    /// Borrow `norm1_out` as input and `ffn_intermediate` as output simultaneously.
+    ///
+    /// Used by diffusion FiLM conditioning to avoid extra temporary clones.
+    #[inline]
+    pub fn norm1_out_and_ffn_intermediate_mut(
+        &mut self,
+    ) -> Option<(&Array2<f32>, &mut Array2<f32>)> {
+        let norm1_out = self.norm1_out.as_ref()?;
+        let ffn_intermediate = self.ffn_intermediate.as_mut()?;
+        Some((norm1_out, ffn_intermediate))
+    }
+
     #[inline]
     pub fn temporal_out(&self) -> Option<&Array2<f32>> {
         self.temporal_out.as_ref()
@@ -356,6 +378,26 @@ impl UnifiedLayerWorkspace {
         self.norm2_out.as_mut()
     }
 
+    /// Borrow `norm2_out` as input and `ffn_out` as output simultaneously.
+    ///
+    /// This keeps feedforward execution on pre-allocated buffers without cloning.
+    #[inline]
+    pub fn norm2_out_and_ffn_out_mut(&mut self) -> Option<(&Array2<f32>, &mut Array2<f32>)> {
+        let norm2_out = self.norm2_out.as_ref()?;
+        let ffn_out = self.ffn_out.as_mut()?;
+        Some((norm2_out, ffn_out))
+    }
+
+    /// Borrow `norm2_out` as input and `residual1` as output simultaneously.
+    ///
+    /// Used by diffusion FiLM FFN conditioning to reuse workspace buffers in-place.
+    #[inline]
+    pub fn norm2_out_and_residual1_mut(&mut self) -> Option<(&Array2<f32>, &mut Array2<f32>)> {
+        let norm2_out = self.norm2_out.as_ref()?;
+        let residual1 = self.residual1.as_mut()?;
+        Some((norm2_out, residual1))
+    }
+
     #[inline]
     pub fn ffn_intermediate(&self) -> Option<&Array2<f32>> {
         self.ffn_intermediate.as_ref()
@@ -374,6 +416,16 @@ impl UnifiedLayerWorkspace {
     #[inline]
     pub fn ffn_out_mut(&mut self) -> Option<&mut Array2<f32>> {
         self.ffn_out.as_mut()
+    }
+
+    /// Borrow `residual1` as input and `ffn_out` as output simultaneously.
+    ///
+    /// This supports diffusion FFN dispatch from modulated residual workspace without copying.
+    #[inline]
+    pub fn residual1_and_ffn_out_mut(&mut self) -> Option<(&Array2<f32>, &mut Array2<f32>)> {
+        let residual1 = self.residual1.as_ref()?;
+        let ffn_out = self.ffn_out.as_mut()?;
+        Some((residual1, ffn_out))
     }
 
     #[inline]

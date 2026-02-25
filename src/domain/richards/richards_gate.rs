@@ -124,6 +124,10 @@ pub struct RichardsGate {
     /// Skipped in serialization to keep checkpoint compatibility.
     #[serde(skip_serializing, skip_deserializing)]
     cached_input: Option<Array2<f32>>,
+
+    /// Optional GPU device for hardware-accelerated forward/backward passes.
+    #[serde(skip_serializing, skip_deserializing)]
+    gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 impl RichardsGate {
@@ -180,6 +184,7 @@ impl RichardsGate {
             temperature: temp_sample,
             temperature_optimizer: Adam::new((1, 1)),
             cached_input: None,
+            gpu_device: None,
         }
     }
 
@@ -424,6 +429,224 @@ impl Layer for RichardsGate {
 
     fn zero_gradients(&mut self) {
         self.zero_gradients()
+    }
+}
+
+// ============================================================================
+// GPU Component Implementation
+// ============================================================================
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl crate::domain::compute::GpuComponent for RichardsGate {
+    fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
+    }
+
+    fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let device = crate::domain::compute::GpuDevice::auto_detect()?;
+        self.gpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(device)));
+        Ok(())
+    }
+
+    fn is_gpu_ready(&self) -> bool {
+        self.gpu_device.is_some()
+    }
+
+    fn gpu_backend_name(&self) -> Option<&'static str> {
+        self.gpu_device
+            .as_ref()
+            .and_then(|device_arc| match device_arc.lock() {
+                Ok(device) => Some(device.backend().as_str()),
+                Err(_) => None,
+            })
+    }
+
+    fn gpu_device(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.gpu_device.clone()
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        batch_size: usize,
+        embed_dim: usize,
+        _seq_len: usize,
+    ) -> crate::common::errors::Result<()> {
+        if let Some(device_arc) = &self.gpu_device {
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to lock GPU device for RichardsGate capacity allocation"
+                            .to_string(),
+                    })?;
+            let size = batch_size * embed_dim;
+            let _ = device.allocate_f32(size)?; // input buffer
+            let _ = device.allocate_f32(size)?; // output buffer
+            Ok(())
+        } else {
+            Err(crate::common::errors::ModelError::Backend {
+                message:
+                    "GPU device not attached to RichardsGate. Call enable_gpu_auto_detect() first."
+                        .to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl RichardsGate {
+    /// GPU-accelerated forward pass for gating.
+    ///
+    /// Applies Richards sigmoid curve on GPU. Since the gate is elementwise,
+    /// this maps naturally to GPU compute shaders.
+    pub fn forward_gpu(
+        &mut self,
+        input: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "RichardsGate::forward_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for RichardsGate forward".to_string(),
+                })?;
+
+        let (rows, cols) = input.dim();
+        let size = rows * cols;
+
+        // Upload input
+        let mut gpu_input = device.allocate_f32(size)?;
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "RichardsGate input is not contiguous".to_string(),
+                })?;
+        device.upload(input_slice, &mut gpu_input)?;
+
+        // Apply Richards curve on GPU using the real kernel
+        let params = self.curve.to_gpu_params(1);
+        let mut gpu_output = device.allocate_f32(size)?;
+        device.richards_curve(&gpu_input, &mut gpu_output, &params, size)?;
+
+        // Download result
+        let mut result = vec![0.0f32; size];
+        device.download(&gpu_output, &mut result)?;
+
+        // Cleanup GPU buffers
+        device.deallocate(gpu_input);
+        device.deallocate(gpu_output);
+        drop(device);
+
+        // Cache input for backward
+        self.cached_input = Some(input.clone());
+
+        ndarray::Array2::from_shape_vec((rows, cols), result).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape RichardsGate GPU output: {}", e),
+            }
+        })
+    }
+
+    /// GPU-accelerated backward pass for gating.
+    pub fn backward_gpu(
+        &mut self,
+        output_grads: &ndarray::Array2<f32>,
+        lr: f32,
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "RichardsGate::backward_gpu",
+        )?;
+
+        // Use cached input for gradient computation
+        let input = self.cached_input.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "RichardsGate backward_gpu called without prior forward pass".to_string(),
+            }
+        })?;
+
+        let (rows, cols) = input.dim();
+        let size = rows * cols;
+
+        // Try GPU-accelerated input gradient via richards_curve_backward_input kernel
+        let input_grads = {
+            let mut device = device_arc.lock().map_err(|_| {
+                crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for RichardsGate backward".to_string(),
+                }
+            })?;
+
+            let params = self.curve.to_gpu_params(1);
+
+            let input_slice = input.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::Backend {
+                    message: "RichardsGate cached input is not contiguous".to_string(),
+                }
+            })?;
+            let grads_slice = output_grads.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::Backend {
+                    message: "RichardsGate output_grads is not contiguous".to_string(),
+                }
+            })?;
+
+            let mut gpu_input = device.allocate_f32(size)?;
+            let mut gpu_upstream = device.allocate_f32(size)?;
+            let mut gpu_output = device.allocate_f32(size)?;
+
+            device.upload(input_slice, &mut gpu_input)?;
+            device.upload(grads_slice, &mut gpu_upstream)?;
+
+            match device.richards_curve_backward_input(
+                &gpu_input,
+                &gpu_upstream,
+                &mut gpu_output,
+                &params,
+                size,
+            ) {
+                Ok(()) => {
+                    let mut result = vec![0.0f32; size];
+                    device.download(&gpu_output, &mut result)?;
+                    device.deallocate(gpu_input);
+                    device.deallocate(gpu_upstream);
+                    device.deallocate(gpu_output);
+                    drop(device);
+
+                    ndarray::Array2::from_shape_vec((rows, cols), result).map_err(|e| {
+                        crate::common::errors::ModelError::Backend {
+                            message: format!(
+                                "Failed to reshape RichardsGate GPU backward output: {}",
+                                e
+                            ),
+                        }
+                    })?
+                }
+                Err(_) => {
+                    // Kernel not available on this backend; fall back to CPU input gradients
+                    device.deallocate(gpu_input);
+                    device.deallocate(gpu_upstream);
+                    device.deallocate(gpu_output);
+                    drop(device);
+
+                    let (cpu_grads, _) = self.compute_gradients(input, output_grads);
+                    cpu_grads
+                }
+            }
+        };
+
+        // Parameter gradients are small (a few scalars) — keep on CPU
+        let (_, param_grads) = self.compute_gradients(input, output_grads);
+        self.apply_gradients(&param_grads, lr)?;
+
+        Ok(input_grads)
     }
 }
 

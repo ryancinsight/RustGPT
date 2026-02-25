@@ -113,6 +113,18 @@ impl Mamba2 {
         self.inner.forward_gpu(input)
     }
 
+    /// GPU-aware backward gradients for Mamba2.
+    ///
+    /// This path is strict: it errors when GPU backend is not selected.
+    #[inline]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> crate::common::errors::Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        self.inner.compute_gradients_gpu(input, output_grads)
+    }
+
     /// Set runtime compute backend.
     #[inline]
     pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
@@ -237,6 +249,10 @@ impl MoHMamba2 {
         &mut self,
         compute_backend: ComputeBackend,
     ) -> crate::common::errors::Result<()> {
+        if self.compute_backend == compute_backend {
+            return Ok(());
+        }
+
         if compute_backend.is_gpu() {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
@@ -320,20 +336,27 @@ impl MoHMamba2 {
                 backends.push(Arc::new(Mutex::new(backend)));
             }
             self.head_gpu_backends = Some(backends);
-        } else if let Some(backends) = self.head_gpu_backends.as_ref() {
-            for backend in backends {
-                let mut locked =
-                    backend
-                        .lock()
-                        .map_err(|_| crate::common::errors::ModelError::Backend {
-                            message: "Failed to acquire MoHMamba2 cached head GPU backend lock"
-                                .to_string(),
-                        })?;
-                locked.set_params(params.clone());
-            }
         }
 
-        Ok(self.head_gpu_backends.as_ref().cloned().unwrap_or_default())
+        let backends = self.head_gpu_backends.as_ref().cloned().unwrap_or_default();
+        for (h, backend) in backends.iter().enumerate().take(self.num_heads) {
+            let mut locked =
+                backend
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: format!(
+                            "Failed to acquire MoHMamba2 cached head GPU backend lock (head {})",
+                            h
+                        ),
+                    })?;
+            locked.set_params(params.clone());
+            let (a, b, c, d, h_init) = self.heads[h]
+                .inner
+                .kernel_matrices_for_ssm_backend(state_dim)?;
+            locked.set_mamba_kernel_matrices(a, b, c, d, h_init);
+        }
+
+        Ok(backends)
     }
 
     pub fn take_tau_metrics(&mut self) -> Option<(f32, f32)> {
@@ -423,6 +446,24 @@ impl MoHMamba2 {
         Ok(output)
     }
 
+    /// GPU-aware backward gradients for MoH Mamba2.
+    ///
+    /// This path is strict: it errors when GPU backend is not selected.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> crate::common::errors::Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "MoHMamba2::compute_gradients_gpu called without a GPU backend selected."
+                    .to_string(),
+            });
+        }
+        Ok(self.compute_gradients(input, output_grads))
+    }
+
     /// GPU forward on non-GPU builds (strict no-fallback error).
     #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
     pub fn forward_gpu(
@@ -431,6 +472,18 @@ impl MoHMamba2 {
     ) -> crate::common::errors::Result<Array2<f32>> {
         Err(crate::common::errors::ModelError::Backend {
             message: "MoHMamba2 GPU forward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+        })
+    }
+
+    /// GPU-aware backward gradients on non-GPU builds (strict error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn compute_gradients_gpu(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> crate::common::errors::Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "MoHMamba2 GPU backward requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
         })
     }
 
@@ -709,6 +762,7 @@ impl Layer for MoHMamba2 {
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let t = input.nrows();
         let d = input.ncols();
+        let use_gpu = self.compute_backend.is_gpu();
         if t == 0 || d == 0 || self.num_heads == 0 || self.head_dim == 0 {
             return (Array2::<f32>::zeros(input.raw_dim()), vec![]);
         }
@@ -757,7 +811,14 @@ impl Layer for MoHMamba2 {
                             let c1 = c0 + self.head_dim;
                             let x_view = input.slice(s![.., c0..c1]);
                             let mut head = self.heads[h].clone();
-                            head.forward_view(&x_view)
+                            if use_gpu {
+                                let x_owned = x_view.to_owned();
+                                head.forward_gpu(&x_owned).unwrap_or_else(|err| {
+                                    panic!("MoHMamba2 head {h} GPU forward failed: {err}")
+                                })
+                            } else {
+                                head.forward_view(&x_view)
+                            }
                         })
                         .collect();
                     &head_outputs_local
@@ -769,7 +830,14 @@ impl Layer for MoHMamba2 {
                         let c1 = c0 + self.head_dim;
                         let x_view = input.slice(s![.., c0..c1]);
                         let mut head = self.heads[h].clone();
-                        head.forward_view(&x_view)
+                        if use_gpu {
+                            let x_owned = x_view.to_owned();
+                            head.forward_gpu(&x_owned).unwrap_or_else(|err| {
+                                panic!("MoHMamba2 head {h} GPU forward failed: {err}")
+                            })
+                        } else {
+                            head.forward_view(&x_view)
+                        }
                     })
                     .collect();
                 &head_outputs_local
@@ -809,12 +877,21 @@ impl Layer for MoHMamba2 {
                     *sg = og * w;
                 });
 
-            let scaled_grads_view = scaled_grads.view();
-            let (dx_h, pgrads_h) = if can_use_cache {
+            let (dx_h, pgrads_h) = if use_gpu {
+                let x_owned = x_view.to_owned();
+                let mut head = self.heads[h].clone();
+                head.forward_gpu(&x_owned).unwrap_or_else(|err| {
+                    panic!("MoHMamba2 head {h} GPU forward failed during backward prep: {err}")
+                });
+                head.compute_gradients_gpu(&x_owned, &scaled_grads)
+                    .unwrap_or_else(|err| panic!("MoHMamba2 head {h} GPU backward failed: {err}"))
+            } else if can_use_cache {
+                let scaled_grads_view = scaled_grads.view();
                 self.heads[h].compute_gradients_view(&x_view, &scaled_grads_view)
             } else {
                 let mut head = self.heads[h].clone();
                 head.forward_view(&x_view);
+                let scaled_grads_view = scaled_grads.view();
                 head.compute_gradients_view(&x_view, &scaled_grads_view)
             };
             let mut gi_block = grad_input.slice_mut(s![.., c0..c1]);
@@ -1013,6 +1090,37 @@ mod tests {
                     err
                 );
             }
+        }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_moh_mamba2_reapply_gpu_backend_preserves_cached_head_backends() {
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let cfg = HeadSelectionStrategy::Fixed { num_active: 2 };
+        let mut moh = MoHMamba2::new(12, 3, &cfg);
+        moh.set_compute_backend_checked(backend)
+            .expect("resolved GPU backend should be accepted");
+        let first_backends = moh
+            .ensure_head_gpu_backends(6)
+            .expect("should initialize cached head GPU backends");
+
+        moh.set_compute_backend_checked(backend)
+            .expect("re-applying same backend should be idempotent");
+        let second_backends = moh
+            .ensure_head_gpu_backends(6)
+            .expect("cached head GPU backends should still be available");
+
+        assert_eq!(first_backends.len(), second_backends.len());
+        for (first, second) in first_backends.iter().zip(second_backends.iter()) {
+            assert!(Arc::ptr_eq(first, second));
         }
     }
 }

@@ -4,6 +4,11 @@ use std::sync::{Arc, RwLock};
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::compute::GpuComponent;
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::gpu_device_utils::resolve_or_create_gpu_device;
+
 use crate::{
     common::errors::Result,
     domain::attention::poly_attention::PolyAttention,
@@ -527,8 +532,69 @@ impl TransformerBlock {
     /// When a GPU backend is selected this eagerly validates shared component
     /// GPU readiness, surfacing unsupported GPU variants immediately.
     pub fn set_compute_backend_checked(&mut self, compute_backend: ComputeBackend) -> Result<()> {
+        self.set_compute_backend_checked_with_shared_device(compute_backend, None)
+    }
+
+    /// Set runtime compute backend with optional externally managed GPU device.
+    ///
+    /// When `shared_device` is provided and `compute_backend` is GPU, this block
+    /// reuses that device for attention/feedforward/norm components to reduce
+    /// per-block device initialization and memory pool fragmentation.
+    pub fn set_compute_backend_checked_with_shared_device(
+        &mut self,
+        compute_backend: ComputeBackend,
+        shared_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
+    ) -> Result<()> {
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        let _ = &shared_device;
+
         self.compute_backend = compute_backend;
         self.unified_workspace.set_compute_backend(compute_backend);
+
+        if compute_backend.is_gpu() {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                // Share one device across all shared components in this block to reduce
+                // duplicated initialization and memory pools.
+                let shared_device = if let Some(device) = shared_device {
+                    device
+                } else {
+                    let (device, _) = resolve_or_create_gpu_device(
+                        self.context.gpu_device(),
+                        compute_backend,
+                        "transformer",
+                    )?;
+                    device
+                };
+                self.context.set_gpu_device(shared_device.clone());
+                self.temporal_mixing.set_gpu_device(shared_device.clone());
+                self.feedforward.set_gpu_device(shared_device.clone());
+                self.pre_attention_norm
+                    .set_gpu_device(shared_device.clone());
+                if let Some(ar) = self.adaptive_residuals.as_mut() {
+                    ar.set_gpu_device(shared_device.clone());
+                }
+                self.pre_ffn_norm.set_gpu_device(shared_device);
+            }
+
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "TransformerBlock requested GPU backend '{}' but this binary was built without GPU features.",
+                        compute_backend.as_str()
+                    ),
+                });
+            }
+        } else {
+            self.context.clear_gpu_device();
+            self.pre_attention_norm.clear_gpu_device();
+            self.pre_ffn_norm.clear_gpu_device();
+            if let Some(ar) = self.adaptive_residuals.as_mut() {
+                ar.clear_gpu_device();
+            }
+        }
+
         self.temporal_mixing
             .set_compute_backend_checked(compute_backend)?;
         self.feedforward
@@ -549,6 +615,56 @@ impl TransformerBlock {
     #[inline]
     pub fn compute_backend(&self) -> ComputeBackend {
         self.compute_backend
+    }
+
+    /// Get the GPU device for this block, if one is set.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn get_gpu_device(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.context.gpu_device()
+    }
+
+    /// Get the GPU device for this block, if one is set (non-GPU feature stub).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn get_gpu_device(&self) -> Option<()> {
+        None
+    }
+
+    /// Get the configuration for this block.
+    pub fn config(&self) -> &TransformerBlockConfig {
+        &self.config
+    }
+
+    /// Forward pass that requires an already-selected GPU backend.
+    ///
+    /// This is a strict troubleshooting path: no CPU fallback is allowed.
+    pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "TransformerBlock::forward_gpu called without a GPU backend selected. \
+                          Call set_compute_backend_checked(...) or forward_gpu_auto_detect(...) first."
+                    .to_string(),
+            });
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "TransformerBlock::forward_gpu requires GPU features. Compile with \
+                          --features gpu-wgpu, gpu-cuda, or gpu-metal."
+                    .to_string(),
+            });
+        }
+
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            Ok(self.forward(_input))
+        }
+    }
+
+    /// Strict GPU forward with automatic backend detection (no fallback).
+    pub fn forward_gpu_auto_detect(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
+        self.enable_gpu_auto_detect()?;
+        self.forward_gpu(input)
     }
 
     #[inline]
@@ -916,16 +1032,12 @@ impl Layer for TransformerBlock {
 
         // Temporal mixing forward into workspace.
         {
-            let norm1_out = workspace
-                .norm1_out()
-                .expect("norm1_out workspace buffer must be allocated")
-                .to_owned();
-            let temporal_out_buf = workspace
-                .temporal_out_mut()
-                .expect("temporal_out workspace buffer must be allocated");
+            let (norm1_out, temporal_out_buf) = workspace
+                .norm1_out_and_temporal_out_mut()
+                .expect("norm1_out and temporal_out workspace buffers must be allocated");
             self.temporal_mixing
                 .forward_with_titan_fusion_default_into(
-                    &norm1_out,
+                    norm1_out,
                     temporal_out_buf,
                     &self.config.titan_memory,
                     &mut self.titan_memory_workspace,
@@ -974,19 +1086,14 @@ impl Layer for TransformerBlock {
                 .expect("norm2_out workspace buffer must be allocated");
             self.pre_ffn_norm.normalize_into(&residual1, norm2_out_buf);
         }
-        let norm2_out = workspace
-            .norm2_out()
-            .expect("norm2_out workspace buffer must be allocated")
-            .to_owned();
-
         // Feedforward with residual connection into workspace.
         {
-            let ffn_out_buf = workspace
-                .ffn_out_mut()
-                .expect("ffn_out workspace buffer must be allocated");
+            let (norm2_out, ffn_out_buf) = workspace
+                .norm2_out_and_ffn_out_mut()
+                .expect("norm2_out and ffn_out workspace buffers must be allocated");
             self.feedforward
                 .forward_with_token_head_activity_into(
-                    &norm2_out,
+                    norm2_out,
                     ffn_out_buf,
                     Some(head_activity_ratio),
                     head_activity_vec,
@@ -1000,6 +1107,10 @@ impl Layer for TransformerBlock {
             .ffn_out()
             .expect("ffn_out workspace buffer must be allocated")
             .to_owned();
+        let norm2_out_cache = workspace
+            .norm2_out()
+            .expect("norm2_out workspace buffer must be allocated")
+            .clone();
 
         // Cache FFN output *before* the residual addition.
         let ffn_out_arc = if let Some(mut arc) = reuse_ffn_out_cache {
@@ -1037,7 +1148,7 @@ impl Layer for TransformerBlock {
             ),
             mix_out: Arc::new(mix_out.clone()),
             residual1: Arc::new(residual1),
-            norm2_out: Arc::new(norm2_out.clone()),
+            norm2_out: Arc::new(norm2_out_cache),
             ffn_out: ffn_out_arc,
         });
         self.unified_workspace = workspace;
@@ -2105,5 +2216,97 @@ mod tests {
             block.compute_backend(),
             crate::domain::compute_backend::ComputeBackend::Cpu
         );
+    }
+
+    #[test]
+    fn test_transformer_block_forward_gpu_requires_gpu_backend_selection() {
+        let config = ModelConfig::transformer(32, 64, 1, 64, None, Some(4));
+        let mut block = TransformerBlock::from_model_config(&config, 0);
+        let input = Array2::zeros((2, 32));
+
+        let err = block
+            .forward_gpu(&input)
+            .expect_err("forward_gpu should fail when backend is CPU");
+        assert!(
+            err.to_string()
+                .contains("forward_gpu called without a GPU backend selected"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_transformer_block_gpu_backend_shares_component_device() {
+        use crate::domain::compute::GpuComponent;
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let mut config = ModelConfig::transformer(32, 64, 1, 64, None, Some(4));
+        config.temporal_mixing = TemporalMixingType::Attention;
+        let mut block = TransformerBlock::from_model_config(&config, 0);
+        block
+            .set_compute_backend_checked(backend)
+            .expect("GPU backend should be accepted when resolved");
+
+        let temporal_device = block
+            .temporal_mixing
+            .gpu_device()
+            .expect("attention temporal mixer should have a GPU device");
+        let feedforward_device = block
+            .feedforward
+            .gpu_device()
+            .expect("feedforward should have a GPU device");
+
+        assert!(Arc::ptr_eq(&temporal_device, &feedforward_device));
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_transformer_block_gpu_backend_reuses_existing_shared_device() {
+        use crate::domain::compute::GpuComponent;
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let mut config = ModelConfig::transformer(32, 64, 1, 64, None, Some(4));
+        config.temporal_mixing = TemporalMixingType::Attention;
+        let mut block = TransformerBlock::from_model_config(&config, 0);
+        block
+            .set_compute_backend_checked(backend)
+            .expect("GPU backend should be accepted when resolved");
+        let initial_device = block
+            .context
+            .gpu_device()
+            .expect("context should have a GPU device after setup");
+
+        block
+            .set_compute_backend_checked(backend)
+            .expect("re-applying same backend should reuse shared device");
+        let reused_device = block
+            .context
+            .gpu_device()
+            .expect("context should still have a GPU device");
+        let temporal_device = block
+            .temporal_mixing
+            .gpu_device()
+            .expect("temporal mixer should still have a GPU device");
+        let feedforward_device = block
+            .feedforward
+            .gpu_device()
+            .expect("feedforward should still have a GPU device");
+
+        assert!(Arc::ptr_eq(&initial_device, &reused_device));
+        assert!(Arc::ptr_eq(&reused_device, &temporal_device));
+        assert!(Arc::ptr_eq(&reused_device, &feedforward_device));
     }
 }

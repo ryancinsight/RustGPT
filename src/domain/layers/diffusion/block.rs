@@ -8,6 +8,11 @@ use ndarray::{Array1, Array2, parallel::prelude::*};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::compute::GpuComponent;
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::gpu_device_utils::resolve_or_create_gpu_device;
+
 use crate::{
     common::{errors::Result, rng::get_rng},
     domain::{
@@ -836,6 +841,18 @@ impl DiffusionBlock {
         }
     }
 
+    /// Get the GPU device for this block, if one is set.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn get_gpu_device(&self) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.context.gpu_device()
+    }
+
+    /// Get the GPU device for this block, if one is set (non-GPU feature stub).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn get_gpu_device(&self) -> Option<()> {
+        None
+    }
+
     /// Set runtime compute backend for this block and shared components.
     pub fn set_compute_backend(&mut self, compute_backend: ComputeBackend) {
         self.set_compute_backend_checked(compute_backend)
@@ -853,8 +870,72 @@ impl DiffusionBlock {
     /// When a GPU backend is selected this eagerly validates shared component
     /// GPU readiness, surfacing unsupported GPU variants immediately.
     pub fn set_compute_backend_checked(&mut self, compute_backend: ComputeBackend) -> Result<()> {
+        self.set_compute_backend_checked_with_shared_device(compute_backend, None)
+    }
+
+    /// Set runtime compute backend with optional externally managed GPU device.
+    ///
+    /// When `shared_device` is provided and `compute_backend` is GPU, this block
+    /// reuses that device for attention/feedforward/norm components to reduce
+    /// per-block device initialization and memory pool fragmentation.
+    pub fn set_compute_backend_checked_with_shared_device(
+        &mut self,
+        compute_backend: ComputeBackend,
+        shared_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
+    ) -> Result<()> {
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        let _ = &shared_device;
+
         self.compute_backend = compute_backend;
         self.unified_workspace.set_compute_backend(compute_backend);
+
+        if compute_backend.is_gpu() {
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            {
+                // Share one detected device across diffusion shared components.
+                let shared_device = if let Some(device) = shared_device {
+                    device
+                } else {
+                    let (device, _) = resolve_or_create_gpu_device(
+                        self.context.gpu_device(),
+                        compute_backend,
+                        "diffusion",
+                    )?;
+                    device
+                };
+                self.context.set_gpu_device(shared_device.clone());
+                self.temporal_mixing.set_gpu_device(shared_device.clone());
+                self.feedforward.set_gpu_device(shared_device.clone());
+                self.film_modulation.set_gpu_device(shared_device.clone());
+                self.time_conditioner.set_gpu_device(shared_device.clone());
+                self.pre_attention_norm
+                    .set_gpu_device(shared_device.clone());
+                if let Some(ar) = self.adaptive_residuals.as_mut() {
+                    ar.set_gpu_device(shared_device.clone());
+                }
+                self.pre_ffn_norm.set_gpu_device(shared_device);
+            }
+
+            #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+            {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "DiffusionBlock requested GPU backend '{}' but this binary was built without GPU features.",
+                        compute_backend.as_str()
+                    ),
+                });
+            }
+        } else {
+            self.context.clear_gpu_device();
+            self.film_modulation.clear_gpu_device();
+            self.time_conditioner.clear_gpu_device();
+            self.pre_attention_norm.clear_gpu_device();
+            self.pre_ffn_norm.clear_gpu_device();
+            if let Some(ar) = self.adaptive_residuals.as_mut() {
+                ar.clear_gpu_device();
+            }
+        }
+
         self.temporal_mixing
             .set_compute_backend_checked(compute_backend)?;
         self.feedforward
@@ -875,6 +956,62 @@ impl DiffusionBlock {
     #[inline]
     pub fn compute_backend(&self) -> ComputeBackend {
         self.compute_backend
+    }
+
+    /// Forward pass that requires an already-selected GPU backend.
+    ///
+    /// This is a strict troubleshooting path: no CPU fallback is allowed.
+    pub fn forward_gpu_with_timestep(
+        &mut self,
+        _x_t: &Array2<f32>,
+        _t: usize,
+    ) -> Result<Array2<f32>> {
+        if !self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "DiffusionBlock::forward_gpu_with_timestep called without a GPU backend selected. \
+                          Call set_compute_backend_checked(...) or forward_gpu_auto_detect_with_timestep(...) first."
+                    .to_string(),
+            });
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        {
+            return Err(crate::common::errors::ModelError::Backend {
+                message:
+                    "DiffusionBlock::forward_gpu_with_timestep requires GPU features. Compile with \
+                          --features gpu-wgpu, gpu-cuda, or gpu-metal."
+                        .to_string(),
+            });
+        }
+
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            Ok(self.forward_with_timestep(_x_t, _t))
+        }
+    }
+
+    /// Forward pass that requires an already-selected GPU backend using `current_timestep`.
+    #[inline]
+    pub fn forward_gpu(&mut self, x_t: &Array2<f32>) -> Result<Array2<f32>> {
+        self.forward_gpu_with_timestep(x_t, self.current_timestep)
+    }
+
+    /// Strict GPU forward with automatic backend detection (no fallback).
+    #[inline]
+    pub fn forward_gpu_auto_detect_with_timestep(
+        &mut self,
+        x_t: &Array2<f32>,
+        t: usize,
+    ) -> Result<Array2<f32>> {
+        self.enable_gpu_auto_detect()?;
+        self.forward_gpu_with_timestep(x_t, t)
+    }
+
+    /// Strict GPU forward with automatic backend detection using `current_timestep`.
+    #[inline]
+    pub fn forward_gpu_auto_detect(&mut self, x_t: &Array2<f32>) -> Result<Array2<f32>> {
+        self.enable_gpu_auto_detect()?;
+        self.forward_gpu(x_t)
     }
 
     pub fn min_snr_weight(&self, t: usize, gamma: f32) -> f32 {
@@ -1068,24 +1205,23 @@ impl DiffusionBlock {
             self.pre_attention_norm
                 .normalize_into(input_used_arc.as_ref(), norm1_out_buf);
         }
+        // FiLM attention conditioning into reusable workspace buffer.
+        {
+            let (norm1_out, norm1_mod_buf) = self
+                .unified_workspace
+                .norm1_out_and_ffn_intermediate_mut()
+                .expect("norm1_out and ffn_intermediate workspace buffers must be allocated");
+            self.film_modulation
+                .apply_attn_conditioning_into(norm1_out, norm1_mod_buf)
+                .unwrap_or_else(|err| {
+                    panic!("DiffusionBlock FiLM attn conditioning failed: {err}")
+                });
+        }
         let norm1_out = self
             .unified_workspace
             .norm1_out()
             .expect("norm1_out workspace buffer must be allocated")
             .clone();
-
-        // FiLM attention conditioning into reusable workspace buffer.
-        {
-            let norm1_mod_buf = self
-                .unified_workspace
-                .ffn_intermediate_mut()
-                .expect("ffn_intermediate workspace buffer must be allocated");
-            self.film_modulation
-                .apply_attn_conditioning_into(&norm1_out, norm1_mod_buf)
-                .unwrap_or_else(|err| {
-                    panic!("DiffusionBlock FiLM attn conditioning failed: {err}")
-                });
-        }
         let norm1_mod = self
             .unified_workspace
             .ffn_intermediate()
@@ -1161,12 +1297,6 @@ impl DiffusionBlock {
                 .expect("norm2_out workspace buffer must be allocated");
             self.pre_ffn_norm.normalize_into(&residual1, norm2_out_buf);
         }
-        let norm2_out = self
-            .unified_workspace
-            .norm2_out()
-            .expect("norm2_out workspace buffer must be allocated")
-            .clone();
-
         // FFN Modulation
         // We can use the new `forward_with_film` in `SharedFeedforward`!
         // But first let's see if we want to modulate *before* passing or pass parameters.
@@ -1180,14 +1310,19 @@ impl DiffusionBlock {
         // To be consistent, let's do manual modulation here using `SharedFilmModulation` helper, then standard forward.
 
         {
-            let norm2_mod_buf = self
+            let (norm2_out, norm2_mod_buf) = self
                 .unified_workspace
-                .residual1_mut()
-                .expect("residual1 workspace buffer must be allocated");
+                .norm2_out_and_residual1_mut()
+                .expect("norm2_out and residual1 workspace buffers must be allocated");
             self.film_modulation
-                .apply_ffn_conditioning_into(&norm2_out, norm2_mod_buf)
+                .apply_ffn_conditioning_into(norm2_out, norm2_mod_buf)
                 .unwrap_or_else(|err| panic!("DiffusionBlock FiLM ffn conditioning failed: {err}"));
         }
+        let norm2_out = self
+            .unified_workspace
+            .norm2_out()
+            .expect("norm2_out workspace buffer must be allocated")
+            .clone();
         let norm2_mod = self
             .unified_workspace
             .residual1()
@@ -1195,13 +1330,13 @@ impl DiffusionBlock {
             .clone();
 
         {
-            let ffn_out_buf = self
+            let (norm2_mod_in, ffn_out_buf) = self
                 .unified_workspace
-                .ffn_out_mut()
-                .expect("ffn_out workspace buffer must be allocated");
+                .residual1_and_ffn_out_mut()
+                .expect("residual1 and ffn_out workspace buffers must be allocated");
             self.feedforward
                 .forward_with_token_head_activity_into(
-                    &norm2_mod,
+                    norm2_mod_in,
                     ffn_out_buf,
                     Some(head_activity_ratio),
                     head_activity_vec,
@@ -1853,9 +1988,35 @@ impl Layer for DiffusionBlock {
             let (ffn_input_grad_mod, ffn_param_grads) =
                 self.feedforward.backward(norm2_mod, &safe_scaled_grads);
 
-            let (norm2_grad, grad_gamma_ffn_1d, grad_beta_ffn_1d) = self
-                .film_modulation
-                .film_backward(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec);
+            let (norm2_grad, grad_gamma_ffn_1d, grad_beta_ffn_1d) = {
+                #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+                {
+                    if self.compute_backend.is_gpu() {
+                        self.film_modulation
+                            .film_backward_gpu(&ffn_input_grad_mod, norm2_out, gamma_ffn_vec)
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "DiffusionBlock FiLM FFN GPU backward failed (GPU attached, no fallback): {}",
+                                    err
+                                )
+                            })
+                    } else {
+                        self.film_modulation.film_backward(
+                            &ffn_input_grad_mod,
+                            norm2_out,
+                            gamma_ffn_vec,
+                        )
+                    }
+                }
+                #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+                {
+                    self.film_modulation.film_backward(
+                        &ffn_input_grad_mod,
+                        norm2_out,
+                        gamma_ffn_vec,
+                    )
+                }
+            };
 
             let (residual1_from_ffn, pre_ffn_param_grads) =
                 self.pre_ffn_norm.compute_gradients(residual1, &norm2_grad);
@@ -1878,9 +2039,35 @@ impl Layer for DiffusionBlock {
                     );
             }
 
-            let (norm1_grad, grad_gamma_attn, grad_beta_attn) =
-                self.film_modulation
-                    .film_backward(&attn_input_grad_mod, norm1_out, gamma_attn_vec);
+            let (norm1_grad, grad_gamma_attn, grad_beta_attn) = {
+                #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+                {
+                    if self.compute_backend.is_gpu() {
+                        self.film_modulation
+                            .film_backward_gpu(&attn_input_grad_mod, norm1_out, gamma_attn_vec)
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "DiffusionBlock FiLM attention GPU backward failed (GPU attached, no fallback): {}",
+                                    err
+                                )
+                            })
+                    } else {
+                        self.film_modulation.film_backward(
+                            &attn_input_grad_mod,
+                            norm1_out,
+                            gamma_attn_vec,
+                        )
+                    }
+                }
+                #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+                {
+                    self.film_modulation.film_backward(
+                        &attn_input_grad_mod,
+                        norm1_out,
+                        gamma_attn_vec,
+                    )
+                }
+            };
 
             let (input_from_norm, pre_attn_param_grads) = self
                 .pre_attention_norm
@@ -1889,39 +2076,11 @@ impl Layer for DiffusionBlock {
             // Gradients w.r.t. the mixed input used by this block: dX'.
             let final_input_used_grads = &residual1_total_grads + &input_from_norm;
 
-            let mut similarity_strength_grad = Array2::zeros((1, 1));
-            if let Some(ctx) = self.context.incoming_context.as_ref()
-                && ctx.nrows() == self.config.embed_dim
-                && ctx.ncols() == self.config.embed_dim
-            {
-                let d = (self.config.embed_dim.max(1)) as f32;
-                let mixed = input_original.dot(ctx);
-                let mut acc = 0.0f64;
-                for (&g, &m) in final_input_used_grads.iter().zip(mixed.iter()) {
-                    let gs: f64 = if g.is_finite() { g as f64 } else { 0.0 };
-                    let ms: f64 = if m.is_finite() { m as f64 } else { 0.0 };
-                    acc += gs * ms;
-                }
-                similarity_strength_grad[[0, 0]] = (acc as f32) / d;
-            }
-
-            let mut final_input_grads = final_input_used_grads;
-            if let Some(ctx) = self.context.incoming_context.as_ref()
-                && ctx.nrows() == self.config.embed_dim
-                && ctx.ncols() == self.config.embed_dim
-            {
-                let d = (self.config.embed_dim.max(1)) as f32;
-                let s = self.context.similarity_context_strength[[0, 0]];
-                let s = if s.is_finite() { s } else { 0.0 };
-                let k = s / d;
-                if k != 0.0 {
-                    let corr = final_input_grads.dot(&ctx.t());
-                    final_input_grads.zip_mut_with(&corr, |g, &c| {
-                        let cs = if c.is_finite() { c } else { 0.0 };
-                        *g += k * cs;
-                    });
-                }
-            }
+            // Reuse shared context-gradient implementation so Diffusion and Transformer
+            // stay behaviorally aligned, including GPU-aware context GEMMs.
+            let (mut final_input_grads, similarity_strength_grad) = self
+                .context
+                .compute_gradients(input_original, &final_input_used_grads);
 
             if let Some(extra_scale) = input_extra_scale {
                 final_input_grads += &(output_grads * extra_scale);
@@ -1962,9 +2121,29 @@ impl Layer for DiffusionBlock {
             );
 
             let h_mat = h_vec.view().to_shape((1, h_vec.len())).unwrap().to_owned();
-            let (_, time_grads) =
-                self.time_conditioner
-                    .backward(&grad_gamma_beta_1d, &h_mat, time_embed);
+            let (_, time_grads) = {
+                #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+                {
+                    if self.compute_backend.is_gpu() {
+                        self.time_conditioner
+                            .backward_gpu(&grad_gamma_beta_1d, &h_mat, time_embed)
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "DiffusionBlock time-conditioner GPU backward failed (GPU attached, no fallback): {}",
+                                    err
+                                )
+                            })
+                    } else {
+                        self.time_conditioner
+                            .backward(&grad_gamma_beta_1d, &h_mat, time_embed)
+                    }
+                }
+                #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+                {
+                    self.time_conditioner
+                        .backward(&grad_gamma_beta_1d, &h_mat, time_embed)
+                }
+            };
             all_param_grads.extend(time_grads);
 
             let adaptive_param_grads = if let Some(residuals) = self.adaptive_residuals.as_ref() {
@@ -2562,6 +2741,93 @@ mod tests {
             block.compute_backend(),
             crate::domain::compute_backend::ComputeBackend::Cpu
         );
+    }
+
+    #[test]
+    fn test_diffusion_block_forward_gpu_requires_gpu_backend_selection() {
+        let mut block = make_test_diffusion_block(DiffusionPredictionTarget::Epsilon);
+        let input = Array2::zeros((2, block.config.embed_dim));
+
+        let err = block
+            .forward_gpu_with_timestep(&input, 0)
+            .expect_err("forward_gpu_with_timestep should fail when backend is CPU");
+        assert!(
+            err.to_string()
+                .contains("forward_gpu_with_timestep called without a GPU backend selected"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_diffusion_block_gpu_backend_shares_component_device() {
+        use crate::domain::compute::GpuComponent;
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let mut block = make_test_diffusion_block(DiffusionPredictionTarget::Epsilon);
+        block
+            .set_compute_backend_checked(backend)
+            .expect("GPU backend should be accepted when resolved");
+
+        let temporal_device = block
+            .temporal_mixing
+            .gpu_device()
+            .expect("attention temporal mixer should have a GPU device");
+        let feedforward_device = block
+            .feedforward
+            .gpu_device()
+            .expect("feedforward should have a GPU device");
+
+        assert!(Arc::ptr_eq(&temporal_device, &feedforward_device));
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_diffusion_block_gpu_backend_reuses_existing_shared_device() {
+        use crate::domain::compute::GpuComponent;
+        use std::sync::Arc;
+
+        let backend =
+            match crate::domain::compute_backend::resolve_compute_backend_strict_auto_gpu() {
+                Ok(backend) => backend,
+                Err(_) => return,
+            };
+
+        let mut block = make_test_diffusion_block(DiffusionPredictionTarget::Epsilon);
+        block
+            .set_compute_backend_checked(backend)
+            .expect("GPU backend should be accepted when resolved");
+        let initial_device = block
+            .context
+            .gpu_device()
+            .expect("context should have a GPU device after setup");
+
+        block
+            .set_compute_backend_checked(backend)
+            .expect("re-applying same backend should reuse shared device");
+        let reused_device = block
+            .context
+            .gpu_device()
+            .expect("context should still have a GPU device");
+        let temporal_device = block
+            .temporal_mixing
+            .gpu_device()
+            .expect("temporal mixer should still have a GPU device");
+        let feedforward_device = block
+            .feedforward
+            .gpu_device()
+            .expect("feedforward should still have a GPU device");
+
+        assert!(Arc::ptr_eq(&initial_device, &reused_device));
+        assert!(Arc::ptr_eq(&reused_device, &temporal_device));
+        assert!(Arc::ptr_eq(&reused_device, &feedforward_device));
     }
 }
 

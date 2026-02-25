@@ -108,6 +108,17 @@ impl CrossArchitectureBufferPool {
         })
     }
 
+    /// Create a new cross-architecture buffer pool with strict Intel NPU detection.
+    pub fn auto_detect_npu() -> Result<Self> {
+        let pool = SharedGpuMemoryPool::auto_detect_npu()?;
+        Ok(Self {
+            pool: Arc::new(RwLock::new(pool)),
+            capacity: (0, 0, 0),
+            architectures: ArchitectureFlags::default(),
+            stats: CrossPoolStats::default(),
+        })
+    }
+
     /// Create with specific backend.
     pub fn with_backend(backend: crate::domain::compute_backend::ComputeBackend) -> Result<Self> {
         let pool = SharedGpuMemoryPool::with_backend(backend)?;
@@ -296,6 +307,12 @@ impl CrossArchitectureBufferPool {
     pub fn auto_detect() -> Result<Self> {
         Err(ModelError::Backend {
             message: "Cross-architecture buffer pool requires GPU features".to_string(),
+        })
+    }
+
+    pub fn auto_detect_npu() -> Result<Self> {
+        Err(ModelError::Backend {
+            message: "Cross-architecture NPU pool requires --features gpu-wgpu".to_string(),
         })
     }
 }

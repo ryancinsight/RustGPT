@@ -58,7 +58,15 @@ impl GpuFeedforwardHelpers {
 
     /// Compute GLU-style feedforward on GPU with gating
     ///
-    /// Computes: output = gate(input @ W_gate) * activation(input @ W_up) @ W_down
+    /// Computes: output = sigmoid(input @ W_gate) * activation(input @ W_up) @ W_down
+    ///
+    /// This is a fused kernel that computes all operations on GPU:
+    /// 1. gate_proj = input @ W_gate
+    /// 2. up_proj = input @ W_up
+    /// 3. gate = sigmoid(gate_proj)
+    /// 4. up = activation(up_proj)
+    /// 5. hidden = gate * up (element-wise)
+    /// 6. output = hidden @ W_down
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     pub fn glu_feedforward(
         backend: &mut UnifiedGpuBackend,
@@ -68,22 +76,8 @@ impl GpuFeedforwardHelpers {
         w_down: &Array2<f32>,
         activation: GpuActivation,
     ) -> Result<Array2<f32>> {
-        // GLU computation:
-        // 1. gate = sigmoid(input @ w_gate)
-        // 2. up = activation(input @ w_up)
-        // 3. hidden = gate * up
-        // 4. output = hidden @ w_down
-
-        // For now, use the standard feedforward path
-        // TODO: Implement fused GLU kernel
-        let (batch_size, embed_dim) = input.dim();
-        let hidden_dim = w_gate.ncols();
-
-        // Create dummy biases (zero) for the standard path
-        let b_zero = ndarray::Array1::zeros(hidden_dim);
-        let b_out = ndarray::Array1::zeros(embed_dim);
-
-        backend.forward_feedforward(input, w_gate, &b_zero, w_down, &b_out, activation)
+        // Use the fused GLU kernel for optimal GPU performance
+        backend.forward_glu(input, w_gate, w_up, w_down, activation)
     }
 
     /// Compute RichardsGLU feedforward using the consolidated GPU executor.

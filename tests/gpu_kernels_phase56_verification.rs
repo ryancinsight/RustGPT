@@ -229,6 +229,7 @@ mod gpu_kernel_tests {
         // Enable GPU auto-detect
         #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
         {
+            use llm::domain::compute::GpuComponent;
             match ctx.enable_gpu_auto_detect() {
                 Ok(_) => {
                     println!("✅ GPU auto-detect enabled");

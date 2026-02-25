@@ -15,6 +15,8 @@ use crate::domain::compute::GpuDevice;
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::GpuComponent;
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::gpu_device_utils::gpu_gemm_with_attached_device;
 
 /// Shared attention context component
 ///
@@ -69,6 +71,12 @@ impl Default for SharedAttentionContext {
 }
 
 impl SharedAttentionContext {
+    /// Clear attached GPU device so context operations run CPU-only.
+    #[inline]
+    pub fn clear_gpu_device(&mut self) {
+        self.gpu_device = None;
+    }
+
     /// Get outgoing similarity context if allocated
     pub fn get_outgoing_context(&self) -> Option<&Array2<f32>> {
         self.outgoing_context.as_ref()
@@ -379,17 +387,14 @@ impl SharedAttentionContext {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
                 if self.is_gpu_ready() {
-                    // Try GPU path, but fall back to CPU on error
-                    if let Ok(mut backend) = crate::domain::layers::components::unified_gpu_backend::UnifiedGpuBackend::auto_detect() {
-                        match self.apply_incoming_context_gpu(input, &mut backend) {
-                            Ok(result) => return Cow::Owned(result),
-                            Err(_) => {} // Fall through to CPU path
-                        }
-                    }
+                    let result = self.apply_context_gpu_strict(input).unwrap_or_else(|err| {
+                        panic!("SharedAttentionContext GPU apply_context failed: {err}")
+                    });
+                    return Cow::Owned(result);
                 }
             }
 
-            // CPU path (fallback)
+            // CPU path
             self.apply_context_cpu(input)
         } else {
             Cow::Borrowed(input)
@@ -428,7 +433,7 @@ impl SharedAttentionContext {
     /// This variant avoids allocating intermediate arrays for hot-path optimization.
     /// Returns Ok(true) if transformation was applied, Ok(false) if output equals input.
     ///
-    /// GPU acceleration: Uses GPU backend if available with fallback to CPU path.
+    /// GPU acceleration: Uses attached GPU backend in strict mode when available.
     #[inline]
     pub fn apply_context_into(
         &self,
@@ -460,20 +465,13 @@ impl SharedAttentionContext {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
                 if self.is_gpu_ready() {
-                    // Try GPU path, but fall back to CPU on error
-                    if let Ok(mut backend) = crate::domain::layers::components::unified_gpu_backend::UnifiedGpuBackend::auto_detect() {
-                        match self.apply_incoming_context_gpu(input, &mut backend) {
-                            Ok(result) => {
-                                output.assign(&result);
-                                return Ok(true);
-                            }
-                            Err(_) => {} // Fall through to CPU path
-                        }
-                    }
+                    let result = self.apply_context_gpu_strict(input)?;
+                    output.assign(&result);
+                    return Ok(true);
                 }
             }
 
-            // CPU path (fallback)
+            // CPU path
             self.apply_context_into_cpu(input, output)
         } else {
             output.assign(input);
@@ -514,6 +512,42 @@ impl SharedAttentionContext {
         }
     }
 
+    /// Strict GPU dispatch for context application using the attached GPU device.
+    ///
+    /// This path never auto-detects a new backend and never falls back to CPU once
+    /// a GPU device is attached to this component.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn apply_context_gpu_strict(&self, input: &Array2<f32>) -> Result<Array2<f32>> {
+        let device_arc = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ModelError::Backend {
+                message: "SharedAttentionContext GPU path requested without attached device"
+                    .to_string(),
+            })?;
+
+        let mut device = device_arc.lock().map_err(|_| ModelError::Backend {
+            message: "Failed to acquire SharedAttentionContext GPU device lock".to_string(),
+        })?;
+
+        let mut workspace = crate::domain::layers::components::unified_layer_workspace::UnifiedLayerWorkspace::new_with_backend(
+            device.backend(),
+        );
+        workspace.set_context_buffer_enabled(true);
+
+        let result = self
+            .apply_context_gpu_with_workspace(input, &mut workspace, &mut device)
+            .map_err(|e| ModelError::Backend {
+                message: format!(
+                    "SharedAttentionContext GPU workspace dispatch failed: {}",
+                    e
+                ),
+            })?;
+
+        workspace.clear_gpu_buffers_with_device(&mut device);
+        Ok(result)
+    }
+
     /// Compute gradients for similarity context
     ///
     /// Returns (final_input_grads, similarity_strength_grad)
@@ -522,6 +556,15 @@ impl SharedAttentionContext {
         input_original: &Array2<f32>,
         final_input_used_grads: &Array2<f32>,
     ) -> (Array2<f32>, Array2<f32>) {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.is_gpu_ready() {
+            return self
+                .compute_gradients_gpu(input_original, final_input_used_grads)
+                .unwrap_or_else(|err| {
+                    panic!("SharedAttentionContext GPU compute_gradients failed: {err}")
+                });
+        }
+
         let mut similarity_strength_grad = Array2::zeros((1, 1));
         let mut final_input_grads = final_input_used_grads.clone();
 
@@ -568,6 +611,88 @@ impl SharedAttentionContext {
         }
 
         (final_input_grads, similarity_strength_grad)
+    }
+
+    /// GPU-aware gradient computation for similarity-context mixing.
+    ///
+    /// Uses attached GPU device for the two dense matrix multiplications in this
+    /// path while preserving the existing analytical gradient behavior.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input_original: &Array2<f32>,
+        final_input_used_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Array2<f32>)> {
+        let mut similarity_strength_grad = Array2::zeros((1, 1));
+        let mut final_input_grads = final_input_used_grads.clone();
+
+        let Some(ctx) = &self.incoming_context else {
+            return Ok((final_input_grads, similarity_strength_grad));
+        };
+
+        let embed_dim = input_original.ncols();
+        if embed_dim == 0 || ctx.nrows() != embed_dim || ctx.ncols() != embed_dim {
+            return Ok((final_input_grads, similarity_strength_grad));
+        }
+
+        let device_arc = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ModelError::Backend {
+                message:
+                    "SharedAttentionContext::compute_gradients_gpu requires an attached GPU device"
+                        .to_string(),
+            })?;
+
+        let d = (embed_dim.max(1)) as f32;
+
+        let mixed = gpu_gemm_with_attached_device(
+            device_arc,
+            input_original,
+            ctx,
+            input_original.nrows(),
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+            "SharedAttentionContext::compute_gradients mixed",
+        )?;
+
+        let mut acc = 0.0f64;
+        Zip::from(final_input_used_grads)
+            .and(&mixed)
+            .for_each(|&g, &m| {
+                let gs = if g.is_finite() { g as f64 } else { 0.0 };
+                let ms = if m.is_finite() { m as f64 } else { 0.0 };
+                acc += gs * ms;
+            });
+        similarity_strength_grad[[0, 0]] = (acc as f32) / d;
+
+        let s = self.get_strength();
+        let s = if s.is_finite() { s } else { 0.0 };
+        let k = s / d;
+        if k != 0.0 {
+            let corr = gpu_gemm_with_attached_device(
+                device_arc,
+                &final_input_grads,
+                ctx,
+                final_input_grads.nrows(),
+                embed_dim,
+                embed_dim,
+                false,
+                true,
+                "SharedAttentionContext::compute_gradients corr",
+            )?;
+
+            Zip::from(&mut final_input_grads)
+                .and(&corr)
+                .for_each(|g, &c| {
+                    let cs = if c.is_finite() { c } else { 0.0 };
+                    *g += k * cs;
+                });
+        }
+
+        Ok((final_input_grads, similarity_strength_grad))
     }
 
     /// Update outgoing context in step mode (optimized for 1D inference)

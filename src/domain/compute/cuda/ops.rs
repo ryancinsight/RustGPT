@@ -210,13 +210,13 @@ impl GpuMatrixOps for CudaMatrixOps {
         })
     }
 
-    fn sum(&self, _pool: &dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
+    fn sum(&mut self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
         Err(ModelError::Backend {
             message: format!("CUDA sum not yet implemented for size {}", size),
         })
     }
 
-    fn mean(&self, _pool: &dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
+    fn mean(&mut self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, size: usize) -> Result<f32> {
         Err(ModelError::Backend {
             message: format!("CUDA mean not yet implemented for size {}", size),
         })
@@ -353,6 +353,23 @@ impl GpuMatrixOps for CudaMatrixOps {
         Err(ModelError::Backend {
             message: format!(
                 "CUDA copy_within_device not yet implemented for size {}",
+                size
+            ),
+        })
+    }
+
+    fn copy_within_device_range(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _src: &GpuBuffer,
+        _src_offset: usize,
+        _dst: &mut GpuBuffer,
+        _dst_offset: usize,
+        size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: format!(
+                "CUDA copy_within_device_range not yet implemented for size {}",
                 size
             ),
         })

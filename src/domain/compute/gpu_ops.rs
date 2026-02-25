@@ -4,7 +4,7 @@
 //! Supports CUDA (cuBLAS), Metal (Metal Performance Shaders), and Vulkan compute.
 
 use super::gpu_memory::{GpuBuffer, GpuMemoryPool};
-use crate::common::errors::Result;
+use crate::common::errors::{ModelError, Result};
 
 /// Parameters for Richards Curve calculation
 ///
@@ -39,6 +39,24 @@ pub struct Scalar(pub f32);
 /// Abstracts the differences between CUDA (cuBLAS), Metal (MPS), and Vulkan compute shaders.
 /// Implementations must ensure numerical accuracy (target: ε ≤ 1e-4 vs CPU reference).
 pub trait GpuMatrixOps: Send + Sync {
+    // ─────────────────────────────────────────────────────────────────
+    // Command Batching / Deferred Submission
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Begin deferred recording mode.
+    ///
+    /// After calling this, dispatch calls should be recorded into an
+    /// internal command buffer rather than submitted immediately.
+    /// Default implementation is a no-op (immediate submission).
+    fn begin_recording(&mut self) {}
+
+    /// Flush all pending recorded commands to the GPU in one submission.
+    ///
+    /// This is the key performance primitive — call it once per training
+    /// step to batch the entire forward + backward pass into a single
+    /// GPU submission, eliminating per-kernel sync bubbles.
+    /// Default implementation is a no-op (immediate submission).
+    fn flush(&mut self) {}
     //
     // BLAS Level 3: Matrix-Matrix Operations
     //
@@ -180,6 +198,73 @@ pub trait GpuMatrixOps: Send + Sync {
         size: usize,
     ) -> Result<()>;
 
+    /// In-place sign-preserving log scaling:
+    /// `x <- sign(x) * log(1 + alpha * |x|) / alpha`
+    fn signed_log1p_scale(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _buffer: &mut GpuBuffer,
+        _alpha: f32,
+        _size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "signed_log1p_scale kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// PolyAttention scalar score transform (element-wise):
+    /// `out = scale * (a * smooth_clip_tanh(x, clip_limit)^p + b)`
+    fn poly_score_transform_scalar(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _input: &GpuBuffer,
+        _output: &mut GpuBuffer,
+        _a: f32,
+        _b: f32,
+        _scale: f32,
+        _p: u32,
+        _clip_limit: f32,
+        _size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "poly_score_transform_scalar kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
+
+    /// PolyAttention scalar score-transform backward (element-wise + reduction contributions).
+    ///
+    /// Inputs:
+    /// - `raw_scores`: pre-transform attention scores
+    /// - `grad_transformed`: dL/d(transformed_scores)
+    ///
+    /// Outputs:
+    /// - `grad_raw`: dL/d(raw_scores)
+    /// - `grad_a_contrib`, `grad_b_contrib`, `grad_scale_contrib`: per-element contributions
+    #[allow(clippy::too_many_arguments)]
+    fn poly_score_transform_scalar_backward(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _raw_scores: &GpuBuffer,
+        _grad_transformed: &GpuBuffer,
+        _grad_raw: &mut GpuBuffer,
+        _grad_a_contrib: &mut GpuBuffer,
+        _grad_b_contrib: &mut GpuBuffer,
+        _grad_scale_contrib: &mut GpuBuffer,
+        _a: f32,
+        _b: f32,
+        _scale: f32,
+        _p: u32,
+        _clip_limit: f32,
+        _size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message:
+                "poly_score_transform_scalar_backward kernel is not implemented for this backend"
+                    .to_string(),
+        })
+    }
+
     /// Element-wise multiply-add: `output = a * input1 + b * input2`
     fn axpy(
         &mut self,
@@ -203,6 +288,25 @@ pub trait GpuMatrixOps: Send + Sync {
         params: &RichardsCurveParams,
         size: usize,
     ) -> Result<()>;
+
+    /// Richards Curve input-gradient application:
+    /// `output = upstream * d(richards_curve(input))/d(input)`
+    ///
+    /// Uses the same parameterization as `richards_curve`, including temperature and affine terms.
+    fn richards_curve_backward_input(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _input: &GpuBuffer,
+        _upstream: &GpuBuffer,
+        _output: &mut GpuBuffer,
+        _params: &RichardsCurveParams,
+        _size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "richards_curve_backward_input kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
 
     //
     // Normalization Operations
@@ -231,6 +335,59 @@ pub trait GpuMatrixOps: Send + Sync {
         cols: usize,
     ) -> Result<()>;
 
+    /// Softmax backward (row-wise):
+    /// `d_input[row, col] = softmax[row, col] * (d_output[row, col] - dot(d_output[row,:], softmax[row,:]))`
+    fn softmax_backward(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _softmax_output: &GpuBuffer,
+        _grad_output: &GpuBuffer,
+        _grad_input: &mut GpuBuffer,
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "softmax_backward kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// Selective Scan forward kernel for SSM recurrence.
+    ///
+    /// Computes:
+    /// - `h_t = A @ h_{t-1} + B @ x_t`
+    /// - `y_t = C @ h_t + D @ x_t`
+    ///
+    /// Buffers are flat row-major:
+    /// - `input`: [seq_len, embed_dim]
+    /// - `a`: [state_dim, state_dim]
+    /// - `b`: [state_dim, embed_dim]
+    /// - `c`: [embed_dim, state_dim]
+    /// - `d`: [embed_dim, embed_dim]
+    /// - `h_init`: [state_dim]
+    /// - `output`: [seq_len, embed_dim]
+    /// - `h_final`: [state_dim]
+    #[allow(clippy::too_many_arguments)]
+    fn selective_scan_forward(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _input: &GpuBuffer,
+        _a: &GpuBuffer,
+        _b: &GpuBuffer,
+        _c: &GpuBuffer,
+        _d: &GpuBuffer,
+        _h_init: &GpuBuffer,
+        _output: &mut GpuBuffer,
+        _h_final: &mut GpuBuffer,
+        _seq_len: usize,
+        _state_dim: usize,
+        _embed_dim: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "selective_scan_forward kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
+
     //
     // PolyAttention Operations
     //
@@ -251,6 +408,56 @@ pub trait GpuMatrixOps: Send + Sync {
         batch_size: usize,
         num_heads: usize,
     ) -> Result<()>;
+
+    /// MoH gate backward pointwise preparation (sigmoid-approx helper path).
+    ///
+    /// Computes, for each `[token, head]` element:
+    /// - `z = alpha[head] * xw + beta[head]`
+    /// - `g = sigmoid(clamp(z, -8, 8))`
+    /// - `d_gate = eff_grads * g * (1 - g)`
+    /// - `d_gate_scaled = d_gate * alpha[head]`
+    ///
+    /// This matches the existing simplified helper semantics used by `moh_gate_backward_gpu`.
+    fn moh_gate_backward_prepare_sigmoid(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _xw: &GpuBuffer,
+        _eff_grads: &GpuBuffer,
+        _alpha: &GpuBuffer,
+        _beta: &GpuBuffer,
+        _d_gate: &mut GpuBuffer,
+        _d_gate_scaled: &mut GpuBuffer,
+        _num_tokens: usize,
+        _num_heads: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message:
+                "moh_gate_backward_prepare_sigmoid kernel is not implemented for this backend"
+                    .to_string(),
+        })
+    }
+
+    /// MoH gate backward per-head reductions for alpha/beta grads (sigmoid-approx helper path).
+    ///
+    /// Computes:
+    /// - `grad_alpha[h] = sum_i d_gate[i,h] * xw[i,h]`
+    /// - `grad_beta[h] = sum_i d_gate[i,h]`
+    fn moh_gate_backward_reduce_alpha_beta(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _xw: &GpuBuffer,
+        _d_gate: &GpuBuffer,
+        _grad_alpha: &mut GpuBuffer,
+        _grad_beta: &mut GpuBuffer,
+        _num_tokens: usize,
+        _num_heads: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message:
+                "moh_gate_backward_reduce_alpha_beta kernel is not implemented for this backend"
+                    .to_string(),
+        })
+    }
 
     /// Fused Polynomial Attention Kernel
     ///
@@ -278,6 +485,54 @@ pub trait GpuMatrixOps: Send + Sync {
         p: usize,
         blr_rank: usize,
     ) -> Result<()>;
+
+    /// Compute `grad_transformed = grad_scores * gate_broadcast` for PolyAttention fused scores.
+    ///
+    /// Layouts:
+    /// - `grad_scores`, `grad_transformed`: [B, H, S, S]
+    /// - `gate`: [B*S, H] (token-major per-query token/head gate)
+    #[allow(clippy::too_many_arguments)]
+    fn poly_attention_gate_broadcast_mul(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _grad_scores: &GpuBuffer,
+        _gate: &GpuBuffer,
+        _grad_transformed: &mut GpuBuffer,
+        _batch_size: usize,
+        _num_heads: usize,
+        _seq_len: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "poly_attention_gate_broadcast_mul kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
+
+    /// Reduce fused-score gradients to per-query/head gate upstream gradients.
+    ///
+    /// Computes:
+    /// `gate_upstream[b,s,h] = sum_j grad_scores[b,h,s,j] * transformed[b,h,s,j]`
+    ///
+    /// Layouts:
+    /// - `grad_scores`, `transformed`: [B, H, S, S]
+    /// - `gate_upstream`: [B*S, H] (token-major)
+    #[allow(clippy::too_many_arguments)]
+    fn poly_attention_gate_reduce_upstream(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _grad_scores: &GpuBuffer,
+        _transformed: &GpuBuffer,
+        _gate_upstream: &mut GpuBuffer,
+        _batch_size: usize,
+        _num_heads: usize,
+        _seq_len: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message:
+                "poly_attention_gate_reduce_upstream kernel is not implemented for this backend"
+                    .to_string(),
+        })
+    }
 
     /// BLR Projection Kernel
     ///
@@ -317,15 +572,34 @@ pub trait GpuMatrixOps: Send + Sync {
         max_pos: usize,
     ) -> Result<()>;
 
+    /// Apply causal masking to attention score tensor laid out as [B, H, S, S].
+    ///
+    /// Sets entries with key index `j > i` to `mask_value`.
+    #[allow(clippy::too_many_arguments)]
+    fn causal_mask_attention_scores(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _scores: &mut GpuBuffer,
+        _batch_size: usize,
+        _num_heads: usize,
+        _seq_len: usize,
+        _mask_value: f32,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "causal_mask_attention_scores kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
+
     //
     // Reduction Operations
     //
 
     /// Compute sum of all elements
-    fn sum(&self, pool: &mut dyn GpuMemoryPool, buffer: &GpuBuffer, size: usize) -> Result<f32>;
+    fn sum(&mut self, pool: &mut dyn GpuMemoryPool, buffer: &GpuBuffer, size: usize) -> Result<f32>;
 
     /// Compute mean of all elements
-    fn mean(&self, pool: &mut dyn GpuMemoryPool, buffer: &GpuBuffer, size: usize) -> Result<f32>;
+    fn mean(&mut self, pool: &mut dyn GpuMemoryPool, buffer: &GpuBuffer, size: usize) -> Result<f32>;
 
     //
     // Data Transfer
@@ -347,6 +621,157 @@ pub trait GpuMatrixOps: Send + Sync {
         gpu_buffer: &mut GpuBuffer,
     ) -> Result<()>;
 
+    //
+    // Sparse Routing Operations (MoE)
+    //
+
+    /// Find Top-K Experts per token
+    #[allow(clippy::too_many_arguments)]
+    fn compute_topk(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _routing_gates: &GpuBuffer,
+        _topk_indices: &mut GpuBuffer,
+        _topk_weights: &mut GpuBuffer,
+        _num_tokens: usize,
+        _num_experts: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "compute_topk kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// Scatter tokens into contiguous expert buffers
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_experts(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _hidden_states: &GpuBuffer,
+        _topk_indices: &GpuBuffer,
+        _global_expert_offsets: &GpuBuffer,
+        _expert_counters: &mut GpuBuffer,
+        _scattered_hidden: &mut GpuBuffer,
+        _original_token_indices: &mut GpuBuffer,
+        _num_tokens: usize,
+        _hidden_dim: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "scatter_experts kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// Gather expert outputs back to original token shape
+    #[allow(clippy::too_many_arguments)]
+    fn gather_experts(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _expert_outputs: &GpuBuffer,
+        _topk_weights: &GpuBuffer,
+        _topk_indices: &GpuBuffer,
+        _global_expert_offsets: &GpuBuffer,
+        _token_expert_slots: &GpuBuffer,
+        _gathered_output: &mut GpuBuffer,
+        _num_tokens: usize,
+        _hidden_dim: usize,
+        _k: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "gather_experts kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+
+    //
+    // Titans Memory Kernels
+    //
+
+    /// Batched MLP forward for Titans neural memory.
+    /// z = W1 @ keys + b1, h = ReLU(z), v_pred = W2 @ h + b2
+    #[allow(clippy::too_many_arguments)]
+    fn titans_mlp_forward(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _keys: &GpuBuffer,
+        _w1: &GpuBuffer,
+        _b1: &GpuBuffer,
+        _w2: &GpuBuffer,
+        _b2: &GpuBuffer,
+        _z_out: &mut GpuBuffer,
+        _h_out: &mut GpuBuffer,
+        _v_pred: &mut GpuBuffer,
+        _num_tokens: usize,
+        _key_dim: usize,
+        _hidden_dim: usize,
+        _val_dim: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "titans_mlp_forward kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// Accumulate W2/b2 gradients for Titans memory.
+    #[allow(clippy::too_many_arguments)]
+    fn titans_grad_w2(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _v_target: &GpuBuffer,
+        _v_pred: &GpuBuffer,
+        _h_act: &GpuBuffer,
+        _grad_w2: &mut GpuBuffer,
+        _grad_b2: &mut GpuBuffer,
+        _num_tokens: usize,
+        _hidden_dim: usize,
+        _val_dim: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "titans_grad_w2 kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// Accumulate W1/b1 gradients for Titans memory.
+    #[allow(clippy::too_many_arguments)]
+    fn titans_grad_w1(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _keys: &GpuBuffer,
+        _v_target: &GpuBuffer,
+        _v_pred: &GpuBuffer,
+        _z: &GpuBuffer,
+        _w2: &GpuBuffer,
+        _grad_w1: &mut GpuBuffer,
+        _grad_b1: &mut GpuBuffer,
+        _num_tokens: usize,
+        _key_dim: usize,
+        _hidden_dim: usize,
+        _val_dim: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "titans_grad_w1 kernel is not implemented for this backend".to_string(),
+        })
+    }
+
+    /// Fused Titans per-element momentum + memory update.
+    /// momentum = eta * momentum - theta * grad
+    /// memory   = (1 - alpha) * memory + momentum
+    #[allow(clippy::too_many_arguments)]
+    fn titans_memory_update(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _grad: &GpuBuffer,
+        _momentum: &mut GpuBuffer,
+        _memory: &mut GpuBuffer,
+        _num_elements: usize,
+        _alpha: f32,
+        _eta: f32,
+        _theta: f32,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "titans_memory_update kernel is not implemented for this backend".to_string(),
+        })
+    }
+
     /// Copy within device (GPU-to-GPU)
     fn copy_within_device(
         &mut self,
@@ -355,6 +780,24 @@ pub trait GpuMatrixOps: Send + Sync {
         dst: &mut GpuBuffer,
         size: usize,
     ) -> Result<()>;
+
+    /// Copy a sub-range within device buffers (GPU-to-GPU).
+    ///
+    /// Offsets and `size` are in `f32` elements.
+    fn copy_within_device_range(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _src: &GpuBuffer,
+        _src_offset: usize,
+        _dst: &mut GpuBuffer,
+        _dst_offset: usize,
+        _size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "copy_within_device_range kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
 
     /// Permute 4D tensor
     ///
@@ -389,6 +832,20 @@ pub trait GpuMatrixOps: Send + Sync {
         value: f32,
     ) -> Result<()>;
 
+    /// Row-wise broadcast addition: matrix[row, col] += bias[col]
+    fn broadcast_add_rows(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _matrix: &mut GpuBuffer,
+        _bias: &GpuBuffer,
+        _batch_size: usize,
+        _cols: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "broadcast_add_rows kernel is not implemented for this backend".to_string(),
+        })
+    }
+
     /// Compute Richards Curve Gating
     ///
     /// output = richards(alpha * input + beta)
@@ -408,6 +865,85 @@ pub trait GpuMatrixOps: Send + Sync {
         batch_size: usize,
         num_heads: usize,
     ) -> Result<()>;
+
+    /// Reduce scalar RichardsCurve parameter gradients over all elements.
+    ///
+    /// Writes the 9 canonical scalar gradients in this fixed order:
+    /// `nu, k, m, beta, temperature, output_gain, output_bias, scale, shift`.
+    /// Callers should filter/reorder by the curve's `*_learnable` flags.
+    #[allow(clippy::too_many_arguments)]
+    fn richards_scalar_param_grads_reduce(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _input: &GpuBuffer,
+        _upstream: &GpuBuffer,
+        _output_grads: &mut GpuBuffer,
+        _params: &RichardsCurveParams,
+        _size: usize,
+        _variant_is_tanh: bool,
+        _birch_exponential_tail: bool,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "richards_scalar_param_grads_reduce kernel is not implemented for this backend"
+                .to_string(),
+        })
+    }
+
+    //
+    // Optimizer Operations
+    //
+
+    /// Adam optimizer step - updates parameters in-place on GPU
+    ///
+    /// Computes the Adam update:
+    /// ```text
+    /// m_t = β₁ · m_{t-1} + (1 - β₁) · g_t
+    /// v_t = β₂ · v_{t-1} + (1 - β₂) · g_t²
+    /// m̂_t = m_t / (1 - β₁^t)
+    /// v̂_t = v_t / (1 - β₂^t)
+    /// θ_t = θ_{t-1} - η · m̂_t / (√v̂_t + ε)
+    /// ```
+    ///
+    /// # Arguments
+    /// * `params` - Parameters buffer (modified in-place)
+    /// * `grads` - Gradients buffer
+    /// * `m` - First moment estimate buffer
+    /// * `v` - Second moment estimate buffer
+    /// * `v_max` - Optional v_max buffer for AMSGrad
+    /// * `lr` - Learning rate
+    /// * `beta1` - First moment decay rate
+    /// * `beta2` - Second moment decay rate
+    /// * `epsilon` - Numerical stability constant
+    /// * `inv_bias1` - Precomputed 1/(1-β₁^t)
+    /// * `inv_bias2` - Precomputed 1/(1-β₂^t)
+    /// * `weight_decay` - Weight decay coefficient
+    /// * `use_decoupled_wd` - Use AdamW-style decoupled weight decay
+    /// * `use_amsgrad` - Use AMSGrad variant
+    /// * `size` - Number of elements
+    #[allow(clippy::too_many_arguments)]
+    fn adam_step(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _params: &mut GpuBuffer,
+        _grads: &GpuBuffer,
+        _m: &mut GpuBuffer,
+        _v: &mut GpuBuffer,
+        _v_max: Option<&mut GpuBuffer>,
+        _lr: f32,
+        _beta1: f32,
+        _beta2: f32,
+        _epsilon: f32,
+        _inv_bias1: f32,
+        _inv_bias2: f32,
+        _weight_decay: f32,
+        _use_decoupled_wd: bool,
+        _use_amsgrad: bool,
+        _size: usize,
+    ) -> Result<()> {
+        Err(ModelError::Backend {
+            message: "adam_step kernel is not implemented for this backend".to_string(),
+        })
+    }
 }
 
 /// CPU-fallback matrix operations (for testing and non-GPU builds)
@@ -641,14 +1177,14 @@ impl GpuMatrixOps for CpuMatrixOps {
         })
     }
 
-    fn sum(&self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, _size: usize) -> Result<f32> {
+    fn sum(&mut self, _pool: &mut dyn GpuMemoryPool, _buffer: &GpuBuffer, _size: usize) -> Result<f32> {
         Err(crate::common::errors::ModelError::Backend {
             message: "CPU sum not implemented".to_string(),
         })
     }
 
     fn mean(
-        &self,
+        &mut self,
         _pool: &mut dyn GpuMemoryPool,
         _buffer: &GpuBuffer,
         _size: usize,
@@ -689,6 +1225,20 @@ impl GpuMatrixOps for CpuMatrixOps {
     ) -> Result<()> {
         Err(crate::common::errors::ModelError::Backend {
             message: "CPU copy_within_device not implemented".to_string(),
+        })
+    }
+
+    fn copy_within_device_range(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _src: &GpuBuffer,
+        _src_offset: usize,
+        _dst: &mut GpuBuffer,
+        _dst_offset: usize,
+        _size: usize,
+    ) -> Result<()> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "CPU copy_within_device_range not implemented".to_string(),
         })
     }
 
@@ -779,6 +1329,31 @@ impl GpuMatrixOps for CpuMatrixOps {
     ) -> Result<()> {
         Err(crate::common::errors::ModelError::Backend {
             message: "CPU moh_gate_activation not implemented".to_string(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adam_step(
+        &mut self,
+        _pool: &mut dyn GpuMemoryPool,
+        _params: &mut GpuBuffer,
+        _grads: &GpuBuffer,
+        _m: &mut GpuBuffer,
+        _v: &mut GpuBuffer,
+        _v_max: Option<&mut GpuBuffer>,
+        _lr: f32,
+        _beta1: f32,
+        _beta2: f32,
+        _epsilon: f32,
+        _inv_bias1: f32,
+        _inv_bias2: f32,
+        _weight_decay: f32,
+        _use_decoupled_wd: bool,
+        _use_amsgrad: bool,
+        _size: usize,
+    ) -> Result<()> {
+        Err(crate::common::errors::ModelError::Backend {
+            message: "CPU adam_step not implemented".to_string(),
         })
     }
 }

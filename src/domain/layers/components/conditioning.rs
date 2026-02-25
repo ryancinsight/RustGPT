@@ -72,6 +72,8 @@ pub struct TimeConditioner {
     pub ema_b1: Array2<f32>,
     pub ema_w2: Array2<f32>,
     pub ema_b2: Array2<f32>,
+    #[serde(skip)]
+    gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 impl TimeConditioner {
@@ -102,7 +104,21 @@ impl TimeConditioner {
             opt_b1: Some(Adam::new((1, 1))),
             opt_w2: Some(Adam::new((1, 1))),
             opt_b2: Some(Adam::new((1, 1))),
+            gpu_device: None,
         }
+    }
+
+    #[inline]
+    pub fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
+    }
+
+    #[inline]
+    pub fn clear_gpu_device(&mut self) {
+        self.gpu_device = None;
     }
 
     /// Forward pass returning (gamma_beta, hidden_state)
@@ -293,6 +309,34 @@ impl TimeConditioner {
             self.compute_gradients(input, grad_output);
         (grad_input, vec![grad_w1, grad_b1, grad_w2, grad_b2])
     }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn backward_gpu(
+        &self,
+        grad_output: &Array1<f32>,
+        hidden_state: &Array2<f32>,
+        input: &Array1<f32>,
+    ) -> crate::common::errors::Result<(Array1<f32>, Vec<Array2<f32>>)> {
+        let _device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "TimeConditioner::backward_gpu",
+        )?;
+        Ok(self.backward(grad_output, hidden_state, input))
+    }
+
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn backward_gpu(
+        &self,
+        _grad_output: &Array1<f32>,
+        _hidden_state: &Array2<f32>,
+        _input: &Array1<f32>,
+    ) -> crate::common::errors::Result<(Array1<f32>, Vec<Array2<f32>>)> {
+        Err(crate::common::errors::ModelError::Backend {
+            message:
+                "TimeConditioner::backward_gpu requires GPU features. Rebuild with --features gpu-wgpu, gpu-cuda, or gpu-metal"
+                    .to_string(),
+        })
+    }
 }
 
 /// Shared FiLM modulation buffers and logic
@@ -309,6 +353,9 @@ pub struct SharedFilmModulation {
     /// Cached capacity (power-of-2) to minimize reallocations
     #[serde(skip)]
     scratch_capacity: usize,
+    /// Optional GPU device for accelerated FiLM conditioning
+    #[serde(skip)]
+    gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 #[inline]
@@ -379,6 +426,7 @@ impl Default for SharedFilmModulation {
             scale_beta: 0.1,
             scratch: Vec::new(),
             scratch_capacity: 0,
+            gpu_device: None,
         }
     }
 }
@@ -398,7 +446,13 @@ impl SharedFilmModulation {
             scale_beta,
             scratch: Vec::new(),
             scratch_capacity: 0,
+            gpu_device: None,
         }
+    }
+
+    #[inline]
+    pub fn clear_gpu_device(&mut self) {
+        self.gpu_device = None;
     }
 
     /// Update modulation parameters from a flat gamma_beta vector
@@ -592,6 +646,313 @@ impl SharedFilmModulation {
         }
 
         grad
+    }
+}
+
+// ============================================================================
+// GPU Component Implementations
+// ============================================================================
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl crate::domain::compute::GpuComponent for SharedFilmModulation {
+    fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
+    }
+
+    fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let device = crate::domain::compute::GpuDevice::auto_detect()?;
+        self.gpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(device)));
+        Ok(())
+    }
+
+    fn is_gpu_ready(&self) -> bool {
+        self.gpu_device.is_some()
+    }
+
+    fn gpu_backend_name(&self) -> Option<&'static str> {
+        self.gpu_device
+            .as_ref()
+            .and_then(|device_arc| match device_arc.lock() {
+                Ok(device) => Some(device.backend().as_str()),
+                Err(_) => None,
+            })
+    }
+
+    fn gpu_device(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.gpu_device.clone()
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        batch_size: usize,
+        embed_dim: usize,
+        _seq_len: usize,
+    ) -> crate::common::errors::Result<()> {
+        if let Some(device_arc) = &self.gpu_device {
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message:
+                            "Failed to lock GPU device for SharedFilmModulation capacity allocation"
+                                .to_string(),
+                    })?;
+            let size = batch_size * embed_dim;
+            let _ = device.allocate_f32(size)?; // input
+            let _ = device.allocate_f32(size)?; // output
+            let _ = device.allocate_f32(embed_dim)?; // gamma
+            let _ = device.allocate_f32(embed_dim)?; // beta
+            Ok(())
+        } else {
+            Err(crate::common::errors::ModelError::Backend {
+                message: "GPU device not attached to SharedFilmModulation. Call enable_gpu_auto_detect() first.".to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl SharedFilmModulation {
+    /// GPU-accelerated FiLM conditioning: output = input * gamma + beta
+    pub fn apply_attn_conditioning_gpu(
+        &self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "SharedFilmModulation::apply_attn_conditioning_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for FiLM conditioning forward".to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = input.dim();
+        let size = batch_size * embed_dim;
+
+        // Upload input
+        let mut gpu_input = device.allocate_f32(size)?;
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "FiLM input not contiguous".to_string(),
+                })?;
+        device.upload(input_slice, &mut gpu_input)?;
+
+        // Upload gamma and beta
+        let gamma = self.gamma_attn.as_slice().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "FiLM gamma not contiguous".to_string(),
+            }
+        })?;
+        let beta = self.beta_attn.as_slice().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "FiLM beta not contiguous".to_string(),
+            }
+        })?;
+        let mut gpu_gamma = device.allocate_f32(embed_dim)?;
+        let mut gpu_beta = device.allocate_f32(embed_dim)?;
+        device.upload(gamma, &mut gpu_gamma)?;
+        device.upload(beta, &mut gpu_beta)?;
+
+        // Use layer_norm kernel as FiLM: output = input * gamma + beta (per-feature affine)
+        let mut gpu_output = device.allocate_f32(size)?;
+        device.layer_norm(
+            &gpu_input,
+            &gpu_gamma,
+            &gpu_beta,
+            &mut gpu_output,
+            batch_size,
+            embed_dim,
+            0.0,
+        )?;
+
+        let mut result = vec![0.0f32; size];
+        device.download(&gpu_output, &mut result)?;
+
+        Array2::from_shape_vec((batch_size, embed_dim), result).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape FiLM output: {}", e),
+            }
+        })
+    }
+
+    /// GPU-accelerated FFN conditioning
+    pub fn apply_ffn_conditioning_gpu(
+        &self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "SharedFilmModulation::apply_ffn_conditioning_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for FiLM FFN conditioning".to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = input.dim();
+        let size = batch_size * embed_dim;
+
+        let mut gpu_input = device.allocate_f32(size)?;
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "FiLM FFN input not contiguous".to_string(),
+                })?;
+        device.upload(input_slice, &mut gpu_input)?;
+
+        let gamma = self.gamma_ffn.as_slice().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "FiLM FFN gamma not contiguous".to_string(),
+            }
+        })?;
+        let beta =
+            self.beta_ffn
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "FiLM FFN beta not contiguous".to_string(),
+                })?;
+        let mut gpu_gamma = device.allocate_f32(embed_dim)?;
+        let mut gpu_beta = device.allocate_f32(embed_dim)?;
+        device.upload(gamma, &mut gpu_gamma)?;
+        device.upload(beta, &mut gpu_beta)?;
+
+        let mut gpu_output = device.allocate_f32(size)?;
+        device.layer_norm(
+            &gpu_input,
+            &gpu_gamma,
+            &gpu_beta,
+            &mut gpu_output,
+            batch_size,
+            embed_dim,
+            0.0,
+        )?;
+
+        let mut result = vec![0.0f32; size];
+        device.download(&gpu_output, &mut result)?;
+
+        Array2::from_shape_vec((batch_size, embed_dim), result).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape FiLM FFN output: {}", e),
+            }
+        })
+    }
+
+    /// GPU-accelerated FiLM backward pass.
+    pub fn film_backward_gpu(
+        &self,
+        output_grads: &Array2<f32>,
+        input: &Array2<f32>,
+        gamma: &Array2<f32>,
+    ) -> crate::common::errors::Result<(Array2<f32>, Array1<f32>, Array1<f32>)> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "SharedFilmModulation::film_backward_gpu",
+        )?;
+
+        if output_grads.dim() != input.dim() {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("output_grads: {:?}", input.dim()),
+                    got: format!("{:?}", output_grads.dim()),
+                },
+            );
+        }
+        if gamma.nrows() != 1 || gamma.ncols() != input.ncols() {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("gamma dims: (1, {})", input.ncols()),
+                    got: format!("{:?}", gamma.dim()),
+                },
+            );
+        }
+
+        let (rows, cols) = input.dim();
+        let size = rows * cols;
+        if size == 0 {
+            return Ok((
+                Array2::zeros((rows, cols)),
+                Array1::zeros(cols),
+                Array1::zeros(cols),
+            ));
+        }
+
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for FiLM backward".to_string(),
+                })?;
+
+        let output_slice =
+            output_grads
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "FiLM backward output_grads must be contiguous".to_string(),
+                })?;
+
+        let gamma_row = gamma.row(0);
+        let gamma_slice =
+            gamma_row
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "FiLM backward gamma row must be contiguous".to_string(),
+                })?;
+        let mut gamma_expanded = vec![0.0f32; size];
+        for r in 0..rows {
+            let start = r * cols;
+            let end = start + cols;
+            gamma_expanded[start..end].copy_from_slice(gamma_slice);
+        }
+
+        let mut grads_buf = device.allocate_f32(size)?;
+        let mut gamma_buf = device.allocate_f32(size)?;
+        let mut input_grads_buf = device.allocate_f32(size)?;
+        device.upload(output_slice, &mut grads_buf)?;
+        device.upload(&gamma_expanded, &mut gamma_buf)?;
+        device.mul(&grads_buf, &gamma_buf, &mut input_grads_buf, size)?;
+
+        let mut input_grads_flat = vec![0.0f32; size];
+        device.download(&input_grads_buf, &mut input_grads_flat)?;
+        device.deallocate(grads_buf);
+        device.deallocate(gamma_buf);
+        device.deallocate(input_grads_buf);
+
+        let input_grads = Array2::from_shape_vec((rows, cols), input_grads_flat).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape FiLM input gradients: {e}"),
+            }
+        })?;
+
+        // Per-feature reductions remain on CPU for numerical stability and deterministic
+        // behavior until a dedicated reduction kernel is wired.
+        let mut grad_gamma = Array1::<f32>::zeros(cols);
+        let mut grad_beta = Array1::<f32>::zeros(cols);
+        for j in 0..cols {
+            let mut sum_gamma = 0.0f32;
+            let mut sum_beta = 0.0f32;
+            for i in 0..rows {
+                let go = output_grads[[i, j]];
+                sum_gamma += go * input[[i, j]];
+                sum_beta += go;
+            }
+            grad_gamma[j] = sum_gamma;
+            grad_beta[j] = sum_beta;
+        }
+
+        Ok((input_grads, grad_gamma, grad_beta))
     }
 }
 

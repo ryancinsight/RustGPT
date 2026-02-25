@@ -117,9 +117,29 @@ pub struct AdaptiveResiduals {
     /// When provided, uses workspace buffers instead of internal scratch_* fields.
     #[serde(skip, default)]
     workspace: Option<AdaptiveResidualsWorkspace>,
+
+    /// Optional GPU device for accelerated computation.
+    #[serde(skip, default)]
+    gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 impl AdaptiveResiduals {
+    /// Set GPU device for accelerated residual operations.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[inline]
+    pub fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
+    }
+
+    /// Clear attached GPU device, reverting to CPU execution.
+    #[inline]
+    pub fn clear_gpu_device(&mut self) {
+        self.gpu_device = None;
+    }
+
     /// Create a new adaptive residuals component with full configuration
     pub fn new(config: AdaptiveResidualConfig) -> Self {
         Self::new_with_workspace(config, None)
@@ -172,6 +192,7 @@ impl AdaptiveResiduals {
             scratch_z: Vec::new(),
 
             workspace,
+            gpu_device: None,
         }
     }
 
@@ -1470,6 +1491,420 @@ impl AdaptiveResiduals {
         } else {
             0.0
         }
+    }
+}
+
+// ============================================================================
+// GPU Component Implementations
+// ============================================================================
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl crate::domain::compute::GpuComponent for AdaptiveResiduals {
+    fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
+    }
+
+    fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let device = crate::domain::compute::GpuDevice::auto_detect()?;
+        self.gpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(device)));
+        Ok(())
+    }
+
+    fn is_gpu_ready(&self) -> bool {
+        self.gpu_device.is_some()
+    }
+
+    fn gpu_backend_name(&self) -> Option<&'static str> {
+        self.gpu_device
+            .as_ref()
+            .and_then(|device_arc| match device_arc.lock() {
+                Ok(device) => Some(device.backend().as_str()),
+                Err(_) => None,
+            })
+    }
+
+    fn gpu_device(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.gpu_device.clone()
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        batch_size: usize,
+        embed_dim: usize,
+        _seq_len: usize,
+    ) -> crate::common::errors::Result<()> {
+        if let Some(device_arc) = &self.gpu_device {
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message:
+                            "Failed to lock GPU device for AdaptiveResiduals capacity allocation"
+                                .to_string(),
+                    })?;
+            let size = batch_size * embed_dim;
+            let _ = device.allocate_f32(size)?;
+            let _ = device.allocate_f32(size)?;
+            Ok(())
+        } else {
+            Err(crate::common::errors::ModelError::Backend {
+                message: "GPU device not attached to AdaptiveResiduals. Call enable_gpu_auto_detect() first.".to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl AdaptiveResiduals {
+    /// GPU-accelerated attention residual: output = input + scale * attn_output
+    ///
+    /// Uploads per-channel scales (expanded to match the batch), performs element-wise
+    /// multiply and addition on the GPU, then downloads the result.
+    pub fn apply_attention_residual_gpu(
+        &mut self,
+        input: &Array2<f32>,
+        attn_output: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "AdaptiveResiduals::apply_attention_residual_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for attention residual forward".to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = input.dim();
+        let size = batch_size * embed_dim;
+
+        // Build expanded scales (batch_size × embed_dim) on CPU
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+        let mut scales_expanded = vec![0.0f32; size];
+        for channel in 0..embed_dim {
+            let mut s = self.attention_residual_scales[[channel, 0]];
+            s = if s.is_finite() { s } else { 1.0 };
+            s = s.clamp(min_scale, threshold);
+            for row in 0..batch_size {
+                scales_expanded[row * embed_dim + channel] = s;
+            }
+        }
+
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "AdaptiveResiduals attention input not contiguous".to_string(),
+                })?;
+        let attn_slice =
+            attn_output
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "AdaptiveResiduals attn_output not contiguous".to_string(),
+                })?;
+
+        // Upload buffers
+        let mut gpu_input = device.allocate_f32(size)?;
+        let mut gpu_attn = device.allocate_f32(size)?;
+        let mut gpu_scales = device.allocate_f32(size)?;
+        device.upload(input_slice, &mut gpu_input)?;
+        device.upload(attn_slice, &mut gpu_attn)?;
+        device.upload(&scales_expanded, &mut gpu_scales)?;
+
+        // scaled_attn = attn_output * scales
+        let mut gpu_scaled = device.allocate_f32(size)?;
+        device.mul(&gpu_attn, &gpu_scales, &mut gpu_scaled, size)?;
+
+        // output = 1.0 * input + 1.0 * scaled_attn
+        let mut gpu_output = device.allocate_f32(size)?;
+        device.axpy(1.0, &gpu_input, 1.0, &gpu_scaled, &mut gpu_output, size)?;
+
+        let mut result = vec![0.0f32; size];
+        device.download(&gpu_output, &mut result)?;
+
+        device.deallocate(gpu_input);
+        device.deallocate(gpu_attn);
+        device.deallocate(gpu_scales);
+        device.deallocate(gpu_scaled);
+        device.deallocate(gpu_output);
+
+        Array2::from_shape_vec((batch_size, embed_dim), result).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape attention residual GPU output: {e}"),
+            }
+        })
+    }
+
+    /// GPU-accelerated FFN residual: output = input + scale * ffn_output
+    pub fn apply_ffn_residual_gpu(
+        &mut self,
+        input: &Array2<f32>,
+        ffn_output: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "AdaptiveResiduals::apply_ffn_residual_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for FFN residual forward".to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = input.dim();
+        let size = batch_size * embed_dim;
+
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+        let mut scales_expanded = vec![0.0f32; size];
+        for channel in 0..embed_dim {
+            let mut s = self.ffn_residual_scales[[channel, 0]];
+            s = if s.is_finite() { s } else { 1.0 };
+            s = s.clamp(min_scale, threshold);
+            for row in 0..batch_size {
+                scales_expanded[row * embed_dim + channel] = s;
+            }
+        }
+
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "AdaptiveResiduals FFN input not contiguous".to_string(),
+                })?;
+        let ffn_slice =
+            ffn_output
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "AdaptiveResiduals ffn_output not contiguous".to_string(),
+                })?;
+
+        let mut gpu_input = device.allocate_f32(size)?;
+        let mut gpu_ffn = device.allocate_f32(size)?;
+        let mut gpu_scales = device.allocate_f32(size)?;
+        device.upload(input_slice, &mut gpu_input)?;
+        device.upload(ffn_slice, &mut gpu_ffn)?;
+        device.upload(&scales_expanded, &mut gpu_scales)?;
+
+        let mut gpu_scaled = device.allocate_f32(size)?;
+        device.mul(&gpu_ffn, &gpu_scales, &mut gpu_scaled, size)?;
+
+        let mut gpu_output = device.allocate_f32(size)?;
+        device.axpy(1.0, &gpu_input, 1.0, &gpu_scaled, &mut gpu_output, size)?;
+
+        let mut result = vec![0.0f32; size];
+        device.download(&gpu_output, &mut result)?;
+
+        device.deallocate(gpu_input);
+        device.deallocate(gpu_ffn);
+        device.deallocate(gpu_scales);
+        device.deallocate(gpu_scaled);
+        device.deallocate(gpu_output);
+
+        Array2::from_shape_vec((batch_size, embed_dim), result).map_err(|e| {
+            crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape FFN residual GPU output: {e}"),
+            }
+        })
+    }
+
+    /// GPU-accelerated backward pass for attention residual.
+    ///
+    /// Given `output = input + scale * attn_output`:
+    /// - `d_input = d_output`
+    /// - `d_attn_output = d_output * scale`
+    /// - Scale gradients are computed on CPU and applied via the optimizer.
+    pub fn backward_attention_residual_gpu(
+        &mut self,
+        output_grads: &Array2<f32>,
+        attn_output: &Array2<f32>,
+        lr: f32,
+    ) -> crate::common::errors::Result<(Array2<f32>, Array2<f32>)> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "AdaptiveResiduals::backward_attention_residual_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for attention residual backward"
+                        .to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = output_grads.dim();
+        let size = batch_size * embed_dim;
+
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+        let mut scales_expanded = vec![0.0f32; size];
+        for channel in 0..embed_dim {
+            let mut s = self.attention_residual_scales[[channel, 0]];
+            s = if s.is_finite() { s } else { 1.0 };
+            s = s.clamp(min_scale, threshold);
+            for row in 0..batch_size {
+                scales_expanded[row * embed_dim + channel] = s;
+            }
+        }
+
+        let grads_slice =
+            output_grads
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "AdaptiveResiduals backward output_grads not contiguous".to_string(),
+                })?;
+
+        // d_input = d_output (identity)
+        let input_grads = output_grads.clone();
+
+        // d_attn_output = d_output * scale (element-wise on GPU)
+        let mut gpu_grads = device.allocate_f32(size)?;
+        let mut gpu_scales = device.allocate_f32(size)?;
+        let mut gpu_attn_grads = device.allocate_f32(size)?;
+        device.upload(grads_slice, &mut gpu_grads)?;
+        device.upload(&scales_expanded, &mut gpu_scales)?;
+        device.mul(&gpu_grads, &gpu_scales, &mut gpu_attn_grads, size)?;
+
+        let mut attn_grads_flat = vec![0.0f32; size];
+        device.download(&gpu_attn_grads, &mut attn_grads_flat)?;
+
+        device.deallocate(gpu_grads);
+        device.deallocate(gpu_scales);
+        device.deallocate(gpu_attn_grads);
+
+        let attn_grads =
+            Array2::from_shape_vec((batch_size, embed_dim), attn_grads_flat).map_err(|e| {
+                crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "Failed to reshape attention residual backward output: {e}"
+                    ),
+                }
+            })?;
+
+        // Scale gradients: dL/d_scale[c] = sum_over_seq( attn_output[seq,c] * d_output[seq,c] )
+        // Computed on CPU for numerical stability and optimizer integration.
+        let mut scale_grads = Array2::zeros((embed_dim, 1));
+        for channel in 0..embed_dim {
+            let mut grad_sum = 0.0f32;
+            for seq in 0..batch_size {
+                let a = attn_output[[seq, channel]];
+                let a = if a.is_finite() { a } else { 0.0 };
+                let g = output_grads[[seq, channel]];
+                let g = if g.is_finite() { g } else { 0.0 };
+                grad_sum += a * g;
+            }
+            let mut g = grad_sum + self.contrastive_grad(channel);
+            if g.abs() < 1e-6 {
+                g = 1e-4 * ((channel as f32 + 1.0) * 0.517).cos();
+            }
+            scale_grads[[channel, 0]] = g;
+        }
+
+        // Apply scale gradients via the existing optimizer path
+        let ffn_grads = Array2::zeros((embed_dim, 1));
+        self.apply_gradients_ref((&scale_grads, &ffn_grads), lr)?;
+
+        Ok((input_grads, attn_grads))
+    }
+
+    /// GPU-accelerated backward pass for FFN residual.
+    ///
+    /// Given `output = input + scale * ffn_output`:
+    /// - `d_input = d_output`
+    /// - `d_ffn_output = d_output * scale`
+    /// - Scale gradients are computed on CPU and applied via the optimizer.
+    pub fn backward_ffn_residual_gpu(
+        &mut self,
+        output_grads: &Array2<f32>,
+        ffn_output: &Array2<f32>,
+        lr: f32,
+    ) -> crate::common::errors::Result<(Array2<f32>, Array2<f32>)> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "AdaptiveResiduals::backward_ffn_residual_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for FFN residual backward".to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = output_grads.dim();
+        let size = batch_size * embed_dim;
+
+        let threshold = self.config.residual_stability_threshold.max(0.0);
+        let min_scale = 0.1f32;
+        let mut scales_expanded = vec![0.0f32; size];
+        for channel in 0..embed_dim {
+            let mut s = self.ffn_residual_scales[[channel, 0]];
+            s = if s.is_finite() { s } else { 1.0 };
+            s = s.clamp(min_scale, threshold);
+            for row in 0..batch_size {
+                scales_expanded[row * embed_dim + channel] = s;
+            }
+        }
+
+        let grads_slice =
+            output_grads
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "AdaptiveResiduals FFN backward output_grads not contiguous"
+                        .to_string(),
+                })?;
+
+        let input_grads = output_grads.clone();
+
+        let mut gpu_grads = device.allocate_f32(size)?;
+        let mut gpu_scales = device.allocate_f32(size)?;
+        let mut gpu_ffn_grads = device.allocate_f32(size)?;
+        device.upload(grads_slice, &mut gpu_grads)?;
+        device.upload(&scales_expanded, &mut gpu_scales)?;
+        device.mul(&gpu_grads, &gpu_scales, &mut gpu_ffn_grads, size)?;
+
+        let mut ffn_grads_flat = vec![0.0f32; size];
+        device.download(&gpu_ffn_grads, &mut ffn_grads_flat)?;
+
+        device.deallocate(gpu_grads);
+        device.deallocate(gpu_scales);
+        device.deallocate(gpu_ffn_grads);
+
+        let ffn_grads =
+            Array2::from_shape_vec((batch_size, embed_dim), ffn_grads_flat).map_err(|e| {
+                crate::common::errors::ModelError::Backend {
+                    message: format!("Failed to reshape FFN residual backward output: {e}"),
+                }
+            })?;
+
+        let mut scale_grads = Array2::zeros((embed_dim, 1));
+        for channel in 0..embed_dim {
+            let mut grad_sum = 0.0f32;
+            for seq in 0..batch_size {
+                let f = ffn_output[[seq, channel]];
+                let f = if f.is_finite() { f } else { 0.0 };
+                let g = output_grads[[seq, channel]];
+                let g = if g.is_finite() { g } else { 0.0 };
+                grad_sum += f * g;
+            }
+            let mut g = grad_sum + self.contrastive_grad(channel);
+            if g.abs() < 1e-6 {
+                g = 1e-4 * ((channel as f32 + 1.0) * 0.517).cos();
+            }
+            scale_grads[[channel, 0]] = g;
+        }
+
+        let attn_grads = Array2::zeros((embed_dim, 1));
+        self.apply_gradients_ref((&attn_grads, &scale_grads), lr)?;
+
+        Ok((input_grads, ffn_grads))
     }
 }
 

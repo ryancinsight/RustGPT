@@ -11,18 +11,18 @@ mod gpu_component_tests {
         compute::GpuComponent,
         layers::components::{
             attention_context::SharedAttentionContext,
-            common::{CommonLayers, FeedForwardVariant, TemporalMixingType},
+            common::{CommonLayerConfig, CommonLayers, FeedForwardVariant},
             feedforward::SharedFeedforward,
             temporal_processing::SharedTemporalProcessing,
         },
-        models::config::ModelConfig,
+        models::config::{ModelConfig, TemporalMixingType},
         richards::RichardsGlu,
     };
 
     fn create_test_config() -> ModelConfig {
         ModelConfig {
             embedding_dim: 64,
-            sequence_length: 128,
+            max_seq_len: 128,
             num_layers: 2,
             temporal_mixing: TemporalMixingType::Attention,
             ..Default::default()
@@ -77,7 +77,21 @@ mod gpu_component_tests {
     #[test]
     fn test_shared_temporal_processing_gpu_component_auto_detect() {
         let config = create_test_config();
-        let common_layers = CommonLayers::new(&config);
+        let common_config = CommonLayerConfig {
+            embed_dim: config.embedding_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.num_heads.unwrap_or(4),
+            poly_degree: 2,
+            max_pos: config.max_seq_len,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: llm::domain::mixtures::HeadSelectionStrategy::Fixed { num_active: config.num_heads.unwrap_or(4) },
+            moh_threshold_modulation: Default::default(),
+            titan_memory: Default::default(),
+            temporal_mixing: config.temporal_mixing,
+        };
+        let common_layers = CommonLayers::new(&common_config);
         let mut temporal =
             SharedTemporalProcessing::new(common_layers.temporal_mixing, None, false);
 
@@ -145,7 +159,21 @@ mod gpu_component_tests {
     #[test]
     fn test_shared_temporal_processing_ensure_capacity() {
         let config = create_test_config();
-        let common_layers = CommonLayers::new(&config);
+        let common_config = CommonLayerConfig {
+            embed_dim: config.embedding_dim,
+            hidden_dim: config.hidden_dim,
+            num_heads: config.num_heads.unwrap_or(4),
+            poly_degree: 2,
+            max_pos: config.max_seq_len,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: llm::domain::mixtures::HeadSelectionStrategy::Fixed { num_active: config.num_heads.unwrap_or(4) },
+            moh_threshold_modulation: Default::default(),
+            titan_memory: Default::default(),
+            temporal_mixing: config.temporal_mixing,
+        };
+        let common_layers = CommonLayers::new(&common_config);
         let mut temporal =
             SharedTemporalProcessing::new(common_layers.temporal_mixing, None, false);
 

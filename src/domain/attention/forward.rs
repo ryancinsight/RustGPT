@@ -73,6 +73,113 @@ pub struct PolyAttentionBatchWorkspace {
     pub y_head: Array2<f32>,
 }
 
+/// Configuration for tiled/flash-style attention
+#[derive(Debug, Clone)]
+pub struct TiledAttentionConfig {
+    /// Block size for query dimension (tokens processed together)
+    pub block_q: usize,
+    /// Block size for key/value dimension (tokens in each tile)
+    pub block_k: usize,
+    /// Whether to use online softmax (flash-style O(n) memory)
+    pub use_online_softmax: bool,
+}
+
+impl Default for TiledAttentionConfig {
+    fn default() -> Self {
+        Self {
+            block_q: 64,
+            block_k: 64,
+            use_online_softmax: true,
+        }
+    }
+}
+
+impl TiledAttentionConfig {
+    /// Create config optimized for a specific sequence length
+    pub fn for_sequence_len(seq_len: usize, head_dim: usize) -> Self {
+        // Choose block sizes based on typical GPU shared memory sizes
+        // Aim for ~32KB shared memory per block (1024 f32 values)
+        let elements_per_block = 8192; // 32KB / 4 bytes
+        let block_k = (elements_per_block / head_dim).min(seq_len).max(16);
+        let block_q = (elements_per_block / head_dim / 2).min(seq_len).max(8);
+
+        Self {
+            block_q,
+            block_k,
+            use_online_softmax: true,
+        }
+    }
+}
+
+/// Workspace for tiled attention computation
+#[derive(Debug, Clone, Default)]
+pub struct TiledAttentionWorkspace {
+    /// Accumulator for online softmax: (block_q, head_dim)
+    pub output_acc: Array2<f64>,
+    /// Running max for online softmax: (block_q,)
+    pub max_scores: Vec<f64>,
+    /// Running sum for online softmax: (block_q,)
+    pub sum_exp: Vec<f64>,
+    /// Block-local attention scores: (block_q, block_k)
+    pub scores_block: Array2<f32>,
+    /// Block-local phi values: (block_q, block_k)
+    pub phi_block: Array2<f32>,
+    /// Q block buffer: (block_q, head_dim)
+    pub q_block: Array2<f32>,
+    /// K block buffer: (block_k, head_dim)
+    pub k_block: Array2<f32>,
+    /// V block buffer: (block_k, head_dim)
+    pub v_block: Array2<f32>,
+    /// BLR components buffer
+    pub q_comp: Vec<f32>,
+    pub q_h: Vec<f32>,
+    pub k_comp: Vec<f32>,
+}
+
+impl TiledAttentionWorkspace {
+    pub fn ensure_capacity(
+        &mut self,
+        block_q: usize,
+        block_k: usize,
+        head_dim: usize,
+        blr_rank: usize,
+    ) {
+        if self.output_acc.shape() != [block_q, head_dim] {
+            self.output_acc = Array2::zeros((block_q, head_dim));
+        }
+        if self.max_scores.len() != block_q {
+            self.max_scores = vec![f64::NEG_INFINITY; block_q];
+        }
+        if self.sum_exp.len() != block_q {
+            self.sum_exp = vec![0.0; block_q];
+        }
+        if self.scores_block.shape() != [block_q, block_k] {
+            self.scores_block = Array2::zeros((block_q, block_k));
+        }
+        if self.phi_block.shape() != [block_q, block_k] {
+            self.phi_block = Array2::zeros((block_q, block_k));
+        }
+        if self.q_block.shape() != [block_q, head_dim] {
+            self.q_block = Array2::zeros((block_q, head_dim));
+        }
+        if self.k_block.shape() != [block_k, head_dim] {
+            self.k_block = Array2::zeros((block_k, head_dim));
+        }
+        if self.v_block.shape() != [block_k, head_dim] {
+            self.v_block = Array2::zeros((block_k, head_dim));
+        }
+        if self.q_comp.len() != blr_rank {
+            self.q_comp = vec![0.0; blr_rank];
+        }
+        if self.q_h.len() != blr_rank {
+            self.q_h = vec![0.0; blr_rank];
+        }
+        if self.k_comp.len() != blr_rank {
+            self.k_comp = vec![0.0; blr_rank];
+        }
+    }
+}
+
 /// Compute polynomial attention forward pass into provided output buffer using workspace
 pub fn compute_poly_attention_forward_into(
     ctx: &mut ForwardContext,
@@ -773,6 +880,360 @@ pub fn compute_poly_attention_forward_baseline(
         head_activity_vec,
         token_head_activity_vec,
         scores_dump: None,
+    }
+}
+
+/// Compute tiled polynomial attention with O(n) memory using online softmax.
+///
+/// This implements a Flash-style tiled attention algorithm that processes
+/// Q and K/V in blocks, maintaining O(block_q * block_k) memory instead
+/// of O(n²) for the full attention matrix.
+///
+/// ## Algorithm (Online Softmax)
+///
+/// For each Q-block `i` and K/V-block `j`:
+/// 1. Compute local scores: `S_ij = Q_i @ K_j^T`
+/// 2. Apply polynomial attention: `Phi_ij = poly(S_ij)`
+/// 3. Update online softmax accumulator:
+///    - `m_new = max(m_old, max(Phi_ij))`
+///    - `scale = exp(m_old - m_new)`
+///    - `sum_new = scale * sum_old + sum(exp(Phi_ij - m_new))`
+///    - `output_new = scale * output_old + exp(Phi_ij - m_new) @ V_j`
+///
+/// ## Memory Complexity
+///
+/// - Standard attention: O(n²) for scores matrix
+/// - Tiled attention: O(block_q * block_k) per head
+///
+/// ## Polynomial Attention Specifics
+///
+/// PolyAttention uses polynomial basis functions for position encoding,
+/// which naturally fits the tiled approach as each tile can compute
+/// its contribution independently.
+pub fn compute_poly_attention_tiled(
+    ctx: &mut ForwardContext,
+    causal: bool,
+    output: &mut Array2<f32>,
+    workspace: &mut PolyAttentionBatchWorkspace,
+    tiled_workspace: &mut TiledAttentionWorkspace,
+    tile_config: &TiledAttentionConfig,
+) -> ForwardResult {
+    let (n, d_model) = (ctx.input.nrows(), ctx.input.ncols());
+    assert_eq!(d_model, ctx.embed_dim);
+
+    let block_q = tile_config.block_q.min(n);
+    let block_k = tile_config.block_k.min(n);
+    let blr_rank = dynamic_blr_rank(ctx.head_dim);
+
+    // Ensure workspace capacity
+    workspace.ensure_capacity(n, ctx.num_heads, ctx.head_dim);
+    tiled_workspace.ensure_capacity(block_q, block_k, ctx.head_dim, blr_rank);
+
+    // Reset cached masks
+    ctx.cached_soft_top_p_mask.take();
+    ctx.cached_thresholds_global.take();
+
+    let dk_scale = 1.0f32 / (ctx.head_dim as f32).sqrt();
+    output.fill(0.0);
+
+    // Compute projections (same as standard forward)
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_q, 0.0, &mut workspace.q_all);
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_k, 0.0, &mut workspace.k_all);
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_v, 0.0, &mut workspace.v_all);
+    ndarray::linalg::general_mat_mul(1.0, ctx.input, ctx.w_g, 0.0, &mut workspace.xw_all);
+
+    // Compute gate values
+    let mut g_sq_sum_global = 0.0f32;
+    let mut g_count_global = 0;
+
+    for h_idx in 0..ctx.num_heads {
+        let a_h = ctx.alpha_g[[0, h_idx]];
+        let b_h = ctx.beta_g[[0, h_idx]];
+
+        for i in 0..n {
+            let z = a_h * workspace.xw_all[[i, h_idx]] + b_h;
+            let gate_poly = ctx.gate.update_scaling_from_max_abs(z.abs() as f64);
+            workspace.gate_values[[i, h_idx]] = gate_poly.forward_scalar_f32(z);
+        }
+
+        g_sq_sum_global += workspace.xw_all.column(h_idx).mapv(|v| v * v).sum();
+        g_count_global += n;
+    }
+
+    // Tiled attention computation
+    for h_idx in 0..ctx.num_heads {
+        let start = h_idx * ctx.head_dim;
+        let end = start + ctx.head_dim;
+
+        let q = workspace.q_all.slice(s![.., start..end]);
+        let k = workspace.k_all.slice(s![.., start..end]);
+        let v = workspace.v_all.slice(s![.., start..end]);
+        let eff_col = workspace.gate_values.column(h_idx);
+
+        let a = ctx.a[[0, 0]];
+        let b = ctx.b[[0, 0]];
+        let scale = ctx.scale[[0, 0]];
+        let p_i32 = ctx.p as i32;
+        let blr_scale = dynamic_blr_scale(blr_rank);
+        let w_block = ctx.w_out.slice(s![start..end, ..]);
+
+        // Process in Q-blocks
+        for q_start in (0..n).step_by(block_q) {
+            let q_end = (q_start + block_q).min(n);
+            let q_len = q_end - q_start;
+
+            // Initialize online softmax accumulators for this Q-block
+            tiled_workspace.output_acc.fill(0.0);
+            for qi in 0..q_len {
+                tiled_workspace.max_scores[qi] = f64::NEG_INFINITY;
+                tiled_workspace.sum_exp[qi] = 0.0;
+            }
+
+            // Copy Q-block to workspace
+            for qi in 0..q_len {
+                for d in 0..ctx.head_dim {
+                    tiled_workspace.q_block[[qi, d]] = q[[q_start + qi, d]];
+                }
+            }
+
+            // Determine K/V range for causal attention
+            let kv_start = if causal { 0 } else { 0 };
+            let kv_end = if causal { q_end } else { n };
+
+            // Process K/V in blocks
+            for k_start in (kv_start..kv_end).step_by(block_k) {
+                let k_end = (k_start + block_k).min(kv_end);
+                let k_len = k_end - k_start;
+
+                // For causal: only process positions <= q positions
+                if causal && k_start > q_end {
+                    break;
+                }
+
+                // Copy K/V blocks to workspace
+                for ki in 0..k_len {
+                    for d in 0..ctx.head_dim {
+                        tiled_workspace.k_block[[ki, d]] = k[[k_start + ki, d]];
+                        tiled_workspace.v_block[[ki, d]] = v[[k_start + ki, d]];
+                    }
+                }
+
+                // Compute attention scores for this tile: (q_len, k_len)
+                // scores_block = q_block @ k_block^T * dk_scale
+                for qi in 0..q_len {
+                    let q_row = tiled_workspace.q_block.row(qi);
+
+                    // Compute BLR components for Q
+                    dynamic_blr_components(&q_row, blr_rank, &mut tiled_workspace.q_comp);
+                    dynamic_blr_query_coeffs(
+                        &tiled_workspace.q_comp,
+                        ctx.low_rank_query_gate,
+                        &mut tiled_workspace.q_h,
+                        &mut vec![0.0; blr_rank], // q_dh unused
+                    );
+
+                    for ki in 0..k_len {
+                        let i = q_start + qi;
+                        let j = k_start + ki;
+
+                        // Skip if causal mask violated
+                        if causal && j > i {
+                            tiled_workspace.scores_block[[qi, ki]] = f32::NEG_INFINITY;
+                            tiled_workspace.phi_block[[qi, ki]] = 0.0;
+                            continue;
+                        }
+
+                        // Check sliding window
+                        if let Some(w) = ctx.window_size {
+                            if j < i.saturating_sub(w - 1) {
+                                tiled_workspace.scores_block[[qi, ki]] = f32::NEG_INFINITY;
+                                tiled_workspace.phi_block[[qi, ki]] = 0.0;
+                                continue;
+                            }
+                        }
+
+                        let k_row = tiled_workspace.k_block.row(ki);
+
+                        // Base attention score
+                        let mut score = 0.0f32;
+                        for d in 0..ctx.head_dim {
+                            score +=
+                                tiled_workspace.q_block[[qi, d]] * tiled_workspace.k_block[[ki, d]];
+                        }
+                        score *= dk_scale;
+
+                        // Add position embedding contribution
+                        let pe_contrib =
+                            ctx.cope
+                                .contribution(&q_row, &k_row, i, j, Some(&ctx.input.view()));
+                        score += pe_contrib;
+
+                        // Add BLR contribution
+                        dynamic_blr_components(&k_row, blr_rank, &mut tiled_workspace.k_comp);
+                        let mut blr = 0.0f32;
+                        for m in 0..blr_rank {
+                            blr += tiled_workspace.q_h[m] * tiled_workspace.k_comp[m];
+                        }
+                        score += blr_scale * blr;
+
+                        // Apply polynomial attention
+                        let s_stable = smooth_clip_tanh(score, 8.0);
+                        let sp = if p_i32 <= 3 {
+                            match p_i32 {
+                                1 => s_stable,
+                                2 => s_stable * s_stable,
+                                3 => s_stable * s_stable * s_stable,
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            let mut result = 1.0f32;
+                            for _ in 0..p_i32 {
+                                result *= s_stable;
+                            }
+                            result
+                        };
+
+                        let phi = scale * (a * sp + b);
+
+                        tiled_workspace.scores_block[[qi, ki]] = score;
+                        tiled_workspace.phi_block[[qi, ki]] = phi;
+                    }
+                }
+
+                // Online softmax update
+                if tile_config.use_online_softmax {
+                    for qi in 0..q_len {
+                        let i = q_start + qi;
+                        let eff_i = eff_col[i] as f64;
+
+                        if eff_i <= ctx.eff_skip_threshold as f64 {
+                            continue;
+                        }
+
+                        // Find max in this K-block for this Q position
+                        let mut block_max = f64::NEG_INFINITY;
+                        for ki in 0..k_len {
+                            let phi = tiled_workspace.phi_block[[qi, ki]] as f64;
+                            if phi.is_finite() {
+                                block_max = block_max.max(phi);
+                            }
+                        }
+
+                        // Update running max
+                        let old_max = tiled_workspace.max_scores[qi];
+                        let new_max = old_max.max(block_max);
+
+                        // Compute scaling factors
+                        let scale_old = if old_max.is_finite() {
+                            (old_max - new_max).exp()
+                        } else {
+                            0.0
+                        };
+
+                        // Compute sum of exp(phi - new_max) for this block
+                        let mut block_sum = 0.0f64;
+                        for ki in 0..k_len {
+                            let phi = tiled_workspace.phi_block[[qi, ki]] as f64;
+                            if phi.is_finite() && phi > f64::NEG_INFINITY {
+                                block_sum += (phi - new_max).exp();
+                            }
+                        }
+
+                        // Update running sum
+                        let old_sum = tiled_workspace.sum_exp[qi];
+                        let new_sum = scale_old * old_sum + block_sum;
+
+                        // Update output accumulator
+                        // output_new = scale_old * output_old + exp(phi - new_max) @ V * eff
+                        for d in 0..ctx.head_dim {
+                            tiled_workspace.output_acc[[qi, d]] *= scale_old;
+                        }
+
+                        for ki in 0..k_len {
+                            let phi = tiled_workspace.phi_block[[qi, ki]] as f64;
+                            if phi.is_finite() && phi > f64::NEG_INFINITY {
+                                let exp_phi = (phi - new_max).exp() * eff_i;
+                                for d in 0..ctx.head_dim {
+                                    tiled_workspace.output_acc[[qi, d]] +=
+                                        exp_phi * (tiled_workspace.v_block[[ki, d]] as f64);
+                                }
+                            }
+                        }
+
+                        tiled_workspace.max_scores[qi] = new_max;
+                        tiled_workspace.sum_exp[qi] = new_sum;
+                    }
+                }
+            }
+
+            // Normalize and write to y_head
+            for qi in 0..q_len {
+                let sum = tiled_workspace.sum_exp[qi];
+                let i = q_start + qi;
+
+                if sum > 0.0 {
+                    let inv_sum = 1.0 / sum;
+                    for d in 0..ctx.head_dim {
+                        workspace.y_head[[i, d]] =
+                            (tiled_workspace.output_acc[[qi, d]] * inv_sum) as f32;
+                    }
+                }
+            }
+        }
+
+        // Project output
+        ndarray::linalg::general_mat_mul(1.0, &workspace.y_head, &w_block, 1.0, output);
+    }
+
+    // Compute metrics
+    let pred_norm = if g_count_global > 0 {
+        Some((g_sq_sum_global / g_count_global as f32).sqrt())
+    } else {
+        None
+    };
+
+    let avg_active_heads = if workspace.gate_values.nrows() > 0 {
+        Some(
+            crate::domain::mixtures::routing::compute_avg_active_components(
+                &workspace.gate_values.view(),
+            ),
+        )
+    } else {
+        None
+    };
+
+    ForwardResult {
+        output: output.clone(),
+        tau_metrics: None,
+        pred_norm,
+        avg_active_heads,
+        head_activity_vec: None,
+        token_head_activity_vec: None,
+        scores_dump: None,
+    }
+}
+
+impl PolyAttentionBatchWorkspace {
+    fn ensure_capacity(&mut self, n: usize, num_heads: usize, head_dim: usize) {
+        let total_dim = num_heads * head_dim;
+        if self.q_all.shape() != [n, total_dim] {
+            self.q_all = Array2::zeros((n, total_dim));
+        }
+        if self.k_all.shape() != [n, total_dim] {
+            self.k_all = Array2::zeros((n, total_dim));
+        }
+        if self.v_all.shape() != [n, total_dim] {
+            self.v_all = Array2::zeros((n, total_dim));
+        }
+        if self.xw_all.shape() != [n, num_heads] {
+            self.xw_all = Array2::zeros((n, num_heads));
+        }
+        if self.gate_values.shape() != [n, num_heads] {
+            self.gate_values = Array2::zeros((n, num_heads));
+        }
+        if self.y_head.shape() != [n, head_dim] {
+            self.y_head = Array2::zeros((n, head_dim));
+        }
     }
 }
 

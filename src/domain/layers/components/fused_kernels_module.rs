@@ -111,20 +111,112 @@ pub mod richards_glu_fused {
     /// # Errors
     /// Returns error if GPU device not available or kernel execution fails
     pub fn execute(
-        _device: &Arc<Mutex<GpuDevice>>,
+        device: &Arc<Mutex<GpuDevice>>,
         _pool: &mut dyn GpuMemoryPool,
         _ops: &mut dyn GpuMatrixOps,
         input: &Array2<f32>,
-        _w1: &Array2<f32>,
-        _w2: &Array2<f32>,
-        _w_out: &Array2<f32>,
-        _params: &RichardsGluFusedKernelParams,
+        w1: &Array2<f32>,
+        w2: &Array2<f32>,
+        w_out: &Array2<f32>,
+        params: &RichardsGluFusedKernelParams,
     ) -> Result<Array2<f32>> {
-        // TODO: Implement two-pass fused kernel execution
-        // Phase 5.6.3 implementation
+        // Two-pass fused kernel execution using existing GPU infrastructure
+        let (batch_size, input_dim) = input.dim();
+        let hidden_dim = params.hidden_dim as usize;
+        let output_dim = params.output_dim as usize;
 
-        // For now, return placeholder
-        Ok(input.clone())
+        // Validate dimensions
+        if batch_size != params.batch_size as usize || input_dim != params.input_dim as usize {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("input: ({}, {})", params.batch_size, params.input_dim),
+                    got: format!("{:?}", input.dim()),
+                },
+            );
+        }
+
+        let mut device = device
+            .lock()
+            .map_err(|_| crate::common::errors::ModelError::Backend {
+                message: "GPU device lock failed in RichardsGluFusedKernel".to_string(),
+            })?;
+
+        // Pass 1: W1 projection → Richards activation → W2 projection → Gating
+        // x1 = input @ W1 (batch, hidden)
+        let x1 = input.dot(w1);
+
+        // Apply Richards activation on GPU
+        let x1_slice =
+            x1.as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "x1 must be contiguous".to_string(),
+                })?;
+        let mut x1_buf = device.allocate_f32(x1.len())?;
+        let mut activated_buf = device.allocate_f32(x1.len())?;
+        device.upload(x1_slice, &mut x1_buf)?;
+
+        device.begin_recording();
+
+        let richards_params = crate::domain::compute::gpu_ops::RichardsCurveParams {
+            nu: params.richards_nu,
+            k: params.richards_k,
+            m: params.richards_m,
+            beta: params.richards_beta,
+            temp_reciprocal: params.activation_temp_inv,
+            output_gain: 1.0,
+            output_bias: 0.0,
+            scale: 1.0,
+            shift: 0.0,
+            adaptive_scale: 1.0,
+            adaptive_shift: 0.0,
+            input_scale: 1.0,
+            gate_scale: 1.0,
+            gate_bias: 0.0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        device.richards_curve(&x1_buf, &mut activated_buf, &richards_params, x1.len())?;
+
+        // x2 = input @ W2 (batch, hidden) for gating
+        let x2 = input.dot(w2);
+
+        // Apply sigmoid for gating
+        let x2_slice =
+            x2.as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "x2 must be contiguous".to_string(),
+                })?;
+        let mut x2_buf = device.allocate_f32(x2.len())?;
+        let mut gate_buf = device.allocate_f32(x2.len())?;
+        device.upload(x2_slice, &mut x2_buf)?;
+        device.sigmoid(&x2_buf, &mut gate_buf, x2.len())?;
+
+        // Gated = activated * gate (element-wise)
+        let mut gated_buf = device.allocate_f32(x1.len())?;
+        device.mul(&activated_buf, &gate_buf, &mut gated_buf, x1.len())?;
+
+        device.flush();
+
+        // Download gated for Pass 2
+        let mut gated_host = vec![0.0f32; x1.len()];
+        device.download(&gated_buf, &mut gated_host)?;
+        let gated = Array2::from_shape_vec((batch_size, hidden_dim), gated_host)?;
+
+        // Pass 2: Output projection with residual
+        // output = input + gated @ W_out
+        let projected = gated.dot(w_out);
+
+        // Cleanup GPU buffers
+        device.deallocate(x1_buf);
+        device.deallocate(activated_buf);
+        device.deallocate(x2_buf);
+        device.deallocate(gate_buf);
+        device.deallocate(gated_buf);
+
+        // Residual connection (CPU for simplicity)
+        let output = input + &projected;
+
+        Ok(output)
     }
 }
 
@@ -157,20 +249,61 @@ pub mod poly_attention_fused {
     }
 
     pub fn execute(
-        _device: &Arc<Mutex<GpuDevice>>,
+        device: &Arc<Mutex<GpuDevice>>,
         _pool: &mut dyn GpuMemoryPool,
         _ops: &mut dyn GpuMatrixOps,
         input: &Array2<f32>,
-        _wq: &Array2<f32>,
-        _wk: &Array2<f32>,
-        _wv: &Array2<f32>,
-        _wo: &Array2<f32>,
-        _params: &PolyAttentionFusedParams,
+        wq: &Array2<f32>,
+        wk: &Array2<f32>,
+        wv: &Array2<f32>,
+        wo: &Array2<f32>,
+        params: &PolyAttentionFusedParams,
     ) -> Result<Array2<f32>> {
-        // TODO: Implement single-pass polynomial attention fused kernel
-        // Phase 5.6.3 implementation
+        let (total_tokens, embed_dim) = input.dim();
+        let num_heads = params.num_heads as usize;
+        let head_dim = params.head_dim as usize;
+        let seq_len = params.seq_len as usize;
+        let batch_size = total_tokens / seq_len;
 
-        Ok(input.clone())
+        // Validate dimensions
+        if embed_dim != params.embed_dim as usize {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("embed_dim: {}", params.embed_dim),
+                    got: format!("{}", embed_dim),
+                },
+            );
+        }
+
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            // Use existing attention_gpu_kernel via UnifiedGpuKernels
+            let attention_params =
+                crate::domain::layers::components::unified_gpu_kernels::AttentionParams::new(
+                    num_heads, embed_dim, seq_len, batch_size,
+                );
+
+            let backend = device
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to acquire GPU device lock for fused poly attention"
+                        .to_string(),
+                })?
+                .backend();
+            let mut kernels =
+                crate::domain::layers::components::unified_gpu_kernels::UnifiedGpuKernels::new(
+                    backend,
+                )?;
+
+            kernels.attention_forward(input, wq, wk, wv, wo, &attention_params)
+        }
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        {
+            let _ = (device, _pool, _ops, input, wq, wk, wv, wo, params);
+            Err(crate::common::errors::ModelError::Backend {
+                message: "poly_attention_fused::execute requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+            })
+        }
     }
 }
 
@@ -195,16 +328,50 @@ pub mod mamba_scan_kernel {
     }
 
     pub fn execute(
-        _device: &Arc<Mutex<GpuDevice>>,
+        device: &Arc<Mutex<GpuDevice>>,
         _pool: &mut dyn GpuMemoryPool,
         _ops: &mut dyn GpuMatrixOps,
         input: &Array2<f32>,
-        _params: &MambaScanParams,
+        params: &MambaScanParams,
     ) -> Result<Array2<f32>> {
-        // TODO: Implement selective scan with GPU optimizations
-        // Phase 5.6.3 implementation
+        let (total_tokens, embed_dim) = input.dim();
+        let seq_len = params.seq_len as usize;
+        let state_dim = params.state_dim as usize;
+        let batch_size = total_tokens / seq_len;
 
-        Ok(input.clone())
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            // Use existing ssm_gpu_kernels via UnifiedGpuKernels
+            let ssm_params = crate::domain::layers::components::unified_gpu_kernels::SsmParams::new(
+                state_dim, embed_dim, seq_len, batch_size,
+            );
+
+            let backend = device
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to acquire GPU device lock for fused Mamba scan".to_string(),
+                })?
+                .backend();
+            let mut kernels =
+                crate::domain::layers::components::unified_gpu_kernels::UnifiedGpuKernels::new(
+                    backend,
+                )?;
+
+            kernels.ssm_forward(
+                input,
+                &ssm_params,
+                crate::domain::layers::components::unified_gpu_backend::GpuTemporalType::Mamba,
+            )
+        }
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        {
+            let _ = (
+                device, _pool, _ops, input, params, state_dim, embed_dim, seq_len, batch_size,
+            );
+            Err(crate::common::errors::ModelError::Backend {
+                message: "mamba_scan_kernel::execute requires GPU features. Compile with --features gpu-wgpu, gpu-cuda, or gpu-metal.".to_string(),
+            })
+        }
     }
 }
 
@@ -219,30 +386,148 @@ pub mod attention_context_ops {
     use std::sync::{Arc, Mutex};
 
     pub fn apply_incoming_context(
-        _device: &Arc<Mutex<GpuDevice>>,
+        device: &Arc<Mutex<GpuDevice>>,
         _pool: &mut dyn GpuMemoryPool,
         _ops: &mut dyn GpuMatrixOps,
         input: &Array2<f32>,
-        _context_strength: &Array2<f32>,
+        context_strength: &Array2<f32>,
     ) -> Result<Array2<f32>> {
-        // TODO: GPU-accelerated context modulation
-        // Simple GEMM: output = input @ context_strength
+        // GPU-accelerated context modulation via GEMM
+        let (batch_size, embed_dim) = input.dim();
+        if context_strength.dim() != (embed_dim, embed_dim) {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("context_strength: ({}, {})", embed_dim, embed_dim),
+                    got: format!("{:?}", context_strength.dim()),
+                },
+            );
+        }
 
-        Ok(input.clone())
+        let mut device = device
+            .lock()
+            .map_err(|_| crate::common::errors::ModelError::Backend {
+                message: "GPU device lock failed in apply_incoming_context".to_string(),
+            })?;
+
+        // GEMM: output = input @ context_strength
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "input must be contiguous".to_string(),
+                })?;
+        let ctx_slice = context_strength.as_slice().ok_or_else(|| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: "context_strength must be contiguous".to_string(),
+            }
+        })?;
+
+        let mut input_buf = device.allocate_f32(input.len())?;
+        let mut ctx_buf = device.allocate_f32(context_strength.len())?;
+        let mut output_buf = device.allocate_f32(batch_size * embed_dim)?;
+
+        device.upload(input_slice, &mut input_buf)?;
+        device.upload(ctx_slice, &mut ctx_buf)?;
+
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &ctx_buf,
+            0.0,
+            &mut output_buf,
+            batch_size,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+
+        let mut output_host = vec![0.0f32; batch_size * embed_dim];
+        device.download(&output_buf, &mut output_host)?;
+
+        device.deallocate(input_buf);
+        device.deallocate(ctx_buf);
+        device.deallocate(output_buf);
+
+        Array2::from_shape_vec((batch_size, embed_dim), output_host).map_err(|err| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: format!("Failed to reshape context output: {err}"),
+            }
+        })
     }
 
     pub fn update_outgoing_context(
-        _device: &Arc<Mutex<GpuDevice>>,
+        device: &Arc<Mutex<GpuDevice>>,
         _pool: &mut dyn GpuMemoryPool,
         _ops: &mut dyn GpuMatrixOps,
         input: &Array2<f32>,
-        _output: &Array2<f32>,
-        _update_rate: f32,
+        output: &Array2<f32>,
+        update_rate: f32,
     ) -> Result<Array2<f32>> {
-        // TODO: GPU-accelerated context update
-        // Compute: context = (input.T @ output) / batch_size
+        // GPU-accelerated context update via GEMM
+        let (batch_size, embed_dim) = input.dim();
+        if output.dim() != (batch_size, embed_dim) {
+            return Err(
+                crate::common::errors::ModelError::DimensionMismatchDetailed {
+                    expected: format!("output: ({}, {})", batch_size, embed_dim),
+                    got: format!("{:?}", output.dim()),
+                },
+            );
+        }
 
-        Ok(Array2::zeros(input.dim()))
+        let mut device = device
+            .lock()
+            .map_err(|_| crate::common::errors::ModelError::Backend {
+                message: "GPU device lock failed in update_outgoing_context".to_string(),
+            })?;
+
+        // GEMM: context = (input.T @ output) * update_rate / batch_size
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "input must be contiguous".to_string(),
+                })?;
+        let output_slice =
+            output
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "output must be contiguous".to_string(),
+                })?;
+
+        let mut input_buf = device.allocate_f32(input.len())?;
+        let mut output_buf = device.allocate_f32(output.len())?;
+        let mut context_buf = device.allocate_f32(embed_dim * embed_dim)?;
+
+        device.upload(input_slice, &mut input_buf)?;
+        device.upload(output_slice, &mut output_buf)?;
+
+        // context = input.T @ output
+        device.gemm_f32(
+            update_rate / batch_size as f32,
+            &input_buf,
+            &output_buf,
+            0.0,
+            &mut context_buf,
+            embed_dim,
+            embed_dim,
+            batch_size,
+            true,
+            false,
+        )?;
+
+        let mut context_host = vec![0.0f32; embed_dim * embed_dim];
+        device.download(&context_buf, &mut context_host)?;
+
+        device.deallocate(input_buf);
+        device.deallocate(output_buf);
+        device.deallocate(context_buf);
+
+        Array2::from_shape_vec((embed_dim, embed_dim), context_host).map_err(|err| {
+            crate::common::errors::ModelError::InvalidInput {
+                message: format!("Failed to reshape context update: {err}"),
+            }
+        })
     }
 }
 

@@ -62,6 +62,12 @@ pub enum ModelError {
 
     #[error("Dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatchDetailed { expected: String, got: String },
+
+    #[error("Lock error: {message}")]
+    Lock { message: String },
+
+    #[error("Invalid state: {message}")]
+    InvalidState { message: String },
 }
 
 impl From<ndarray::ShapeError> for ModelError {

@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::GpuComponent;
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::gpu_device_utils::resolve_or_create_gpu_device;
 
 /// Shared temporal processing component
 ///
@@ -339,7 +341,7 @@ impl SharedTemporalProcessing {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
-        self.temporal_mixing.compute_gradients(input, output_grads)
+        self.compute_gradients(input, output_grads)
     }
 
     /// Apply gradients to the temporal processing layer
@@ -399,12 +401,16 @@ impl SharedTemporalProcessing {
         }
     }
 
+    /// Returns true if the temporal mixer uses the shared GPU device (attention).
     #[inline]
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     fn uses_shared_gpu_device(&self) -> bool {
         matches!(self.temporal_mixing, TemporalMixingLayer::Attention(_))
     }
 
+    /// Returns true if the temporal mixer uses a variant-local GPU backend (SSM variants).
     #[inline]
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     fn uses_variant_local_gpu_backend(&self) -> bool {
         matches!(
             self.temporal_mixing,
@@ -451,13 +457,11 @@ impl SharedTemporalProcessing {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
                 if self.uses_shared_gpu_device() {
-                    let device = GpuDevice::new(compute_backend)?;
-                    tracing::info!(
-                        "GPU device attached: {} ({})",
-                        device.name(),
-                        device.backend().as_str()
-                    );
-                    let device_arc = Arc::new(Mutex::new(device));
+                    let (device_arc, _) = resolve_or_create_gpu_device(
+                        self.gpu_device.clone(),
+                        compute_backend,
+                        "temporal",
+                    )?;
 
                     self.gpu_device = Some(device_arc.clone());
                     self.temporal_mixing.set_gpu_device(device_arc);
@@ -808,7 +812,35 @@ impl SharedTemporalProcessing {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            return self
+                .compute_gradients_gpu(input, output_grads)
+                .unwrap_or_else(|err| {
+                    panic!("SharedTemporalProcessing GPU backward failed: {err}")
+                });
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        if self.compute_backend.is_gpu() {
+            panic!(
+                "SharedTemporalProcessing configured for GPU backend '{}' but this binary has no GPU features enabled.",
+                self.compute_backend.as_str()
+            );
+        }
+
         self.temporal_mixing.compute_gradients(input, output_grads)
+    }
+
+    /// Compute gradients through GPU-aware temporal mixing dispatch.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        self.temporal_mixing
+            .compute_gradients_gpu(input, output_grads)
     }
 
     /// Get a reference to the underlying temporal mixing layer
@@ -942,6 +974,13 @@ impl GpuComponent for SharedTemporalProcessing {
 mod tests {
     use super::*;
     use crate::domain::{compute_backend::ComputeBackend, models::config::TemporalMixingType};
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    use crate::domain::{
+        compute::GpuDevice, compute_backend::resolve_compute_backend_strict_auto_gpu,
+    };
 
     #[test]
     fn test_shared_temporal_processing_layer_type() {
@@ -1151,6 +1190,47 @@ mod tests {
 
         assert!(stp.is_gpu_ready());
         assert_eq!(stp.gpu_backend_name(), Some("vulkan"));
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_shared_temporal_processing_reuses_preattached_gpu_device_for_attention() {
+        let backend = match resolve_compute_backend_strict_auto_gpu() {
+            Ok(backend) => backend,
+            Err(_) => return,
+        };
+
+        let config = crate::domain::layers::components::common::CommonLayerConfig {
+            embed_dim: 8,
+            hidden_dim: 16,
+            num_heads: 2,
+            poly_degree: 3,
+            max_pos: 16,
+            window_size: None,
+            use_moe: false,
+            moe_config: None,
+            head_selection: crate::domain::mixtures::HeadSelectionStrategy::Fixed { num_active: 2 },
+            moh_threshold_modulation: crate::domain::richards::adaptive::AdaptiveScalar::default(),
+            titan_memory: crate::domain::models::config::TitanMemoryConfig::default(),
+            temporal_mixing: TemporalMixingType::Attention,
+        };
+        let layers = crate::domain::layers::components::common::CommonLayers::new(&config);
+        let mut stp = SharedTemporalProcessing::new(layers.temporal_mixing, None, false);
+
+        let device = Arc::new(Mutex::new(
+            GpuDevice::new(backend).expect("resolved backend should create a GPU device"),
+        ));
+        stp.gpu_device = Some(device.clone());
+
+        stp.set_compute_backend_checked(backend)
+            .expect("pre-attached matching GPU device should be reused");
+
+        let attached = stp
+            .gpu_device
+            .as_ref()
+            .expect("GPU device should remain attached")
+            .clone();
+        assert!(Arc::ptr_eq(&attached, &device));
     }
 }
 

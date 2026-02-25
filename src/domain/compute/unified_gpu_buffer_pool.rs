@@ -21,7 +21,7 @@
 
 use crate::common::errors::{ModelError, Result};
 
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::{GpuBuffer, UnifiedGpuExecutor};
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]

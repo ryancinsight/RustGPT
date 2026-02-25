@@ -68,9 +68,12 @@ pub mod feedforward;
 pub mod feedforward_gpu;
 pub mod fused_kernels_module;
 pub mod gpu_backward_fusion;
+pub mod gpu_device_utils;
 pub mod gpu_gemm_kernels;
 pub mod gpu_shared_executor;
 pub mod gradient_router;
+pub mod moh_gpu_kernels;
+pub mod shared_components_unified;
 pub mod shared_gpu_manager;
 pub mod ssm_gpu_kernels;
 pub mod temporal_processing;
@@ -93,6 +96,7 @@ pub use fused_kernels_module::{
 };
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 pub use gpu_shared_executor::{GpuExecutionStats, GpuSharedExecutor};
+pub use shared_components_unified::SharedComponentBackend;
 pub use shared_gpu_manager::SharedComponentGpuManager;
 pub use unified_buffer_pool::{
     BufferHandle, BufferPoolConfig, BufferPoolStats, SharedBufferManager, UnifiedBufferPool,

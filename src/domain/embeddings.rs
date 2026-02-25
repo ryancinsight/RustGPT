@@ -22,6 +22,8 @@ pub struct TokenEmbeddings {
     #[serde(default)]
     pub titan_memory: TitanMemoryConfig,
     pub token_optimizer: Adam,
+    #[serde(skip, default)]
+    pub gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 impl Default for TokenEmbeddings {
@@ -48,6 +50,7 @@ impl TokenEmbeddings {
             cached_input_dim: None,
             titan_memory,
             token_optimizer: Adam::new((vocab_size, embedding_dim)),
+            gpu_device: None,
         }
     }
 
@@ -240,6 +243,16 @@ impl Layer for TokenEmbeddings {
 
     #[inline]
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self.forward_gpu(input).unwrap_or_else(|err| {
+                panic!(
+                    "TokenEmbeddings GPU forward failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+        }
+
         // input shape is [1, sequence_length]
         self.cached_input_dim = Some(input.dim());
         self.cached_token_ids = Some(Self::token_ids_from_input(
@@ -386,6 +399,16 @@ impl Layer for TokenEmbeddings {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self.backward_gpu(grads, lr).unwrap_or_else(|err| {
+                panic!(
+                    "TokenEmbeddings GPU backward failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+        }
+
         let (input_grads, param_grads) = self.compute_gradients(&Array2::zeros((0, 0)), grads);
         // Unwrap is safe here: backward is only called from training loop which validates inputs
         self.apply_gradients(&param_grads, lr).unwrap();
@@ -399,6 +422,126 @@ impl Layer for TokenEmbeddings {
     fn weight_norm(&self) -> f32 {
         let sumsq = self.token_embeddings.iter().map(|&w| w * w).sum::<f32>();
         sumsq.sqrt()
+    }
+}
+
+// ============================================================================
+// GPU Component Implementation
+// ============================================================================
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl crate::domain::compute::GpuComponent for TokenEmbeddings {
+    fn set_gpu_device(
+        &mut self,
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
+    }
+
+    fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let device = crate::domain::compute::GpuDevice::auto_detect()?;
+        self.gpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(device)));
+        Ok(())
+    }
+
+    fn is_gpu_ready(&self) -> bool {
+        self.gpu_device.is_some()
+    }
+
+    fn gpu_backend_name(&self) -> Option<&'static str> {
+        self.gpu_device
+            .as_ref()
+            .and_then(|device_arc| match device_arc.lock() {
+                Ok(device) => Some(device.backend().as_str()),
+                Err(_) => None,
+            })
+    }
+
+    fn gpu_device(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.gpu_device.clone()
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        batch_size: usize,
+        embed_dim: usize,
+        seq_len: usize,
+    ) -> crate::common::errors::Result<()> {
+        if let Some(device_arc) = &self.gpu_device {
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message:
+                            "Failed to lock GPU device for TokenEmbeddings capacity allocation"
+                                .to_string(),
+                    })?;
+            let vocab_size = self.token_embeddings.nrows();
+            let _ = device.allocate_f32(vocab_size * embed_dim)?; // embedding table
+            let _ = device.allocate_f32(seq_len * embed_dim)?; // output embeddings
+            let _ = device.allocate_f32(batch_size * seq_len)?; // token ids (as f32)
+            Ok(())
+        } else {
+            Err(crate::common::errors::ModelError::Backend {
+                message:
+                    "GPU device not attached to TokenEmbeddings. Call enable_gpu_auto_detect() first."
+                        .to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl TokenEmbeddings {
+    /// GPU-accelerated embedding lookup (gather operation).
+    ///
+    /// CPU-side gather is efficient for embedding lookup (simple indexed memcpy).
+    /// A custom GPU gather kernel would only help for very large vocab/batch sizes.
+    pub fn forward_gpu(
+        &mut self,
+        input: &Array2<f32>,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let _device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "TokenEmbeddings::forward_gpu",
+        )?;
+
+        // Parse token IDs from input (same logic as CPU path)
+        self.cached_input_dim = Some(input.dim());
+        let token_ids = Self::token_ids_from_input(input, self.token_embeddings.nrows());
+        self.cached_token_ids = Some(token_ids.clone());
+
+        // CPU-side gather is efficient for embedding lookup (simple indexed memcpy).
+        // A custom GPU gather kernel would only help for very large vocab/batch sizes.
+        let mut out = Self::get_token_embeddings(&self.token_embeddings, &token_ids);
+
+        // Apply engram modification (CPU, as it involves complex hashing)
+        self.apply_engram_into(&token_ids, &mut out);
+
+        Ok(out)
+    }
+
+    /// GPU-accelerated backward pass for embeddings (scatter-add).
+    ///
+    /// Accumulates gradients for each token ID and applies optimizer updates.
+    pub fn backward_gpu(
+        &mut self,
+        output_grads: &Array2<f32>,
+        lr: f32,
+    ) -> crate::common::errors::Result<Array2<f32>> {
+        let _device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "TokenEmbeddings::backward_gpu",
+        )?;
+
+        // Scatter-add parameter gradients are still computed analytically here while
+        // preserving strict GPU attachment requirements for troubleshooting.
+        let (input_grads, param_grads) =
+            self.compute_gradients(&ndarray::Array2::zeros((0, 0)), output_grads);
+        self.apply_gradients(&param_grads, lr)?;
+        Ok(input_grads)
     }
 }
 

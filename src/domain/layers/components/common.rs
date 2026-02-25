@@ -334,6 +334,38 @@ impl TemporalMixingLayer {
         }
     }
 
+    /// GPU-aware backward dispatch for temporal mixing variants.
+    ///
+    /// Variants with dedicated GPU backward kernels should be routed here.
+    /// Variants that are still being integrated currently use their existing
+    /// analytical gradient implementation.
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> crate::common::errors::Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        match self {
+            TemporalMixingLayer::Attention(layer) => {
+                layer.compute_gradients_gpu(input, output_grads)
+            }
+            TemporalMixingLayer::RgLru(layer) => layer.compute_gradients_gpu(input, output_grads),
+            TemporalMixingLayer::RgLruMoH(layer) => {
+                layer.compute_gradients_gpu(input, output_grads)
+            }
+            TemporalMixingLayer::Mamba(layer) => layer.compute_gradients_gpu(input, output_grads),
+            TemporalMixingLayer::Mamba2(layer) => layer.compute_gradients_gpu(input, output_grads),
+            TemporalMixingLayer::MambaMoH(layer) => {
+                layer.compute_gradients_gpu(input, output_grads)
+            }
+            TemporalMixingLayer::Mamba2MoH(layer) => {
+                layer.compute_gradients_gpu(input, output_grads)
+            }
+            TemporalMixingLayer::Titans(_) => Err(crate::common::errors::ModelError::Backend {
+                message: "GPU backward not yet implemented for Titans".to_string(),
+            }),
+        }
+    }
+
     /// Ensure GPU execution context is attached for variants that support GPU kernels.
     ///
     /// Uses strict automatic GPU detection and does not silently fallback to CPU.
@@ -341,10 +373,7 @@ impl TemporalMixingLayer {
     pub fn ensure_gpu_device_auto_detect(&mut self) -> crate::common::errors::Result<()> {
         match self {
             TemporalMixingLayer::Attention(layer) => layer.ensure_gpu_device_auto_detect(),
-            TemporalMixingLayer::RgLru(_) => {
-                // RgLru: GPU device auto-detection OK (no specialized GPU device setup needed)
-                Ok(())
-            }
+            TemporalMixingLayer::RgLru(layer) => layer.enable_gpu_auto_detect(),
             TemporalMixingLayer::RgLruMoH(layer) => layer.enable_gpu_auto_detect(),
             TemporalMixingLayer::Mamba(layer) => layer.enable_gpu_auto_detect(),
             TemporalMixingLayer::Mamba2(layer) => layer.enable_gpu_auto_detect(),
@@ -772,7 +801,10 @@ impl FeedForwardVariant {
     pub fn ensure_gpu_device_auto_detect(&mut self) -> crate::common::errors::Result<()> {
         match self {
             FeedForwardVariant::RichardsGlu(layer) => {
-                if layer.gpu_device.is_none() {
+                if let Some(device) = layer.gpu_device.clone() {
+                    // Re-propagate device to nested gate component after clone/load.
+                    layer.set_gpu_device(device);
+                } else {
                     let device = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::domain::compute::GpuDevice::auto_detect()?,
                     ));
@@ -781,13 +813,33 @@ impl FeedForwardVariant {
                 Ok(())
             }
             FeedForwardVariant::MixtureOfExperts(layer) => {
-                if layer.gpu_device.is_none() {
-                    let device = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::domain::compute::GpuDevice::auto_detect()?,
-                    ));
+                if let Some(device) = layer.gpu_device.clone() {
+                    // Re-propagate to router + experts so GPU backward paths stay attached.
                     layer.set_gpu_device(device);
+                } else {
+                    layer.enable_gpu_auto_detect()?;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Backward pass on GPU-capable variants.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> crate::common::errors::Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        match self {
+            FeedForwardVariant::RichardsGlu(layer) => {
+                let mut gpu_layer = (**layer).clone();
+                let grad_input = gpu_layer.backward_gpu(output_grads, 0.0)?;
+                let (_, param_grads) = layer.compute_gradients(input, output_grads);
+                Ok((grad_input, param_grads))
+            }
+            FeedForwardVariant::MixtureOfExperts(layer) => {
+                layer.compute_gradients_gpu(input, output_grads)
             }
         }
     }

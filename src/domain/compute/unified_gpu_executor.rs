@@ -14,11 +14,8 @@
 
 use crate::common::errors::{ModelError, Result};
 
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
-use crate::domain::compute::gpu_memory::GpuBuffer;
-
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
-use crate::domain::compute::GpuDevice;
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::compute::{GpuBuffer, GpuDevice};
 
 /// Unified GPU kernel executor for shared components.
 ///
@@ -66,6 +63,17 @@ impl UnifiedGpuExecutor {
     /// ```
     pub fn auto_detect() -> Result<Self> {
         let device = GpuDevice::auto_detect()?;
+        Ok(Self {
+            device,
+            auto_detected: true,
+        })
+    }
+
+    /// Create a new GPU executor with strict Intel NPU detection.
+    ///
+    /// Errors if an Intel NPU-capable adapter is not available.
+    pub fn auto_detect_npu() -> Result<Self> {
+        let device = GpuDevice::auto_detect_npu()?;
         Ok(Self {
             device,
             auto_detected: true,
@@ -161,6 +169,10 @@ impl UnifiedGpuExecutor {
         batch_size: usize,
         embed_dim: usize,
     ) -> Result<()> {
+        if batch_size == 0 || embed_dim == 0 {
+            return Ok(());
+        }
+
         self.device.compute_similarity_softmax(
             activation,
             similarity_out,
@@ -225,11 +237,12 @@ impl UnifiedGpuExecutor {
             false,
         )?;
 
-        // Step 2: Add value bias
-        // Note: This requires a row-wise broadcast add, which we implement
-        // as a scaled addition with scale=1.0 for each row
-        // For simplicity, we assume bias is pre-broadcast or use a dedicated kernel
-        // TODO: Implement broadcast_add kernel for bias addition
+        // Step 2: Add value bias (broadcast across batch)
+        // Implement row-wise broadcast add: value[i,:] += b_value[:]
+        self.device
+            .broadcast_add_rows(&mut value_buf, b_value, batch_size, hidden_dim)?;
+
+        // Step 3: Compute gate projection
 
         // Step 3: Compute gate projection
         // gate_linear = input @ w_gate
@@ -295,6 +308,15 @@ impl UnifiedGpuExecutor {
         seq_len: usize,
         head_dim: usize,
     ) -> Result<()> {
+        if batch_size == 0 || num_heads == 0 || seq_len == 0 {
+            return Ok(());
+        }
+        if head_dim == 0 {
+            return Err(ModelError::InvalidInput {
+                message: "softmax_attention received head_dim=0".to_string(),
+            });
+        }
+
         let total_tokens = batch_size * num_heads * seq_len;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
@@ -396,6 +418,12 @@ impl UnifiedGpuExecutor {
         Err(ModelError::Backend {
             message: "GPU execution requires one of: --features gpu-wgpu, gpu-cuda, or gpu-metal"
                 .to_string(),
+        })
+    }
+
+    pub fn auto_detect_npu() -> Result<Self> {
+        Err(ModelError::Backend {
+            message: "Intel NPU execution requires --features gpu-wgpu".to_string(),
         })
     }
 }

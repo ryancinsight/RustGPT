@@ -24,7 +24,7 @@
 //! ```
 
 use crate::common::errors::{ModelError, Result};
-use crate::domain::compute_backend::ComputeBackend;
+use crate::domain::compute_backend::{ComputeBackend, resolve_compute_backend_strict_auto_npu};
 use std::time::{Duration, Instant};
 
 /// Automatic GPU detection and health check
@@ -104,6 +104,19 @@ impl GpuAutoDetector {
             .or_else(|_| detector.try_detect_metal())
             .or_else(|_| detector.try_detect_wgpu())
             .map(|_| detector)
+    }
+
+    /// Strict Intel NPU detection - errors if no Intel NPU-capable adapter is available.
+    ///
+    /// This path does not fall back to CUDA/Metal/Vulkan general GPU selection.
+    pub fn detect_npu_strict() -> Result<Self> {
+        let mut detector = Self::new();
+        let backend = resolve_compute_backend_strict_auto_npu()?;
+        detector.backend = Some(backend);
+        detector.is_ready = true;
+        detector.status = GpuDetectionStatus::Healthy;
+        tracing::info!("✓ NPU Backend: Intel NPU/WGPU (detected and healthy)");
+        Ok(detector)
     }
 
     /// Detect with retry logic for troubleshooting
@@ -215,6 +228,7 @@ impl GpuAutoDetector {
             Some(ComputeBackend::Cuda) => "CUDA",
             Some(ComputeBackend::Metal) => "Metal",
             Some(ComputeBackend::Vulkan) => "Vulkan/WGPU",
+            Some(ComputeBackend::Npu) => "Intel NPU/WGPU",
             Some(ComputeBackend::Cpu) => "CPU",
             None => "None",
         }
@@ -327,6 +341,26 @@ mod tests {
             }
             Err(e) => {
                 println!("No GPU available (expected on CPU-only systems): {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_detection_npu_strict() {
+        let result = GpuAutoDetector::detect_npu_strict();
+        match result {
+            Ok(detector) => {
+                assert_eq!(detector.backend, Some(ComputeBackend::Npu));
+                assert!(detector.is_ready);
+            }
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("npu")
+                        || msg.contains("gpu")
+                        || msg.contains("fallback")
+                        || msg.contains("compiled")
+                );
             }
         }
     }

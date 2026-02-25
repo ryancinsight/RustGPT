@@ -29,12 +29,12 @@
 
 use crate::common::errors::{ModelError, Result};
 
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use std::collections::HashMap;
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use std::sync::{Arc, RwLock};
 
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::{GpuBuffer, GpuDevice};
 
 /// Buffer slot identifiers for the shared memory pool.
@@ -153,6 +153,12 @@ impl SharedGpuMemoryPool {
     /// Create a new shared memory pool with automatic GPU detection.
     pub fn auto_detect() -> Result<Self> {
         let device = GpuDevice::auto_detect()?;
+        Self::with_device(Arc::new(RwLock::new(device)))
+    }
+
+    /// Create a new shared memory pool with strict Intel NPU detection.
+    pub fn auto_detect_npu() -> Result<Self> {
+        let device = GpuDevice::auto_detect_npu()?;
         Self::with_device(Arc::new(RwLock::new(device)))
     }
 
@@ -457,6 +463,12 @@ impl SharedGpuMemoryPool {
     pub fn auto_detect() -> Result<Self> {
         Err(ModelError::Backend {
             message: "Shared GPU memory pool requires GPU features".to_string(),
+        })
+    }
+
+    pub fn auto_detect_npu() -> Result<Self> {
+        Err(ModelError::Backend {
+            message: "Shared GPU memory pool NPU mode requires --features gpu-wgpu".to_string(),
         })
     }
 }

@@ -5,13 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    common::{
-        errors::{ModelError, Result},
-        rng::get_rng,
-    },
+    common::{errors::Result, rng::get_rng},
     domain::{
         compute::{
-            GpuRichardsDerivativeKernel,
             gpu_device::GpuDevice,
             gpu_memory::{GpuBuffer, GpuMemoryPool},
             gpu_ops::GpuMatrixOps,
@@ -23,16 +19,30 @@ use crate::{
 };
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::common::errors::ModelError;
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::GpuComponent;
 
 #[cfg(any(feature = "gpu-wgpu", feature = "wgpu"))]
 use crate::domain::compute::RichardsGluFusedParams;
+#[cfg(any(feature = "gpu-wgpu", feature = "wgpu"))]
+use crate::domain::compute::WgpuMemoryPool;
 
 #[derive(Debug, Clone)]
 pub struct RichardsGluGpuCache {
     pub w1: GpuBuffer,
     pub w2: GpuBuffer,
     pub w_out: GpuBuffer,
+}
+
+#[derive(Debug, Clone)]
+pub struct RichardsGluGpuForwardCache {
+    pub input: GpuBuffer,
+    pub gated: GpuBuffer,
+    pub gate_sigma: GpuBuffer,
+    pub x2: GpuBuffer,
+    pub x1: GpuBuffer,
+    pub value: GpuBuffer,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -62,12 +72,60 @@ pub struct RichardsGlu {
     /// GPU weights cache
     #[serde(skip)]
     pub gpu_cache: Option<RichardsGluGpuCache>,
+    /// GPU forward intermediates retained for backward to reduce re-uploads
+    #[serde(skip)]
+    pub gpu_forward_cache: Option<RichardsGluGpuForwardCache>,
     /// GPU Device Context
     #[serde(skip)]
     pub gpu_device: Option<Arc<Mutex<GpuDevice>>>,
 }
 
 impl RichardsGlu {
+    #[inline]
+    fn gpu_strict_no_fallback_mode() -> bool {
+        std::env::var("RUSTGPT_GPU_STRICT_NO_FALLBACK")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn richards_curve_supports_gpu_scalar_param_reduction(
+        curve: &crate::domain::richards::RichardsCurve,
+    ) -> bool {
+        !curve.gamma_learnable && !curve.bias_learnable
+    }
+
+    #[inline]
+    fn pack_richards_scalar_grads_from_canonical(
+        curve: &crate::domain::richards::RichardsCurve,
+        canonical: &[f32; 9],
+    ) -> Vec<f64> {
+        let mut out = Vec::with_capacity(curve.scalar_weights_len());
+        let flags = [
+            curve.nu_learnable,
+            curve.k_learnable,
+            curve.m_learnable,
+            curve.beta_learnable,
+            curve.temperature_learnable,
+            curve.output_gain_learnable,
+            curve.output_bias_learnable,
+            curve.scale_learnable,
+            curve.shift_learnable,
+        ];
+        for (idx, enabled) in flags.into_iter().enumerate() {
+            if enabled {
+                let g = canonical[idx];
+                out.push(if g.is_finite() { g as f64 } else { 0.0 });
+            }
+        }
+        out
+    }
+
     pub fn new(embedding_dim: usize, hidden_dim: usize) -> Self {
         // Xavier/Glorot initialization via Normal(0, sqrt(2/fan_in))
         let mut rng = get_rng();
@@ -96,13 +154,80 @@ impl RichardsGlu {
             streaming_workspace: None,
             batch_workspace: None,
             gpu_cache: None,
+            gpu_forward_cache: None,
             gpu_device: None,
         }
     }
 
     /// Set the GPU device for this layer
     pub fn set_gpu_device(&mut self, device: Arc<Mutex<GpuDevice>>) {
-        self.gpu_device = Some(device);
+        self.gpu_device = Some(device.clone());
+        // Cached GPU buffer handles are tied to a specific memory pool/device instance.
+        // Invalidate on device reassignment to avoid stale buffer IDs.
+        self.gpu_cache = None;
+        self.gpu_forward_cache = None;
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            self.gate.set_gpu_device(device);
+        }
+    }
+
+    fn clear_gpu_cache_for_pool(&mut self, pool: &mut dyn GpuMemoryPool) {
+        if let Some(cache) = self.gpu_cache.take() {
+            pool.deallocate(cache.w1);
+            pool.deallocate(cache.w2);
+            pool.deallocate(cache.w_out);
+        }
+    }
+
+    fn clear_gpu_forward_cache_for_pool(&mut self, pool: &mut dyn GpuMemoryPool) {
+        if let Some(cache) = self.gpu_forward_cache.take() {
+            pool.deallocate(cache.input);
+            pool.deallocate(cache.gated);
+            pool.deallocate(cache.gate_sigma);
+            pool.deallocate(cache.x2);
+            pool.deallocate(cache.x1);
+            pool.deallocate(cache.value);
+        }
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "wgpu"))]
+    fn gpu_cache_valid_for_pool(&self, pool: &dyn GpuMemoryPool) -> bool {
+        let Some(cache) = self.gpu_cache.as_ref() else {
+            return false;
+        };
+        if let Some(wgpu_pool) = pool.as_any().downcast_ref::<WgpuMemoryPool>() {
+            return wgpu_pool.get_buffer(cache.w1.id).is_some()
+                && wgpu_pool.get_buffer(cache.w2.id).is_some()
+                && wgpu_pool.get_buffer(cache.w_out.id).is_some();
+        }
+        true
+    }
+
+    #[cfg(not(any(feature = "gpu-wgpu", feature = "wgpu")))]
+    fn gpu_cache_valid_for_pool(&self, _pool: &dyn GpuMemoryPool) -> bool {
+        self.gpu_cache.is_some()
+    }
+
+    #[cfg(any(feature = "gpu-wgpu", feature = "wgpu"))]
+    fn gpu_forward_cache_valid_for_pool(&self, pool: &dyn GpuMemoryPool) -> bool {
+        let Some(cache) = self.gpu_forward_cache.as_ref() else {
+            return false;
+        };
+        if let Some(wgpu_pool) = pool.as_any().downcast_ref::<WgpuMemoryPool>() {
+            return wgpu_pool.get_buffer(cache.input.id).is_some()
+                && wgpu_pool.get_buffer(cache.gated.id).is_some()
+                && wgpu_pool.get_buffer(cache.gate_sigma.id).is_some()
+                && wgpu_pool.get_buffer(cache.x2.id).is_some()
+                && wgpu_pool.get_buffer(cache.x1.id).is_some()
+                && wgpu_pool.get_buffer(cache.value.id).is_some();
+        }
+        true
+    }
+
+    #[cfg(not(any(feature = "gpu-wgpu", feature = "wgpu")))]
+    fn gpu_forward_cache_valid_for_pool(&self, _pool: &dyn GpuMemoryPool) -> bool {
+        self.gpu_forward_cache.is_some()
     }
 
     /// Ensure GPU cache is initialized and up-to-date
@@ -112,7 +237,10 @@ impl RichardsGlu {
         _ops: &mut dyn GpuMatrixOps,
     ) -> Result<()> {
         if self.gpu_cache.is_some() {
-            return Ok(());
+            if self.gpu_cache_valid_for_pool(pool) {
+                return Ok(());
+            }
+            self.clear_gpu_cache_for_pool(pool);
         }
 
         // Upload w1 (transposed for GEMM A @ B^T)
@@ -164,6 +292,8 @@ impl RichardsGlu {
 
         let mut device = device_arc.lock().unwrap();
         let (pool, ops) = device.execution_context();
+        // Drop prior retained forward buffers before producing new ones.
+        self.clear_gpu_forward_cache_for_pool(pool);
 
         // OPTIMIZATION: Cache GPU weights (Phase 5.6 GPU optimization)
         // Upload weights once on first call, reuse thereafter
@@ -186,7 +316,7 @@ impl RichardsGlu {
         let mut output_buf = pool.allocate(output_size)?;
 
         // 3. Run kernel and get intermediate buffers
-        let (x1_buf, x2_buf, value_buf, gated_buf) =
+        let (x1_buf, x2_buf, value_buf, gate_sigma_buf, gated_buf) =
             self.forward_gpu_kernel(pool, ops, &input_buf, &mut output_buf, batch_size)?;
 
         // 4. Download output
@@ -194,17 +324,39 @@ impl RichardsGlu {
         let output_slice = output_array.as_slice_mut().unwrap();
         pool.download(&output_buf, output_slice)?;
 
-        // 5. Download intermediate values for backward pass
-        // These are required by backward_gpu() to compute gradients
+        // Retain forward intermediates on GPU for backward to avoid re-upload churn.
+        pool.deallocate(output_buf);
+        self.gpu_forward_cache = Some(RichardsGluGpuForwardCache {
+            input: input_buf,
+            gated: gated_buf,
+            gate_sigma: gate_sigma_buf,
+            x2: x2_buf,
+            x1: x1_buf,
+            value: value_buf,
+        });
+
+        // In strict GPU mode, skip CPU downloads of large forward intermediates.
+        // backward_gpu() will lazily materialize the CPU caches still needed by
+        // parameter-gradient code that is not yet GPU-native.
+        if Self::gpu_strict_no_fallback_mode() {
+            self.cached_x1 = None;
+            self.cached_x2 = None;
+            self.cached_swish = None;
+            self.cached_gated = None;
+            return Ok(output_array);
+        }
+
+        // 5. Download intermediate values for backward pass (compatibility path)
         let mut x1_array = Array2::zeros((batch_size, hidden_dim));
         let mut x2_array = Array2::zeros((batch_size, hidden_dim));
         let mut value_array = Array2::zeros((batch_size, hidden_dim));
         let mut gated_array = Array2::zeros((batch_size, hidden_dim));
+        let cache = self.gpu_forward_cache.as_ref().unwrap();
 
-        pool.download(&x1_buf, x1_array.as_slice_mut().unwrap())?;
-        pool.download(&x2_buf, x2_array.as_slice_mut().unwrap())?;
-        pool.download(&value_buf, value_array.as_slice_mut().unwrap())?;
-        pool.download(&gated_buf, gated_array.as_slice_mut().unwrap())?;
+        pool.download(&cache.x1, x1_array.as_slice_mut().unwrap())?;
+        pool.download(&cache.x2, x2_array.as_slice_mut().unwrap())?;
+        pool.download(&cache.value, value_array.as_slice_mut().unwrap())?;
+        pool.download(&cache.gated, gated_array.as_slice_mut().unwrap())?;
 
         // 6. Cache intermediate values for backward pass
         self.cached_x1 = Some(x1_array);
@@ -225,7 +377,7 @@ impl RichardsGlu {
         input: &GpuBuffer,
         output: &mut GpuBuffer,
         batch_size: usize,
-    ) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer, GpuBuffer)> {
+    ) -> Result<(GpuBuffer, GpuBuffer, GpuBuffer, GpuBuffer, GpuBuffer)> {
         self.ensure_gpu_cache(pool, ops)?;
 
         let cache = self.gpu_cache.as_ref().unwrap();
@@ -307,7 +459,7 @@ impl RichardsGlu {
         )?;
 
         // Return handles to intermediate buffers for backward pass
-        Ok((x1, x2, value, gated))
+        Ok((x1, x2, value, gate_val, gated))
     }
 
     /// GPU Fused Forward Pass using RichardsGLU fused kernel
@@ -419,6 +571,16 @@ impl RichardsGlu {
 
         let mut device = device_arc.lock().unwrap();
         let (pool, ops) = device.execution_context();
+        self.ensure_gpu_cache(pool, ops)?;
+
+        // Reuse retained GPU forward buffers when available on the current pool.
+        let mut retained_forward = None;
+        if self.gpu_forward_cache_valid_for_pool(pool) {
+            retained_forward = self.gpu_forward_cache.clone();
+        } else if self.gpu_forward_cache.is_some() {
+            self.clear_gpu_forward_cache_for_pool(pool);
+        }
+        let cache_weights = self.gpu_cache.as_ref().cloned();
 
         // Get cached forward values
         let input = self.cached_input.as_ref().ok_or_else(|| {
@@ -462,20 +624,24 @@ impl RichardsGlu {
         let grad_output_buf = pool.upload(grad_output_slice)?;
 
         // Step 2: grad_w_out = gated.T @ grad_output
-        // Use gated from CPU (cached) and compute gradient on GPU
-        let gated = self.cached_gated.as_ref().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "No cached gated. Call forward_gpu() before backward_gpu().".to_string(),
-            }
-        })?;
-
-        let gated_slice =
-            gated
-                .as_slice()
-                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+        // Prefer retained GPU gated activations; only use CPU cache if needed.
+        let gated_buf = if let Some(ref fwd) = retained_forward {
+            fwd.gated
+        } else {
+            let gated = self.cached_gated.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "No cached gated. Call forward_gpu() before backward_gpu()."
+                        .to_string(),
+                }
+            })?;
+            let gated_slice = gated.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
                     message: "gated must be contiguous".to_string(),
-                })?;
-        let gated_buf = pool.upload(gated_slice)?;
+                }
+            })?;
+            pool.upload(gated_slice)?
+        };
+        let gated_buf_uploaded = retained_forward.is_none();
 
         let mut grad_w_out_buf = pool.allocate(hidden_dim * embedding_dim * 4)?;
         ops.gemm_f32(
@@ -493,14 +659,19 @@ impl RichardsGlu {
         )?;
 
         // Step 3: grad_gated = grad_output @ w_out.T
-        let w_out_t = self.w_out.t();
-        let w_out_standard = w_out_t.as_standard_layout();
-        let w_out_slice = w_out_standard.as_slice().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "w_out must be contiguous".to_string(),
-            }
-        })?;
-        let w_out_buf = pool.upload(w_out_slice)?;
+        let w_out_buf = if let Some(ref cache) = cache_weights {
+            cache.w_out
+        } else {
+            let w_out_t = self.w_out.t();
+            let w_out_standard = w_out_t.as_standard_layout();
+            let w_out_slice = w_out_standard.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "w_out must be contiguous".to_string(),
+                }
+            })?;
+            pool.upload(w_out_slice)?
+        };
+        let w_out_buf_uploaded = cache_weights.is_none();
 
         let mut grad_gated_buf = pool.allocate(batch_size * hidden_dim * 4)?;
         ops.gemm_f32(
@@ -517,32 +688,67 @@ impl RichardsGlu {
             false, // don't transpose B (w_out.T already transposed)
         )?;
 
-        // Step 4-5: Compute grad_value and grad_gate_sigma (element-wise operations)
-        // Download grad_gated back to CPU for element-wise operations
-        let mut grad_gated = Array2::zeros((batch_size, hidden_dim));
-        let grad_gated_slice = grad_gated.as_slice_mut().unwrap();
-        pool.download(&grad_gated_buf, grad_gated_slice)?;
+        // Step 4-5: Compute grad_value and grad_gate_sigma on GPU, then download for
+        // parameter-gradient paths that still run on CPU.
+        let hidden_size = batch_size * hidden_dim;
 
-        // Use cached forward values
-        let value = self.cached_swish.as_ref().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "No cached value. Call forward_gpu() before backward_gpu().".to_string(),
-            }
-        })?;
-        let x1 = self.cached_x1.as_ref().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "No cached x1. Call forward_gpu() before backward_gpu().".to_string(),
-            }
-        })?;
-        let x2 = self.cached_x2.as_ref().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "No cached x2. Call forward_gpu() before backward_gpu().".to_string(),
-            }
-        })?;
+        let x1_buf = if let Some(ref fwd) = retained_forward {
+            fwd.x1
+        } else {
+            let x1 = self.cached_x1.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "No cached x1. Call forward_gpu() before backward_gpu().".to_string(),
+                }
+            })?;
+            let x1_slice = x1.as_slice().ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                message: "x1 must be contiguous".to_string(),
+            })?;
+            pool.upload(x1_slice)?
+        };
+        let x1_buf_uploaded = retained_forward.is_none();
 
-        let gated = self.cached_gated.as_ref().unwrap();
-        let grad_value = &grad_gated * gated;
-        let grad_gate_sigma = &grad_gated * value;
+        let value_buf = if let Some(ref fwd) = retained_forward {
+            fwd.value
+        } else {
+            let value = self.cached_swish.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "No cached value. Call forward_gpu() before backward_gpu().".to_string(),
+                }
+            })?;
+            let value_slice = value.as_slice().ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                message: "value must be contiguous".to_string(),
+            })?;
+            pool.upload(value_slice)?
+        };
+        let value_buf_uploaded = retained_forward.is_none();
+
+        let mut grad_value_buf = pool.allocate(hidden_size * 4)?;
+        let mut grad_gate_sigma_buf = pool.allocate(hidden_size * 4)?;
+        let mut df_dx_buf = pool.allocate(hidden_size * 4)?;
+        let mut grad_x1_buf = pool.allocate(hidden_size * 4)?;
+
+        // grad_value = grad_gated * gate_sigma (exact on retained-GPU forward path).
+        let gate_sigma_buf = if let Some(ref fwd) = retained_forward {
+            fwd.gate_sigma
+        } else {
+            // Compatibility fallback: legacy path lacks cached gate_sigma and approximates with
+            // `gated`. Prefer retained GPU forward cache to keep exact semantics.
+            gated_buf
+        };
+        ops.mul(
+            pool,
+            &grad_gated_buf,
+            &gate_sigma_buf,
+            &mut grad_value_buf,
+            hidden_size,
+        )?;
+        ops.mul(
+            pool,
+            &grad_gated_buf,
+            &value_buf,
+            &mut grad_gate_sigma_buf,
+            hidden_size,
+        )?;
 
         // Phase 5.7: Use GPU kernel for Richards derivatives of value function
         // Richards activation gradient: df/dx = richards(x) + x * drichards/dx
@@ -552,70 +758,63 @@ impl RichardsGlu {
         let curve_point = 0.5f32; // Default: lower asymptote
         let alpha = 1.0f32; // Default: growth/scale factor
         let max_val = 2.0f32; // Default: upper asymptote
-
-        let grad_x1 = GpuRichardsDerivativeKernel::compute_gradient(
-            x1,
-            value,
-            &grad_value,
-            curve_point,
-            alpha,
-            max_val,
+        let d_richards_dx = alpha * (1.0 - curve_point / max_val);
+        // df_dx = value + x1 * d_richards_dx
+        ops.axpy(
+            pool,
+            d_richards_dx,
+            &x1_buf,
+            1.0,
+            &value_buf,
+            &mut df_dx_buf,
+            hidden_size,
         )?;
+        // grad_x1 = grad_value * df_dx
+        ops.mul(pool, &grad_value_buf, &df_dx_buf, &mut grad_x1_buf, hidden_size)?;
 
-        // Compute grad_x2 using gate derivative (CPU implementation)
-        // For RichardsGate applied with temperature scaling:
-        // grad_x2 = gate_deriv(x2/T) * grad_gate_sigma * (1/T)
-        // Note: Gate derivatives keep original CPU implementation for now
-        // Future: implement GpuGateDerivativeKernel when needed
-        let mut grad_x2 = Array2::<f32>::zeros((batch_size, hidden_dim));
-        let gate_temp_reciprocal = 1.0 / self.gate.temperature;
+        let mut grad_value_cpu: Option<Array2<f32>> = None;
+        let mut grad_gate_sigma_cpu: Option<Array2<f32>> = None;
 
-        let x2_contig = x2.as_standard_layout();
-        let gg_contig = grad_gate_sigma.as_standard_layout();
-        let x2_slice = x2_contig.as_slice().expect("x2 must be contiguous");
-        let gg_slice = gg_contig.as_slice().expect("grad_gate must be contiguous");
-        let gx2_slice = grad_x2.as_slice_mut().expect("grad_x2 must be contiguous");
-
-        // Compute gate derivatives in parallel
-        gx2_slice
-            .par_chunks_mut(hidden_dim)
-            .zip(x2_slice.par_chunks(hidden_dim))
-            .zip(gg_slice.par_chunks(hidden_dim))
-            .for_each(|((gx2_row, x2_row), gg_row)| {
-                let mut gate_scaled_row = vec![0.0; x2_row.len()];
-                let mut gate_curve_deriv_row = vec![0.0; x2_row.len()];
-
-                // Scale x2 by temperature for derivative computation
-                for j in 0..x2_row.len() {
-                    gate_scaled_row[j] = x2_row[j] * gate_temp_reciprocal;
+        // Compute grad_x2 on GPU: grad_gate_sigma * d(gate(x2))/dx2
+        let x2_buf = if let Some(ref fwd) = retained_forward {
+            fwd.x2
+        } else {
+            let x2 = self.cached_x2.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "No cached x2. Call forward_gpu() before backward_gpu().".to_string(),
                 }
-
-                // Compute gate curve derivative
-                self.gate
-                    .curve
-                    .derivative_into_f32(&gate_scaled_row, &mut gate_curve_deriv_row);
-
-                // Accumulate: grad = gate_deriv * grad_gate_sigma * (1/temperature)
-                for j in 0..x2_row.len() {
-                    let gate_deriv = gate_curve_deriv_row[j] * gate_temp_reciprocal;
-                    gx2_row[j] = gate_deriv * gg_row[j];
-                }
-            });
-
-        // Step 6: Upload grad_x1, grad_x2 back to GPU
-        let grad_x1_slice = grad_x1.as_slice().unwrap();
-        let grad_x2_slice = grad_x2.as_slice().unwrap();
-        let grad_x1_buf = pool.upload(grad_x1_slice)?;
-        let grad_x2_buf = pool.upload(grad_x2_slice)?;
-
-        // Step 7: grad_w1 = input.T @ grad_x1
-        let input_slice =
-            input
+            })?;
+            let x2_slice = x2
                 .as_slice()
                 .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
-                    message: "input must be contiguous".to_string(),
+                    message: "x2 must be contiguous".to_string(),
                 })?;
-        let input_buf = pool.upload(input_slice)?;
+            pool.upload(x2_slice)?
+        };
+        let x2_buf_uploaded = retained_forward.is_none();
+        let mut grad_x2_buf = pool.allocate(hidden_size * 4)?;
+        let gate_params = self.gate.curve.to_gpu_params(1);
+        ops.richards_curve_backward_input(
+            pool,
+            &x2_buf,
+            &grad_gate_sigma_buf,
+            &mut grad_x2_buf,
+            &gate_params,
+            hidden_size,
+        )?;
+
+        // Step 7: grad_w1 = input.T @ grad_x1
+        let input_buf = if let Some(ref fwd) = retained_forward {
+            fwd.input
+        } else {
+            let input_slice = input.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "input must be contiguous".to_string(),
+                }
+            })?;
+            pool.upload(input_slice)?
+        };
+        let input_buf_uploaded = retained_forward.is_none();
 
         let mut grad_w1_buf = pool.allocate(embedding_dim * hidden_dim * 4)?;
         ops.gemm_f32(
@@ -650,14 +849,19 @@ impl RichardsGlu {
 
         // Step 9: grad_input = grad_x1 @ w1.T + grad_x2 @ w2.T
         // First: grad_x1 @ w1.T
-        let w1_t = self.w1.t();
-        let w1_standard = w1_t.as_standard_layout();
-        let w1_slice = w1_standard.as_slice().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "w1 must be contiguous".to_string(),
-            }
-        })?;
-        let w1_buf = pool.upload(w1_slice)?;
+        let w1_buf = if let Some(ref cache) = cache_weights {
+            cache.w1
+        } else {
+            let w1_t = self.w1.t();
+            let w1_standard = w1_t.as_standard_layout();
+            let w1_slice = w1_standard.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "w1 must be contiguous".to_string(),
+                }
+            })?;
+            pool.upload(w1_slice)?
+        };
+        let w1_buf_uploaded = cache_weights.is_none();
 
         let mut grad_input_buf = pool.allocate(batch_size * embedding_dim * 4)?;
         ops.gemm_f32(
@@ -675,14 +879,19 @@ impl RichardsGlu {
         )?;
 
         // Second: grad_x2 @ w2.T, accumulate into grad_input
-        let w2_t = self.w2.t();
-        let w2_standard = w2_t.as_standard_layout();
-        let w2_slice = w2_standard.as_slice().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "w2 must be contiguous".to_string(),
-            }
-        })?;
-        let w2_buf = pool.upload(w2_slice)?;
+        let w2_buf = if let Some(ref cache) = cache_weights {
+            cache.w2
+        } else {
+            let w2_t = self.w2.t();
+            let w2_standard = w2_t.as_standard_layout();
+            let w2_slice = w2_standard.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "w2 must be contiguous".to_string(),
+                }
+            })?;
+            pool.upload(w2_slice)?
+        };
+        let w2_buf_uploaded = cache_weights.is_none();
 
         ops.gemm_f32(
             pool,
@@ -698,6 +907,85 @@ impl RichardsGlu {
             false, // don't transpose B (w2.T already transposed)
         )?;
 
+        // Reduce Richards scalar parameter gradients on GPU (common GLU path).
+        // Falls back to CPU reductions below for unsupported configurations/backends.
+        let mut value_curve_scalar_grads_gpu: Option<[f32; 9]> = None;
+        let mut gate_curve_scalar_grads_gpu: Option<[f32; 9]> = None;
+
+        if Self::richards_curve_supports_gpu_scalar_param_reduction(&self.richards_activation.richards_curve)
+        {
+            let mut curve_output_grads_buf = pool.allocate(hidden_size * 4)?;
+            ops.mul(
+                pool,
+                &x1_buf,
+                &grad_value_buf,
+                &mut curve_output_grads_buf,
+                hidden_size,
+            )?;
+
+            let mut scalar_grads_buf = pool.allocate(9 * 4)?;
+            let richards_params = self.richards_activation.richards_curve.to_gpu_params(1);
+            let reduce_result = ops.richards_scalar_param_grads_reduce(
+                pool,
+                &x1_buf,
+                &curve_output_grads_buf,
+                &mut scalar_grads_buf,
+                &richards_params,
+                hidden_size,
+                matches!(self.richards_activation.richards_curve.variant, Variant::Tanh),
+                self.richards_activation.richards_curve.birch_exponential_tail,
+            );
+
+            match reduce_result {
+                Ok(()) => {
+                    let mut host = [0.0f32; 9];
+                    pool.download(&scalar_grads_buf, &mut host)?;
+                    value_curve_scalar_grads_gpu = Some(host);
+                }
+                Err(e) => {
+                    if Self::gpu_strict_no_fallback_mode() {
+                        pool.deallocate(scalar_grads_buf);
+                        pool.deallocate(curve_output_grads_buf);
+                        return Err(e);
+                    }
+                }
+            }
+
+            pool.deallocate(scalar_grads_buf);
+            pool.deallocate(curve_output_grads_buf);
+        }
+
+        if Self::richards_curve_supports_gpu_scalar_param_reduction(&self.gate.curve) {
+            let mut scalar_grads_buf = pool.allocate(9 * 4)?;
+            let gate_params = self.gate.curve.to_gpu_params(1);
+            let reduce_result = ops.richards_scalar_param_grads_reduce(
+                pool,
+                &x2_buf,
+                &grad_gate_sigma_buf,
+                &mut scalar_grads_buf,
+                &gate_params,
+                hidden_size,
+                matches!(self.gate.curve.variant, Variant::Tanh),
+                self.gate.curve.birch_exponential_tail,
+            );
+
+            match reduce_result {
+                Ok(()) => {
+                    let mut host = [0.0f32; 9];
+                    pool.download(&scalar_grads_buf, &mut host)?;
+                    gate_curve_scalar_grads_gpu = Some(host);
+                }
+                Err(e) => {
+                    if Self::gpu_strict_no_fallback_mode() {
+                        pool.deallocate(scalar_grads_buf);
+                        return Err(e);
+                    }
+                }
+            }
+
+            pool.deallocate(scalar_grads_buf);
+        }
+
         // Step 10: Download gradients and optionally compute bias gradients via reduction kernel
         let mut grad_w1 = Array2::zeros((embedding_dim, hidden_dim));
         let mut grad_w2 = Array2::zeros((embedding_dim, hidden_dim));
@@ -709,6 +997,40 @@ impl RichardsGlu {
         pool.download(&grad_w_out_buf, grad_w_out.as_slice_mut().unwrap())?;
         pool.download(&grad_input_buf, grad_input.as_slice_mut().unwrap())?;
 
+        // Release temporary GPU buffers for backward pass.
+        pool.deallocate(grad_output_buf);
+        if gated_buf_uploaded {
+            pool.deallocate(gated_buf);
+        }
+        pool.deallocate(grad_w_out_buf);
+        if w_out_buf_uploaded {
+            pool.deallocate(w_out_buf);
+        }
+        pool.deallocate(grad_gated_buf);
+        pool.deallocate(df_dx_buf);
+        pool.deallocate(grad_x1_buf);
+        pool.deallocate(grad_x2_buf);
+        if x2_buf_uploaded {
+            pool.deallocate(x2_buf);
+        }
+        if x1_buf_uploaded {
+            pool.deallocate(x1_buf);
+        }
+        if value_buf_uploaded {
+            pool.deallocate(value_buf);
+        }
+        if input_buf_uploaded {
+            pool.deallocate(input_buf);
+        }
+        pool.deallocate(grad_w1_buf);
+        pool.deallocate(grad_w2_buf);
+        if w1_buf_uploaded {
+            pool.deallocate(w1_buf);
+        }
+        pool.deallocate(grad_input_buf);
+        if w2_buf_uploaded {
+            pool.deallocate(w2_buf);
+        }
         // Phase 5.7: Optional bias gradient computation using reduction kernel
         // Bias gradients = sum of gradients over batch dimension
         // bias_grad[j] = sum_i(grad_w[i, j])
@@ -730,31 +1052,88 @@ impl RichardsGlu {
         }
         */
 
-        // Compute RichardsActivation gradients (value function)
-        // value(x) = x * curve(x) => dL/d(curve(x)) = x * dL/d(value)
-        // (value is cached_swish, x1 is cached_x1, grad_value was computed above)
-        let x1 = self.cached_x1.as_ref().unwrap();
+        // Compute RichardsActivation scalar parameter gradients
+        if let Some(canonical) = value_curve_scalar_grads_gpu {
+            let value_grads =
+                Self::pack_richards_scalar_grads_from_canonical(&self.richards_activation.richards_curve, &canonical);
+            let mut value_grads_sum = Array2::<f32>::zeros((1, value_grads.len()));
+            for (k, &g) in value_grads.iter().enumerate() {
+                value_grads_sum[[0, k]] = g as f32;
+            }
+            param_grads.push(value_grads_sum);
+        } else {
+            // CPU fallback for unsupported curve/backend configurations
+            if grad_value_cpu.is_none() {
+                let mut grad_value = Array2::zeros((batch_size, hidden_dim));
+                pool.download(&grad_value_buf, grad_value.as_slice_mut().unwrap())?;
+                grad_value_cpu = Some(grad_value);
+            }
+            if self.cached_x1.is_none()
+                && let Some(ref fwd) = retained_forward
+            {
+                let mut x1_array = Array2::zeros((batch_size, hidden_dim));
+                pool.download(&fwd.x1, x1_array.as_slice_mut().unwrap())?;
+                self.cached_x1 = Some(x1_array);
+            }
+            let x1 = self.cached_x1.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "No cached x1. Call forward_gpu() before backward_gpu().".to_string(),
+                }
+            })?;
+            let grad_value = grad_value_cpu.as_ref().unwrap();
+            let curve_output_grads = x1 * grad_value;
+            let value_grads = self
+                .richards_activation
+                .richards_curve
+                .grad_weights_matrix_f32(x1, &curve_output_grads);
 
-        // grad_value was computed in Step 4-5, now compute curve_output_grads = x1 * grad_value
-        let curve_output_grads = x1 * &grad_value;
-
-        // Get Richards curve weight gradients
-        let value_grads = self
-            .richards_activation
-            .richards_curve
-            .grad_weights_matrix_f32(x1, &curve_output_grads);
-
-        // Convert to Array2 format expected by apply_gradients
-        let mut value_grads_sum = Array2::<f32>::zeros((1, value_grads.len()));
-        for (k, &g) in value_grads.iter().enumerate() {
-            value_grads_sum[[0, k]] = g as f32;
+            let mut value_grads_sum = Array2::<f32>::zeros((1, value_grads.len()));
+            for (k, &g) in value_grads.iter().enumerate() {
+                value_grads_sum[[0, k]] = g as f32;
+            }
+            param_grads.push(value_grads_sum);
         }
-        param_grads.push(value_grads_sum);
 
-        // Compute RichardsGate gradients (use CPU implementation from cached values)
-        let x2 = self.cached_x2.as_ref().unwrap();
-        let (_, gate_param_grads) = self.gate.compute_gradients(x2, &grad_gate_sigma);
-        param_grads.extend(gate_param_grads);
+        // Compute RichardsGate scalar parameter gradients
+        if let Some(canonical) = gate_curve_scalar_grads_gpu {
+            let gate_scalar_grads = Self::pack_richards_scalar_grads_from_canonical(&self.gate.curve, &canonical);
+            let gate_param_grads: Vec<Array2<f32>> = gate_scalar_grads
+                .into_iter()
+                .map(|g| Array2::from_elem((1, 1), g as f32))
+                .collect();
+            param_grads.extend(gate_param_grads);
+        } else {
+            // CPU fallback for unsupported curve/backend configurations
+            if grad_gate_sigma_cpu.is_none() {
+                let mut grad_gate_sigma = Array2::zeros((batch_size, hidden_dim));
+                pool.download(
+                    &grad_gate_sigma_buf,
+                    grad_gate_sigma.as_slice_mut().unwrap(),
+                )?;
+                grad_gate_sigma_cpu = Some(grad_gate_sigma);
+            }
+            if self.cached_x2.is_none()
+                && let Some(ref fwd) = retained_forward
+            {
+                let mut x2_array = Array2::zeros((batch_size, hidden_dim));
+                pool.download(&fwd.x2, x2_array.as_slice_mut().unwrap())?;
+                self.cached_x2 = Some(x2_array);
+            }
+            let x2 = self.cached_x2.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "No cached x2. Call forward_gpu() before backward_gpu().".to_string(),
+                }
+            })?;
+            let grad_gate_sigma = grad_gate_sigma_cpu.as_ref().unwrap();
+            let (_, gate_param_grads) = self.gate.compute_gradients(x2, grad_gate_sigma);
+            param_grads.extend(gate_param_grads);
+        }
+
+        pool.deallocate(grad_value_buf);
+        pool.deallocate(grad_gate_sigma_buf);
+
+        // Forward intermediates are single-use for backward.
+        self.clear_gpu_forward_cache_for_pool(pool);
 
         // Apply gradients via CPU optimizers
         self.apply_gradients(&param_grads, learning_rate)?;
@@ -1016,6 +1395,12 @@ impl Layer for RichardsGlu {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        if self.gpu_device.is_some() {
+            return self
+                .backward_gpu(grads, lr)
+                .unwrap_or_else(|err| panic!("RichardsGlu GPU backward execution failed: {err}"));
+        }
+
         let input = self
             .cached_input
             .as_ref()
@@ -1209,6 +1594,10 @@ impl Layer for RichardsGlu {
             self.gate.apply_gradients(gate_grads, lr)?;
         }
 
+        // CPU-side optimizer updates changed weights; force re-upload on next GPU forward.
+        self.gpu_cache = None;
+        self.gpu_forward_cache = None;
+
         Ok(())
     }
 
@@ -1383,12 +1772,12 @@ impl RichardsGlu {
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 impl GpuComponent for RichardsGlu {
     fn set_gpu_device(&mut self, device: Arc<Mutex<GpuDevice>>) {
-        self.gpu_device = Some(device);
+        RichardsGlu::set_gpu_device(self, device);
     }
 
     fn enable_gpu_auto_detect(&mut self) -> Result<()> {
         let device = GpuDevice::auto_detect()?;
-        self.gpu_device = Some(Arc::new(Mutex::new(device)));
+        RichardsGlu::set_gpu_device(self, Arc::new(Mutex::new(device)));
         Ok(())
     }
 

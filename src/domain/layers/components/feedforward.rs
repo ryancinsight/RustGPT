@@ -13,8 +13,10 @@
 use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::{GpuComponent, GpuDevice};
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::gpu_device_utils::resolve_or_create_gpu_device;
 use crate::{
     common::errors::Result,
     domain::compute_backend::{ComputeBackend, resolve_compute_backend_strict_auto_gpu},
@@ -23,7 +25,7 @@ use crate::{
     },
     domain::network::Layer,
 };
-#[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use std::sync::{Arc, Mutex};
 
 /// Shared feedforward component with workspace management
@@ -57,7 +59,7 @@ pub struct SharedFeedforward {
     /// If attached, enables GPU execution with strict no-fallback semantics
     #[serde(skip)]
     #[allow(dead_code)]
-    #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     gpu_device: Option<Arc<Mutex<GpuDevice>>>,
 }
 
@@ -69,7 +71,7 @@ impl SharedFeedforward {
             last_batch_size: None,
             last_embed_dim: None,
             compute_backend: ComputeBackend::Cpu,
-            #[cfg(any(feature = "gpu-wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+            #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             gpu_device: None,
         }
     }
@@ -85,23 +87,20 @@ impl SharedFeedforward {
         self.last_batch_size = Some(batch_size);
         self.last_embed_dim = Some(embed_dim);
 
-        // GPU path - enabled with strict no-fallback
+        // Strict GPU path: never fall back to CPU once a GPU backend is selected.
         #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
-        if self.compute_backend.is_gpu() && self.gpu_device.is_some() {
-            match self.feedforward.forward_gpu(input) {
-                Ok(result) => {
-                    tracing::debug!(
-                        "GPU feedforward: batch={}, embed_dim={}",
-                        batch_size,
-                        embed_dim
-                    );
-                    return result;
-                }
-                Err(e) => {
-                    // Log error but don't silently fall back - this indicates a real problem
-                    tracing::error!("GPU feedforward failed: {}. Check GPU setup.", e);
-                }
-            }
+        if self.compute_backend.is_gpu() {
+            return self.forward_gpu(input).unwrap_or_else(|err| {
+                panic!("SharedFeedforward GPU forward failed: {err}");
+            });
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        if self.compute_backend.is_gpu() {
+            panic!(
+                "SharedFeedforward configured for GPU backend '{}' but this binary has no GPU features enabled.",
+                self.compute_backend.as_str()
+            );
         }
 
         // CPU path (default or when GPU not available)
@@ -127,14 +126,36 @@ impl SharedFeedforward {
     /// * `Ok(())` on success
     /// * `Err` if output dimensions don't match input
     ///
-    /// Note: GPU path temporarily disabled pending full kernel implementation.
     pub fn forward_into(&mut self, input: &Array2<f32>, output: &mut Array2<f32>) -> Result<()> {
-        // GPU path temporarily disabled - kernels need full implementation
-        // if self.compute_backend.is_gpu() { ... }
-
         let (batch_size, embed_dim) = input.dim();
         self.last_batch_size = Some(batch_size);
         self.last_embed_dim = Some(embed_dim);
+
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            let gpu_out = self.forward_gpu(input)?;
+            if gpu_out.dim() != output.dim() {
+                return Err(crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "Output dimension mismatch: expected {:?}, got {:?}",
+                        gpu_out.dim(),
+                        output.dim()
+                    ),
+                });
+            }
+            output.assign(&gpu_out);
+            return Ok(());
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        if self.compute_backend.is_gpu() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: format!(
+                    "SharedFeedforward configured for GPU backend '{}' but this binary has no GPU features enabled.",
+                    self.compute_backend.as_str()
+                ),
+            });
+        }
         self.feedforward.forward_into(input, output)
     }
 
@@ -176,14 +197,11 @@ impl SharedFeedforward {
         if compute_backend.is_gpu() {
             #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
             {
-                let device = GpuDevice::new(compute_backend)?;
-                tracing::info!(
-                    "GPU device attached to feedforward: {} ({})",
-                    device.name(),
-                    device.backend().as_str()
-                );
-                let device_arc = Arc::new(Mutex::new(device));
-
+                let (device_arc, _) = resolve_or_create_gpu_device(
+                    self.gpu_device.clone(),
+                    compute_backend,
+                    "feedforward",
+                )?;
                 self.gpu_device = Some(device_arc.clone());
                 self.feedforward.set_gpu_device(device_arc);
 
@@ -224,6 +242,10 @@ impl SharedFeedforward {
         &mut self,
         device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
     ) {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        {
+            self.gpu_device = Some(device.clone());
+        }
         self.feedforward.set_gpu_device(device);
     }
 
@@ -254,28 +276,8 @@ impl SharedFeedforward {
     pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
         #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
         {
-            match &self.feedforward {
-                FeedForwardVariant::RichardsGlu(glu) => {
-                    // Ensure GPU is ready
-                    self.feedforward.ensure_gpu_device_auto_detect()?;
-
-                    // Use optimized fused kernel through feedforward variant
-                    self.feedforward.forward_gpu(_input)
-                }
-                FeedForwardVariant::MixtureOfExperts(_) => {
-                    // Ensure GPU is ready
-                    self.feedforward.ensure_gpu_device_auto_detect()?;
-
-                    // MoE GPU path delegates to MoeGpuBackend (Phase 5.6)
-                    // Dispatcher handles:
-                    // 1. Router computation (two-layer network with Richards normalization)
-                    // 2. Softmax + top-k selection
-                    // 3. Expert selection and routing
-                    // 4. Parallel expert computation
-                    // 5. Weighted combination
-                    self.feedforward.forward_gpu(_input)
-                }
-            }
+            self.feedforward.ensure_gpu_device_auto_detect()?;
+            self.feedforward.forward_gpu(_input)
         }
         #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
         {
@@ -291,7 +293,35 @@ impl SharedFeedforward {
         input: &Array2<f32>,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            return self
+                .compute_gradients_gpu(input, output_grads)
+                .unwrap_or_else(|err| panic!("SharedFeedforward GPU backward failed: {err}"));
+        }
+
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        if self.compute_backend.is_gpu() {
+            panic!(
+                "SharedFeedforward configured for GPU backend '{}' but this binary has no GPU features enabled.",
+                self.compute_backend.as_str()
+            );
+        }
+
         self.feedforward.compute_gradients(input, output_grads)
+    }
+
+    /// Backward pass on GPU-capable variants.
+    ///
+    /// Returns `(input_grads, param_grads)` to keep compatibility with the shared
+    /// gradient-routing path used by Transformer/Diffusion blocks.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        self.feedforward.compute_gradients_gpu(input, output_grads)
     }
 
     #[inline]
@@ -349,8 +379,31 @@ impl SharedFeedforward {
         head_activity_vec: Option<&[f32]>,
         token_head_activity_vec: Option<&[f32]>,
     ) -> Array2<f32> {
-        // GPU path temporarily disabled - kernels need full implementation
-        // if self.compute_backend.is_gpu() { ... }
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            self.feedforward
+                .ensure_gpu_device_auto_detect()
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "SharedFeedforward failed to attach GPU device for activity-aware forward: {err}"
+                    )
+                });
+
+            if matches!(self.feedforward, FeedForwardVariant::RichardsGlu(_)) {
+                return self.forward_gpu(input).unwrap_or_else(|err| {
+                    panic!("SharedFeedforward RichardsGlu GPU forward failed: {err}");
+                });
+            }
+
+            if let FeedForwardVariant::MixtureOfExperts(layer) = &mut self.feedforward {
+                return layer.forward_with_head_features_and_token_activity(
+                    input,
+                    head_activity_ratio,
+                    head_activity_vec,
+                    token_head_activity_vec,
+                );
+            }
+        }
 
         // CPU path
         self.feedforward.forward_with_token_head_activity(
@@ -365,7 +418,6 @@ impl SharedFeedforward {
     ///
     /// Uses true in-place execution for RichardsGlu; MoE currently falls back to assignment
     /// from the activity-aware forward path when head-conditioning is required.
-    /// Note: GPU path temporarily disabled pending full kernel implementation.
     pub fn forward_with_token_head_activity_into(
         &mut self,
         input: &Array2<f32>,
@@ -374,8 +426,45 @@ impl SharedFeedforward {
         head_activity_vec: Option<&[f32]>,
         token_head_activity_vec: Option<&[f32]>,
     ) -> Result<()> {
-        // GPU path temporarily disabled - kernels need full implementation
-        // if self.compute_backend.is_gpu() { ... }
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.compute_backend.is_gpu() {
+            self.feedforward.ensure_gpu_device_auto_detect()?;
+
+            if matches!(self.feedforward, FeedForwardVariant::RichardsGlu(_)) {
+                let gpu_out = self.forward_gpu(input)?;
+                if gpu_out.dim() != output.dim() {
+                    return Err(crate::common::errors::ModelError::InvalidInput {
+                        message: format!(
+                            "Output dimension mismatch: expected {:?}, got {:?}",
+                            gpu_out.dim(),
+                            output.dim()
+                        ),
+                    });
+                }
+                output.assign(&gpu_out);
+                return Ok(());
+            }
+
+            if let FeedForwardVariant::MixtureOfExperts(layer) = &mut self.feedforward {
+                let out = layer.forward_with_head_features_and_token_activity(
+                    input,
+                    head_activity_ratio,
+                    head_activity_vec,
+                    token_head_activity_vec,
+                );
+                if out.dim() != output.dim() {
+                    return Err(crate::common::errors::ModelError::InvalidInput {
+                        message: format!(
+                            "Output dimension mismatch: expected {:?}, got {:?}",
+                            out.dim(),
+                            output.dim()
+                        ),
+                    });
+                }
+                output.assign(&out);
+                return Ok(());
+            }
+        }
 
         // CPU path
         match &mut self.feedforward {
@@ -483,9 +572,9 @@ impl SharedFeedforward {
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     pub fn forward_gpu_buffer(
         &mut self,
-        _gpu_input: &crate::domain::compute::GpuBuffer,
-        _gpu_output: &mut crate::domain::compute::GpuBuffer,
-        _gpu_device: &mut crate::domain::compute::GpuDevice,
+        gpu_input: &crate::domain::compute::GpuBuffer,
+        gpu_output: &mut crate::domain::compute::GpuBuffer,
+        gpu_device: &mut crate::domain::compute::GpuDevice,
         batch_size: usize,
         embed_dim: usize,
     ) -> crate::common::errors::Result<()> {
@@ -500,45 +589,40 @@ impl SharedFeedforward {
             });
         }
 
-        // The feedforward computation depends on the variant:
-        // - RichardsGlu: x1 = linear1(input), x2 = linear2(input), gate = sigmoid(x2), output = x1 * gate
-        // - MoE: router selects experts, weighted combination of expert outputs
+        self.feedforward.ensure_gpu_device_auto_detect()?;
 
-        match &self.feedforward {
-            FeedForwardVariant::RichardsGlu(_) => {
-                // RichardsGlu requires:
-                // 1. GEMM for linear projections
-                // 2. Element-wise sigmoid for gating
-                // 3. Element-wise multiplication for gating
+        match &mut self.feedforward {
+            FeedForwardVariant::RichardsGlu(layer) => {
+                if embed_dim != layer.w1.nrows() || embed_dim != layer.w_out.ncols() {
+                    return Err(crate::common::errors::ModelError::InvalidInput {
+                        message: format!(
+                            "RichardsGlu GPU buffer forward dimension mismatch: input embed_dim={}, w1 rows={}, w_out cols={}",
+                            embed_dim,
+                            layer.w1.nrows(),
+                            layer.w_out.ncols()
+                        ),
+                    });
+                }
 
-                // For now, return an error indicating kernel requirements
-                // Full implementation would require:
-                // - Access to weight matrices on GPU
-                // - Multiple GEMM operations
-                // - Element-wise operations
+                // True on-device execution: no host roundtrip for input/output tensors.
+                let (pool, ops) = gpu_device.execution_context();
+                let (x1, x2, value, gate_sigma, gated) =
+                    layer.forward_gpu_kernel(pool, ops, gpu_input, gpu_output, batch_size)?;
 
-                Err(crate::common::errors::ModelError::Backend {
-                    message: format!(
-                        "RichardsGlu GPU kernel not yet implemented for batch_size={}, embed_dim={}. \
-                         Requires: GEMM, sigmoid, element-wise multiply kernels.",
-                        batch_size, embed_dim
-                    ),
-                })
+                // This buffer path is forward-only; release temporary intermediates.
+                pool.deallocate(x1);
+                pool.deallocate(x2);
+                pool.deallocate(value);
+                pool.deallocate(gate_sigma);
+                pool.deallocate(gated);
+                Ok(())
             }
-            FeedForwardVariant::MixtureOfExperts(_) => {
-                // MoE requires:
-                // 1. Router computation (GEMM + softmax)
-                // 2. Expert selection (top-k)
-                // 3. Expert computations (multiple GEMMs)
-                // 4. Weighted combination
-
-                Err(crate::common::errors::ModelError::Backend {
-                    message: format!(
-                        "MixtureOfExperts GPU kernel not yet implemented for batch_size={}, embed_dim={}. \
-                         Requires: router GEMM, softmax, top-k selection, expert GEMMs.",
-                        batch_size, embed_dim
-                    ),
-                })
+            FeedForwardVariant::MixtureOfExperts(layer) => {
+                let (pool, ops) = gpu_device.execution_context();
+                let output = layer.forward_gpu_kernel(pool, ops, gpu_input, batch_size, embed_dim, embed_dim)?;
+                ops.copy_within_device(pool, &output, gpu_output, batch_size * embed_dim)?;
+                pool.deallocate(output);
+                Ok(())
             }
         }
     }
@@ -637,6 +721,14 @@ mod tests {
             gating::GatingConfig,
             moe::{ExpertRouterConfig, LearnedKAdapter, MixtureOfExperts},
         },
+    };
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    use crate::domain::{
+        compute::{GpuComponent, GpuDevice},
+        compute_backend::resolve_compute_backend_strict_auto_gpu,
     };
 
     #[test]
@@ -737,5 +829,34 @@ mod tests {
             .expect("CPU backend should always be accepted");
 
         assert_eq!(processor.compute_backend(), ComputeBackend::Cpu);
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[test]
+    fn test_shared_feedforward_reuses_preattached_gpu_device() {
+        let backend = match resolve_compute_backend_strict_auto_gpu() {
+            Ok(backend) => backend,
+            Err(_) => return,
+        };
+
+        let richards_glu = crate::domain::richards::RichardsGlu::new(8, 16);
+        let mut processor =
+            SharedFeedforward::new(FeedForwardVariant::RichardsGlu(Box::new(richards_glu)));
+
+        let device = Arc::new(Mutex::new(
+            GpuDevice::new(backend).expect("resolved backend should create a GPU device"),
+        ));
+        processor.set_gpu_device(device.clone());
+
+        processor
+            .set_compute_backend_checked(backend)
+            .expect("pre-attached matching GPU device should be reused");
+
+        assert_eq!(processor.compute_backend(), backend);
+
+        let attached = processor
+            .gpu_device()
+            .expect("GPU device should remain attached after backend setup");
+        assert!(Arc::ptr_eq(&attached, &device));
     }
 }

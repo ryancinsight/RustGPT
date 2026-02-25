@@ -590,13 +590,43 @@ pub fn backward_qkv_gemm_gpu(
     // Phase 5.6.4b: GPU GEMM computation
     // grad_w = input^T @ output_grads
     // Dimensions: [embed, total_tokens] @ [total_tokens, embed] = [embed, embed]
-
-    // TODO: For now, use CPU fallback (Phase 5.6.4a bridge)
-    // Will replace with GPU kernel implementation
-    let input_t = input.t();
-    use ndarray::linalg::general_mat_mul;
+    
+    // Allocate GPU buffers
+    let input_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
+    let grads_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
+    let output_size = embed_dim * embed_dim * std::mem::size_of::<f32>();
+    
+    let mut input_buf = device.allocate(input_size)?;
+    let mut grads_buf = device.allocate(grads_size)?;
+    let mut output_buf = device.allocate(output_size)?;
+    
+    // Upload data to GPU
+    device.upload(input.as_slice().unwrap(), &mut input_buf)?;
+    device.upload(output_grads.as_slice().unwrap(), &mut grads_buf)?;
+    
+    // Compute: grad_w = input^T @ output_grads
+    // trans_a = true (input^T), trans_b = false
+    device.gemm_f32(
+        1.0,
+        &input_buf,
+        &grads_buf,
+        0.0,
+        &mut output_buf,
+        embed_dim,       // m = embed_dim (output rows)
+        embed_dim,       // n = embed_dim (output cols)
+        total_tokens,    // k = total_tokens
+        true,            // trans_a = true (input.T)
+        false,           // trans_b = false
+    )?;
+    
+    // Download result
     let mut grad_w = Array2::zeros((embed_dim, embed_dim));
-    general_mat_mul(1.0, &input_t, output_grads, 0.0, &mut grad_w);
+    device.download(&output_buf, grad_w.as_slice_mut().unwrap())?;
+    
+    // Cleanup
+    device.deallocate(input_buf);
+    device.deallocate(grads_buf);
+    device.deallocate(output_buf);
 
     Ok(grad_w)
 }
@@ -622,12 +652,43 @@ pub fn backward_output_gemm_gpu(
     // Phase 5.6.4b: GPU GEMM computation
     // grad_wo = attention_output^T @ output_grads
     // Dimensions: [embed, total_tokens] @ [total_tokens, embed] = [embed, embed]
-
-    // TODO: Replace with GPU kernel
-    let attn_out_t = attention_output.t();
-    use ndarray::linalg::general_mat_mul;
+    
+    // Allocate GPU buffers
+    let input_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
+    let grads_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
+    let output_size = embed_dim * embed_dim * std::mem::size_of::<f32>();
+    
+    let mut input_buf = device.allocate(input_size)?;
+    let mut grads_buf = device.allocate(grads_size)?;
+    let mut output_buf = device.allocate(output_size)?;
+    
+    // Upload data to GPU
+    device.upload(attention_output.as_slice().unwrap(), &mut input_buf)?;
+    device.upload(output_grads.as_slice().unwrap(), &mut grads_buf)?;
+    
+    // Compute: grad_wo = attention_output^T @ output_grads
+    // trans_a = true (attention_output^T), trans_b = false
+    device.gemm_f32(
+        1.0,
+        &input_buf,
+        &grads_buf,
+        0.0,
+        &mut output_buf,
+        embed_dim,       // m = embed_dim (output rows)
+        embed_dim,       // n = embed_dim (output cols)
+        total_tokens,    // k = total_tokens
+        true,            // trans_a = true (attention_output.T)
+        false,           // trans_b = false
+    )?;
+    
+    // Download result
     let mut grad_wo = Array2::zeros((embed_dim, embed_dim));
-    general_mat_mul(1.0, &attn_out_t, output_grads, 0.0, &mut grad_wo);
+    device.download(&output_buf, grad_wo.as_slice_mut().unwrap())?;
+    
+    // Cleanup
+    device.deallocate(input_buf);
+    device.deallocate(grads_buf);
+    device.deallocate(output_buf);
 
     Ok(grad_wo)
 }
@@ -650,22 +711,61 @@ pub fn backward_qkv_gemm_fused_gpu(
         });
     }
 
-    // Phase 5.6.4b: Fused kernel
+    // Phase 5.6.4b: Fused kernel on GPU
     // All 3 GEMMs can be batched in a single GPU dispatch
     // grad_q = grad_k = grad_v = input^T @ output_grads
     // (In practice, they'd have different output_grads splits for separate heads)
-
-    let input_t = input.t();
-    use ndarray::linalg::general_mat_mul;
-
+    
+    // Allocate GPU buffers
+    let input_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
+    let grads_size = total_tokens * embed_dim * std::mem::size_of::<f32>();
+    let output_size = embed_dim * embed_dim * std::mem::size_of::<f32>();
+    
+    let mut input_buf = device.allocate(input_size)?;
+    let mut grads_buf = device.allocate(grads_size)?;
+    let mut grad_q_buf = device.allocate(output_size)?;
+    let mut grad_k_buf = device.allocate(output_size)?;
+    let mut grad_v_buf = device.allocate(output_size)?;
+    
+    // Upload data to GPU
+    device.upload(input.as_slice().unwrap(), &mut input_buf)?;
+    device.upload(output_grads.as_slice().unwrap(), &mut grads_buf)?;
+    
+    // Compute: grad = input^T @ output_grads (same computation for all 3)
+    // trans_a = true (input^T), trans_b = false
+    device.gemm_f32(
+        1.0,
+        &input_buf,
+        &grads_buf,
+        0.0,
+        &mut grad_q_buf,
+        embed_dim,
+        embed_dim,
+        total_tokens,
+        true,
+        false,
+    )?;
+    
+    // Copy result for grad_k and grad_v (same gradient)
+    let grad_q_size = embed_dim * embed_dim * std::mem::size_of::<f32>();
+    device.copy_within_device(&grad_q_buf, &mut grad_k_buf, grad_q_size)?;
+    device.copy_within_device(&grad_q_buf, &mut grad_v_buf, grad_q_size)?;
+    
+    // Download results
     let mut grad_q = Array2::zeros((embed_dim, embed_dim));
     let mut grad_k = Array2::zeros((embed_dim, embed_dim));
     let mut grad_v = Array2::zeros((embed_dim, embed_dim));
-
-    // For fused kernel, all 3 can be computed in parallel on GPU
-    general_mat_mul(1.0, &input_t, output_grads, 0.0, &mut grad_q);
-    general_mat_mul(1.0, &input_t, output_grads, 0.0, &mut grad_k);
-    general_mat_mul(1.0, &input_t, output_grads, 0.0, &mut grad_v);
+    
+    device.download(&grad_q_buf, grad_q.as_slice_mut().unwrap())?;
+    device.download(&grad_k_buf, grad_k.as_slice_mut().unwrap())?;
+    device.download(&grad_v_buf, grad_v.as_slice_mut().unwrap())?;
+    
+    // Cleanup
+    device.deallocate(input_buf);
+    device.deallocate(grads_buf);
+    device.deallocate(grad_q_buf);
+    device.deallocate(grad_k_buf);
+    device.deallocate(grad_v_buf);
 
     Ok((grad_q, grad_k, grad_v))
 }

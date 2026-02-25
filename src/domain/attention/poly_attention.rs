@@ -41,6 +41,8 @@ use crate::{
 
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 use crate::domain::compute::{GpuComponent, GpuMatrixOps, GpuMemoryPool};
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+use crate::domain::layers::components::gpu_device_utils::gpu_gemm_with_attached_device;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AdaptiveDegreeConfig {
@@ -409,10 +411,38 @@ pub struct PolyAttentionGpuWeights {
     pub gate_params: GpuBuffer,
 }
 
+#[derive(Clone, Debug)]
+pub enum PolyAttentionGpuForwardVariant {
+    FlattenedCore,
+    PerHeadFusedExperimental,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolyAttentionGpuForwardCache {
+    pub variant: PolyAttentionGpuForwardVariant,
+    pub q: GpuBuffer,
+    pub k: GpuBuffer,
+    pub v: GpuBuffer,
+    pub raw_scores: GpuBuffer,
+    pub attn_weights: GpuBuffer,
+    pub content_scores: Option<GpuBuffer>,
+    pub pos_scores: Option<GpuBuffer>,
+    pub q_h: Option<GpuBuffer>,
+    pub k_comp: Option<GpuBuffer>,
+    pub gate: Option<GpuBuffer>,
+    pub gate_logits: Option<GpuBuffer>,
+    pub total_tokens: usize,
+    pub embed_dim: usize,
+    pub seq_len: usize,
+    pub batch_size: usize,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PolyAttention {
     #[serde(skip)]
     pub gpu_weights: Option<PolyAttentionGpuWeights>,
+    #[serde(skip)]
+    pub gpu_forward_cache: Option<PolyAttentionGpuForwardCache>,
 
     /// GPU device for accelerated attention computation (Phase 5.6)
     /// When attached, enables GPU-accelerated forward pass with strict no-fallback semantics
@@ -595,6 +625,7 @@ impl PolyAttention {
 
         Self {
             gpu_weights: None,
+            gpu_forward_cache: None,
             gpu_device: None,
             low_rank_query_gate,
             embed_dim,
@@ -1628,18 +1659,493 @@ impl PolyAttention {
         output
     }
 
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn clear_gpu_forward_cache_with_pool(&mut self, pool: &mut dyn GpuMemoryPool) {
+        if let Some(cache) = self.gpu_forward_cache.take() {
+            pool.deallocate(cache.q);
+            pool.deallocate(cache.k);
+            pool.deallocate(cache.v);
+            pool.deallocate(cache.raw_scores);
+            pool.deallocate(cache.attn_weights);
+            if let Some(buf) = cache.content_scores {
+                pool.deallocate(buf);
+            }
+            if let Some(buf) = cache.pos_scores {
+                pool.deallocate(buf);
+            }
+            if let Some(buf) = cache.q_h {
+                pool.deallocate(buf);
+            }
+            if let Some(buf) = cache.k_comp {
+                pool.deallocate(buf);
+            }
+            if let Some(buf) = cache.gate {
+                pool.deallocate(buf);
+            }
+            if let Some(buf) = cache.gate_logits {
+                pool.deallocate(buf);
+            }
+        }
+    }
+
+    #[inline]
+    fn gpu_strict_no_fallback_enabled() -> bool {
+        std::env::var("RUSTGPT_GPU_STRICT_NO_FALLBACK")
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                t == "1"
+                    || t.eq_ignore_ascii_case("true")
+                    || t.eq_ignore_ascii_case("yes")
+                    || t.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn gpu_polyattention_per_head_experimental_enabled() -> bool {
+        std::env::var("RUSTGPT_POLYATTN_GPU_PER_HEAD_EXPERIMENTAL")
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                t == "1"
+                    || t.eq_ignore_ascii_case("true")
+                    || t.eq_ignore_ascii_case("yes")
+                    || t.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    }
+
+    fn polyattention_per_head_fused_gpu_compat_error(&self) -> Option<String> {
+        if self.cope.as_standard_embeddings().is_none() {
+            return Some(
+                "requires Standard CoPE embeddings (UnifiedCoPE::Standard)".to_string(),
+            );
+        }
+        let gating = &self.moh.head_selection_config.gating;
+        if gating.use_learned_predictor {
+            return Some("does not support learned MoH predictor yet".to_string());
+        }
+        if gating.use_soft_top_p {
+            return Some("does not support soft-top-p MoH routing yet".to_string());
+        }
+        if gating.num_active != self.num_heads {
+            return Some(format!(
+                "requires num_active == num_heads (got {} vs {})",
+                gating.num_active, self.num_heads
+            ));
+        }
+        if !self.moh.head_selection_config.always_on_heads.is_empty() {
+            return Some("does not support always_on_heads overrides yet".to_string());
+        }
+        None
+    }
+
+    fn refresh_selection_caches_for_gpu_forward(&mut self, input: &Array2<f32>) {
+        self.moh.cached_soft_top_p_mask = None;
+        self.cached_thresholds_global = None;
+
+        if !self.moh.head_selection_config.gating.use_learned_predictor {
+            return;
+        }
+
+        crate::domain::attention::config::ensure_threshold_predictor_initialized(
+            &mut self.moh.threshold_predictor,
+            self.embed_dim,
+            self.num_heads,
+            crate::domain::attention::config::ThresholdPredictorOptimizers {
+                opt_w_tau: &mut self.moh.opt_w_tau,
+                opt_b_tau: &mut self.moh.opt_b_tau,
+                opt_w2_tau: &mut self.moh.opt_w2_tau,
+                opt_b2_tau: &mut self.moh.opt_b2_tau,
+                opt_cond_w_tau: &mut self.moh.opt_cond_w_tau,
+            },
+        );
+
+        if input.nrows() == 0 {
+            self.cached_thresholds_global = Some(Array2::zeros((0, self.num_heads)));
+            return;
+        }
+
+        if let Some(predictor) = self.moh.threshold_predictor.as_mut() {
+            let scaled_input = if let Some(scale) = self.token_threshold_scale.as_ref() {
+                if scale.nrows() == input.nrows() && scale.ncols() == 1 {
+                    let mut tmp = input.clone();
+                    let n = tmp.nrows();
+                    let d = tmp.ncols();
+                    for i in 0..n {
+                        let s = scale[[i, 0]];
+                        for j in 0..d {
+                            tmp[[i, j]] *= s;
+                        }
+                    }
+                    Some(tmp)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let input_view = match scaled_input.as_ref() {
+                Some(tmp) => tmp.view(),
+                None => input.view(),
+            };
+            let mut t = predictor.predict_with_condition(
+                &input_view,
+                self.token_latent_features.as_ref().map(|f| f.view()),
+            );
+            let modulation = self
+                .moh
+                .head_selection_config
+                .threshold_modulation
+                .value(self.training_progress);
+            t.mapv_inplace(|v| v * modulation);
+
+            let k = self.moh.head_selection_config.gating.num_active as f32;
+            let n = t.nrows();
+            let h = t.ncols();
+            for i in 0..n {
+                let mut sum = 0.0f32;
+                for j in 0..h {
+                    sum += t[[i, j]];
+                }
+                if sum > 0.0 {
+                    let scale = k / sum;
+                    for j in 0..h {
+                        t[[i, j]] *= scale;
+                    }
+                }
+            }
+            self.cached_thresholds_global = Some(t);
+        }
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gpu_per_head_fused_experimental(
+        &mut self,
+        device: &mut GpuDevice,
+        input: &Array2<f32>,
+        gpu_weights: &PolyAttentionGpuWeights,
+        total_tokens: usize,
+        embed_dim: usize,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<Array2<f32>> {
+        let head_dim = self.head_dim;
+        let num_heads = self.num_heads;
+        let bh = batch_size * num_heads;
+        let per_head_qkv_elems = batch_size * num_heads * seq_len * head_dim;
+        let per_head_scores_elems = batch_size * num_heads * seq_len * seq_len;
+        let rows_softmax = batch_size * num_heads * seq_len;
+        let blr_rank = crate::domain::attention::utils::dynamic_blr_rank(head_dim);
+
+        let input_slice =
+            input.as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::InvalidInput {
+                    message: "Input array must be contiguous".to_string(),
+                })?;
+        let mut input_buf = device.allocate_f32(total_tokens * embed_dim)?;
+        device.upload(input_slice, &mut input_buf)?;
+
+        let mut q_flat_buf = device.allocate_f32(total_tokens * embed_dim)?;
+        let mut k_flat_buf = device.allocate_f32(total_tokens * embed_dim)?;
+        let mut v_flat_buf = device.allocate_f32(total_tokens * embed_dim)?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_q,
+            0.0,
+            &mut q_flat_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_k,
+            0.0,
+            &mut k_flat_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_v,
+            0.0,
+            &mut v_flat_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+
+        // [B,S,H,Dh] -> [B,H,S,Dh]
+        let mut q_head_buf = device.allocate_f32(per_head_qkv_elems)?;
+        let mut k_head_buf = device.allocate_f32(per_head_qkv_elems)?;
+        let mut v_head_buf = device.allocate_f32(per_head_qkv_elems)?;
+        let stride_b = seq_len * num_heads * head_dim;
+        let stride_s = num_heads * head_dim;
+        let stride_h = head_dim;
+        let stride_d = 1usize;
+        device.permute_4d(
+            &q_flat_buf,
+            &mut q_head_buf,
+            [batch_size, num_heads, seq_len, head_dim],
+            [stride_b, stride_h, stride_s, stride_d],
+        )?;
+        device.permute_4d(
+            &k_flat_buf,
+            &mut k_head_buf,
+            [batch_size, num_heads, seq_len, head_dim],
+            [stride_b, stride_h, stride_s, stride_d],
+        )?;
+        device.permute_4d(
+            &v_flat_buf,
+            &mut v_head_buf,
+            [batch_size, num_heads, seq_len, head_dim],
+            [stride_b, stride_h, stride_s, stride_d],
+        )?;
+
+        let mut content_scores_buf = device.allocate_f32(per_head_scores_elems)?;
+        device.gemm_batched_f32(
+            1.0f32 / (head_dim as f32).sqrt(),
+            &q_head_buf,
+            &k_head_buf,
+            0.0,
+            &mut content_scores_buf,
+            seq_len,
+            seq_len,
+            head_dim,
+            bh,
+            [seq_len * head_dim, seq_len * head_dim, seq_len * seq_len],
+            false,
+            true,
+        )?;
+
+        let pos_embeddings = self.cope.as_standard_embeddings().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "Experimental per-head GPU PolyAttention requires Standard CoPE"
+                    .to_string(),
+            }
+        })?;
+        let pos_emb_binding = pos_embeddings.as_standard_layout();
+        let pos_emb_slice = pos_emb_binding.as_slice().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "Standard CoPE embeddings must be contiguous".to_string(),
+            }
+        })?;
+        let mut pos_emb_buf = device.allocate_f32(pos_emb_slice.len())?;
+        device.upload(pos_emb_slice, &mut pos_emb_buf)?;
+
+        let mut pos_scores_buf = device.allocate_f32(per_head_scores_elems)?;
+        device.compute_cope_scores(
+            &q_head_buf,
+            &pos_emb_buf,
+            &mut pos_scores_buf,
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            self.cope.max_pos(),
+        )?;
+
+        let mut q_h_buf = device.allocate_f32(batch_size * num_heads * seq_len * blr_rank)?;
+        let mut k_comp_buf = device.allocate_f32(batch_size * num_heads * seq_len * blr_rank)?;
+        let low_rank_params = self.moh.low_rank_query_gate.to_gpu_params(1);
+        device.blr_projection(
+            &q_head_buf,
+            &k_head_buf,
+            &mut q_h_buf,
+            &mut k_comp_buf,
+            &low_rank_params,
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            blr_rank,
+        )?;
+
+        let mut gate_logits_buf = device.allocate_f32(total_tokens * num_heads)?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_g,
+            0.0,
+            &mut gate_logits_buf,
+            total_tokens,
+            num_heads,
+            embed_dim,
+            false,
+            false,
+        )?;
+        let mut gate_buf = device.allocate_f32(total_tokens * num_heads)?;
+        let gate_curve_params = self.moh.gate.curve.to_gpu_params(1);
+        device.moh_gate_activation(
+            &gate_logits_buf,
+            &gpu_weights.alpha_g,
+            &gpu_weights.beta_g,
+            &gate_curve_params,
+            &mut gate_buf,
+            total_tokens,
+            num_heads,
+        )?;
+
+        let mut fused_scores_buf = device.allocate_f32(per_head_scores_elems)?;
+        device.poly_attention_fused(
+            &content_scores_buf,
+            &pos_scores_buf,
+            &q_h_buf,
+            &k_comp_buf,
+            &gpu_weights.poly_a,
+            &gpu_weights.poly_b,
+            &gpu_weights.poly_scale,
+            &gate_buf,
+            &mut fused_scores_buf,
+            batch_size,
+            num_heads,
+            seq_len,
+            self.cope.max_pos(),
+            self.p,
+            blr_rank,
+        )?;
+        if self.last_causal {
+            device.causal_mask_attention_scores(
+                &mut fused_scores_buf,
+                batch_size,
+                num_heads,
+                seq_len,
+                -1.0e9,
+            )?;
+        }
+
+        let mut attn_weights_buf = device.allocate_f32(per_head_scores_elems)?;
+        device.softmax(&fused_scores_buf, &mut attn_weights_buf, rows_softmax, seq_len)?;
+
+        let mut attn_head_buf = device.allocate_f32(per_head_qkv_elems)?;
+        device.gemm_batched_f32(
+            1.0,
+            &attn_weights_buf,
+            &v_head_buf,
+            0.0,
+            &mut attn_head_buf,
+            seq_len,
+            head_dim,
+            seq_len,
+            bh,
+            [seq_len * seq_len, seq_len * head_dim, seq_len * head_dim],
+            false,
+            false,
+        )?;
+
+        // [B,H,S,Dh] -> [B,S,H,Dh] == flattened [T,E]
+        let mut attn_flat_buf = device.allocate_f32(total_tokens * embed_dim)?;
+        let in_stride_b = num_heads * seq_len * head_dim;
+        let in_stride_h = seq_len * head_dim;
+        let in_stride_s = head_dim;
+        device.permute_4d(
+            &attn_head_buf,
+            &mut attn_flat_buf,
+            [batch_size, seq_len, num_heads, head_dim],
+            [in_stride_b, in_stride_s, in_stride_h, 1],
+        )?;
+
+        let mut output_buf = device.allocate_f32(total_tokens * embed_dim)?;
+        device.gemm_f32(
+            1.0,
+            &attn_flat_buf,
+            &gpu_weights.w_out,
+            0.0,
+            &mut output_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+
+        let mut output_array = Array2::zeros((total_tokens, embed_dim));
+        let output_slice = output_array
+            .as_slice_mut()
+            .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                message: "Output array must be contiguous".to_string(),
+            })?;
+        device.download(&output_buf, output_slice)?;
+
+        self.cached_q = None;
+        self.cached_k = None;
+        self.cached_v = None;
+        self.cached_attn_weights = None;
+        self.gpu_forward_cache = Some(PolyAttentionGpuForwardCache {
+            variant: PolyAttentionGpuForwardVariant::PerHeadFusedExperimental,
+            q: q_head_buf,
+            k: k_head_buf,
+            v: v_head_buf,
+            raw_scores: fused_scores_buf,
+            attn_weights: attn_weights_buf,
+            content_scores: Some(content_scores_buf),
+            pos_scores: Some(pos_scores_buf),
+            q_h: Some(q_h_buf),
+            k_comp: Some(k_comp_buf),
+            gate: Some(gate_buf),
+            gate_logits: Some(gate_logits_buf),
+            total_tokens,
+            embed_dim,
+            seq_len,
+            batch_size,
+        });
+
+        // Download gate_buf so we can update MoH metrics for training telemetry
+        let mut gate_array = ndarray::Array2::<f32>::zeros((total_tokens, self.num_heads));
+        device.download(&gate_buf, gate_array.as_slice_mut().unwrap())?;
+        
+        self.moh.head_selection_config.metrics_g_sq_sum += (total_tokens * self.num_heads) as f32; // Proxy
+        self.moh.head_selection_config.metrics_g_count += total_tokens * self.num_heads;
+        self.moh.head_selection_config.update_metrics(&gate_array.view());
+
+        for buf in [
+            input_buf,
+            q_flat_buf,
+            k_flat_buf,
+            v_flat_buf,
+            pos_emb_buf,
+            attn_head_buf,
+            attn_flat_buf,
+            output_buf,
+        ] {
+            device.deallocate(buf);
+        }
+
+        Ok(output_array)
+    }
+
     /// GPU-accelerated forward pass using attention_gpu_kernel
     ///
     /// Requires GPU device to be attached (via ensure_gpu_device).
     /// Falls back to CPU forward_impl_baseline if GPU is not available.
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     pub fn forward_gpu(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
-        use crate::domain::compute::GpuMatrixOps;
-        use crate::domain::layers::components::attention_gpu_kernel;
-        use crate::domain::layers::components::unified_gpu_kernels::AttentionParams;
-
         // Cache input for backward pass
         self.cached_input = Some(input.clone());
+        self.refresh_selection_caches_for_gpu_forward(input);
+
+        let (total_tokens, embed_dim) = input.dim();
+        if total_tokens == 0 || embed_dim == 0 {
+            let empty = Array2::zeros((total_tokens, embed_dim));
+            self.cached_q = Some(empty.clone());
+            self.cached_k = Some(empty.clone());
+            self.cached_v = Some(empty.clone());
+            self.cached_attn_weights = Some(Array2::zeros((0, 0)));
+            return Ok(empty);
+        }
 
         let device_arc = self
             .gpu_device
@@ -1651,18 +2157,54 @@ impl PolyAttention {
 
         let mut device = device_arc.lock().unwrap();
         let (pool, ops) = device.execution_context();
+        self.clear_gpu_forward_cache_with_pool(pool);
+
+        if Self::gpu_strict_no_fallback_enabled() {
+            return Err(crate::common::errors::ModelError::Backend {
+                message: "PolyAttention::forward_gpu strict mode is enabled, but the active GPU runtime path is still flattened-core and does not implement full PolyAttention semantics (MoH gating, CoPE, BLR, predictor parity). Disable RUSTGPT_GPU_STRICT_NO_FALLBACK for the interim path or use a fully parity-complete GPU path.".to_string(),
+            });
+        }
 
         // OPTIMIZATION: Ensure GPU weights are cached (Phase 5.6 GPU optimization)
         // This uploads weights once and reuses them across all forward passes
         self.ensure_gpu_weights(pool, ops)?;
 
-        let (batch_size_seq, embed_dim) = input.dim();
-        let seq_len = self.window_size.unwrap_or(batch_size_seq);
-        let batch_size = if seq_len > 0 {
-            batch_size_seq / seq_len
-        } else {
-            1
-        };
+        // Keep GPU attention dimensions consistent with actual input shape.
+        // `window_size` is a masking policy, not a guaranteed tensor reshape factor.
+        let mut seq_len = self
+            .window_size
+            .unwrap_or(total_tokens)
+            .max(1)
+            .min(total_tokens);
+        if total_tokens % seq_len != 0 {
+            seq_len = total_tokens;
+        }
+        let batch_size = total_tokens / seq_len;
+
+        let gpu_weights = self.gpu_weights.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "GPU weights not cached after ensure_gpu_weights".to_string(),
+            }
+        })?.clone();
+
+        if Self::gpu_polyattention_per_head_experimental_enabled() {
+            if let Some(reason) = self.polyattention_per_head_fused_gpu_compat_error() {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: format!(
+                        "Experimental per-head GPU PolyAttention forward requested but config is unsupported: {reason}"
+                    ),
+                });
+            }
+            return self.forward_gpu_per_head_fused_experimental(
+                &mut device,
+                input,
+                &gpu_weights,
+                total_tokens,
+                embed_dim,
+                batch_size,
+                seq_len,
+            );
+        }
 
         // Upload input only (weights are cached)
         let input_slice =
@@ -1673,151 +2215,1741 @@ impl PolyAttention {
                 })?;
         let input_buf = pool.upload(input_slice)?;
 
-        // Get cached GPU weights
-        let gpu_weights = self.gpu_weights.as_ref().ok_or_else(|| {
+        let _ = ops;
+
+        let total_tokens = batch_size * seq_len;
+        let scores_elems = total_tokens * total_tokens;
+        let qkv_elems = total_tokens * embed_dim;
+        let attn_scale = 1.0f32 / (self.head_dim as f32).sqrt();
+
+        let a_scalar = *self.a.get((0, 0)).ok_or_else(|| {
             crate::common::errors::ModelError::Backend {
-                message: "GPU weights not cached after ensure_gpu_weights".to_string(),
+                message: "PolyAttention GPU forward currently requires scalar a parameter (1x1)"
+                    .to_string(),
+            }
+        })?;
+        let b_scalar = *self.b.get((0, 0)).ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "PolyAttention GPU forward currently requires scalar b parameter (1x1)"
+                    .to_string(),
+            }
+        })?;
+        let scale_scalar = *self.scale.get((0, 0)).ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message:
+                    "PolyAttention GPU forward currently requires scalar scale parameter (1x1)"
+                        .to_string(),
             }
         })?;
 
-        // Create attention params
-        let params = AttentionParams::new(self.num_heads, embed_dim, seq_len, batch_size)
-            .with_causal(self.last_causal);
+        let mut q_buf = device.allocate_f32(qkv_elems)?;
+        let mut k_buf = device.allocate_f32(qkv_elems)?;
+        let mut v_buf = device.allocate_f32(qkv_elems)?;
+        let mut scores_buf = device.allocate_f32(scores_elems)?;
+        let mut poly_scores_buf = device.allocate_f32(scores_elems)?;
+        let mut attn_weights_buf = device.allocate_f32(scores_elems)?;
+        let mut attn_out_buf = device.allocate_f32(qkv_elems)?;
+        let mut output_buf = device.allocate_f32(qkv_elems)?;
 
-        // Call GPU kernel - need to drop pool borrow first
-        let _ = ops;
-        let (output_buf, q_buf, k_buf, v_buf, attn_weights_buf) =
-            attention_gpu_kernel::forward_gpu(
-                &mut device,
-                &input_buf,
-                &gpu_weights.w_q,
-                &gpu_weights.w_k,
-                &gpu_weights.w_v,
-                &gpu_weights.w_out,
-                &params,
-            )?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_q,
+            0.0,
+            &mut q_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_k,
+            0.0,
+            &mut k_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &input_buf,
+            &gpu_weights.w_v,
+            0.0,
+            &mut v_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            attn_scale,
+            &q_buf,
+            &k_buf,
+            0.0,
+            &mut scores_buf,
+            total_tokens,
+            total_tokens,
+            embed_dim,
+            false,
+            true,
+        )?;
+        device.poly_score_transform_scalar(
+            &scores_buf,
+            &mut poly_scores_buf,
+            a_scalar,
+            b_scalar,
+            scale_scalar,
+            self.p as u32,
+            8.0,
+            scores_elems,
+        )?;
+        device.softmax(
+            &poly_scores_buf,
+            &mut attn_weights_buf,
+            total_tokens,
+            total_tokens,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &attn_weights_buf,
+            &v_buf,
+            0.0,
+            &mut attn_out_buf,
+            total_tokens,
+            embed_dim,
+            total_tokens,
+            false,
+            false,
+        )?;
+        device.gemm_f32(
+            1.0,
+            &attn_out_buf,
+            &gpu_weights.w_out,
+            0.0,
+            &mut output_buf,
+            total_tokens,
+            embed_dim,
+            embed_dim,
+            false,
+            false,
+        )?;
 
         // Download result - get execution context after GPU kernel is done
         let (pool, _ops) = device.execution_context();
-        let mut output_array = Array2::zeros((batch_size_seq, embed_dim));
+        let mut output_array = Array2::zeros((total_tokens, embed_dim));
         let output_slice = output_array.as_slice_mut().unwrap();
         pool.download(&output_buf, output_slice)?;
 
-        // Download Q, K, V projections for backward pass
-        let mut q_array = Array2::zeros((batch_size_seq, embed_dim));
-        let mut k_array = Array2::zeros((batch_size_seq, embed_dim));
-        let mut v_array = Array2::zeros((batch_size_seq, embed_dim));
-        pool.download(&q_buf, q_array.as_slice_mut().unwrap())?;
-        pool.download(&k_buf, k_array.as_slice_mut().unwrap())?;
-        pool.download(&v_buf, v_array.as_slice_mut().unwrap())?;
+        // Avoid downloading large intermediates here: backward consumes retained GPU caches.
+        self.cached_q = None;
+        self.cached_k = None;
+        self.cached_v = None;
+        self.cached_attn_weights = None;
+        self.gpu_forward_cache = Some(PolyAttentionGpuForwardCache {
+            variant: PolyAttentionGpuForwardVariant::FlattenedCore,
+            q: q_buf,
+            k: k_buf,
+            v: v_buf,
+            raw_scores: scores_buf,
+            attn_weights: attn_weights_buf,
+            content_scores: None,
+            pos_scores: None,
+            q_h: None,
+            k_comp: None,
+            gate: None,
+            gate_logits: None,
+            total_tokens,
+            embed_dim,
+            seq_len,
+            batch_size,
+        });
 
-        // Download attention weights (batch*heads × seq_len × seq_len)
-        let attn_weights_size = batch_size * self.num_heads * seq_len * seq_len;
-        let mut attn_weights_array =
-            Array2::zeros((batch_size * self.num_heads, seq_len * seq_len));
-        pool.download(
-            &attn_weights_buf,
-            attn_weights_array.as_slice_mut().unwrap(),
-        )?;
-
-        // Cache intermediates for backward pass
-        self.cached_q = Some(q_array);
-        self.cached_k = Some(k_array);
-        self.cached_v = Some(v_array);
-        self.cached_attn_weights = Some(attn_weights_array);
-
-        // Cleanup buffers (input, output, intermediates)
+        // Cleanup buffers (q/k/v/attn_weights retained on GPU for backward)
+        pool.deallocate(poly_scores_buf);
+        pool.deallocate(attn_out_buf);
         pool.deallocate(input_buf);
         pool.deallocate(output_buf);
-        pool.deallocate(q_buf);
-        pool.deallocate(k_buf);
-        pool.deallocate(v_buf);
-        pool.deallocate(attn_weights_buf);
+
+        // Fallback GPU path doesn't implement dynamic soft gating yet, so all heads are active.
+        // Update the gating metrics to reflect 100% activity so training logs are accurate.
+        let uniform_eff = ndarray::Array2::ones((total_tokens, self.num_heads));
+        self.moh.head_selection_config.metrics_g_sq_sum += (total_tokens * self.num_heads) as f32;
+        self.moh.head_selection_config.metrics_g_count += total_tokens * self.num_heads;
+        self.moh.head_selection_config.update_metrics(&uniform_eff.view());
 
         Ok(output_array)
     }
 
-    /// GPU-accelerated forward pass (fallback to CPU)
+    /// GPU-accelerated forward pass on non-GPU builds (strict no-fallback error).
     #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
-    pub fn forward_gpu(&mut self, input: &Array2<f32>) -> Result<Array2<f32>> {
-        // No GPU features - use CPU baseline
-        Ok(self.forward_impl_baseline(input, self.last_causal))
+    pub fn forward_gpu(&mut self, _input: &Array2<f32>) -> Result<Array2<f32>> {
+        Err(crate::common::errors::ModelError::Backend {
+            message:
+                "PolyAttention::forward_gpu requires GPU features. Rebuild with --features gpu-wgpu, gpu-cuda, or gpu-metal"
+                    .to_string(),
+        })
     }
 
     /// GPU-accelerated backward pass for training
     ///
-    /// Uses cached Q, K, V, attention weights from forward pass.
-    /// Computes gradients via softmax backward and GEMM operations on GPU.
+    /// Strict no-fallback path for GPU training.
+    ///
+    /// Native GPU backward kernels are required; the analytical CPU fallback is disabled.
     #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
     pub fn backward_gpu(&mut self, grads: &Array2<f32>, lr: f32) -> Result<Array2<f32>> {
-        use crate::domain::compute::GpuMatrixOps;
-
-        let cached_input = self.cached_input.as_ref().ok_or_else(|| {
+        let cached_input = self.cached_input.clone().ok_or_else(|| {
             crate::common::errors::ModelError::InvalidInput {
                 message: "cached_input missing - forward must be called before backward"
                     .to_string(),
             }
         })?;
 
-        let cached_q = self.cached_q.as_ref().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "cached_q missing - forward_gpu must be called before backward_gpu"
+        let device_arc = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                message: "PolyAttention::backward_gpu requires an attached GPU device. Call ensure_gpu_device_auto_detect() first.".to_string(),
+            })?
+            .clone();
+        {
+            let _device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to lock PolyAttention GPU device in backward_gpu"
+                            .to_string(),
+                    })?;
+            let _ = &_device;
+        }
+
+        let (input_grads, param_grads) = self.compute_gradients_gpu(&cached_input, grads)?;
+        self.apply_gradients(&param_grads, lr)?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message:
+                        "Failed to lock PolyAttention GPU device to clear forward cache in backward_gpu"
+                            .to_string(),
+                })?;
+        let (pool, _ops) = device.execution_context();
+        self.clear_gpu_forward_cache_with_pool(pool);
+        Ok(input_grads)
+    }
+
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    fn compute_gradients_gpu_per_head_fused_experimental(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        let cache = self.gpu_forward_cache.as_ref().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "PerHeadFusedExperimental backward requires retained GPU forward cache"
                     .to_string(),
             }
         })?;
+        if !matches!(
+            cache.variant,
+            PolyAttentionGpuForwardVariant::PerHeadFusedExperimental
+        ) {
+            return Err(crate::common::errors::ModelError::Backend {
+                message:
+                    "compute_gradients_gpu_per_head_fused_experimental called with non-experimental cache"
+                        .to_string(),
+            });
+        }
 
-        let cached_k = self.cached_k.as_ref().ok_or_else(|| {
+        let (t, d) = input.dim();
+        let batch_size = cache.batch_size;
+        let seq_len = cache.seq_len;
+        let num_heads = self.num_heads;
+        let head_dim = self.head_dim;
+        let bh = batch_size * num_heads;
+        let rows_softmax = bh * seq_len;
+        let per_head_qkv = batch_size * num_heads * seq_len * head_dim;
+        let per_head_scores = batch_size * num_heads * seq_len * seq_len;
+
+        let input_slice = input.as_slice().ok_or_else(|| {
             crate::common::errors::ModelError::InvalidInput {
-                message: "cached_k missing - forward_gpu must be called before backward_gpu"
+                message: "PolyAttention experimental GPU backward input must be contiguous"
                     .to_string(),
             }
         })?;
-
-        let cached_v = self.cached_v.as_ref().ok_or_else(|| {
-            crate::common::errors::ModelError::InvalidInput {
-                message: "cached_v missing - forward_gpu must be called before backward_gpu"
-                    .to_string(),
-            }
-        })?;
-
-        let cached_attn_weights = self.cached_attn_weights.as_ref().ok_or_else(|| {
+        let output_grads_slice = output_grads.as_slice().ok_or_else(|| {
             crate::common::errors::ModelError::InvalidInput {
                 message:
-                    "cached_attn_weights missing - forward_gpu must be called before backward_gpu"
+                    "PolyAttention experimental GPU backward output_grads must be contiguous"
                         .to_string(),
             }
         })?;
 
-        // Get GPU device or fall back to CPU
-        let device_arc = match self.gpu_device.as_ref() {
-            Some(d) => d.clone(),
+        let device_arc = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                message: "PolyAttention experimental GPU backward requires attached GPU device"
+                    .to_string(),
+            })?
+            .clone();
+
+        let mut grad_input_total;
+        let grad_w_q;
+        let grad_w_k;
+        let grad_w_v;
+        let grad_w_out;
+        let grad_w_g;
+        let grad_alpha_g;
+        let grad_beta_g;
+        let mut grad_a_scalar = 0.0f32;
+        let mut grad_b_scalar = 0.0f32;
+        let mut grad_scale_scalar = 0.0f32;
+        let mut titan_applied_on_device = false;
+        {
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message:
+                            "Failed to lock GPU device in experimental per-head GPU backward"
+                                .to_string(),
+                    })?;
+
+            let cached_weight_bufs = self
+                .gpu_weights
+                .as_ref()
+                .map(|weights| (weights.w_q, weights.w_k, weights.w_v, weights.w_out));
+
+            let mut temp_wq_buf: Option<GpuBuffer> = None;
+            let mut temp_wk_buf: Option<GpuBuffer> = None;
+            let mut temp_wv_buf: Option<GpuBuffer> = None;
+            let mut temp_wo_buf: Option<GpuBuffer> = None;
+            let (wq_buf_src, wk_buf_src, wv_buf_src, wo_buf_src) = if let Some(bufs) = cached_weight_bufs {
+                bufs
+            } else {
+                let wq_slice = self.w_q.as_slice().ok_or_else(|| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: "PolyAttention::compute_gradients_gpu w_q must be contiguous"
+                            .to_string(),
+                    }
+                })?;
+                let wk_slice = self.w_k.as_slice().ok_or_else(|| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: "PolyAttention::compute_gradients_gpu w_k must be contiguous"
+                            .to_string(),
+                    }
+                })?;
+                let wv_slice = self.w_v.as_slice().ok_or_else(|| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: "PolyAttention::compute_gradients_gpu w_v must be contiguous"
+                            .to_string(),
+                    }
+                })?;
+                let wo_slice = self.w_out.as_slice().ok_or_else(|| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: "PolyAttention::compute_gradients_gpu w_out must be contiguous"
+                            .to_string(),
+                    }
+                })?;
+                let mut wq_buf = device.allocate_f32(d * d)?;
+                let mut wk_buf = device.allocate_f32(d * d)?;
+                let mut wv_buf = device.allocate_f32(d * d)?;
+                let mut wo_buf = device.allocate_f32(d * d)?;
+                device.upload(wq_slice, &mut wq_buf)?;
+                device.upload(wk_slice, &mut wk_buf)?;
+                device.upload(wv_slice, &mut wv_buf)?;
+                device.upload(wo_slice, &mut wo_buf)?;
+                temp_wq_buf = Some(wq_buf);
+                temp_wk_buf = Some(wk_buf);
+                temp_wv_buf = Some(wv_buf);
+                temp_wo_buf = Some(wo_buf);
+                (wq_buf, wk_buf, wv_buf, wo_buf)
+            };
+            let mut gate_upstream_buf_opt: Option<GpuBuffer> = None;
+            let mut host_gate_dw = vec![0.0f32; d * num_heads];
+            let mut host_gate_dalpha = vec![0.0f32; num_heads];
+            let mut host_gate_dbeta = vec![0.0f32; num_heads];
+            let mut gate_grads_computed = false;
+
+            let mut input_buf = device.allocate_f32(t * d)?;
+            let mut dy_buf = device.allocate_f32(t * d)?;
+            device.upload(input_slice, &mut input_buf)?;
+            device.upload(output_grads_slice, &mut dy_buf)?;
+
+            let mut d_attn_out_flat = device.allocate_f32(t * d)?;
+            let mut d_attn_out_head = device.allocate_f32(per_head_qkv)?;
+            let mut attn_out_head = device.allocate_f32(per_head_qkv)?;
+            let mut attn_out_flat = device.allocate_f32(t * d)?;
+            let mut d_p_buf = device.allocate_f32(per_head_scores)?;
+            let mut d_s_buf = device.allocate_f32(per_head_scores)?;
+            let mut d_v_head = device.allocate_f32(per_head_qkv)?;
+            let mut d_v_flat = device.allocate_f32(t * d)?;
+            let mut d_q_head = device.allocate_f32(per_head_qkv)?;
+            let mut d_k_head = device.allocate_f32(per_head_qkv)?;
+            let mut d_q_flat = device.allocate_f32(t * d)?;
+            let mut d_k_flat = device.allocate_f32(t * d)?;
+            let mut d_wq_buf = device.allocate_f32(d * d)?;
+            let mut d_wk_buf = device.allocate_f32(d * d)?;
+            let mut d_wv_buf = device.allocate_f32(d * d)?;
+            let mut d_wo_buf = device.allocate_f32(d * d)?;
+            let mut d_x_buf = device.allocate_f32(t * d)?;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            // d_attn_out(flat) = dY @ W_out^T
+            device.gemm_f32(
+                1.0,
+                &dy_buf,
+                &wo_buf_src,
+                0.0,
+                &mut d_attn_out_flat,
+                t,
+                d,
+                d,
+                false,
+                true,
+            )?;
+
+            // [B,S,H,Dh] -> [B,H,S,Dh]
+            let stride_b = seq_len * num_heads * head_dim;
+            let stride_s = num_heads * head_dim;
+            let stride_h = head_dim;
+            device.permute_4d(
+                &d_attn_out_flat,
+                &mut d_attn_out_head,
+                [batch_size, num_heads, seq_len, head_dim],
+                [stride_b, stride_h, stride_s, 1],
+            )?;
+
+            // attn_out_head = A @ V (batched per [B,H])
+            device.gemm_batched_f32(
+                1.0,
+                &cache.attn_weights,
+                &cache.v,
+                0.0,
+                &mut attn_out_head,
+                seq_len,
+                head_dim,
+                seq_len,
+                bh,
+                [seq_len * seq_len, seq_len * head_dim, seq_len * head_dim],
+                false,
+                false,
+            )?;
+
+            // [B,H,S,Dh] -> [B,S,H,Dh] contiguous flat attn_out
+            let in_stride_b = num_heads * seq_len * head_dim;
+            let in_stride_h = seq_len * head_dim;
+            let in_stride_s = head_dim;
+            device.permute_4d(
+                &attn_out_head,
+                &mut attn_out_flat,
+                [batch_size, seq_len, num_heads, head_dim],
+                [in_stride_b, in_stride_s, in_stride_h, 1],
+            )?;
+
+            // dW_out = attn_out^T @ dY
+            device.gemm_f32(
+                1.0,
+                &attn_out_flat,
+                &dy_buf,
+                0.0,
+                &mut d_wo_buf,
+                d,
+                d,
+                t,
+                true,
+                false,
+            )?;
+
+            // dP = d_attn_out_head @ V^T (batched)
+            device.gemm_batched_f32(
+                1.0,
+                &d_attn_out_head,
+                &cache.v,
+                0.0,
+                &mut d_p_buf,
+                seq_len,
+                seq_len,
+                head_dim,
+                bh,
+                [seq_len * head_dim, seq_len * head_dim, seq_len * seq_len],
+                false,
+                true,
+            )?;
+
+            // Softmax backward over rows [B*H*S, S]
+            device.softmax_backward(&cache.attn_weights, &d_p_buf, &mut d_s_buf, rows_softmax, seq_len)?;
+
+            // Partial fused-score backward on GPU:
+            // 1) exact gate and scalar-poly backward through the retained per-head fused cache
+            // 2) use d(s_raw) as a surrogate for the content-score path until full
+            //    decomposition (CoPE/BLR/gate split) is implemented.
+            if let (Some(content_scores_buf_src), Some(pos_scores_buf_src), Some(q_h_buf_src), Some(k_comp_buf_src), Some(gate_buf_src)) =
+                (cache.content_scores, cache.pos_scores, cache.q_h, cache.k_comp, cache.gate)
+            {
+                let mut blr_scores_buf = device.allocate_f32(per_head_scores)?;
+                device.gemm_batched_f32(
+                    1.0,
+                    &q_h_buf_src,
+                    &k_comp_buf_src,
+                    0.0,
+                    &mut blr_scores_buf,
+                    seq_len,
+                    seq_len,
+                    crate::domain::attention::utils::dynamic_blr_rank(head_dim),
+                    bh,
+                    [seq_len * crate::domain::attention::utils::dynamic_blr_rank(head_dim), seq_len * crate::domain::attention::utils::dynamic_blr_rank(head_dim), seq_len * seq_len],
+                    false,
+                    true,
+                )?;
+
+                let mut s_raw_buf = device.allocate_f32(per_head_scores)?;
+                device.copy_within_device(&content_scores_buf_src, &mut s_raw_buf, per_head_scores)?;
+                device.add_scaled(1.0, &pos_scores_buf_src, &mut s_raw_buf, per_head_scores)?;
+                device.add_scaled(1.0, &blr_scores_buf, &mut s_raw_buf, per_head_scores)?;
+
+                let a_scalar = *self.a.get((0, 0)).ok_or_else(|| {
+                    crate::common::errors::ModelError::Backend {
+                        message:
+                            "Experimental per-head GPU backward currently requires scalar a (1x1)"
+                                .to_string(),
+                    }
+                })?;
+                let b_scalar = *self.b.get((0, 0)).ok_or_else(|| {
+                    crate::common::errors::ModelError::Backend {
+                        message:
+                            "Experimental per-head GPU backward currently requires scalar b (1x1)"
+                                .to_string(),
+                    }
+                })?;
+                let scale_scalar = *self.scale.get((0, 0)).ok_or_else(|| {
+                    crate::common::errors::ModelError::Backend {
+                        message: "Experimental per-head GPU backward currently requires scalar scale (1x1)"
+                            .to_string(),
+                    }
+                })?;
+
+                let mut transformed_buf = device.allocate_f32(per_head_scores)?;
+                device.poly_score_transform_scalar(
+                    &s_raw_buf,
+                    &mut transformed_buf,
+                    a_scalar,
+                    b_scalar,
+                    scale_scalar,
+                    self.p as u32,
+                    8.0,
+                    per_head_scores,
+                )?;
+
+                // grad_transformed = d(fused_scores) * gate_broadcast(query/head)
+                let mut grad_transformed_buf = device.allocate_f32(per_head_scores)?;
+                device.poly_attention_gate_broadcast_mul(
+                    &d_s_buf,
+                    &gate_buf_src,
+                    &mut grad_transformed_buf,
+                    batch_size,
+                    num_heads,
+                    seq_len,
+                )?;
+
+                // Scalar-poly backward and scalar reductions (a/b/scale)
+                let mut d_s_raw_buf = device.allocate_f32(per_head_scores)?;
+                let mut grad_a_contrib_buf = device.allocate_f32(per_head_scores)?;
+                let mut grad_b_contrib_buf = device.allocate_f32(per_head_scores)?;
+                let mut grad_scale_contrib_buf = device.allocate_f32(per_head_scores)?;
+                device.poly_score_transform_scalar_backward(
+                    &s_raw_buf,
+                    &grad_transformed_buf,
+                    &mut d_s_raw_buf,
+                    &mut grad_a_contrib_buf,
+                    &mut grad_b_contrib_buf,
+                    &mut grad_scale_contrib_buf,
+                    a_scalar,
+                    b_scalar,
+                    scale_scalar,
+                    self.p as u32,
+                    8.0,
+                    per_head_scores,
+                )?;
+                grad_a_scalar = device.sum(&grad_a_contrib_buf, per_head_scores)?;
+                grad_b_scalar = device.sum(&grad_b_contrib_buf, per_head_scores)?;
+                grad_scale_scalar = device.sum(&grad_scale_contrib_buf, per_head_scores)?;
+
+                // Upstream gradient for MoH gate output:
+                // d_gate[b,s,h] = sum_j d(fused_scores)[b,h,s,j] * transformed[b,h,s,j]
+                let mut gate_upstream_buf = device.allocate_f32(t * num_heads)?;
+                device.poly_attention_gate_reduce_upstream(
+                    &d_s_buf,
+                    &transformed_buf,
+                    &mut gate_upstream_buf,
+                    batch_size,
+                    num_heads,
+                    seq_len,
+                )?;
+                gate_upstream_buf_opt = Some(gate_upstream_buf);
+
+                // Use d(s_raw) as the current surrogate for d(content_scores) to improve Q/K
+                // gradients compared with using d(fused_scores) directly.
+                device.deallocate(d_s_buf);
+                d_s_buf = d_s_raw_buf;
+
+                for buf in [
+                    blr_scores_buf,
+                    s_raw_buf,
+                    transformed_buf,
+                    grad_transformed_buf,
+                    grad_a_contrib_buf,
+                    grad_b_contrib_buf,
+                    grad_scale_contrib_buf,
+                ] {
+                    device.deallocate(buf);
+                }
+            }
+
+            device.gemm_batched_f32(
+                attn_scale,
+                &d_s_buf,
+                &cache.k,
+                0.0,
+                &mut d_q_head,
+                seq_len,
+                head_dim,
+                seq_len,
+                bh,
+                [seq_len * seq_len, seq_len * head_dim, seq_len * head_dim],
+                false,
+                false,
+            )?;
+            device.gemm_batched_f32(
+                attn_scale,
+                &d_s_buf,
+                &cache.q,
+                0.0,
+                &mut d_k_head,
+                seq_len,
+                head_dim,
+                seq_len,
+                bh,
+                [seq_len * seq_len, seq_len * head_dim, seq_len * head_dim],
+                true,
+                false,
+            )?;
+
+            // dV = A^T @ d_attn_out_head (batched)
+            device.gemm_batched_f32(
+                1.0,
+                &cache.attn_weights,
+                &d_attn_out_head,
+                0.0,
+                &mut d_v_head,
+                seq_len,
+                head_dim,
+                seq_len,
+                bh,
+                [seq_len * seq_len, seq_len * head_dim, seq_len * head_dim],
+                true,
+                false,
+            )?;
+
+            // Flatten dV back to [T,E]
+            device.permute_4d(
+                &d_v_head,
+                &mut d_v_flat,
+                [batch_size, seq_len, num_heads, head_dim],
+                [in_stride_b, in_stride_s, in_stride_h, 1],
+            )?;
+            device.permute_4d(
+                &d_q_head,
+                &mut d_q_flat,
+                [batch_size, seq_len, num_heads, head_dim],
+                [in_stride_b, in_stride_s, in_stride_h, 1],
+            )?;
+            device.permute_4d(
+                &d_k_head,
+                &mut d_k_flat,
+                [batch_size, seq_len, num_heads, head_dim],
+                [in_stride_b, in_stride_s, in_stride_h, 1],
+            )?;
+
+            // dW_q / dW_k = X^T @ dQ_flat / dK_flat
+            device.gemm_f32(
+                1.0,
+                &input_buf,
+                &d_q_flat,
+                0.0,
+                &mut d_wq_buf,
+                d,
+                d,
+                t,
+                true,
+                false,
+            )?;
+            device.gemm_f32(
+                1.0,
+                &input_buf,
+                &d_k_flat,
+                0.0,
+                &mut d_wk_buf,
+                d,
+                d,
+                t,
+                true,
+                false,
+            )?;
+
+            // dW_v = X^T @ dV_flat
+            device.gemm_f32(
+                1.0,
+                &input_buf,
+                &d_v_flat,
+                0.0,
+                &mut d_wv_buf,
+                d,
+                d,
+                t,
+                true,
+                false,
+            )?;
+
+            // dX = dV@Wv^T + dQ@Wq^T + dK@Wk^T.
+            // Fused-score decomposition (gate/poly/CoPE/BLR) is still pending, but core Q/K/V
+            // projection-path contributions are all applied here on-device.
+            device.gemm_f32(
+                1.0,
+                &d_v_flat,
+                &wv_buf_src,
+                0.0,
+                &mut d_x_buf,
+                t,
+                d,
+                d,
+                false,
+                true,
+            )?;
+            device.gemm_f32(
+                1.0,
+                &d_q_flat,
+                &wq_buf_src,
+                1.0,
+                &mut d_x_buf,
+                t,
+                d,
+                d,
+                false,
+                true,
+            )?;
+            device.gemm_f32(
+                1.0,
+                &d_k_flat,
+                &wk_buf_src,
+                1.0,
+                &mut d_x_buf,
+                t,
+                d,
+                d,
+                false,
+                true,
+            )?;
+
+            // MoH gate backward (partial parity, sigmoid-approx helper semantics) inline on-device.
+            if let (Some(gate_upstream_buf), Some(gate_logits_buf_src)) =
+                (gate_upstream_buf_opt.take(), cache.gate_logits)
+            {
+                let wg_slice = self.moh.w_g.as_slice().ok_or_else(|| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message:
+                            "PolyAttention experimental GPU backward MoH w_g must be contiguous"
+                                .to_string(),
+                    }
+                })?;
+                let alpha_slice =
+                    self.moh.alpha_g.as_slice().ok_or_else(|| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message:
+                                "PolyAttention experimental GPU backward MoH alpha_g must be contiguous"
+                                    .to_string(),
+                        }
+                    })?;
+                let beta_slice =
+                    self.moh.beta_g.as_slice().ok_or_else(|| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message:
+                                "PolyAttention experimental GPU backward MoH beta_g must be contiguous"
+                                    .to_string(),
+                        }
+                    })?;
+
+                let mut wg_gate_buf = device.allocate_f32(d * num_heads)?;
+                let mut alpha_gate_buf = device.allocate_f32(num_heads)?;
+                let mut beta_gate_buf = device.allocate_f32(num_heads)?;
+                device.upload(wg_slice, &mut wg_gate_buf)?;
+                device.upload(alpha_slice, &mut alpha_gate_buf)?;
+                device.upload(beta_slice, &mut beta_gate_buf)?;
+
+                let mut d_gate_buf_local = device.allocate_f32(t * num_heads)?;
+                let mut d_gate_scaled_buf_local = device.allocate_f32(t * num_heads)?;
+                let mut d_wg_gate_buf = device.allocate_f32(d * num_heads)?;
+                let mut d_alpha_gate_buf = device.allocate_f32(num_heads)?;
+                let mut d_beta_gate_buf = device.allocate_f32(num_heads)?;
+                let mut d_x_gate_buf = device.allocate_f32(t * d)?;
+
+                device.moh_gate_backward_prepare_sigmoid(
+                    &gate_logits_buf_src,
+                    &gate_upstream_buf,
+                    &alpha_gate_buf,
+                    &beta_gate_buf,
+                    &mut d_gate_buf_local,
+                    &mut d_gate_scaled_buf_local,
+                    t,
+                    num_heads,
+                )?;
+                device.gemm_f32(
+                    1.0,
+                    &input_buf,
+                    &d_gate_scaled_buf_local,
+                    0.0,
+                    &mut d_wg_gate_buf,
+                    d,
+                    num_heads,
+                    t,
+                    true,
+                    false,
+                )?;
+                device.moh_gate_backward_reduce_alpha_beta(
+                    &gate_logits_buf_src,
+                    &d_gate_buf_local,
+                    &mut d_alpha_gate_buf,
+                    &mut d_beta_gate_buf,
+                    t,
+                    num_heads,
+                )?;
+                device.gemm_f32(
+                    1.0,
+                    &d_gate_buf_local,
+                    &wg_gate_buf,
+                    0.0,
+                    &mut d_x_gate_buf,
+                    t,
+                    d,
+                    num_heads,
+                    false,
+                    true,
+                )?;
+                device.add_scaled(1.0, &d_x_gate_buf, &mut d_x_buf, t * d)?;
+
+                device.download(&d_wg_gate_buf, &mut host_gate_dw)?;
+                device.download(&d_alpha_gate_buf, &mut host_gate_dalpha)?;
+                device.download(&d_beta_gate_buf, &mut host_gate_dbeta)?;
+                gate_grads_computed = true;
+
+                for buf in [
+                    gate_upstream_buf,
+                    wg_gate_buf,
+                    alpha_gate_buf,
+                    beta_gate_buf,
+                    d_gate_buf_local,
+                    d_gate_scaled_buf_local,
+                    d_wg_gate_buf,
+                    d_alpha_gate_buf,
+                    d_beta_gate_buf,
+                    d_x_gate_buf,
+                ] {
+                    device.deallocate(buf);
+                }
+            }
+
+            // Apply Titan memory reverse-time recurrence directly to dX on-device
+            // to avoid download->CPU update->reuse churn in the training hot path.
+            if self.titan_memory.enabled && t > 0 && d > 0 {
+                let retain = 1.0 - self.titan_memory.decay;
+                let tm_scale = self.titan_memory.scale;
+                let eta = self.titan_memory.eta;
+                let mut dacc_buf = device.allocate_f32(d)?;
+                let mut row_buf = device.allocate_f32(d)?;
+                let mut grad_row_buf = device.allocate_f32(d)?;
+
+                if device.fill_f32(&mut dacc_buf, 0.0).is_err() {
+                    let zeros = vec![0.0f32; d];
+                    device.upload(&zeros, &mut dacc_buf)?;
+                }
+
+                for i in (0..t).rev() {
+                    let offset = i * d;
+                    device.copy_within_device_range(&dy_buf, offset, &mut row_buf, 0, d)?;
+
+                    if retain != 1.0 {
+                        device.scale(retain, &mut dacc_buf, d)?;
+                    }
+                    if tm_scale != 0.0 {
+                        device.add_scaled(tm_scale, &row_buf, &mut dacc_buf, d)?;
+                    }
+
+                    device.copy_within_device_range(&d_x_buf, offset, &mut grad_row_buf, 0, d)?;
+                    if eta != 0.0 {
+                        device.add_scaled(eta, &dacc_buf, &mut grad_row_buf, d)?;
+                    }
+                    device.copy_within_device_range(&grad_row_buf, 0, &mut d_x_buf, offset, d)?;
+                }
+
+                device.deallocate(dacc_buf);
+                device.deallocate(row_buf);
+                device.deallocate(grad_row_buf);
+                titan_applied_on_device = true;
+            }
+
+            let mut host_dx = vec![0.0f32; t * d];
+            let mut host_dwq = vec![0.0f32; d * d];
+            let mut host_dwk = vec![0.0f32; d * d];
+            let mut host_dwv = vec![0.0f32; d * d];
+            let mut host_dwo = vec![0.0f32; d * d];
+            device.download(&d_x_buf, &mut host_dx)?;
+            device.download(&d_wq_buf, &mut host_dwq)?;
+            device.download(&d_wk_buf, &mut host_dwk)?;
+            device.download(&d_wv_buf, &mut host_dwv)?;
+            device.download(&d_wo_buf, &mut host_dwo)?;
+
+            for buf in [
+                input_buf,
+                dy_buf,
+                d_attn_out_flat,
+                d_attn_out_head,
+                attn_out_head,
+                attn_out_flat,
+                d_p_buf,
+                d_s_buf,
+                d_q_head,
+                d_k_head,
+                d_v_head,
+                d_q_flat,
+                d_k_flat,
+                d_v_flat,
+                d_wq_buf,
+                d_wk_buf,
+                d_wv_buf,
+                d_wo_buf,
+                d_x_buf,
+            ] {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wq_buf {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wk_buf {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wv_buf {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wo_buf {
+                device.deallocate(buf);
+            }
+
+            grad_input_total = Array2::from_shape_vec((t, d), host_dx).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention experimental GPU backward grad_input reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_q = Array2::from_shape_vec((d, d), host_dwq).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention experimental GPU backward grad_w_q reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_k = Array2::from_shape_vec((d, d), host_dwk).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention experimental GPU backward grad_w_k reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_v = Array2::from_shape_vec((d, d), host_dwv).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention experimental GPU backward grad_w_v reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_out = Array2::from_shape_vec((d, d), host_dwo).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention experimental GPU backward grad_w_out reshape failed: {err}"
+                    ),
+                }
+            })?;
+            if gate_grads_computed {
+                grad_w_g = Array2::from_shape_vec((d, num_heads), host_gate_dw).map_err(|err| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: format!(
+                            "PolyAttention experimental GPU backward grad_w_g reshape failed: {err}"
+                        ),
+                    }
+                })?;
+                grad_alpha_g =
+                    Array2::from_shape_vec((1, num_heads), host_gate_dalpha).map_err(|err| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message: format!(
+                                "PolyAttention experimental GPU backward grad_alpha_g reshape failed: {err}"
+                            ),
+                        }
+                    })?;
+                grad_beta_g =
+                    Array2::from_shape_vec((1, num_heads), host_gate_dbeta).map_err(|err| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message: format!(
+                                "PolyAttention experimental GPU backward grad_beta_g reshape failed: {err}"
+                            ),
+                        }
+                    })?;
+            } else {
+                grad_w_g = Array2::<f32>::zeros(self.moh.w_g.dim());
+                grad_alpha_g = Array2::<f32>::zeros(self.moh.alpha_g.dim());
+                grad_beta_g = Array2::<f32>::zeros(self.moh.beta_g.dim());
+            }
+        }
+
+        // CPU Titan fallback only when the backend path above could not apply it on-device.
+        if !titan_applied_on_device && self.titan_memory.enabled && t > 0 && d > 0 {
+            let retain = 1.0 - self.titan_memory.decay;
+            let tm_scale = self.titan_memory.scale;
+            let eta = self.titan_memory.eta;
+            let mut dacc = vec![0.0f32; d];
+            for i in (0..t).rev() {
+                for j in 0..d {
+                    dacc[j] = dacc[j] * retain + tm_scale * output_grads[[i, j]];
+                    grad_input_total[[i, j]] += eta * dacc[j];
+                }
+            }
+        }
+
+        // Gate-poly parameter backward is still pending in the experimental path.
+        let grad_gate_poly = Array2::<f32>::zeros((1, self.moh.gate.parameters()));
+
+        let mut all_param_grads = Vec::new();
+        all_param_grads.push(grad_w_q); // w_q (partial: fused-score decomposition pending)
+        all_param_grads.push(grad_w_k); // w_k (partial: fused-score decomposition pending)
+        all_param_grads.push(grad_w_v); // w_v
+        all_param_grads.push(grad_w_out); // w_out
+        all_param_grads.push(Array2::from_elem((1, 1), grad_a_scalar)); // a (scalar poly only)
+        all_param_grads.push(Array2::from_elem((1, 1), grad_b_scalar)); // b (scalar poly only)
+        all_param_grads.push(Array2::from_elem((1, 1), grad_scale_scalar)); // scale (scalar poly only)
+        all_param_grads.push(grad_w_g); // w_g (helper path, simplified gate derivative)
+        all_param_grads.push(grad_alpha_g); // alpha_g (helper path)
+        all_param_grads.push(grad_beta_g); // beta_g (helper path)
+        all_param_grads.push(grad_gate_poly); // gate poly (pending)
+
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+            let predictor = self.moh.threshold_predictor.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::GradientError {
+                    message: "PolyAttention invariant violated: use_learned_predictor=true but threshold_predictor=None"
+                        .to_string(),
+                }
+            })?;
+            all_param_grads.push(Array2::<f32>::zeros(predictor.weights1.dim()));
+            all_param_grads.push(Array2::<f32>::zeros((predictor.bias1.len(), 1)));
+            all_param_grads.push(Array2::<f32>::zeros(predictor.weights2.dim()));
+            all_param_grads.push(Array2::<f32>::zeros((predictor.bias2.len(), 1)));
+            all_param_grads.push(Array2::<f32>::zeros(predictor.cond_w.dim()));
+            all_param_grads.push(Array2::<f32>::zeros((
+                1,
+                predictor.activation.scalar_weights_len(),
+            )));
+        }
+
+        Ok((grad_input_total, all_param_grads))
+    }
+
+    /// GPU-accelerated backward pass on non-GPU builds (strict no-fallback error).
+    #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+    pub fn backward_gpu(&mut self, _grads: &Array2<f32>, _lr: f32) -> Result<Array2<f32>> {
+        Err(crate::common::errors::ModelError::Backend {
+            message:
+                "PolyAttention::backward_gpu requires GPU features. Rebuild with --features gpu-wgpu, gpu-cuda, or gpu-metal"
+                    .to_string(),
+        })
+    }
+
+    /// GPU-only gradient path for training loops that route via `compute_gradients(...)`.
+    ///
+    /// Analytical CPU fallback is intentionally disabled here.
+    #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+    pub fn compute_gradients_gpu(
+        &self,
+        input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        let (total_tokens, embed_dim) = input.dim();
+        if output_grads.dim() != (total_tokens, embed_dim) {
+            return Err(crate::common::errors::ModelError::DimensionMismatchDetailed {
+                expected: format!("output_grads: ({total_tokens}, {embed_dim})"),
+                got: format!("{:?}", output_grads.dim()),
+            });
+        }
+        if embed_dim != self.embed_dim {
+            return Err(crate::common::errors::ModelError::DimensionMismatchDetailed {
+                expected: format!("embed_dim: {}", self.embed_dim),
+                got: format!("{embed_dim}"),
+            });
+        }
+        let cache_variant = match self.gpu_forward_cache.as_ref() {
+            Some(cache) if cache.total_tokens == total_tokens && cache.embed_dim == embed_dim => {
+                cache.variant.clone()
+            }
+            Some(_) => {
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: "PolyAttention::compute_gradients_gpu full-parity path requires a matching retained GPU forward cache. Call forward_gpu() with the same input shape immediately before backward_gpu().".to_string(),
+                })
+            }
             None => {
-                // No GPU device attached, use CPU backward
-                let input_grads = self.backward(grads, lr);
-                return Ok(input_grads);
+                return Err(crate::common::errors::ModelError::Backend {
+                    message: "PolyAttention::compute_gradients_gpu full-parity path requires retained GPU forward intermediates. Call forward_gpu() before backward_gpu() (no recompute fallback in strict mode).".to_string(),
+                })
             }
         };
 
-        let mut device = device_arc.lock().unwrap();
-        let (pool, ops) = device.execution_context();
+        if matches!(
+            cache_variant,
+            PolyAttentionGpuForwardVariant::PerHeadFusedExperimental
+        ) {
+            return self.compute_gradients_gpu_per_head_fused_experimental(input, output_grads);
+        }
 
-        // GPU backward computation using cached intermediates
-        // Fallback to CPU for now to maintain correctness
-        // TODO: Implement full GPU backward with softmax gradient kernel
-        let _ = pool;
-        let _ = ops;
+        let device_arc = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                message: "PolyAttention::compute_gradients_gpu requires an attached GPU device."
+                    .to_string(),
+            })?
+            .clone();
+        {
+            let _device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to lock PolyAttention GPU device in compute_gradients_gpu"
+                            .to_string(),
+                    })?;
+        }
 
-        // Use CPU backward for correctness
-        // This maintains gradient correctness while forward runs on GPU
-        let input_grads = self.backward(grads, lr);
-        Ok(input_grads)
+        // Core transformer attention backward on GPU.
+        // Uses retained forward cache (Q/K/V/attn_weights) for exact gradients when available.
+        let mut grad_input_total;
+        let grad_w_q;
+        let grad_w_k;
+        let grad_w_v;
+        let grad_w_out;
+        let mut grad_a_scalar = 0.0f32;
+        let mut grad_b_scalar = 0.0f32;
+        let mut grad_scale_scalar = 0.0f32;
+        let mut titan_applied_on_device = false;
+        {
+            use crate::domain::layers::components::attention_gpu_kernel;
+            use crate::domain::layers::components::unified_gpu_kernels::AttentionParams;
+
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to lock PolyAttention GPU device for exact attention backward"
+                            .to_string(),
+                    })?;
+            let input_slice = input.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: "PolyAttention::compute_gradients_gpu input must be contiguous"
+                        .to_string(),
+                }
+            })?;
+            let output_grads_slice = output_grads.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message:
+                        "PolyAttention::compute_gradients_gpu output_grads must be contiguous"
+                            .to_string(),
+                }
+            })?;
+            let t = total_tokens;
+            let d = embed_dim;
+            let attn_scale = 1.0f32 / (self.head_dim as f32).sqrt();
+            let a_scalar = *self.a.get((0, 0)).ok_or_else(|| {
+                crate::common::errors::ModelError::Backend {
+                    message:
+                        "PolyAttention::compute_gradients_gpu currently requires scalar a (1x1)"
+                            .to_string(),
+                }
+            })?;
+            let b_scalar = *self.b.get((0, 0)).ok_or_else(|| {
+                crate::common::errors::ModelError::Backend {
+                    message:
+                        "PolyAttention::compute_gradients_gpu currently requires scalar b (1x1)"
+                            .to_string(),
+                }
+            })?;
+            let scale_scalar = *self.scale.get((0, 0)).ok_or_else(|| {
+                crate::common::errors::ModelError::Backend {
+                    message: "PolyAttention::compute_gradients_gpu currently requires scalar scale (1x1)".to_string(),
+                }
+            })?;
+
+            let mut input_buf = device.allocate_f32(t * d)?;
+            let mut dy_buf = device.allocate_f32(t * d)?;
+            device.upload(input_slice, &mut input_buf)?;
+            device.upload(output_grads_slice, &mut dy_buf)?;
+
+            let cached_weight_bufs = self
+                .gpu_weights
+                .as_ref()
+                .map(|weights| (weights.w_q, weights.w_k, weights.w_v, weights.w_out));
+
+            let mut temp_wq_buf: Option<GpuBuffer> = None;
+            let mut temp_wk_buf: Option<GpuBuffer> = None;
+            let mut temp_wv_buf: Option<GpuBuffer> = None;
+            let mut temp_wo_buf: Option<GpuBuffer> = None;
+            let (wq_buf_src, wk_buf_src, wv_buf_src, wo_buf_src) =
+                if let Some(bufs) = cached_weight_bufs {
+                    bufs
+                } else {
+                    let wq_slice = self.w_q.as_slice().ok_or_else(|| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message: "PolyAttention::compute_gradients_gpu w_q must be contiguous"
+                                .to_string(),
+                        }
+                    })?;
+                    let wk_slice = self.w_k.as_slice().ok_or_else(|| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message: "PolyAttention::compute_gradients_gpu w_k must be contiguous"
+                                .to_string(),
+                        }
+                    })?;
+                    let wv_slice = self.w_v.as_slice().ok_or_else(|| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message: "PolyAttention::compute_gradients_gpu w_v must be contiguous"
+                                .to_string(),
+                        }
+                    })?;
+                    let wo_slice = self.w_out.as_slice().ok_or_else(|| {
+                        crate::common::errors::ModelError::InvalidInput {
+                            message: "PolyAttention::compute_gradients_gpu w_out must be contiguous"
+                                .to_string(),
+                        }
+                    })?;
+
+                    let mut wq_buf = device.allocate_f32(d * d)?;
+                    let mut wk_buf = device.allocate_f32(d * d)?;
+                    let mut wv_buf = device.allocate_f32(d * d)?;
+                    let mut wo_buf = device.allocate_f32(d * d)?;
+                    device.upload(wq_slice, &mut wq_buf)?;
+                    device.upload(wk_slice, &mut wk_buf)?;
+                    device.upload(wv_slice, &mut wv_buf)?;
+                    device.upload(wo_slice, &mut wo_buf)?;
+                    temp_wq_buf = Some(wq_buf);
+                    temp_wk_buf = Some(wk_buf);
+                    temp_wv_buf = Some(wv_buf);
+                    temp_wo_buf = Some(wo_buf);
+                    (wq_buf, wk_buf, wv_buf, wo_buf)
+                };
+
+            let mut temp_output_buf: Option<GpuBuffer> = None;
+            let (q_buf_src, k_buf_src, v_buf_src, raw_scores_buf_src, attn_weights_buf_src) =
+                if let Some(cache) = self.gpu_forward_cache.as_ref() {
+                    if cache.total_tokens == t && cache.embed_dim == d {
+                        (cache.q, cache.k, cache.v, cache.raw_scores, cache.attn_weights)
+                    } else {
+                        let mut seq_len = self.window_size.unwrap_or(t).max(1).min(t);
+                        if t % seq_len != 0 {
+                            seq_len = t;
+                        }
+                        let batch_size = t / seq_len;
+                        let params = AttentionParams::new(self.num_heads, d, seq_len, batch_size)
+                            .with_causal(self.last_causal);
+                        let (output_buf, q_buf, k_buf, v_buf, attn_weights_buf) =
+                            attention_gpu_kernel::forward_gpu(
+                                &mut device,
+                                &input_buf,
+                                &wq_buf_src,
+                                &wk_buf_src,
+                                &wv_buf_src,
+                                &wo_buf_src,
+                                &params,
+                            )?;
+                        temp_output_buf = Some(output_buf);
+                        let mut raw_scores_buf = device.allocate_f32(t * t)?;
+                        device.gemm_f32(
+                            attn_scale,
+                            &q_buf,
+                            &k_buf,
+                            0.0,
+                            &mut raw_scores_buf,
+                            t,
+                            t,
+                            d,
+                            false,
+                            true,
+                        )?;
+                        (q_buf, k_buf, v_buf, raw_scores_buf, attn_weights_buf)
+                    }
+                } else {
+                    let mut seq_len = self.window_size.unwrap_or(t).max(1).min(t);
+                    if t % seq_len != 0 {
+                        seq_len = t;
+                    }
+                    let batch_size = t / seq_len;
+                    let params = AttentionParams::new(self.num_heads, d, seq_len, batch_size)
+                        .with_causal(self.last_causal);
+                    let (output_buf, q_buf, k_buf, v_buf, attn_weights_buf) =
+                        attention_gpu_kernel::forward_gpu(
+                            &mut device,
+                            &input_buf,
+                            &wq_buf_src,
+                            &wk_buf_src,
+                            &wv_buf_src,
+                            &wo_buf_src,
+                            &params,
+                        )?;
+                    temp_output_buf = Some(output_buf);
+                    let mut raw_scores_buf = device.allocate_f32(t * t)?;
+                    device.gemm_f32(
+                        attn_scale,
+                        &q_buf,
+                        &k_buf,
+                        0.0,
+                        &mut raw_scores_buf,
+                        t,
+                        t,
+                        d,
+                        false,
+                        true,
+                    )?;
+                    (q_buf, k_buf, v_buf, raw_scores_buf, attn_weights_buf)
+                };
+
+            let mut d_attn_out_buf = device.allocate_f32(t * d)?;
+            let mut d_p_buf = device.allocate_f32(t * t)?;
+            let mut d_s_buf = device.allocate_f32(t * t)?;
+            let mut d_q_buf = device.allocate_f32(t * d)?;
+            let mut d_k_buf = device.allocate_f32(t * d)?;
+            let mut d_v_buf = device.allocate_f32(t * d)?;
+            let mut attn_out_buf = device.allocate_f32(t * d)?;
+            let mut d_wq_buf = device.allocate_f32(d * d)?;
+            let mut d_wk_buf = device.allocate_f32(d * d)?;
+            let mut d_wv_buf = device.allocate_f32(d * d)?;
+            let mut d_wo_buf = device.allocate_f32(d * d)?;
+            let mut d_x_buf = device.allocate_f32(t * d)?;
+
+            // d_attn_out = dY @ W_o^T
+            device.gemm_f32(
+                1.0,
+                &dy_buf,
+                &wo_buf_src,
+                0.0,
+                &mut d_attn_out_buf,
+                t,
+                d,
+                d,
+                false,
+                true,
+            )?;
+
+            // attn_out = P @ V
+            device.gemm_f32(
+                1.0,
+                &attn_weights_buf_src,
+                &v_buf_src,
+                0.0,
+                &mut attn_out_buf,
+                t,
+                d,
+                t,
+                false,
+                false,
+            )?;
+
+            // dW_out = attn_out^T @ dY
+            device.gemm_f32(
+                1.0,
+                &attn_out_buf,
+                &dy_buf,
+                0.0,
+                &mut d_wo_buf,
+                d,
+                d,
+                t,
+                true,
+                false,
+            )?;
+
+            // dP = d_attn_out @ V^T
+            device.gemm_f32(
+                1.0,
+                &d_attn_out_buf,
+                &v_buf_src,
+                0.0,
+                &mut d_p_buf,
+                t,
+                t,
+                d,
+                false,
+                true,
+            )?;
+
+            // dV = P^T @ d_attn_out
+            device.gemm_f32(
+                1.0,
+                &attn_weights_buf_src,
+                &d_attn_out_buf,
+                0.0,
+                &mut d_v_buf,
+                t,
+                d,
+                t,
+                true,
+                false,
+            )?;
+
+            // dS = softmax_backward(P, dP)
+            device.softmax_backward(&attn_weights_buf_src, &d_p_buf, &mut d_s_buf, t, t)?;
+
+            // Backprop through polynomial score transform used in GPU forward:
+            // transformed = scale * (a * smooth_clip_tanh(raw)^p + b)
+            let mut grad_a_contrib_buf = device.allocate_f32(t * t)?;
+            let mut grad_b_contrib_buf = device.allocate_f32(t * t)?;
+            let mut grad_scale_contrib_buf = device.allocate_f32(t * t)?;
+            let mut d_raw_scores_buf = device.allocate_f32(t * t)?;
+            device.poly_score_transform_scalar_backward(
+                &raw_scores_buf_src,
+                &d_s_buf,
+                &mut d_raw_scores_buf,
+                &mut grad_a_contrib_buf,
+                &mut grad_b_contrib_buf,
+                &mut grad_scale_contrib_buf,
+                a_scalar,
+                b_scalar,
+                scale_scalar,
+                self.p as u32,
+                8.0,
+                t * t,
+            )?;
+            grad_a_scalar = device.sum(&grad_a_contrib_buf, t * t)?;
+            grad_b_scalar = device.sum(&grad_b_contrib_buf, t * t)?;
+            grad_scale_scalar = device.sum(&grad_scale_contrib_buf, t * t)?;
+            device.deallocate(grad_a_contrib_buf);
+            device.deallocate(grad_b_contrib_buf);
+            device.deallocate(grad_scale_contrib_buf);
+            device.deallocate(d_s_buf);
+            d_s_buf = d_raw_scores_buf;
+
+            // dQ = scale * dS @ K
+            device.gemm_f32(
+                1.0,
+                &d_s_buf,
+                &k_buf_src,
+                0.0,
+                &mut d_q_buf,
+                t,
+                d,
+                t,
+                false,
+                false,
+            )?;
+
+            // dK = scale * dS^T @ Q
+            device.gemm_f32(
+                1.0,
+                &d_s_buf,
+                &q_buf_src,
+                0.0,
+                &mut d_k_buf,
+                t,
+                d,
+                t,
+                true,
+                false,
+            )?;
+
+            // dWq/dWk/dWv = X^T @ dQ/dK/dV
+            device.gemm_f32(1.0, &input_buf, &d_q_buf, 0.0, &mut d_wq_buf, d, d, t, true, false)?;
+            device.gemm_f32(1.0, &input_buf, &d_k_buf, 0.0, &mut d_wk_buf, d, d, t, true, false)?;
+            device.gemm_f32(1.0, &input_buf, &d_v_buf, 0.0, &mut d_wv_buf, d, d, t, true, false)?;
+
+            // dX = dQ@Wq^T + dK@Wk^T + dV@Wv^T
+            device.gemm_f32(1.0, &d_q_buf, &wq_buf_src, 0.0, &mut d_x_buf, t, d, d, false, true)?;
+            device.gemm_f32(1.0, &d_k_buf, &wk_buf_src, 1.0, &mut d_x_buf, t, d, d, false, true)?;
+            device.gemm_f32(1.0, &d_v_buf, &wv_buf_src, 1.0, &mut d_x_buf, t, d, d, false, true)?;
+
+            // Apply Titan memory reverse-time recurrence directly to dX on-device
+            // to avoid download->upload churn in the training hot path.
+            if self.titan_memory.enabled && t > 0 && d > 0 {
+                let retain = 1.0 - self.titan_memory.decay;
+                let tm_scale = self.titan_memory.scale;
+                let eta = self.titan_memory.eta;
+                let mut dacc_buf = device.allocate_f32(d)?;
+                let mut row_buf = device.allocate_f32(d)?;
+                let mut grad_row_buf = device.allocate_f32(d)?;
+
+                if device.fill_f32(&mut dacc_buf, 0.0).is_err() {
+                    let zeros = vec![0.0f32; d];
+                    device.upload(&zeros, &mut dacc_buf)?;
+                }
+
+                for i in (0..t).rev() {
+                    let offset = i * d;
+                    device.copy_within_device_range(&dy_buf, offset, &mut row_buf, 0, d)?;
+
+                    if retain != 1.0 {
+                        device.scale(retain, &mut dacc_buf, d)?;
+                    }
+                    if tm_scale != 0.0 {
+                        device.add_scaled(tm_scale, &row_buf, &mut dacc_buf, d)?;
+                    }
+
+                    device.copy_within_device_range(&d_x_buf, offset, &mut grad_row_buf, 0, d)?;
+                    if eta != 0.0 {
+                        device.add_scaled(eta, &dacc_buf, &mut grad_row_buf, d)?;
+                    }
+                    device.copy_within_device_range(&grad_row_buf, 0, &mut d_x_buf, offset, d)?;
+                }
+
+                device.deallocate(dacc_buf);
+                device.deallocate(row_buf);
+                device.deallocate(grad_row_buf);
+                titan_applied_on_device = true;
+            }
+
+            let mut host_dx = vec![0.0f32; t * d];
+            let mut host_dwq = vec![0.0f32; d * d];
+            let mut host_dwk = vec![0.0f32; d * d];
+            let mut host_dwv = vec![0.0f32; d * d];
+            let mut host_dwo = vec![0.0f32; d * d];
+            device.download(&d_x_buf, &mut host_dx)?;
+            device.download(&d_wq_buf, &mut host_dwq)?;
+            device.download(&d_wk_buf, &mut host_dwk)?;
+            device.download(&d_wv_buf, &mut host_dwv)?;
+            device.download(&d_wo_buf, &mut host_dwo)?;
+
+            // Recomputed forward intermediates are temporary; retained cache buffers are owned
+            // by `self.gpu_forward_cache` and must be released only by cache cleanup.
+            if let Some(output_buf) = temp_output_buf {
+                device.deallocate(output_buf);
+                device.deallocate(q_buf_src);
+                device.deallocate(k_buf_src);
+                device.deallocate(v_buf_src);
+                device.deallocate(raw_scores_buf_src);
+                device.deallocate(attn_weights_buf_src);
+            }
+
+            if let Some(buf) = temp_wq_buf {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wk_buf {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wv_buf {
+                device.deallocate(buf);
+            }
+            if let Some(buf) = temp_wo_buf {
+                device.deallocate(buf);
+            }
+
+            for buf in [
+                input_buf,
+                dy_buf,
+                d_attn_out_buf,
+                d_p_buf,
+                d_s_buf,
+                d_q_buf,
+                d_k_buf,
+                d_v_buf,
+                attn_out_buf,
+                d_wq_buf,
+                d_wk_buf,
+                d_wv_buf,
+                d_wo_buf,
+                d_x_buf,
+            ] {
+                device.deallocate(buf);
+            }
+
+            grad_input_total =
+                Array2::from_shape_vec((t, d), host_dx).map_err(|err| {
+                    crate::common::errors::ModelError::InvalidInput {
+                        message: format!(
+                            "PolyAttention::compute_gradients_gpu grad_input reshape failed: {err}"
+                        ),
+                    }
+                })?;
+            grad_w_q = Array2::from_shape_vec((d, d), host_dwq).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention::compute_gradients_gpu grad_w_q reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_k = Array2::from_shape_vec((d, d), host_dwk).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention::compute_gradients_gpu grad_w_k reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_v = Array2::from_shape_vec((d, d), host_dwv).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention::compute_gradients_gpu grad_w_v reshape failed: {err}"
+                    ),
+                }
+            })?;
+            grad_w_out = Array2::from_shape_vec((d, d), host_dwo).map_err(|err| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message: format!(
+                        "PolyAttention::compute_gradients_gpu grad_w_out reshape failed: {err}"
+                    ),
+                }
+            })?;
+        }
+
+        // Exact Titan-memory gradient contribution on GPU (no analytical CPU fallback).
+        if !titan_applied_on_device && self.titan_memory.enabled && total_tokens > 0 && embed_dim > 0 {
+            let retain = 1.0 - self.titan_memory.decay;
+            let tm_scale = self.titan_memory.scale;
+            let eta = self.titan_memory.eta;
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to lock PolyAttention GPU device for Titan backward"
+                            .to_string(),
+                    })?;
+
+            let grad_input_slice = grad_input_total.as_slice_mut().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message:
+                        "PolyAttention::compute_gradients_gpu grad_input_total must be contiguous"
+                            .to_string(),
+                }
+            })?;
+            let output_grads_slice = output_grads.as_slice().ok_or_else(|| {
+                crate::common::errors::ModelError::InvalidInput {
+                    message:
+                        "PolyAttention::compute_gradients_gpu output_grads must be contiguous"
+                            .to_string(),
+                }
+            })?;
+
+            let mut grad_input_buf = device.allocate_f32(total_tokens * embed_dim)?;
+            let mut output_grads_buf = device.allocate_f32(total_tokens * embed_dim)?;
+            let mut dacc_buf = device.allocate_f32(embed_dim)?;
+            let mut row_buf = device.allocate_f32(embed_dim)?;
+            let mut grad_row_buf = device.allocate_f32(embed_dim)?;
+
+            device.upload(grad_input_slice, &mut grad_input_buf)?;
+            device.upload(output_grads_slice, &mut output_grads_buf)?;
+            if device.fill_f32(&mut dacc_buf, 0.0).is_err() {
+                let zeros = vec![0.0f32; embed_dim];
+                device.upload(&zeros, &mut dacc_buf)?;
+            }
+
+            for i in (0..total_tokens).rev() {
+                let offset = i * embed_dim;
+                device.copy_within_device_range(
+                    &output_grads_buf,
+                    offset,
+                    &mut row_buf,
+                    0,
+                    embed_dim,
+                )?;
+
+                if retain != 1.0 {
+                    device.scale(retain, &mut dacc_buf, embed_dim)?;
+                }
+                if tm_scale != 0.0 {
+                    device.add_scaled(tm_scale, &row_buf, &mut dacc_buf, embed_dim)?;
+                }
+
+                device.copy_within_device_range(
+                    &grad_input_buf,
+                    offset,
+                    &mut grad_row_buf,
+                    0,
+                    embed_dim,
+                )?;
+                if eta != 0.0 {
+                    device.add_scaled(eta, &dacc_buf, &mut grad_row_buf, embed_dim)?;
+                }
+                device.copy_within_device_range(
+                    &grad_row_buf,
+                    0,
+                    &mut grad_input_buf,
+                    offset,
+                    embed_dim,
+                )?;
+            }
+
+            device.download(&grad_input_buf, grad_input_slice)?;
+            device.deallocate(grad_input_buf);
+            device.deallocate(output_grads_buf);
+            device.deallocate(dacc_buf);
+            device.deallocate(row_buf);
+            device.deallocate(grad_row_buf);
+        }
+
+        // TODO: Wire GPU MoH backward kernels (or a non-mutating gradient helper) into this
+        // `&self` GPU gradient path. For now, MoH parameter gradients remain placeholder zeros.
+        let mut all_param_grads = Vec::new();
+        all_param_grads.push(grad_w_q);
+        all_param_grads.push(grad_w_k);
+        all_param_grads.push(grad_w_v);
+        all_param_grads.push(grad_w_out);
+        all_param_grads.push(Array2::<f32>::from_elem((1, 1), grad_a_scalar)); // a
+        all_param_grads.push(Array2::<f32>::from_elem((1, 1), grad_b_scalar)); // b
+        all_param_grads.push(Array2::<f32>::from_elem((1, 1), grad_scale_scalar)); // scale
+
+        // Use zeroed gradients for now - full GPU MoH backward integration pending
+        // The GPU kernels are implemented in moh_gpu_kernels.rs
+        all_param_grads.push(Array2::<f32>::zeros(self.moh.w_g.dim())); // w_g
+        all_param_grads.push(Array2::<f32>::zeros(self.moh.alpha_g.dim())); // alpha_g
+        all_param_grads.push(Array2::<f32>::zeros(self.moh.beta_g.dim())); // beta_g
+        all_param_grads.push(Array2::<f32>::zeros((1, self.moh.gate.parameters()))); // gate poly
+
+        if self.moh.head_selection_config.gating.use_learned_predictor {
+            let predictor = self.moh.threshold_predictor.as_ref().ok_or_else(|| {
+                crate::common::errors::ModelError::GradientError {
+                    message: "PolyAttention invariant violated: use_learned_predictor=true but threshold_predictor=None"
+                        .to_string(),
+                }
+            })?;
+            all_param_grads.push(Array2::<f32>::zeros(predictor.weights1.dim()));
+            all_param_grads.push(Array2::<f32>::zeros((predictor.bias1.len(), 1)));
+            all_param_grads.push(Array2::<f32>::zeros(predictor.weights2.dim()));
+            all_param_grads.push(Array2::<f32>::zeros((predictor.bias2.len(), 1)));
+            all_param_grads.push(Array2::<f32>::zeros(predictor.cond_w.dim()));
+            all_param_grads.push(Array2::<f32>::zeros((
+                1,
+                predictor.activation.scalar_weights_len(),
+            )));
+        }
+
+        Ok((grad_input_total, all_param_grads))
     }
 
-    /// GPU-accelerated backward pass (not implemented - use CPU)
+    /// Non-GPU build behavior for compute_gradients_gpu (strict no-fallback error).
     #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
-    pub fn backward_gpu(&mut self, grads: &Array2<f32>, lr: f32) -> Result<Array2<f32>> {
-        // No GPU features - fallback to CPU backward
-        Ok(self.backward(grads, lr))
+    pub fn compute_gradients_gpu(
+        &self,
+        _input: &Array2<f32>,
+        _output_grads: &Array2<f32>,
+    ) -> Result<(Array2<f32>, Vec<Array2<f32>>)> {
+        Err(crate::common::errors::ModelError::Backend {
+            message:
+                "PolyAttention::compute_gradients_gpu requires GPU features. Rebuild with --features gpu-wgpu, gpu-cuda, or gpu-metal"
+                    .to_string(),
+        })
     }
 
     /// Ensure GPU device is attached with automatic detection
@@ -1831,6 +3963,8 @@ impl PolyAttention {
 
         // Auto-detect GPU device
         let device = GpuDevice::auto_detect()?;
+        self.gpu_weights = None;
+        self.gpu_forward_cache = None;
         self.gpu_device = Some(Arc::new(Mutex::new(device)));
         Ok(())
     }
@@ -2153,10 +4287,22 @@ impl PolyAttention {
         // Skip any remaining gradient arrays that may be for CoPE
         // The cope gradients were already applied during compute_gradients_parallel
         let _ = idx; // idx may not be used if no predictor, but that's fine
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        self.sync_gpu_weight_cache_after_update()?;
         Ok(())
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self.backward_gpu(grads, lr).unwrap_or_else(|err| {
+                panic!(
+                    "PolyAttention GPU backward failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+        }
+
         let input = self
             .cached_input
             .as_ref()
@@ -2184,6 +4330,35 @@ impl PolyAttention {
             self.last_causal,
             output_grads,
         )
+    }
+
+    #[inline]
+    fn backward_qkv_projection(
+        &self,
+        input: &Array2<f32>,
+        weights: &Array2<f32>,
+        label: &str,
+    ) -> Array2<f32> {
+        #[cfg(not(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal")))]
+        let _ = label;
+
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if let Some(device_arc) = &self.gpu_device {
+            return gpu_gemm_with_attached_device(
+                device_arc,
+                input,
+                weights,
+                input.nrows(),
+                weights.ncols(),
+                input.ncols(),
+                false,
+                false,
+                label,
+            )
+            .unwrap_or_else(|err| panic!("{label} failed on GPU-attached PolyAttention: {err}"));
+        }
+
+        input.dot(weights)
     }
 
     pub fn compute_gradients_parallel_from_state(
@@ -2224,10 +4399,11 @@ impl PolyAttention {
             anomaly: bool,
         }
 
-        // Monolithic forward projections for gradient computation
-        let q_all = input.dot(&self.w_q);
-        let k_all = input.dot(&self.w_k);
-        let v_all = input.dot(&self.w_v);
+        // Monolithic forward projections for gradient computation.
+        // When a GPU device is attached, use strict GPU GEMM for these dense projections.
+        let q_all = self.backward_qkv_projection(input, &self.w_q, "PolyAttention backward q_all");
+        let k_all = self.backward_qkv_projection(input, &self.w_k, "PolyAttention backward k_all");
+        let v_all = self.backward_qkv_projection(input, &self.w_v, "PolyAttention backward v_all");
 
         let head_results: Vec<HeadGradients> = (0..self.num_heads)
             .into_par_iter()
@@ -2262,11 +4438,10 @@ impl PolyAttention {
                 gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
                 let mut m_col = Array2::<f32>::ones((n, 1));
                 if moh.head_selection_config.gating.use_learned_predictor {
-                    let thresholds = cached_thresholds_global
-                        .as_ref()
-                        .expect("forward must cache thresholds when learned predictor is enabled");
-                    let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
-                    m_col.assign(&head_thresholds);
+                    if let Some(thresholds) = cached_thresholds_global.as_ref() {
+                        let head_thresholds = thresholds.slice(s![.., h_idx..h_idx + 1]);
+                        m_col.assign(&head_thresholds);
+                    }
                 } else if moh.head_selection_config.gating.use_soft_top_p
                     && let Some(mask) = &cached_soft_top_p_mask
                     && mask.nrows() == n
@@ -2638,84 +4813,89 @@ impl PolyAttention {
                 || moh.head_selection_config.gating.load_balance_weight > 0.0
                 || moh.head_selection_config.gating.sparsity_weight > 0.0)
         {
-            let m_mat = cached_thresholds_global
-                .as_ref()
-                .expect("forward must cache thresholds when learned predictor is enabled");
-            let mut g_mat = Array2::<f32>::zeros((n, self.num_heads));
-            let mut eff_mat = Array2::<f32>::zeros((n, self.num_heads));
-            let mut z_mat = Array2::<f32>::zeros((n, self.num_heads));
-            let mut max_abs_vec: Vec<f64> = vec![0.0; self.num_heads];
-            for h in 0..self.num_heads {
-                let w_g_col = moh.w_g.slice(s![.., h..h + 1]);
-                let xw_col = input.dot(&w_g_col);
-                let a_h = moh.alpha_g[[0, h]];
-                let b_h = moh.beta_g[[0, h]];
-                let mut z_col = xw_col.clone();
-                z_col.mapv_inplace(|v| a_h * v + b_h);
-                let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
-                max_abs_vec[h] = max_abs_z as f64;
-                let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
-                let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
-                gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
-                for i in 0..n {
-                    z_mat[[i, h]] = z_col[[i, 0]];
-                    g_mat[[i, h]] = g_col[[i, 0]];
-                    eff_mat[[i, h]] = g_col[[i, 0]] * m_mat[[i, h]];
-                }
+            if cached_thresholds_global.is_none() {
+                tracing::warn!(
+                    "PolyAttention backward: learned predictor aux gradients requested without cached thresholds; skipping aux-loss gradient contribution for this step"
+                );
             }
-            let inv_n = 1.0f32 / (n as f32);
-            let inv_h = 1.0f32 / (self.num_heads as f32);
-            let target_heads = ((moh.head_selection_config.min_heads
-                + moh.head_selection_config.max_heads) as f32)
-                * 0.5;
-            for i in 0..n {
-                let mut s = 0.0f32;
+            if let Some(m_mat) = cached_thresholds_global.as_ref() {
+                let mut g_mat = Array2::<f32>::zeros((n, self.num_heads));
+                let mut eff_mat = Array2::<f32>::zeros((n, self.num_heads));
+                let mut z_mat = Array2::<f32>::zeros((n, self.num_heads));
+                let mut max_abs_vec: Vec<f64> = vec![0.0; self.num_heads];
                 for h in 0..self.num_heads {
-                    s += eff_mat[[i, h]];
-                }
-                let mean = s * inv_h;
-                let mut base_d = 0.0f32;
-                if moh.head_selection_config.gating.complexity_loss_weight > 0.0 {
-                    base_d += moh.head_selection_config.gating.complexity_loss_weight
-                        * (s - target_heads)
-                        * inv_n;
-                }
-                base_d += moh.head_selection_config.gating.sparsity_weight * inv_n * inv_h;
-                for h in 0..self.num_heads {
-                    let eff_h = eff_mat[[i, h]];
-                    let mut d_eff_h = base_d;
-                    if moh.head_selection_config.gating.load_balance_weight > 0.0 {
-                        d_eff_h += 2.0
-                            * moh.head_selection_config.gating.load_balance_weight
-                            * inv_n
-                            * inv_h
-                            * (eff_h - mean);
-                    }
-                    let d_g_i = d_eff_h * m_mat[[i, h]];
+                    let w_g_col = moh.w_g.slice(s![.., h..h + 1]);
+                    let xw_col = input.dot(&w_g_col);
                     let a_h = moh.alpha_g[[0, h]];
-                    let z_i = z_mat[[i, h]];
-                    let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
-                    let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
-                    let grad_g_i = d_g_i * dphi_dz_i;
-                    let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
-                    for (wi, &gw) in gws.iter().enumerate() {
-                        grad_gate_poly_vec_acc[wi] += gw;
+                    let b_h = moh.beta_g[[0, h]];
+                    let mut z_col = xw_col.clone();
+                    z_col.mapv_inplace(|v| a_h * v + b_h);
+                    let max_abs_z = z_col.iter().fold(0.0_f32, |m, &z| m.max(z.abs()));
+                    max_abs_vec[h] = max_abs_z as f64;
+                    let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_z as f64);
+                    let mut g_col = Array2::<f32>::zeros(z_col.raw_dim());
+                    gate_poly.forward_matrix_f32_into(&z_col, &mut g_col);
+                    for i in 0..n {
+                        z_mat[[i, h]] = z_col[[i, 0]];
+                        g_mat[[i, h]] = g_col[[i, 0]];
+                        eff_mat[[i, h]] = g_col[[i, 0]] * m_mat[[i, h]];
                     }
-                    for d in 0..self.embed_dim {
-                        grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i;
+                }
+                let inv_n = 1.0f32 / (n as f32);
+                let inv_h = 1.0f32 / (self.num_heads as f32);
+                let target_heads = ((moh.head_selection_config.min_heads
+                    + moh.head_selection_config.max_heads)
+                    as f32)
+                    * 0.5;
+                for i in 0..n {
+                    let mut s = 0.0f32;
+                    for h in 0..self.num_heads {
+                        s += eff_mat[[i, h]];
                     }
-                    let xw_val = if a_h.abs() > 1e-8 {
-                        (z_i - moh.beta_g[[0, h]]) / a_h
-                    } else {
-                        0.0
-                    };
-                    grad_alpha_g[[0, h]] += grad_g_i * xw_val;
-                    grad_beta_g[[0, h]] += grad_g_i;
-                    for d in 0..self.embed_dim {
-                        grad_input_total[[i, d]] += a_h * moh.w_g[[d, h]] * grad_g_i;
+                    let mean = s * inv_h;
+                    let mut base_d = 0.0f32;
+                    if moh.head_selection_config.gating.complexity_loss_weight > 0.0 {
+                        base_d += moh.head_selection_config.gating.complexity_loss_weight
+                            * (s - target_heads)
+                            * inv_n;
                     }
-                    if let Some(acc) = threshold_grad_accum.as_mut() {
-                        acc[[i, h]] += d_eff_h * g_mat[[i, h]];
+                    base_d += moh.head_selection_config.gating.sparsity_weight * inv_n * inv_h;
+                    for h in 0..self.num_heads {
+                        let eff_h = eff_mat[[i, h]];
+                        let mut d_eff_h = base_d;
+                        if moh.head_selection_config.gating.load_balance_weight > 0.0 {
+                            d_eff_h += 2.0
+                                * moh.head_selection_config.gating.load_balance_weight
+                                * inv_n
+                                * inv_h
+                                * (eff_h - mean);
+                        }
+                        let d_g_i = d_eff_h * m_mat[[i, h]];
+                        let a_h = moh.alpha_g[[0, h]];
+                        let z_i = z_mat[[i, h]];
+                        let gate_poly = moh.gate.update_scaling_from_max_abs(max_abs_vec[h]);
+                        let dphi_dz_i = gate_poly.backward_scalar_f32(z_i);
+                        let grad_g_i = d_g_i * dphi_dz_i;
+                        let gws = gate_poly.grad_weights_scalar_f32(z_i, d_g_i);
+                        for (wi, &gw) in gws.iter().enumerate() {
+                            grad_gate_poly_vec_acc[wi] += gw;
+                        }
+                        for d in 0..self.embed_dim {
+                            grad_w_g[[d, h]] += a_h * input[[i, d]] * grad_g_i;
+                        }
+                        let xw_val = if a_h.abs() > 1e-8 {
+                            (z_i - moh.beta_g[[0, h]]) / a_h
+                        } else {
+                            0.0
+                        };
+                        grad_alpha_g[[0, h]] += grad_g_i * xw_val;
+                        grad_beta_g[[0, h]] += grad_g_i;
+                        for d in 0..self.embed_dim {
+                            grad_input_total[[i, d]] += a_h * moh.w_g[[d, h]] * grad_g_i;
+                        }
+                        if let Some(acc) = threshold_grad_accum.as_mut() {
+                            acc[[i, h]] += d_eff_h * g_mat[[i, h]];
+                        }
                     }
                 }
             }
@@ -3127,6 +5307,16 @@ impl Layer for PolyAttention {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self.forward_gpu(input).unwrap_or_else(|err| {
+                panic!(
+                    "PolyAttention GPU forward failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+        }
+
         // default causal
         self.forward_impl(input, true)
     }
@@ -3612,6 +5802,8 @@ mod tests {
 impl GpuComponent for PolyAttention {
     /// Attach a pre-configured GPU device
     fn set_gpu_device(&mut self, device: Arc<Mutex<GpuDevice>>) {
+        self.gpu_weights = None;
+        self.gpu_forward_cache = None;
         self.gpu_device = Some(device);
     }
 
@@ -3621,6 +5813,8 @@ impl GpuComponent for PolyAttention {
     /// No silent fallback to CPU computation.
     fn enable_gpu_auto_detect(&mut self) -> Result<()> {
         let device = GpuDevice::auto_detect()?;
+        self.gpu_weights = None;
+        self.gpu_forward_cache = None;
         self.gpu_device = Some(Arc::new(Mutex::new(device)));
         Ok(())
     }
@@ -3686,6 +5880,67 @@ impl GpuComponent for PolyAttention {
 /// Additional GPU methods for PolyAttention (not part of GpuComponent trait)
 #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
 impl PolyAttention {
+    /// Synchronize cached GPU weights after CPU-side optimizer updates.
+    ///
+    /// Keeps GPU transformer/polyattention forward passes consistent during training
+    /// without reallocating the cached GPU buffers every step.
+    fn sync_gpu_weight_cache_after_update(&mut self) -> crate::common::errors::Result<()> {
+        if self.gpu_device.is_none() || self.gpu_weights.is_none() {
+            return Ok(());
+        }
+
+        let w_q_vec: Vec<f32> = self.w_q.t().as_standard_layout().iter().copied().collect();
+        let w_k_vec: Vec<f32> = self.w_k.t().as_standard_layout().iter().copied().collect();
+        let w_v_vec: Vec<f32> = self.w_v.t().as_standard_layout().iter().copied().collect();
+        let w_out_vec: Vec<f32> = self.w_out.t().as_standard_layout().iter().copied().collect();
+        let w_g_vec: Vec<f32> = self
+            .moh
+            .w_g
+            .t()
+            .as_standard_layout()
+            .iter()
+            .copied()
+            .collect();
+        let alpha_g_vec: Vec<f32> = self.moh.alpha_g.iter().copied().collect();
+        let beta_g_vec: Vec<f32> = self.moh.beta_g.iter().copied().collect();
+        let a_vec: Vec<f32> = self.a.iter().copied().collect();
+        let b_vec: Vec<f32> = self.b.iter().copied().collect();
+        let scale_vec: Vec<f32> = self.scale.iter().copied().collect();
+
+        let device_arc = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                message: "PolyAttention GPU device missing during cache sync".to_string(),
+            })?
+            .clone();
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock PolyAttention GPU device during cache sync"
+                        .to_string(),
+                })?;
+        let (pool, ops) = device.execution_context();
+        let gpu_weights = self.gpu_weights.as_mut().ok_or_else(|| {
+            crate::common::errors::ModelError::Backend {
+                message: "PolyAttention GPU weight cache missing during sync".to_string(),
+            }
+        })?;
+
+        ops.upload(pool, &w_q_vec, &mut gpu_weights.w_q)?;
+        ops.upload(pool, &w_k_vec, &mut gpu_weights.w_k)?;
+        ops.upload(pool, &w_v_vec, &mut gpu_weights.w_v)?;
+        ops.upload(pool, &w_out_vec, &mut gpu_weights.w_out)?;
+        ops.upload(pool, &w_g_vec, &mut gpu_weights.w_g)?;
+        ops.upload(pool, &alpha_g_vec, &mut gpu_weights.alpha_g)?;
+        ops.upload(pool, &beta_g_vec, &mut gpu_weights.beta_g)?;
+        ops.upload(pool, &a_vec, &mut gpu_weights.poly_a)?;
+        ops.upload(pool, &b_vec, &mut gpu_weights.poly_b)?;
+        ops.upload(pool, &scale_vec, &mut gpu_weights.poly_scale)?;
+        Ok(())
+    }
+
     /// Ensure GPU weight cache is initialized and up-to-date
     fn ensure_gpu_weights(
         &mut self,
@@ -3767,7 +6022,8 @@ impl PolyAttention {
         let scale_buf = pool.upload(&scale_vec)?;
 
         // Upload gate parameters
-        let gate_params_vec: Vec<f32> = Vec::new(); // Placeholder for now
+        // Keep at least one element to avoid zero-sized uniform/storage bindings.
+        let gate_params_vec: Vec<f32> = vec![0.0];
         let gate_params_buf = pool.upload(&gate_params_vec)?;
 
         self.gpu_weights = Some(PolyAttentionGpuWeights {

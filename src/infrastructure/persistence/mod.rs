@@ -3,6 +3,7 @@ pub mod dataset;
 pub mod loader;
 pub mod mnist_loader;
 pub mod model_storage;
+pub mod rkyv_dataset;
 pub mod speech_loader;
 
 pub use loader::DatasetLoader;

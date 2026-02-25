@@ -29,6 +29,7 @@ pub mod fused_kernels;
 pub mod gpu_auto_detect;
 pub mod gpu_component;
 pub mod gpu_device;
+pub mod gpu_fused_forward;
 pub mod gpu_memory;
 pub mod gpu_ops;
 pub mod gpu_reduction_kernels;
@@ -62,6 +63,8 @@ pub use fused_kernels::{
     FusedKernelMetrics, FusedKernelResult, RichardsGluFusedKernelExecutor,
     RichardsGluFusedPass1Params, RichardsGluFusedPass2Params,
 };
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+pub use fused_kernels::{GpuTransferStats, GpuWeightCache};
 pub use gpu_auto_detect::{
     GpuAutoDetector, GpuDetectionDiagnostics, GpuDetectionStatus, GpuFeatureSet,
 };

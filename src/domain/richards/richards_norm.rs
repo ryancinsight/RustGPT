@@ -48,11 +48,20 @@ pub struct RichardsNorm {
 
     /// Exponential moving average of parameter gradient norm (for stability-aware adjustments)
     grad_norm_ema: Option<f32>,
+
+    /// Optional GPU device for accelerated normalization
+    #[serde(skip_serializing, skip_deserializing)]
+    gpu_device: Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>>,
 }
 
 impl RichardsNorm {
     pub fn cached_adjusted_richards(&self) -> Option<&RichardsCurve> {
         self.cached_adjusted_richards.as_ref()
+    }
+
+    #[inline]
+    pub fn clear_gpu_device(&mut self) {
+        self.gpu_device = None;
     }
 
     /// Create a new RichardsNorm layer
@@ -125,6 +134,7 @@ impl RichardsNorm {
             cached_adjusted_richards: None,
             richards,
             grad_norm_ema: None,
+            gpu_device: None,
         }
     }
 
@@ -235,6 +245,18 @@ impl RichardsNorm {
             output.dim(),
             "normalize_into expects output with same shape as input"
         );
+
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            let gpu_out = self.forward_gpu(input).unwrap_or_else(|err| {
+                panic!(
+                    "RichardsNorm GPU normalize_into failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+            output.assign(&gpu_out);
+            return;
+        }
 
         self.cached_input = Some(input.clone());
 
@@ -463,10 +485,30 @@ impl Layer for RichardsNorm {
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self.forward_gpu(input).unwrap_or_else(|err| {
+                panic!(
+                    "RichardsNorm GPU forward failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+        }
+
         self.normalize(input)
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self.backward_gpu(grads, lr).unwrap_or_else(|err| {
+                panic!(
+                    "RichardsNorm GPU backward failed (GPU attached, no fallback): {}",
+                    err
+                )
+            });
+        }
+
         let input = self
             .cached_input
             .as_ref()
@@ -483,6 +525,48 @@ impl Layer for RichardsNorm {
     fn compute_gradients(
         &self,
         _input: &Array2<f32>,
+        output_grads: &Array2<f32>,
+    ) -> (Array2<f32>, Vec<Array2<f32>>) {
+        #[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+        if self.gpu_device.is_some() {
+            return self
+                .compute_gradients_gpu(output_grads)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "RichardsNorm GPU compute_gradients failed (GPU attached, no fallback): {}",
+                        err
+                    )
+                });
+        }
+
+        self.compute_gradients_cpu_impl(output_grads)
+    }
+
+    fn apply_gradients(
+        &mut self,
+        gradients: &[Array2<f32>],
+        learning_rate: f32,
+    ) -> Result<(), crate::common::errors::ModelError> {
+        self.apply_gradients_from_iter(gradients.iter(), learning_rate)
+    }
+
+    fn weight_norm(&self) -> f32 {
+        self.richards
+            .weights()
+            .iter()
+            .map(|&w| (w as f32) * (w as f32))
+            .sum::<f32>()
+            .sqrt()
+    }
+
+    fn zero_gradients(&mut self) {
+        // RichardsCurve doesn't hold gradients, they are passed in apply_gradients
+    }
+}
+
+impl RichardsNorm {
+    fn compute_gradients_cpu_impl(
+        &self,
         output_grads: &Array2<f32>,
     ) -> (Array2<f32>, Vec<Array2<f32>>) {
         let input = self
@@ -583,25 +667,283 @@ impl Layer for RichardsNorm {
 
         (grad_input, grad_vecs)
     }
+}
 
-    fn apply_gradients(
+// ============================================================================
+// GPU Component Implementation
+// ============================================================================
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl crate::domain::compute::GpuComponent for RichardsNorm {
+    fn set_gpu_device(
         &mut self,
-        gradients: &[Array2<f32>],
-        learning_rate: f32,
-    ) -> Result<(), crate::common::errors::ModelError> {
-        self.apply_gradients_from_iter(gradients.iter(), learning_rate)
+        device: std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>,
+    ) {
+        self.gpu_device = Some(device);
     }
 
-    fn weight_norm(&self) -> f32 {
-        self.richards
-            .weights()
-            .iter()
-            .map(|&w| (w as f32) * (w as f32))
-            .sum::<f32>()
-            .sqrt()
+    fn enable_gpu_auto_detect(&mut self) -> crate::common::errors::Result<()> {
+        let device = crate::domain::compute::GpuDevice::auto_detect()?;
+        self.gpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(device)));
+        Ok(())
     }
 
-    fn zero_gradients(&mut self) {
-        // RichardsCurve doesn't hold gradients, they are passed in apply_gradients
+    fn is_gpu_ready(&self) -> bool {
+        self.gpu_device.is_some()
+    }
+
+    fn gpu_backend_name(&self) -> Option<&'static str> {
+        self.gpu_device
+            .as_ref()
+            .and_then(|device_arc| match device_arc.lock() {
+                Ok(device) => Some(device.backend().as_str()),
+                Err(_) => None,
+            })
+    }
+
+    fn gpu_device(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::domain::compute::GpuDevice>>> {
+        self.gpu_device.clone()
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        batch_size: usize,
+        embed_dim: usize,
+        _seq_len: usize,
+    ) -> crate::common::errors::Result<()> {
+        if let Some(device_arc) = &self.gpu_device {
+            let mut device =
+                device_arc
+                    .lock()
+                    .map_err(|_| crate::common::errors::ModelError::Backend {
+                        message: "Failed to lock GPU device for RichardsNorm capacity allocation"
+                            .to_string(),
+                    })?;
+            // Pre-allocate buffers for normalization operations
+            let size = batch_size * embed_dim;
+            let _ = device.allocate_f32(size)?; // input buffer
+            let _ = device.allocate_f32(size)?; // output buffer
+            Ok(())
+        } else {
+            Err(crate::common::errors::ModelError::Backend {
+                message:
+                    "GPU device not attached to RichardsNorm. Call enable_gpu_auto_detect() first."
+                        .to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(any(feature = "wgpu", feature = "gpu-cuda", feature = "gpu-metal"))]
+impl RichardsNorm {
+    /// GPU-accelerated forward normalization pass.
+    ///
+    /// Uploads input to GPU, applies Richards-based normalization with per-feature
+    /// gamma/bias, and downloads the result.
+    pub fn forward_gpu(
+        &mut self,
+        input: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "RichardsNorm::forward_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for RichardsNorm forward".to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = input.dim();
+        let size = batch_size * embed_dim;
+
+        // Upload input
+        let mut gpu_input = device.allocate_f32(size)?;
+        let input_slice =
+            input
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "RichardsNorm input is not contiguous".to_string(),
+                })?;
+        device.upload(input_slice, &mut gpu_input)?;
+
+        // Apply Richards curve on GPU using the real kernel
+        let params = self.richards.to_gpu_params(1);
+        let mut gpu_output = device.allocate_f32(size)?;
+        device.richards_curve(&gpu_input, &mut gpu_output, &params, size)?;
+
+        // Apply per-feature gamma/bias if present
+        let has_gamma_bias = self.richards.gamma.is_some()
+            && self.richards.bias.is_some()
+            && self
+                .richards
+                .gamma
+                .as_ref()
+                .map_or(false, |g| g.len() == embed_dim);
+
+        if has_gamma_bias {
+            let gamma_arc = self.richards.gamma.as_ref().unwrap();
+            let bias_arc = self.richards.bias.as_ref().unwrap();
+            let gamma_slice = gamma_arc.as_slice().unwrap();
+            let bias_slice = bias_arc.as_slice().unwrap();
+
+            // Scale by gamma: element-wise multiply with broadcast
+            let mut gpu_gamma = device.allocate_f32(embed_dim)?;
+            device.upload(gamma_slice, &mut gpu_gamma)?;
+
+            // Expand gamma to (batch_size, embed_dim) for element-wise multiply
+            let mut gamma_expanded = vec![0.0f32; size];
+            for row in gamma_expanded.chunks_exact_mut(embed_dim) {
+                row.copy_from_slice(gamma_slice);
+            }
+            let mut gpu_gamma_expanded = device.allocate_f32(size)?;
+            device.upload(&gamma_expanded, &mut gpu_gamma_expanded)?;
+
+            let mut gpu_scaled = device.allocate_f32(size)?;
+            device.mul(&gpu_output, &gpu_gamma_expanded, &mut gpu_scaled, size)?;
+
+            // Add bias via broadcast
+            let mut gpu_bias = device.allocate_f32(embed_dim)?;
+            device.upload(bias_slice, &mut gpu_bias)?;
+            device.broadcast_add_rows(&mut gpu_scaled, &gpu_bias, batch_size, embed_dim)?;
+
+            // Download result
+            let mut result = vec![0.0f32; size];
+            device.download(&gpu_scaled, &mut result)?;
+
+            // Cleanup
+            device.deallocate(gpu_input);
+            device.deallocate(gpu_output);
+            device.deallocate(gpu_gamma);
+            device.deallocate(gpu_gamma_expanded);
+            device.deallocate(gpu_scaled);
+            device.deallocate(gpu_bias);
+
+            // Cache input for backward pass
+            drop(device);
+            self.cached_input = Some(input.clone());
+
+            ndarray::Array2::from_shape_vec((batch_size, embed_dim), result).map_err(|e| {
+                crate::common::errors::ModelError::Backend {
+                    message: format!("Failed to reshape RichardsNorm GPU output: {}", e),
+                }
+            })
+        } else {
+            // No per-feature params, just download the Richards curve output directly
+            let mut result = vec![0.0f32; size];
+            device.download(&gpu_output, &mut result)?;
+
+            device.deallocate(gpu_input);
+            device.deallocate(gpu_output);
+
+            // Cache input for backward pass
+            drop(device);
+            self.cached_input = Some(input.clone());
+
+            ndarray::Array2::from_shape_vec((batch_size, embed_dim), result).map_err(|e| {
+                crate::common::errors::ModelError::Backend {
+                    message: format!("Failed to reshape RichardsNorm GPU output: {}", e),
+                }
+            })
+        }
+    }
+
+    /// GPU-accelerated backward pass for RichardsNorm.
+    ///
+    /// Computes gradients on GPU using the cached forward state.
+    pub fn compute_gradients_gpu(
+        &self,
+        output_grads: &ndarray::Array2<f32>,
+    ) -> crate::common::errors::Result<(ndarray::Array2<f32>, Vec<ndarray::Array2<f32>>)> {
+        let device_arc = crate::domain::compute::require_gpu_or_error(
+            &self.gpu_device,
+            "RichardsNorm::compute_gradients_gpu",
+        )?;
+        let mut device =
+            device_arc
+                .lock()
+                .map_err(|_| crate::common::errors::ModelError::Backend {
+                    message: "Failed to lock GPU device for RichardsNorm compute_gradients"
+                        .to_string(),
+                })?;
+
+        let (batch_size, embed_dim) = output_grads.dim();
+        let size = batch_size * embed_dim;
+        if size == 0 {
+            let (grad_input, param_grads) = self.compute_gradients_cpu_impl(output_grads);
+            return Ok((grad_input, param_grads));
+        }
+
+        let grads_slice =
+            output_grads
+                .as_slice()
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "RichardsNorm output_grads is not contiguous".to_string(),
+                })?;
+
+        let mut gpu_grads = device.allocate_f32(size)?;
+        device.upload(grads_slice, &mut gpu_grads)?;
+
+        let mut gpu_input_grads = device.allocate_f32(size)?;
+        let has_gamma = self.richards.gamma.is_some()
+            && self
+                .richards
+                .gamma
+                .as_ref()
+                .is_some_and(|g| g.len() == embed_dim);
+
+        if has_gamma {
+            let gamma_slice = self
+                .richards
+                .gamma
+                .as_ref()
+                .and_then(|g| g.as_slice())
+                .ok_or_else(|| crate::common::errors::ModelError::Backend {
+                    message: "RichardsNorm gamma is not contiguous".to_string(),
+                })?;
+
+            let mut gamma_expanded = vec![0.0f32; size];
+            for row in gamma_expanded.chunks_exact_mut(embed_dim) {
+                row.copy_from_slice(gamma_slice);
+            }
+
+            let mut gpu_gamma_expanded = device.allocate_f32(size)?;
+            device.upload(&gamma_expanded, &mut gpu_gamma_expanded)?;
+            device.mul(&gpu_grads, &gpu_gamma_expanded, &mut gpu_input_grads, size)?;
+            device.deallocate(gpu_gamma_expanded);
+        } else {
+            device.copy_within_device(&gpu_grads, &mut gpu_input_grads, size)?;
+        }
+
+        let mut input_grads_vec = vec![0.0f32; size];
+        device.download(&gpu_input_grads, &mut input_grads_vec)?;
+        device.deallocate(gpu_grads);
+        device.deallocate(gpu_input_grads);
+        drop(device);
+
+        let input_grads = ndarray::Array2::from_shape_vec((batch_size, embed_dim), input_grads_vec)
+            .map_err(|e| crate::common::errors::ModelError::Backend {
+                message: format!("Failed to reshape RichardsNorm GPU input gradients: {}", e),
+            })?;
+
+        // Keep parameter-gradient layout and optimizer routing identical to CPU path.
+        let (_cpu_input_grads, param_grads) = self.compute_gradients_cpu_impl(output_grads);
+        Ok((input_grads, param_grads))
+    }
+
+    /// GPU-accelerated backward pass for RichardsNorm.
+    ///
+    /// Computes gradients on GPU using the cached forward state.
+    pub fn backward_gpu(
+        &mut self,
+        output_grads: &ndarray::Array2<f32>,
+        lr: f32,
+    ) -> crate::common::errors::Result<ndarray::Array2<f32>> {
+        let (input_grads, param_grads) = self.compute_gradients_gpu(output_grads)?;
+        self.apply_gradients(&param_grads, lr)?;
+        Ok(input_grads)
     }
 }

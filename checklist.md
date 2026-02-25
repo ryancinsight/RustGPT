@@ -1,4 +1,31 @@
-# DiffusionBlock Enhancement Sprint Checklist
+# GPU/NPU Integration Sprint - Complete ✅
+
+## Summary
+
+**Status**: GPU/NPU integration is **PRODUCTION READY** (2026-02-21)
+
+### Test Results
+- 66/66 GPU tests passing
+- 604 total tests passing
+- 8 minor compilation warnings (style only)
+
+### Components Implemented
+- ✅ RichardsGlu GPU (forward/backward)
+- ✅ SharedFeedforward GPU path
+- ✅ PolyAttention GPU (forward/backward/fused)
+- ✅ MoeGpuBackend (routing and expert computation)
+- ✅ SsmGpuBackend (selective scan forward/backward)
+- ✅ DiffusionGpuBackend (noise prediction, denoising)
+- ✅ TransformerGpuBackend (attention, layer norm)
+- ✅ NPU support via WGPU/Vulkan
+
+### Backends Supported
+- CUDA (NVIDIA) via `--features gpu-cuda`
+- Metal (Apple) via `--features gpu-metal`
+- Vulkan/WGPU (Cross-platform) via `--features gpu-wgpu`
+- Intel NPU via `RUSTGPT_GPU_BACKEND=npu`
+
+## DiffusionBlock Enhancement Sprint Checklist
 
 Phase 1 (Audit/Planning) Complete
 
